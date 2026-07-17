@@ -1,0 +1,16 @@
+[package]
+name = "peregrine-cuda"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "colibrì CUDA GPU lane: FFI to the validated ../c/backend_cuda.cu kernels (feature = cuda)"
+build = "build.rs"
+
+[features]
+# Off by default so the workspace builds on hosts without nvcc/CUDA. Enable on an
+# NVIDIA box: `cargo build -p peregrine-cuda --features cuda`.
+default = []
+cuda = []
+
+[dependencies]
