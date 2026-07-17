@@ -30,7 +30,7 @@ io_uring to cut syscalls.
   all on CPU, GPU groups 21ms total"* (`c/glm.c:2921-2923`). So on the same MoE block, CPU-expert
   compute and GPU-expert compute never run at once. Metal has a GPU∥disk overlap that CUDA lacks.
 
-**Chosen direction (user-confirmed):** A **full from-scratch Rust engine**, targeting
+**Chosen direction** A **full from-scratch Rust engine**, targeting
 **Linux + NVIDIA CUDA**, whose goal is to **beat current tok/s** by closing that phased gap —
 a completion-driven scheduler where the GPU lane, CPU lane, and io_uring SSD lane all drain the
 same layer's experts simultaneously. Byte-exact parity with the C engine is **not** required:
