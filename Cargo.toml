@@ -1,0 +1,30 @@
+# peregrine — cargo workspace.
+#
+# A Rust MoE inference engine (spin-off of colibrì) that drives CPU, GPU, SSD,
+# and RAM concurrently. See DESIGN.md. Crates:
+#   peregrine-core     formats: Cfg, safetensors index, QT quant, dtype
+#   peregrine-kernels  std::arch int4/int8/int2 + f32 matmul (token-exact)
+#   peregrine-io       io_uring reactor (registered files), LRU/LFRU tiers
+#   peregrine-cuda     FFI to cuda/backend_cuda.cu (feature = "cuda")
+#   peregrine-model    MLA, router, MoE, DSA, MTP + top-level Model
+#   peregrine-sched    concurrent MoE scheduler: io_uring streaming || CPU
+#   peregrine-engine   binary `peregrine`: CLI + stdio serve protocol
+[workspace]
+resolver = "2"
+members = ["crates/peregrine-core", "crates/peregrine-kernels", "crates/peregrine-model", "crates/peregrine-io", "crates/peregrine-sched", "crates/peregrine-engine", "crates/peregrine-cuda"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/s-b-repo/peregrine"
+
+[workspace.dependencies]
+serde_json = "1"
+
+# Release profile tuned for the CPU matmul path (M1+): fat LTO + single codegen
+# unit so the SIMD kernels inline across crate boundaries. Harmless for M0.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
