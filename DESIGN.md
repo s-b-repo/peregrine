@@ -7,11 +7,11 @@
 
 ## Context
 
-**What prompted this:** The request is to make the engine use RAM, CPU, GPU, and SSD in
+the engine use RAM, CPU, GPU, and SSD in
 parallel *at the same time* to improve throughput, and to build a Rust version that uses
 io_uring to cut syscalls.
 
-**What the research found (important — reshapes the request):**
+**What the research found:**
 
 - **io_uring already exists in the C engine** (`URING=1`, Linux-only, `c/uring.h`). It is a
   hand-rolled raw-syscall ring (no liburing), batches up to 512 reads / 64 expert-loads per
