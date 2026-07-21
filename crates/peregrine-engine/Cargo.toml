@@ -1,0 +1,15 @@
+[package]
+name = "peregrine-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "peregrine engine binary: stdio serve protocol (drop-in for colibrì's c/glm) + demo mode"
+
+[[bin]]
+name = "peregrine"
+path = "src/main.rs"
+
+[dependencies]
+peregrine-model = { path = "../peregrine-model" }
+peregrine-core = { path = "../peregrine-core" }
