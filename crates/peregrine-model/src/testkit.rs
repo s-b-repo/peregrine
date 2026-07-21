@@ -4,7 +4,7 @@
 //! demo mode to exercise loading + the full forward end-to-end.
 
 use peregrine_core::pack::{f32_bytes, quant_i4, quant_i8, write_safetensors, Blob};
-use peregrine_core::Cfg;
+use peregrine_core::{Cfg, Error};
 use std::path::Path;
 
 struct Lcg(u64);
@@ -29,8 +29,8 @@ pub fn tiny_cfg_json() -> serde_json::Value {
 }
 
 /// Write a tiny random model into `dir`, seeded by `seed` for reproducibility.
-pub fn build_tiny_model_seeded(dir: &Path, seed: u64) {
-    let cfg: Cfg = Cfg::from_json(&tiny_cfg_json()).unwrap();
+pub fn build_tiny_model_seeded(dir: &Path, seed: u64) -> Result<(), Error> {
+    let cfg: Cfg = Cfg::from_json(&tiny_cfg_json())?;
     let mut r = Lcg(seed);
     let rnd = |n: usize, r: &mut Lcg| (0..n).map(|_| r.f()).collect::<Vec<f32>>();
     let (d, h) = (cfg.hidden as usize, cfg.n_heads as usize);
@@ -95,12 +95,13 @@ pub fn build_tiny_model_seeded(dir: &Path, seed: u64) {
         }
     }
 
-    std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(dir.join("config.json"), serde_json::to_vec(&tiny_cfg_json()).unwrap()).unwrap();
-    write_safetensors(dir, &blobs).unwrap();
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&tiny_cfg_json())?)?;
+    write_safetensors(dir, &blobs)?;
+    Ok(())
 }
 
 /// Convenience: build the tiny model with the default seed.
-pub fn build_tiny_model(dir: &Path) {
-    build_tiny_model_seeded(dir, 0xC0FFEE);
+pub fn build_tiny_model(dir: &Path) -> Result<(), Error> {
+    build_tiny_model_seeded(dir, 0xC0FFEE)
 }

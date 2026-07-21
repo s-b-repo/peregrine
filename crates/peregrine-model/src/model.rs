@@ -6,9 +6,12 @@
 //! for the 744B model is M2. Absorption/DSA are M5 — attention runs the dense
 //! reconstruction path.
 
-use peregrine_core::{Cfg, Error, SafeTensors};
+use parking_lot::Mutex;
+use peregrine_core::{Cfg, Context, Error, SafeTensors};
+use peregrine_io::Reactor;
 
 use crate::attention::{mla_attention, AttnWeights, LayerKv};
+use crate::concurrent::{default_workers, moe_forward_concurrent};
 use crate::math::rmsnorm;
 use crate::mlp::{moe_forward, Mlp};
 use crate::sample::Sampler;
@@ -55,6 +58,30 @@ pub struct Model {
     final_norm: Vec<f32>,
     lm_head: QtWeight,
     kv: Vec<LayerKv>,
+    /// When set, routed experts are streamed from `st` per layer on demand
+    /// instead of held resident — required to run models that exceed RAM
+    /// (e.g. the 744B GLM-5.2). `LayerW::experts` is empty in this mode.
+    stream_experts: bool,
+    /// Retained safetensors index (keeps shard fds open) for streaming reads.
+    st: SafeTensors,
+    /// The concurrent MoE lane's dedicated io_uring ring (streaming mode only);
+    /// separate from `st`'s ring so a whole layer's experts stream on the I/O
+    /// lane while the CPU pool computes. `None` when experts are resident.
+    io_reactor: Option<Mutex<Reactor>>,
+    /// CPU-lane worker count for the concurrent MoE.
+    workers: usize,
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes (0 if unreadable).
+fn mem_available_bytes() -> u64 {
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return 0 };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            return kb * 1024;
+        }
+    }
+    0
 }
 
 fn load_f32(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
@@ -66,9 +93,44 @@ fn load_f32(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
 impl Model {
     /// Load a model directory (config.json + `*.safetensors` in the int4/int8
     /// container format).
+    /// Load a model directory, auto-deciding whether to stream routed experts
+    /// from disk (large models) or hold them resident (small models). The
+    /// `COLI_STREAM=1|0` env var overrides the decision.
     pub fn load(dir: &std::path::Path) -> Result<Model, Error> {
+        Self::load_inner(dir, None)
+    }
+
+    /// Load, forcing routed-expert streaming on (`true`) or off (`false`).
+    /// Bypasses the RAM-budget heuristic — used to run a >RAM model explicitly
+    /// and to test that the streamed path matches the resident one.
+    pub fn load_streaming(dir: &std::path::Path, stream: bool) -> Result<Model, Error> {
+        Self::load_inner(dir, Some(stream))
+    }
+
+    fn load_inner(dir: &std::path::Path, force_stream: Option<bool>) -> Result<Model, Error> {
         let cfg = Cfg::load(dir)?;
         let st = SafeTensors::open(dir)?;
+
+        // Decide whether routed experts must be streamed from disk: sum their
+        // on-disk payload and compare to available RAM (leaving headroom for
+        // activations/KV). An explicit override or `COLI_STREAM=1|0` wins.
+        let routed_bytes: u64 = st
+            .tensors()
+            .iter()
+            .filter(|t| t.name.contains(".mlp.experts."))
+            .map(|t| t.nbytes as u64)
+            .sum();
+        let stream_experts = force_stream.unwrap_or_else(|| {
+            match std::env::var("COLI_STREAM").ok().as_deref() {
+                Some("1") | Some("true") => true,
+                Some("0") | Some("false") => false,
+                _ => {
+                    let avail = mem_available_bytes();
+                    avail > 0 && routed_bytes as f64 > 0.6 * avail as f64
+                }
+            }
+        });
+
         let (d, h) = (cfg.hidden as usize, cfg.n_heads as usize);
         let (qkh, vh) = (cfg.qk_head as usize, cfg.v_head as usize);
         let (ql, kvl, qkr, qkn) = (cfg.q_lora as usize, cfg.kv_lora as usize, cfg.qk_rope as usize, cfg.qk_nope as usize);
@@ -103,11 +165,22 @@ impl Model {
                 });
                 for e in 0..e_n {
                     let pe = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
-                    experts.push(Mlp {
-                        gate: QtWeight::load(&st, &pe("gate_proj.weight"), mi, d)?,
-                        up: QtWeight::load(&st, &pe("up_proj.weight"), mi, d)?,
-                        down: QtWeight::load(&st, &pe("down_proj.weight"), d, mi)?,
-                    });
+                    if stream_experts {
+                        // don't hold experts resident; just verify they're present
+                        // so a malformed checkpoint fails at load, not mid-decode.
+                        for t in ["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
+                            let name = pe(t);
+                            if !st.has(&name) {
+                                return Err(Error::Format(format!("missing expert tensor: {name}")));
+                            }
+                        }
+                    } else {
+                        experts.push(Mlp {
+                            gate: QtWeight::load(&st, &pe("gate_proj.weight"), mi, d)?,
+                            up: QtWeight::load(&st, &pe("up_proj.weight"), mi, d)?,
+                            down: QtWeight::load(&st, &pe("down_proj.weight"), d, mi)?,
+                        });
+                    }
                 }
             }
 
@@ -131,7 +204,15 @@ impl Model {
         }
 
         let kv = (0..cfg.n_layers).map(|_| LayerKv::new(kvl, qkr)).collect();
-        Ok(Model { cfg, embed, layers, final_norm, lm_head, kv })
+        // The concurrent MoE lane needs its own ring, set up once, so a layer's
+        // experts stream while the CPU pool computes. Only in streaming mode.
+        let io_reactor = if stream_experts {
+            Some(Mutex::new(Reactor::new(256).ctx(|| "concurrent MoE io_uring reactor init".to_string())?))
+        } else {
+            None
+        };
+        let workers = default_workers();
+        Ok(Model { cfg, embed, layers, final_norm, lm_head, kv, stream_experts, st, io_reactor, workers })
     }
 
     /// Clear the KV cache to start a fresh sequence.
@@ -152,8 +233,9 @@ impl Model {
     }
 
     /// Run `tokens` (new positions starting at `pos_base`) through all layers,
-    /// appending to the KV cache. Returns logits `[S, vocab]`.
-    pub fn forward_step(&mut self, tokens: &[i32], pos_base: usize) -> Vec<f32> {
+    /// appending to the KV cache. Returns logits `[S, vocab]`. Fallible because
+    /// streamed layers read experts from disk mid-forward.
+    pub fn forward_step(&mut self, tokens: &[i32], pos_base: usize) -> Result<Vec<f32>, Error> {
         let s_n = tokens.len();
         let d = self.cfg.hidden as usize;
         let eps = self.cfg.eps;
@@ -168,7 +250,9 @@ impl Model {
         }
 
         // split disjoint fields so attention can borrow layers (imm) + kv (mut)
-        let Model { cfg, layers, kv, .. } = self;
+        let Model { cfg, layers, kv, st, stream_experts, io_reactor, workers, .. } = self;
+        let stream_experts = *stream_experts;
+        let workers = *workers;
         for (li, l) in layers.iter().enumerate() {
             let nrm = Self::rmsnorm_rows(&x, &l.in_ln, s_n, d, eps);
             let attn = mla_attention(&l.attn(), &nrm, s_n, pos_base, &mut kv[li], cfg);
@@ -176,21 +260,35 @@ impl Model {
                 x[z] += attn[z];
             }
             let nrm2 = Self::rmsnorm_rows(&x, &l.post_ln, s_n, d, eps);
-            let ffn = if l.sparse {
-                moe_forward(
-                    &nrm2,
-                    &l.router,
-                    &l.router_bias,
-                    &l.experts,
-                    l.shared.as_ref(),
-                    s_n,
-                    d,
-                    cfg.topk as usize,
-                    cfg.norm_topk,
-                    cfg.routed_scale,
-                )
+            let ffn: Vec<f32> = if l.sparse {
+                if stream_experts {
+                    // concurrent lane: io_uring streams experts ∥ CPU pool computes
+                    let reactor = io_reactor
+                        .as_ref()
+                        .ok_or_else(|| Error::Format("streaming mode without an io_uring reactor".into()))?;
+                    moe_forward_concurrent(
+                        st, reactor, workers, li, cfg, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n,
+                    )?
+                } else {
+                    moe_forward(
+                        &nrm2,
+                        &l.router,
+                        &l.router_bias,
+                        &l.experts,
+                        l.shared.as_ref(),
+                        s_n,
+                        d,
+                        cfg.topk as usize,
+                        cfg.norm_topk,
+                        cfg.routed_scale,
+                    )
+                }
             } else {
-                l.dense.as_ref().unwrap().swiglu(&nrm2, s_n)
+                let dense = l
+                    .dense
+                    .as_ref()
+                    .ok_or_else(|| Error::Format(format!("layer {li}: dense MLP weights missing")))?;
+                dense.swiglu(&nrm2, s_n)
             };
             for z in 0..s_n * d {
                 x[z] += ffn[z];
@@ -198,40 +296,40 @@ impl Model {
         }
 
         let xf = Self::rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
-        self.lm_head.apply_vec(&xf, s_n)
+        Ok(self.lm_head.apply_vec(&xf, s_n))
     }
 
     /// Greedy/sampled generation: prefill `prompt`, then decode `n_new` tokens.
     /// Resets the KV cache first. Returns the newly generated token ids.
-    pub fn generate(&mut self, prompt: &[i32], n_new: usize, sampler: &mut Sampler) -> Vec<i32> {
+    pub fn generate(&mut self, prompt: &[i32], n_new: usize, sampler: &mut Sampler) -> Result<Vec<i32>, Error> {
         // an empty prompt has no last-position logits to sample from, and no
         // requested tokens is a no-op — both would otherwise underflow below.
         if prompt.is_empty() || n_new == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.reset();
         let vocab = self.cfg.vocab as usize;
-        let logits = self.forward_step(prompt, 0);
+        let logits = self.forward_step(prompt, 0)?;
         let mut next = sampler.pick(&logits[(prompt.len() - 1) * vocab..prompt.len() * vocab], -1) as i32;
         let mut out = vec![next];
         for step in 1..n_new {
             let pos = prompt.len() + step - 1; // first decode attends at prompt.len()
-            let lg = self.forward_step(&[next], pos);
+            let lg = self.forward_step(&[next], pos)?;
             next = sampler.pick(&lg[..vocab], -1) as i32;
             out.push(next);
         }
-        out
+        Ok(out)
     }
 
     /// Teacher-forcing predictions: greedy argmax at each position of a single
     /// full forward over `tokens`. The shape the oracle gate compares against.
-    pub fn teacher_forcing(&mut self, tokens: &[i32]) -> Vec<i32> {
+    pub fn teacher_forcing(&mut self, tokens: &[i32]) -> Result<Vec<i32>, Error> {
         self.reset();
         let vocab = self.cfg.vocab as usize;
-        let logits = self.forward_step(tokens, 0);
-        (0..tokens.len())
+        let logits = self.forward_step(tokens, 0)?;
+        Ok((0..tokens.len())
             .map(|s| crate::sample::argmax(&logits[s * vocab..s * vocab + vocab]) as i32)
-            .collect()
+            .collect())
     }
 }
 
@@ -241,63 +339,85 @@ mod tests {
     use crate::testkit::build_tiny_model;
     use std::path::PathBuf;
 
-    fn tmp_model_dir(tag: &str) -> PathBuf {
+    fn tmp_model_dir(tag: &str) -> Result<PathBuf, peregrine_core::Error> {
         let d = std::env::temp_dir().join(format!("peregrine_model_{}_{}", std::process::id(), tag));
-        let _ = std::fs::remove_dir_all(&d);
-        build_tiny_model(&d);
-        d
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        build_tiny_model(&d)?;
+        Ok(d)
     }
 
     #[test]
-    fn loads_and_runs_forward() {
-        let dir = tmp_model_dir("fwd");
-        let mut m = Model::load(&dir).unwrap();
-        let logits = m.forward_step(&[1, 5, 9, 2], 0);
+    fn loads_and_runs_forward() -> Result<(), peregrine_core::Error> {
+        let dir = tmp_model_dir("fwd")?;
+        let mut m = Model::load(&dir)?;
+        let logits = m.forward_step(&[1, 5, 9, 2], 0)?;
         assert_eq!(logits.len(), 4 * m.cfg.vocab as usize);
         assert!(logits.iter().all(|v| v.is_finite()), "logits must be finite");
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
-    fn generate_is_deterministic_greedy() {
-        let dir = tmp_model_dir("gen");
-        let mut m = Model::load(&dir).unwrap();
+    fn streamed_experts_match_resident() -> Result<(), peregrine_core::Error> {
+        // The on-demand streamed expert path must produce identical logits to
+        // the resident path — same bytes, same kernels, only load timing differs.
+        let dir = tmp_model_dir("stream")?;
+        let mut resident = Model::load_streaming(&dir, false)?;
+        let mut streamed = Model::load_streaming(&dir, true)?;
+        assert!(streamed.stream_experts && !resident.stream_experts);
+        let toks = [1, 5, 9, 2, 7];
+        let lr = resident.forward_step(&toks, 0)?;
+        let ls = streamed.forward_step(&toks, 0)?;
+        assert_eq!(lr, ls, "streamed logits must equal resident logits");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn generate_is_deterministic_greedy() -> Result<(), peregrine_core::Error> {
+        let dir = tmp_model_dir("gen")?;
+        let mut m = Model::load(&dir)?;
         let prompt = [3, 7, 1, 4];
         let mut s1 = Sampler::new(0.0, 0.9, 1); // greedy
-        let a = m.generate(&prompt, 8, &mut s1);
+        let a = m.generate(&prompt, 8, &mut s1)?;
         let mut s2 = Sampler::new(0.0, 0.9, 1);
-        let b = m.generate(&prompt, 8, &mut s2);
+        let b = m.generate(&prompt, 8, &mut s2)?;
         assert_eq!(a, b, "greedy generation must be deterministic");
         assert!(a.iter().all(|&t| (t as usize) < m.cfg.vocab as usize));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
-    fn decode_matches_teacher_forcing_prefix() {
+    fn decode_matches_teacher_forcing_prefix() -> Result<(), peregrine_core::Error> {
         // greedy decode's first token == teacher-forcing argmax at the last
         // prompt position (both are argmax of the same prefill logits).
-        let dir = tmp_model_dir("tf");
-        let mut m = Model::load(&dir).unwrap();
+        let dir = tmp_model_dir("tf")?;
+        let mut m = Model::load(&dir)?;
         let prompt = [2, 6, 3, 8, 1];
-        let tf = m.teacher_forcing(&prompt);
+        let tf = m.teacher_forcing(&prompt)?;
         let mut s = Sampler::new(0.0, 0.9, 1);
-        let gen = m.generate(&prompt, 1, &mut s);
+        let gen = m.generate(&prompt, 1, &mut s)?;
         assert_eq!(gen[0], tf[prompt.len() - 1]);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
-    fn handles_empty_prompt_and_out_of_range_tokens() {
+    fn handles_empty_prompt_and_out_of_range_tokens() -> Result<(), peregrine_core::Error> {
         // regression: empty prompt / zero n_new must not underflow, and out-of-
         // range or negative token ids must be clamped, not index out of bounds.
-        let dir = tmp_model_dir("edge");
-        let mut m = Model::load(&dir).unwrap();
+        let dir = tmp_model_dir("edge")?;
+        let mut m = Model::load(&dir)?;
         let mut s = Sampler::new(0.0, 0.9, 1);
-        assert!(m.generate(&[], 4, &mut s).is_empty());
-        assert!(m.generate(&[1, 2], 0, &mut s).is_empty());
-        let logits = m.forward_step(&[9999, -3, 0], 0);
+        assert!(m.generate(&[], 4, &mut s)?.is_empty());
+        assert!(m.generate(&[1, 2], 0, &mut s)?.is_empty());
+        let logits = m.forward_step(&[9999, -3, 0], 0)?;
         assert_eq!(logits.len(), 3 * m.cfg.vocab as usize);
         assert!(logits.iter().all(|v| v.is_finite()));
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

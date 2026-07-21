@@ -9,99 +9,92 @@
 //! This is the CPU∥SSD half of the three-lane design; the GPU lane composes the
 //! same way (feature-gated FFI, validated on an NVIDIA box).
 
+// Quality gates: no unsafe, no panicking error handling (denied in tests too).
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 pub mod reconstruct;
 
 use std::os::unix::io::RawFd;
 
+use peregrine_core::{Context, Error};
 use peregrine_model::{batch_union, route, Mlp, Routed};
-use reconstruct::{mlp_from_blob, MlpDims};
+use reconstruct::{mlp_from_segments, QtMeta};
 
 /// Where an expert's weights live.
 pub enum ExpertLoc<'a> {
     /// already in RAM — compute immediately on the CPU lane
     Resident(&'a Mlp),
-    /// on disk — stream via the io_uring I/O lane, then compute
-    Disk(DiskExpert),
+    /// on disk — stream via the io_uring I/O lane, then compute. Boxed because a
+    /// `DiskExpert` (3 tensors × regions) dwarfs the resident pointer, and it's
+    /// always about to incur a disk read anyway.
+    Disk(Box<DiskExpert>),
 }
 
-/// A streamable expert: one coalesced blob at `[offset, offset+len)` in `fd`.
+/// One on-disk quantized tensor: the packed-weight region and the f32-scale
+/// region (each `(fd, offset, len)`), plus the format/shape to rebuild it. The
+/// two regions are the actual safetensors tensor byte ranges — streamed in
+/// place, no sidecar file.
+#[derive(Clone, Copy, Debug)]
+pub struct DiskQt {
+    pub w_fd: RawFd,
+    pub w_off: u64,
+    pub w_len: usize,
+    pub s_fd: RawFd,
+    pub s_off: u64,
+    pub s_len: usize,
+    pub meta: QtMeta,
+}
+
+/// A streamable expert: its gate/up/down tensors, each streamed from the
+/// checkpoint and reconstructed after the reads complete.
+#[derive(Clone, Copy, Debug)]
 pub struct DiskExpert {
-    pub fd: RawFd,
-    pub offset: u64,
-    pub len: usize,
-    pub dims: MlpDims,
+    pub gate: DiskQt,
+    pub up: DiskQt,
+    pub down: DiskQt,
 }
 
 /// Owns the io_uring ring so it's set up **once** and reused across every
 /// `moe_streamed` call (the ring is a syscall + a couple of mmaps to create —
-/// per-layer-per-token setup would dominate). Falls back to `pread` when
-/// io_uring is unavailable. This is the persistent I/O lane.
+/// per-layer-per-token setup would dominate). This is the persistent I/O lane;
+/// there is no pread fallback — a missing ring is a hard error.
 pub struct Streamer {
-    #[cfg(target_os = "linux")]
-    reactor: Option<peregrine_io::Reactor>,
-    /// distinct shard fds currently registered as fixed files (stable for a
-    /// loaded model, so registration happens once and reads reuse it).
-    #[cfg(target_os = "linux")]
-    registered: Vec<RawFd>,
+    reactor: peregrine_io::Reactor,
 }
 
 impl Streamer {
-    /// Create a reusable streamer with a ring of `depth` submission slots
-    /// (larger batches are chunked to this depth by `read_many`).
-    pub fn new(depth: u32) -> Streamer {
-        #[cfg(target_os = "linux")]
-        {
-            Streamer { reactor: peregrine_io::Reactor::new(depth.max(1)).ok(), registered: Vec::new() }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Streamer {}
-        }
+    /// Create a reusable streamer with a ring of `depth` submission slots.
+    /// Errors if io_uring is unavailable (Linux without io_uring, or non-Linux).
+    pub fn new(depth: u32) -> Result<Streamer, Error> {
+        let reactor = peregrine_io::Reactor::new(depth.max(1)).ctx(|| "io_uring reactor init".to_string())?;
+        Ok(Streamer { reactor })
     }
 
-    /// Read every disk expert's blob (io_uring batch on Linux, else `pread`).
-    fn read_experts(&mut self, specs: &[(usize, RawFd, u64, usize, MlpDims)]) -> Vec<(usize, Vec<u8>, MlpDims)> {
-        use peregrine_io::{pread_many, ReadReq};
+    /// Stream every disk expert's gate/up/down tensors (6 regions each) and
+    /// reconstruct them into `Mlp`s. Each region is read to completion through
+    /// the io_uring ring (short completions are retried by `read_exact`); any
+    /// I/O error propagates — no fallback.
+    fn read_experts(&mut self, experts: &[(usize, &DiskExpert)]) -> Result<Vec<(usize, Mlp)>, Error> {
+        let read_qt = |reactor: &mut peregrine_io::Reactor, q: &DiskQt| -> Result<(Vec<u8>, Vec<u8>), Error> {
+            let mut w = vec![0u8; q.w_len];
+            let mut s = vec![0u8; q.s_len];
+            reactor.read_exact(q.w_fd, q.w_off, &mut w).ctx(|| format!("io_uring expert weight read @ {}", q.w_off))?;
+            reactor.read_exact(q.s_fd, q.s_off, &mut s).ctx(|| format!("io_uring expert scale read @ {}", q.s_off))?;
+            Ok((w, s))
+        };
 
-        // Register this batch's distinct shard fds as fixed files when the set
-        // changes (once, for a stable model) so reads skip per-op fd lookup.
-        #[cfg(target_os = "linux")]
-        if let Some(r) = self.reactor.as_mut() {
-            let mut fds: Vec<RawFd> = specs.iter().map(|s| s.1).collect();
-            fds.sort_unstable();
-            fds.dedup();
-            if !fds.is_empty() && fds != self.registered {
-                match r.register_files(&fds) {
-                    Ok(()) => self.registered = fds,
-                    Err(_) => self.registered.clear(),
-                }
-            }
+        let mut out = Vec::with_capacity(experts.len());
+        for (eid, de) in experts {
+            let metas = [de.gate.meta, de.up.meta, de.down.meta];
+            let bufs6 = [
+                read_qt(&mut self.reactor, &de.gate)?,
+                read_qt(&mut self.reactor, &de.up)?,
+                read_qt(&mut self.reactor, &de.down)?,
+            ];
+            out.push((*eid, mlp_from_segments(&metas, &bufs6)?));
         }
-
-        let mut bufs: Vec<Vec<u8>> = specs.iter().map(|&(_, _, _, len, _)| vec![0u8; len]).collect();
-        {
-            let mut reqs: Vec<ReadReq> = bufs
-                .iter_mut()
-                .zip(specs)
-                .map(|(b, s)| ReadReq { fd: s.1, offset: s.2, buf: b.as_mut_slice(), tag: s.0 as u64 })
-                .collect();
-
-            #[cfg(target_os = "linux")]
-            let served = self.reactor.as_mut().map(|r| r.read_many(&mut reqs).is_ok()).unwrap_or(false);
-            #[cfg(not(target_os = "linux"))]
-            let served = false;
-
-            if !served {
-                pread_many(&mut reqs);
-            }
-        }
-        bufs.into_iter().zip(specs).map(|(b, s)| (s.0, b, s.4)).collect()
-    }
-}
-
-impl Default for Streamer {
-    fn default() -> Self {
-        Streamer::new(64)
+        Ok(out)
     }
 }
 
@@ -152,38 +145,40 @@ pub fn moe_streamed(
     routed_scale: f32,
     experts: &[ExpertLoc],
     shared: Option<&Mlp>,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, Error> {
     let e_n = experts.len();
     let r = route(x, router_w, router_bias, s_n, hidden, e_n, topk, norm_topk, routed_scale);
     let uniq = batch_union(&r, s_n);
 
     // partition the batch-union by residency
     let mut resident: Vec<(usize, &Mlp)> = Vec::new();
-    let mut disk_specs: Vec<(usize, RawFd, u64, usize, MlpDims)> = Vec::new();
+    let mut disk: Vec<(usize, &DiskExpert)> = Vec::new();
     for &e in &uniq {
         match &experts[e as usize] {
             ExpertLoc::Resident(m) => resident.push((e as usize, m)),
-            ExpertLoc::Disk(d) => disk_specs.push((e as usize, d.fd, d.offset, d.len, d.dims)),
+            ExpertLoc::Disk(d) => disk.push((e as usize, d.as_ref())),
         }
     }
 
     // I/O lane (streaming, reusing the persistent ring) ∥ CPU lane (resident compute)
     let sr = &mut *streamer;
-    let specs_ref = &disk_specs;
-    let (out_from_resident, disk_blobs) = std::thread::scope(|sc| {
-        let io = sc.spawn(move || sr.read_experts(specs_ref));
+    let disk_ref = &disk;
+    let (mut out, streamed) = std::thread::scope(|sc| {
+        let io = sc.spawn(move || sr.read_experts(disk_ref));
         let mut out = vec![0f32; s_n * hidden];
         for &(eid, mlp) in &resident {
             contribute(&mut out, x, mlp, &r, eid, hidden, s_n);
         }
-        let blobs = io.join().expect("io lane panicked");
-        (out, blobs)
+        // a panic in the io lane becomes an error here, never a re-panic
+        let streamed = match io.join() {
+            Ok(res) => res,
+            Err(_) => Err(Error::Format("io lane thread panicked".into())),
+        };
+        (out, streamed)
     });
 
     // compute the streamed experts (now resident) and merge
-    let mut out = out_from_resident;
-    for (eid, blob, dims) in disk_blobs {
-        let mlp = mlp_from_blob(&blob, dims);
+    for (eid, mlp) in streamed? {
         contribute(&mut out, x, &mlp, &r, eid, hidden, s_n);
     }
 
@@ -193,16 +188,16 @@ pub fn moe_streamed(
             out[z] += hs[z];
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::reconstruct::{blob_len, mlp_to_blob, MlpDims};
+    use super::reconstruct::QtMeta;
     use super::*;
-    use peregrine_core::pack::quant_i4;
-    use peregrine_model::{moe_forward, Mlp, QtWeight};
+    use peregrine_core::pack::{f32_bytes, quant_i4};
     use peregrine_core::QtFmt;
+    use peregrine_model::{moe_forward, Mlp, QtWeight, QuantFmt};
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
 
@@ -216,7 +211,7 @@ mod tests {
 
     fn qi4(w: &[f32], o: usize, i: usize) -> QtWeight {
         let (q, s) = quant_i4(w, o, i);
-        QtWeight::new(QtFmt::Int4, o, i, q, s)
+        QtWeight::new(QuantFmt::Int4, o, i, q, s)
     }
 
     fn make_mlp(r: &mut Lcg, hidden: usize, inter: usize) -> Mlp {
@@ -226,10 +221,38 @@ mod tests {
         Mlp { gate: qi4(&g, inter, hidden), up: qi4(&u, inter, hidden), down: qi4(&d, hidden, inter) }
     }
 
+    /// Append one QtWeight's weight + scale regions to `f`, returning its DiskQt
+    /// (with offsets relative to the start of the file = absolute here).
+    fn write_qt(
+        f: &mut std::fs::File,
+        cursor: &mut u64,
+        fd: RawFd,
+        w: &QtWeight,
+        o: usize,
+        i: usize,
+    ) -> Result<DiskQt, std::io::Error> {
+        let (q, s) = w.raw();
+        let sb = f32_bytes(s);
+        let w_off = *cursor;
+        f.write_all(q)?;
+        *cursor += q.len() as u64;
+        let s_off = *cursor;
+        f.write_all(&sb)?;
+        *cursor += sb.len() as u64;
+        Ok(DiskQt {
+            w_fd: fd,
+            w_off,
+            w_len: q.len(),
+            s_fd: fd,
+            s_off,
+            s_len: sb.len(),
+            meta: QtMeta { fmt: QtFmt::Int4, o, i, gs: 0 },
+        })
+    }
+
     #[test]
-    fn concurrent_matches_sequential() {
+    fn concurrent_matches_sequential() -> Result<(), peregrine_core::Error> {
         let (hidden, inter, e_n, k, s_n) = (16usize, 8usize, 6usize, 2usize, 4usize);
-        let dims = MlpDims { hidden, inter };
         let mut r = Lcg(0xF00D);
 
         let x: Vec<f32> = (0..s_n * hidden).map(|_| r.f()).collect();
@@ -241,46 +264,44 @@ mod tests {
         // sequential reference: all experts resident
         let seq = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), s_n, hidden, k, true, 2.5);
 
-        // write the odd-indexed experts to a disk blob file; even ones stay resident
+        // write the odd-indexed experts' gate/up/down (6 regions each) to a file;
+        // even ones stay resident — exercises the mixed CPU∥IO path.
         let path = std::env::temp_dir().join(format!("peregrine_sched_{}", std::process::id()));
-        let mut f = std::fs::File::create(&path).unwrap();
-        let mut offsets = vec![0u64; e_n];
+        let mut f = std::fs::File::create(&path)?;
+        let rf = std::fs::File::open(&path)?;
+        let fd = rf.as_raw_fd();
         let mut cursor = 0u64;
-        for (e, expert) in experts.iter().enumerate() {
+        let mut disk: Vec<Option<DiskExpert>> = (0..e_n).map(|_| None).collect();
+        for (e, m) in experts.iter().enumerate() {
             if e % 2 == 1 {
-                let blob = mlp_to_blob(expert);
-                assert_eq!(blob.len(), blob_len(dims));
-                offsets[e] = cursor;
-                f.write_all(&blob).unwrap();
-                cursor += blob.len() as u64;
+                let gate = write_qt(&mut f, &mut cursor, fd, &m.gate, inter, hidden)?;
+                let up = write_qt(&mut f, &mut cursor, fd, &m.up, inter, hidden)?;
+                let down = write_qt(&mut f, &mut cursor, fd, &m.down, hidden, inter)?;
+                disk[e] = Some(DiskExpert { gate, up, down });
             }
         }
-        f.sync_all().unwrap();
-        let rf = std::fs::File::open(&path).unwrap();
-        let fd = rf.as_raw_fd();
+        f.sync_all()?;
 
         let locs: Vec<ExpertLoc> = experts
             .iter()
             .enumerate()
-            .map(|(e, m)| {
-                if e % 2 == 1 {
-                    ExpertLoc::Disk(DiskExpert { fd, offset: offsets[e], len: blob_len(dims), dims })
-                } else {
-                    ExpertLoc::Resident(m)
-                }
+            .map(|(e, m)| match disk[e] {
+                Some(de) => ExpertLoc::Disk(Box::new(de)),
+                None => ExpertLoc::Resident(m),
             })
             .collect();
 
         // one persistent streamer, reused across calls (the ring is set up once)
-        let mut streamer = Streamer::new(64);
-        let conc = moe_streamed(&mut streamer, &x, hidden, s_n, &router_w, &router_bias, k, true, 2.5, &locs, Some(&shared));
-        let conc2 = moe_streamed(&mut streamer, &x, hidden, s_n, &router_w, &router_bias, k, true, 2.5, &locs, Some(&shared));
+        let mut streamer = Streamer::new(64)?;
+        let conc = moe_streamed(&mut streamer, &x, hidden, s_n, &router_w, &router_bias, k, true, 2.5, &locs, Some(&shared))?;
+        let conc2 = moe_streamed(&mut streamer, &x, hidden, s_n, &router_w, &router_bias, k, true, 2.5, &locs, Some(&shared))?;
         assert_eq!(conc, conc2, "reused streamer must give identical output");
 
         for z in 0..s_n * hidden {
             let tol = 1e-3 * seq[z].abs().max(1.0);
             assert!((seq[z] - conc[z]).abs() < tol, "z={z} seq={} conc={}", seq[z], conc[z]);
         }
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path)?;
+        Ok(())
     }
 }

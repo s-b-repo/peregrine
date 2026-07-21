@@ -9,4 +9,8 @@ description = "colibrì GLM-5.2 forward pass: MLA attention, sigmoid router, MoE
 [dependencies]
 peregrine-core = { path = "../peregrine-core" }
 peregrine-kernels = { path = "../peregrine-kernels" }
+peregrine-io = { path = "../peregrine-io" }
 serde_json.workspace = true
+bytemuck = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"

@@ -8,3 +8,6 @@ description = "colibrì engine core: config, safetensors index, quantized-tensor
 
 [dependencies]
 serde_json.workspace = true
+peregrine-io = { path = "../peregrine-io" }
+thiserror = "2"
+parking_lot = "0.12"

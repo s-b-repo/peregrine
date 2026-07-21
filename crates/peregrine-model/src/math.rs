@@ -91,7 +91,7 @@ pub fn rope_interleave(v: &mut [f32], pos: usize, c: &Cfg) {
 mod tests {
     use super::*;
 
-    fn cfg_with_rope(qk_rope: i64, theta: f32) -> Cfg {
+    fn cfg_with_rope(qk_rope: i64, theta: f32) -> Result<Cfg, peregrine_core::Error> {
         // minimal Cfg for RoPE tests — only qk_rope/theta are read
         let j = serde_json::json!({
             "hidden_size": 8, "num_hidden_layers": 1, "num_attention_heads": 1,
@@ -101,7 +101,7 @@ mod tests {
             "v_head_dim": 1, "n_shared_experts": 0, "vocab_size": 8, "n_group": 1,
             "topk_group": 1, "rope_parameters": {"rope_theta": theta}
         });
-        Cfg::from_json(&j).unwrap()
+        Cfg::from_json(&j)
     }
 
     #[test]
@@ -124,18 +124,19 @@ mod tests {
     }
 
     #[test]
-    fn rope_pos0_is_deinterleave() {
+    fn rope_pos0_is_deinterleave() -> Result<(), peregrine_core::Error> {
         // pos=0 → all angles 0 → cs=1,sn=0 → output is evens-then-odds
-        let c = cfg_with_rope(4, 10000.0);
+        let c = cfg_with_rope(4, 10000.0)?;
         let mut v = [10.0f32, 11.0, 12.0, 13.0];
         rope_interleave(&mut v, 0, &c);
         assert_eq!(v, [10.0, 12.0, 11.0, 13.0]); // [a0,a1 | b0,b1]
+        Ok(())
     }
 
     #[test]
-    fn rope_preserves_pair_energy() {
+    fn rope_preserves_pair_energy() -> Result<(), peregrine_core::Error> {
         // each (a,b) pair is a rotation → magnitude preserved
-        let c = cfg_with_rope(4, 10000.0);
+        let c = cfg_with_rope(4, 10000.0)?;
         let orig = [1.0f32, 2.0, -3.0, 0.5];
         let mut v = orig;
         rope_interleave(&mut v, 7, &c);
@@ -145,5 +146,6 @@ mod tests {
             let e_out = v[j].powi(2) + v[half + j].powi(2);
             assert!((e_in - e_out).abs() < 1e-4, "pair {j}");
         }
+        Ok(())
     }
 }

@@ -116,12 +116,13 @@ mod tests {
     }
 
     #[test]
-    fn clear_winner_swaps() {
+    fn clear_winner_swaps() -> Result<(), &'static str> {
         let heat = [10u32, 500];
         let last = [0u32, 0];
-        let s = pick_lfru(&heat, &last, 0, &[0]).unwrap();
+        let s = pick_lfru(&heat, &last, 0, &[0]).ok_or("pick_lfru returned None")?;
         assert_eq!(s.slot, 0);
         assert_eq!(s.eid, 1);
+        Ok(())
     }
 
     #[test]
