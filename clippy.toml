@@ -1,0 +1,5 @@
+# No panicking error handling anywhere — production OR tests. Tests return
+# Result and use `?`; the enforced crates deny unwrap/expect/panic everywhere.
+allow-unwrap-in-tests = false
+allow-expect-in-tests = false
+allow-panic-in-tests = false
