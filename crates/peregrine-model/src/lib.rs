@@ -10,7 +10,13 @@
 // index several tensors at once — `needless_range_loop` is noise in this crate.
 #![allow(clippy::needless_range_loop)]
 
+// Quality gates: no unsafe here, and no panicking error handling anywhere
+// (denied even in tests).
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 pub mod attention;
+pub mod concurrent;
 pub mod math;
 pub mod mlp;
 pub mod model;
@@ -27,4 +33,4 @@ pub use model::Model;
 pub use mtp::speculative_sample;
 pub use router::{batch_union, route, Routed};
 pub use sample::{argmax, Sampler};
-pub use weight::QtWeight;
+pub use weight::{QtWeight, QuantFmt};

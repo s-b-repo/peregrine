@@ -59,17 +59,15 @@ mod uring {
         /// `entries` = submission-queue depth (rounded up to a power of two by the
         /// kernel). Cold NVMe streaming wants this ≥ the per-layer expert count.
         ///
-        /// The ring is set up with `SINGLE_ISSUER` (all submissions come from the
-        /// one owner thread → the kernel skips per-op submitter locking) and
-        /// `COOP_TASKRUN` (completion task work is run cooperatively at
-        /// `io_uring_enter` instead of via IPIs → less overhead). Both match our
-        /// one-thread-drains-the-ring model and reduce per-batch cost. If a kernel
-        /// rejects the flags we fall back to a plain ring. (`SQPOLL` — submission
-        /// with no `enter` syscall at all — is a further win but needs privileges,
-        /// so it's left opt-in for future work.)
+        /// The ring is set up with `COOP_TASKRUN` (completion task work runs
+        /// cooperatively at `io_uring_enter` instead of via IPIs → less overhead).
+        /// We deliberately do **not** set `SINGLE_ISSUER`: the streaming scheduler
+        /// reuses one persistent `Reactor` across `moe_streamed` calls that submit
+        /// from different (scoped) worker threads, and single-issuer would reject
+        /// a second submitting task with `-EEXIST`. If a kernel rejects the flag we
+        /// fall back to a plain ring. (`SQPOLL` needs privileges → future opt-in.)
         pub fn new(entries: u32) -> io::Result<Reactor> {
             let ring = IoUring::builder()
-                .setup_single_issuer()
                 .setup_coop_taskrun()
                 .build(entries)
                 .or_else(|_| IoUring::new(entries))?;
@@ -83,11 +81,37 @@ mod uring {
         /// on failure, reads simply fall back to the plain-fd path.
         pub fn register_files(&mut self, fds: &[RawFd]) -> io::Result<()> {
             if !self.registered.is_empty() {
-                let _ = self.ring.submitter().unregister_files();
+                self.ring.submitter().unregister_files()?;
                 self.registered.clear();
             }
             self.ring.submitter().register_files(fds)?;
             self.registered = fds.to_vec();
+            Ok(())
+        }
+
+        /// Read exactly `buf.len()` bytes at `off` from `fd`, looping to complete
+        /// a short completion (a positioned read may legally return fewer bytes).
+        /// Errors on a negative completion code or a premature EOF — never a
+        /// partial success, never a fallback.
+        pub fn read_exact(&mut self, fd: RawFd, off: u64, buf: &mut [u8]) -> io::Result<()> {
+            let total = buf.len();
+            let mut done = 0usize;
+            while done < total {
+                let n = {
+                    let mut reqs = [ReadReq { fd, offset: off + done as u64, buf: &mut buf[done..], tag: 0 }];
+                    self.read_many(&mut reqs)?[0]
+                };
+                if n < 0 {
+                    return Err(io::Error::from_raw_os_error((-n) as i32));
+                }
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("io_uring read hit EOF after {done} of {total} bytes"),
+                    ));
+                }
+                done += n as usize;
+            }
             Ok(())
         }
 
@@ -156,29 +180,75 @@ mod uring {
 #[cfg(target_os = "linux")]
 pub use uring::Reactor;
 
+/// Non-Linux placeholder so dependents compile without `cfg`. Every method
+/// errors — this engine's disk path is io_uring, with no pread fallback, so a
+/// non-Linux build fails loudly at first use rather than silently degrading.
+#[cfg(not(target_os = "linux"))]
+pub struct Reactor;
+
+#[cfg(not(target_os = "linux"))]
+impl Reactor {
+    fn unsupported<T>() -> std::io::Result<T> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "io_uring requires Linux"))
+    }
+    pub fn new(_entries: u32) -> std::io::Result<Reactor> {
+        Self::unsupported()
+    }
+    pub fn register_files(&mut self, _fds: &[RawFd]) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn is_registered(&self, _fd: RawFd) -> bool {
+        false
+    }
+    pub fn read_many(&mut self, _reqs: &mut [ReadReq]) -> std::io::Result<Vec<i64>> {
+        Self::unsupported()
+    }
+    pub fn read_exact(&mut self, _fd: RawFd, _off: u64, _buf: &mut [u8]) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+}
+
+/// Read a whole file through io_uring (open → size → one ring-backed exact read).
+/// For the small metadata files (`config.json`) and any full-file load; bulk
+/// tensor reads use a persistent [`Reactor`] instead of a per-call ring.
+pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len() as usize;
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        let mut reactor = Reactor::new(1)?;
+        reactor.read_exact(f.as_raw_fd(), 0, &mut buf)?;
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
 
-    fn temp_file_with(pattern: &[u8], n: usize) -> (std::fs::File, std::path::PathBuf, Vec<u8>) {
+    fn temp_file_with(
+        pattern: &[u8],
+        n: usize,
+    ) -> std::io::Result<(std::fs::File, std::path::PathBuf, Vec<u8>)> {
         let path = std::env::temp_dir().join(format!("peregrine_io_{}_{}", std::process::id(), n));
         let mut data = Vec::new();
         while data.len() < n {
             data.extend_from_slice(pattern);
         }
         data.truncate(n);
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&data).unwrap();
-        f.sync_all().unwrap();
-        let rf = std::fs::File::open(&path).unwrap();
-        (rf, path, data)
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(&data)?;
+        f.sync_all()?;
+        let rf = std::fs::File::open(&path)?;
+        Ok((rf, path, data))
     }
 
     #[test]
-    fn pread_many_reads_offsets() {
+    fn pread_many_reads_offsets() -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
-        let (f, path, data) = temp_file_with(b"0123456789", 1000);
+        let (f, path, data) = temp_file_with(b"0123456789", 1000)?;
         let fd = f.as_raw_fd();
         let mut b0 = [0u8; 10];
         let mut b1 = [0u8; 16];
@@ -193,14 +263,15 @@ mod tests {
         assert_eq!(&b0, &data[0..10]);
         assert_eq!(&b1, &data[100..116]);
         assert_eq!(&b2, &data[500..508]);
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path)?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn uring_matches_pread() {
+    fn uring_matches_pread() -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
-        let (f, path, data) = temp_file_with(b"abcdefghijklmnop", 8192);
+        let (f, path, data) = temp_file_with(b"abcdefghijklmnop", 8192)?;
         let fd = f.as_raw_fd();
         // 20 reads > ring depth 8 → exercises chunking
         let mut bufs: Vec<Vec<u8>> = (0..20).map(|k| vec![0u8; 64 + k]).collect();
@@ -210,17 +281,18 @@ mod tests {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("io_uring unavailable ({e}); skipping");
-                let _ = std::fs::remove_file(&path);
-                return;
+                std::fs::remove_file(&path)?;
+                return Ok(());
             }
         };
+        // worker-cap tuning is a best-effort optimization; ignore if unsupported
         let _ = reactor.set_iowq_max_workers(4, 4);
         let mut reqs: Vec<ReadReq> = bufs
             .iter_mut()
             .enumerate()
             .map(|(k, b)| ReadReq { fd, offset: offs[k], buf: b.as_mut_slice(), tag: k as u64 })
             .collect();
-        let res = reactor.read_many(&mut reqs).unwrap();
+        let res = reactor.read_many(&mut reqs)?;
 
         for k in 0..20 {
             let len = 64 + k;
@@ -228,27 +300,28 @@ mod tests {
             let off = offs[k] as usize;
             assert_eq!(&bufs[k][..], &data[off..off + len], "read {k} data mismatch");
         }
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path)?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn uring_registered_files_read() {
+    fn uring_registered_files_read() -> std::io::Result<()> {
         // reads through IOSQE_FIXED_FILE (registered fd) must return the same
         // bytes as a plain read.
         use std::os::unix::io::AsRawFd;
-        let (f, path, data) = temp_file_with(b"registered-file-payload", 4096);
+        let (f, path, data) = temp_file_with(b"registered-file-payload", 4096)?;
         let fd = f.as_raw_fd();
         let mut reactor = match Reactor::new(8) {
             Ok(r) => r,
             Err(_) => {
-                let _ = std::fs::remove_file(&path);
-                return;
+                std::fs::remove_file(&path)?;
+                return Ok(());
             }
         };
         if reactor.register_files(&[fd]).is_err() {
-            let _ = std::fs::remove_file(&path); // kernel without fixed-files → skip
-            return;
+            std::fs::remove_file(&path)?; // kernel without fixed-files → skip
+            return Ok(());
         }
         assert!(reactor.is_registered(fd));
         let mut b0 = vec![0u8; 32];
@@ -257,10 +330,11 @@ mod tests {
             ReadReq { fd, offset: 10, buf: &mut b0, tag: 0 },
             ReadReq { fd, offset: 100, buf: &mut b1, tag: 1 },
         ];
-        let res = reactor.read_many(&mut reqs).unwrap();
+        let res = reactor.read_many(&mut reqs)?;
         assert_eq!(res, vec![32, 40]);
         assert_eq!(&b0[..], &data[10..42]);
         assert_eq!(&b1[..], &data[100..140]);
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path)?;
+        Ok(())
     }
 }
