@@ -12,3 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 peregrine-model = { path = "../peregrine-model" }
+peregrine-core = { path = "../peregrine-core" }

@@ -5,7 +5,7 @@
 //! `qk_head`/`attn_scale`, the DSA `idx_type` per-layer schedule, and the
 //! `CKR` bounds validation from PR #25 (hostile config.json must not pass).
 
-use crate::Error;
+use crate::{Context, Error};
 use serde_json::Value;
 use std::path::Path;
 
@@ -63,9 +63,9 @@ impl Cfg {
     /// Load and validate `<dir>/config.json`.
     pub fn load(dir: &Path) -> Result<Cfg, Error> {
         let path = dir.join("config.json");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Format(format!("{}: {e}", path.display())))?;
-        let root: Value = serde_json::from_str(&text)?;
+        // read through the io_uring lane (no std::fs read path)
+        let bytes = peregrine_io::read_file(&path).ctx(|| path.display().to_string())?;
+        let root: Value = serde_json::from_slice(&bytes)?;
         Cfg::from_json(&root)
     }
 
@@ -226,8 +226,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_tiny_oracle() {
-        let c = Cfg::from_json(&tiny_json()).unwrap();
+    fn parses_tiny_oracle() -> Result<(), Error> {
+        let c = Cfg::from_json(&tiny_json())?;
         assert_eq!(c.hidden, 128);
         assert_eq!(c.n_layers, 5);
         assert_eq!(c.first_dense, 3);
@@ -242,6 +242,7 @@ mod tests {
         assert_eq!(c.theta, 10000.0);
         assert_eq!(c.stop_ids, vec![1, 2, 3]);
         assert_eq!(c.idx_type.len(), 5);
+        Ok(())
     }
 
     #[test]
@@ -259,10 +260,11 @@ mod tests {
     }
 
     #[test]
-    fn scalar_eos_token() {
+    fn scalar_eos_token() -> Result<(), Error> {
         let mut j = tiny_json();
         j["eos_token_id"] = serde_json::json!(7);
-        let c = Cfg::from_json(&j).unwrap();
+        let c = Cfg::from_json(&j)?;
         assert_eq!(c.stop_ids, vec![7]);
+        Ok(())
     }
 }

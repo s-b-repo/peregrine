@@ -104,6 +104,7 @@ impl QtInfo {
 mod tests {
     use super::*;
     use crate::safetensors::test_support::{write_safetensors, Blob};
+    use crate::Error;
     use std::path::PathBuf;
 
     #[test]
@@ -125,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_formats() {
+    fn detect_formats() -> Result<(), Error> {
         // O=2, I=32
         let (o, i) = (2i64, 32i64);
         let packed4 = (o * ((i + 1) / 2)) as usize; // 32 bytes
@@ -146,8 +147,8 @@ mod tests {
                 // full precision (no .qs)
                 Blob { name: "wf", dtype: "F32", shape: vec![o, i], bytes: vec![0u8; (o * i * 4) as usize] },
             ],
-        );
-        let st = SafeTensors::open(&dir).unwrap();
+        )?;
+        let st = SafeTensors::open(&dir)?;
 
         assert_eq!(QtInfo::detect(&st, "w4", o, i).fmt, QtFmt::Int4);
         let g = QtInfo::detect(&st, "wg", o, i);
@@ -157,6 +158,7 @@ mod tests {
         assert_eq!(QtInfo::detect(&st, "w8", o, i).fmt, QtFmt::Int8);
         assert_eq!(QtInfo::detect(&st, "wf", o, i).fmt, QtFmt::F32);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

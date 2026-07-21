@@ -221,7 +221,7 @@ mod tests {
         }
     }
 
-    fn cfg() -> Cfg {
+    fn cfg() -> Result<Cfg, peregrine_core::Error> {
         let j = serde_json::json!({
             "hidden_size": 16, "num_hidden_layers": 2, "num_attention_heads": 2,
             "n_routed_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 8,
@@ -230,7 +230,7 @@ mod tests {
             "v_head_dim": 6, "n_shared_experts": 1, "vocab_size": 32, "n_group": 1,
             "topk_group": 1, "rope_parameters": {"rope_theta": 10000.0}, "rms_norm_eps": 1e-5
         });
-        Cfg::from_json(&j).unwrap()
+        Cfg::from_json(&j)
     }
 
     struct Weights {
@@ -277,8 +277,8 @@ mod tests {
     }
 
     #[test]
-    fn single_token_is_value_projection() {
-        let c = cfg();
+    fn single_token_is_value_projection() -> Result<(), peregrine_core::Error> {
+        let c = cfg()?;
         let w = make_weights(&c, 1);
         let (h, qkn, vh, kvl) = (c.n_heads as usize, c.qk_nope as usize, c.v_head as usize, c.kv_lora as usize);
         let mut r = Lcg(555);
@@ -296,11 +296,12 @@ mod tests {
         for d in 0..c.hidden as usize {
             assert!((out[d] - expect[d]).abs() < 1e-4);
         }
+        Ok(())
     }
 
     #[test]
-    fn attention_is_causal() {
-        let c = cfg();
+    fn attention_is_causal() -> Result<(), peregrine_core::Error> {
+        let c = cfg()?;
         let w = make_weights(&c, 2);
         let hidden = c.hidden as usize;
         let s_n = 4;
@@ -318,11 +319,12 @@ mod tests {
                 assert!((out_a[p * hidden + d] - out_b[p * hidden + d]).abs() < 1e-6);
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn decode_step_matches_prefill() {
-        let c = cfg();
+    fn decode_step_matches_prefill() -> Result<(), peregrine_core::Error> {
+        let c = cfg()?;
         let w = make_weights(&c, 3);
         let hidden = c.hidden as usize;
         let mut r = Lcg(24680);
@@ -335,13 +337,14 @@ mod tests {
         for d in 0..hidden {
             assert!((out_full[3 * hidden + d] - out_dec[d]).abs() < 1e-4);
         }
+        Ok(())
     }
 
     #[test]
-    fn absorb_approximates_dense() {
+    fn absorb_approximates_dense() -> Result<(), peregrine_core::Error> {
         // absorb is an algebraic rearrangement of dense; they differ only by
         // kv_b activation quantization in the dense reconstruction.
-        let c = cfg();
+        let c = cfg()?;
         let w = make_weights(&c, 7);
         let hidden = c.hidden as usize;
         let s_n = 5;
@@ -355,12 +358,13 @@ mod tests {
             let scale = dense[z].abs().max(1.0);
             assert!((dense[z] - absorb[z]).abs() < 0.1 * scale, "z={z} dense={} absorb={}", dense[z], absorb[z]);
         }
+        Ok(())
     }
 
     #[test]
-    fn absorb_is_causal() {
+    fn absorb_is_causal() -> Result<(), peregrine_core::Error> {
         // the absorb core must be causal too (exact, no tolerance)
-        let c = cfg();
+        let c = cfg()?;
         let w = make_weights(&c, 8);
         let hidden = c.hidden as usize;
         let s_n = 4;
@@ -378,5 +382,6 @@ mod tests {
                 assert!((a[p * hidden + d] - b[p * hidden + d]).abs() < 1e-6);
             }
         }
+        Ok(())
     }
 }

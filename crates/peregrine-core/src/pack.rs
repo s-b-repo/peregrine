@@ -98,15 +98,47 @@ pub fn quant_i4(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<f32>) {
     (q, sc)
 }
 
+/// Quantize a weight `[O, I]` to grouped packed int4 (colibrì fmt 4): one scale
+/// per `gs`-element group along the input dim. Returns `(bytes[O*ceil(I/2)],
+/// scale[O*ceil(I/gs)])` with scales laid out `sc[o*ng + g]` — the layout
+/// `convert_fp8_to_int4.py --group-size gs` emits and [`crate::qt`] detects.
+pub fn quant_i4_grouped(w: &[f32], o: usize, i: usize, gs: usize) -> (Vec<u8>, Vec<f32>) {
+    let rb = i.div_ceil(2);
+    let ng = i.div_ceil(gs);
+    let mut q = vec![0u8; o * rb];
+    let mut sc = vec![0f32; o * ng];
+    for oo in 0..o {
+        let row = &w[oo * i..oo * i + i];
+        for g in 0..ng {
+            let (s, e) = (g * gs, ((g + 1) * gs).min(i));
+            let amax = row[s..e].iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let scale = (amax / 7.0).max(1e-12);
+            sc[oo * ng + g] = scale;
+            for ii in s..e {
+                let v = (row[ii] / scale).round_ties_even().clamp(-8.0, 7.0) as i32;
+                let bias = (v + 8) as u8 & 0x0F;
+                if ii & 1 == 0 {
+                    q[oo * rb + (ii >> 1)] |= bias;
+                } else {
+                    q[oo * rb + (ii >> 1)] |= bias << 4;
+                }
+            }
+        }
+    }
+    (q, sc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{QtFmt, QtInfo, SafeTensors};
 
     #[test]
-    fn written_model_reads_back() {
+    fn written_model_reads_back() -> Result<(), crate::Error> {
         let dir = std::env::temp_dir().join(format!("coli_pack_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
         let (o, i) = (3usize, 8usize);
         let w: Vec<f32> = (0..o * i).map(|k| (k as f32 * 0.1) - 1.0).collect();
         let (q4, s4) = quant_i4(&w, o, i);
@@ -117,13 +149,13 @@ mod tests {
                 Blob::new("w.qs", "F32", vec![o as i64], f32_bytes(&s4)),
                 Blob::new("norm", "F32", vec![4], f32_bytes(&[1.0, 2.0, 3.0, 4.0])),
             ],
-        )
-        .unwrap();
-        let st = SafeTensors::open(&dir).unwrap();
+        )?;
+        let st = SafeTensors::open(&dir)?;
         assert_eq!(QtInfo::detect(&st, "w", o as i64, i as i64).fmt, QtFmt::Int4);
         let mut n = [0f32; 4];
-        st.read_f32("norm", &mut n).unwrap();
+        st.read_f32("norm", &mut n)?;
         assert_eq!(n, [1.0, 2.0, 3.0, 4.0]);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

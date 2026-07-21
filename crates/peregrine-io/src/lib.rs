@@ -11,14 +11,14 @@
 
 // tier.h is ported with explicit expert-index loops for line-by-line parity.
 #![allow(clippy::needless_range_loop)]
+// Quality gates: io_uring submission is the only (irreducible) `unsafe` here; no
+// panicking error handling in library code.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod cache;
 pub mod ring;
 pub mod tier;
 
 pub use cache::ExpertCache;
-pub use ring::{pread_many, ReadReq};
+pub use ring::{pread_many, read_file, Reactor, ReadReq};
 pub use tier::{decay, lfru_score, pick_lfru, pick_swap, Swap};
-
-#[cfg(target_os = "linux")]
-pub use ring::Reactor;

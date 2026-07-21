@@ -7,13 +7,22 @@
 // they mirror the C ports (for line-by-line verification) and most index several
 // slices at once, so `needless_range_loop` is noise here.
 #![allow(clippy::needless_range_loop)]
+// Quality gates: SIMD intrinsics are the only (irreducible) `unsafe` here; no
+// panicking error handling in library code.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod idot;
 pub mod matmul;
 pub mod quant;
 
-pub use idot::{dot_i4i8, dot_i4i8_scalar, dot_i8i8, dot_i8i8_scalar};
-pub use matmul::{matmul_f32, matmul_i4_from_f32, matmul_i4_idot, matmul_i8_from_f32, matmul_q_idot};
+pub use idot::{
+    dot_i2i8_scalar, dot_i4i8, dot_i4i8_grouped, dot_i4i8_grouped_scalar, dot_i4i8_scalar, dot_i8i8,
+    dot_i8i8_scalar,
+};
+pub use matmul::{
+    matmul_f32, matmul_i4_from_f32, matmul_i4_idot, matmul_i4g_from_f32, matmul_i4g_idot,
+    matmul_i8_from_f32, matmul_q_idot,
+};
 pub use quant::qrow_i8;
 
 /// Human-readable summary of which SIMD kernel family this CPU will use, for
