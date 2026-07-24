@@ -3,9 +3,11 @@
 //! non-streaming), `GET /v1/models`, and `GET /health`.
 //!
 //! Design & safety:
-//! - The model holds one KV cache, so generation is serialized behind a
-//!   `std::sync::Mutex<Model>`; each request runs on `spawn_blocking` (inference
-//!   is CPU-bound) and streams decoded token deltas back over an async channel.
+//! - A single [`batch`] engine thread owns the model and continuously batches all
+//!   in-flight requests (one decode token per active sequence per step), so
+//!   concurrent requests share expert reads instead of serializing behind a lock.
+//!   Each handler submits a request and streams decoded token deltas back over an
+//!   async channel.
 //! - No panics anywhere (deny-lints below); every error becomes an OpenAI-shaped
 //!   JSON body. Binds `127.0.0.1` by default; optional bearer `--api-key`;
 //!   `max_tokens` and prompt-length caps; graceful Ctrl-C shutdown.
@@ -13,7 +15,9 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::sync::{Arc, Mutex};
+mod batch;
+
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -21,11 +25,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use batch::{EngineHandle, EngineOut, EngineRequest};
 use clap::Parser;
 use peregrine_core::Error;
 use peregrine_model::{Model, Sampler};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// CLI configuration.
@@ -53,6 +59,9 @@ struct Args {
     /// Public model id reported by /v1/models and in responses.
     #[arg(long, default_value = "glm-5.2")]
     model_id: String,
+    /// Max sequences decoded together per batched step (continuous-batching width).
+    #[arg(long, default_value_t = 32)]
+    max_batch: usize,
 }
 
 /// Shared, cloneable server state.
@@ -62,8 +71,8 @@ struct AppState {
 }
 
 struct Inner {
-    model: Mutex<Model>,
-    tokenizer: Tokenizer,
+    engine: EngineHandle,
+    tokenizer: Arc<Tokenizer>,
     args: Args,
 }
 
@@ -166,54 +175,21 @@ fn seed() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x9E3779B9)
 }
 
-/// Streamed greedy/sampled generation over the locked model. Calls `on_delta`
-/// with each new decoded text fragment; returns the number of tokens produced.
-fn generate_stream(
-    model: &mut Model,
-    tokenizer: &Tokenizer,
-    prompt_ids: &[u32],
+/// Submit a request to the batch engine and return its token-id stream. The
+/// caller decodes ids to text — incrementally for streaming, in one shot
+/// otherwise — so the engine stays tokenizer-free and both paths share it.
+fn submit_request(
+    state: &AppState,
+    ids: &[u32],
     max_new: usize,
     temperature: f32,
     top_p: f32,
-    mut on_delta: impl FnMut(&str) -> Result<(), ()>,
-) -> Result<usize, ApiError> {
-    model.reset();
-    let vocab = model.cfg.vocab as usize;
-    let stop = model.cfg.stop_ids.clone();
-    let prompt: Vec<i32> = prompt_ids.iter().map(|&x| x as i32).collect();
-    if prompt.is_empty() {
-        return Ok(0);
-    }
-    let mut sampler = Sampler::new(temperature, top_p, seed());
-    let logits = model.forward_step(&prompt, 0)?;
-    let last = (prompt.len() - 1) * vocab;
-    let mut tok = sampler.pick(&logits[last..last + vocab], -1) as i32;
-
-    let mut out_ids: Vec<u32> = Vec::new();
-    let mut prev = String::new();
-    let mut n = 0usize;
-    loop {
-        if stop.contains(&tok) {
-            break;
-        }
-        out_ids.push(tok as u32);
-        n += 1;
-        // incremental decode: emit the newly-completed suffix
-        let text = tk(tokenizer.decode(&out_ids, true))?;
-        if text.len() > prev.len() {
-            if on_delta(&text[prev.len()..]).is_err() {
-                break; // client disconnected
-            }
-            prev = text;
-        }
-        if n >= max_new {
-            break;
-        }
-        let pos = prompt.len() + n - 1;
-        let lg = model.forward_step(&[tok], pos)?;
-        tok = sampler.pick(&lg[..vocab], -1) as i32;
-    }
-    Ok(n)
+) -> Result<mpsc::Receiver<EngineOut>, ApiError> {
+    let (tx, rx) = mpsc::channel::<EngineOut>(64);
+    let prompt: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
+    let sampler = Sampler::new(temperature, top_p, seed());
+    state.inner.engine.submit(EngineRequest { prompt, max_new, sampler, out: tx })?;
+    Ok(rx)
 }
 
 /// Resolve + validate common generation params against the server caps.
@@ -272,51 +248,53 @@ async fn chat_completions(
     check_auth(&state, &headers)?;
     let (ids, max_new, temperature, top_p) = resolve_params(&state, &req)?;
     let model_id = state.inner.args.model_id.clone();
+    let mut rx = submit_request(&state, &ids, max_new, temperature, top_p)?;
+    let tokenizer = state.inner.tokenizer.clone();
 
     if req.stream {
-        // SSE: a blocking task generates and pushes deltas; the response streams them.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
-        let inner = state.inner.clone();
+        // SSE: an async task decodes engine token ids into text deltas and pushes
+        // OpenAI chunk events; the response streams them.
+        let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
         let mid = model_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut model = match inner.model.lock() {
-                Ok(m) => m,
-                Err(_) => {
-                    let _ = tx.blocking_send(Ok(sse_error("model lock poisoned")));
-                    return;
-                }
-            };
-            let send_chunk = |delta: &str| -> Result<(), ()> {
-                let ev = chunk_event(&mid, Some(delta), None);
-                tx.blocking_send(Ok(ev)).map_err(|_| ())
-            };
-            match generate_stream(&mut model, &inner.tokenizer, &ids, max_new, temperature, top_p, send_chunk) {
-                Ok(_) => {
-                    let _ = tx.blocking_send(Ok(chunk_event(&mid, None, Some("stop"))));
-                    let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
-                }
-                Err(e) => {
-                    let _ = tx.blocking_send(Ok(sse_error(&e.message)));
+        tokio::spawn(async move {
+            let mut out_ids: Vec<u32> = Vec::new();
+            let mut prev = String::new();
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    EngineOut::Token(t) => {
+                        out_ids.push(t);
+                        // incremental decode: emit the newly-completed suffix
+                        if let Ok(text) = tokenizer.decode(&out_ids, true) {
+                            if text.len() > prev.len() {
+                                let ev = chunk_event(&mid, Some(&text[prev.len()..]), None);
+                                if sse_tx.send(Ok(ev)).await.is_err() {
+                                    return; // client disconnected
+                                }
+                                prev = text;
+                            }
+                        }
+                    }
+                    EngineOut::Error(m) => {
+                        let _ = sse_tx.send(Ok(sse_error(&m))).await;
+                        return;
+                    }
                 }
             }
+            let _ = sse_tx.send(Ok(chunk_event(&mid, None, Some("stop")))).await;
+            let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
         });
-        let stream = ReceiverStream::new(rx);
+        let stream = ReceiverStream::new(sse_rx);
         Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
     } else {
-        // Non-streaming: collect the full completion, then return one JSON body.
-        let inner = state.inner.clone();
-        let text = tokio::task::spawn_blocking(move || -> Result<String, ApiError> {
-            let mut model = inner.model.lock().map_err(|_| ApiError::internal("model lock poisoned"))?;
-            let mut out = String::new();
-            generate_stream(&mut model, &inner.tokenizer, &ids, max_new, temperature, top_p, |d| {
-                out.push_str(d);
-                Ok(())
-            })?;
-            Ok(out)
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("worker join: {e}")))??;
-
+        // Non-streaming: collect the whole token stream, decode once, one JSON body.
+        let mut out_ids: Vec<u32> = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                EngineOut::Token(t) => out_ids.push(t),
+                EngineOut::Error(m) => return Err(ApiError::internal(m)),
+            }
+        }
+        let text = tk(tokenizer.decode(&out_ids, true))?;
         let body = serde_json::json!({
             "id": format!("chatcmpl-{}", seed()),
             "object": "chat.completion",
@@ -356,8 +334,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = Model::load(&dir)?;
     let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer: {e}"))?;
 
+    // One engine thread owns the model and continuously batches all requests.
+    let (engine, _engine_join) = batch::spawn(model, args.max_batch)?;
+
     let addr = format!("{}:{}", args.host, args.port);
-    let state = AppState { inner: Arc::new(Inner { model: Mutex::new(model), tokenizer, args }) };
+    let state = AppState { inner: Arc::new(Inner { engine, tokenizer: Arc::new(tokenizer), args }) };
 
     let app = Router::new()
         .route("/health", get(health))

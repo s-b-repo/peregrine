@@ -9,7 +9,7 @@
 
 use peregrine_core::{Error, QtFmt, QtInfo, SafeTensors};
 use peregrine_kernels::{
-    dot_i2i8_scalar, matmul_i4_from_f32, matmul_i4g_from_f32, matmul_i8_from_f32, qrow_i8,
+    dot_i2i8, matmul_i4_from_f32, matmul_i4g_from_f32, matmul_i8_from_f32, qrow_i8,
 };
 
 /// The quantized formats the compute path supports. F32 is rejected at load, so
@@ -115,9 +115,9 @@ impl QtWeight {
                 matmul_i4g_from_f32(y, x, &self.q, &self.scale, s_n, self.i, self.o, self.gs, xq, sx)
             }
             QuantFmt::Int2 => {
-                // No SIMD int2 kernel yet; quantize activations then scalar-dot
-                // each row. int2 is rare (extra compression), so correctness over
-                // speed here — the token-exact path is still the scalar reference.
+                // Quantize activations, then int2·int8 dot each row (AVX2 when
+                // available, else scalar — bit-identical). int2 is rare (extra
+                // compression); the scalar path remains the token-exact reference.
                 for s in 0..s_n {
                     sx[s] = qrow_i8(&x[s * self.i..s * self.i + self.i], &mut xq[s * self.i..s * self.i + self.i]);
                 }
@@ -126,7 +126,7 @@ impl QtWeight {
                     let w = &self.q[o * rb..o * rb + rb];
                     let sc = self.scale[o];
                     for s in 0..s_n {
-                        let d = dot_i2i8_scalar(w, &xq[s * self.i..s * self.i + self.i], self.i) as f32;
+                        let d = dot_i2i8(w, &xq[s * self.i..s * self.i + self.i], self.i) as f32;
                         y[s * self.o + o] = d * sc * sx[s];
                     }
                 }
