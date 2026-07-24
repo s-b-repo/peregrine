@@ -28,11 +28,11 @@ pub mod sample;
 pub mod testkit;
 pub mod weight;
 
-pub use attention::{mla_attention, mla_attention_absorb, AttnWeights, LayerKv};
+pub use attention::{mla_attention, mla_attention_absorb, mla_attention_batched, AttnWeights, LayerKv, RowAttn};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoidf, siluf, silu_mul, softmax};
 pub use mlp::{moe_forward, Mlp};
-pub use model::Model;
+pub use model::{Model, SeqKv};
 pub use mtp::speculative_sample;
 pub use router::{batch_union, route, Routed};
-pub use sample::{argmax, Sampler};
+pub use sample::{argmax, pick_batch_greedy, Sampler};
 pub use weight::{QtWeight, QuantFmt};

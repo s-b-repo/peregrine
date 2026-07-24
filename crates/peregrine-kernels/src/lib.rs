@@ -16,8 +16,8 @@ pub mod matmul;
 pub mod quant;
 
 pub use idot::{
-    dot_i2i8_scalar, dot_i4i8, dot_i4i8_grouped, dot_i4i8_grouped_scalar, dot_i4i8_scalar, dot_i8i8,
-    dot_i8i8_scalar,
+    dot_i2i8, dot_i2i8_scalar, dot_i4i8, dot_i4i8_grouped, dot_i4i8_grouped_scalar, dot_i4i8_scalar,
+    dot_i8i8, dot_i8i8_scalar,
 };
 pub use matmul::{
     matmul_f32, matmul_i4_from_f32, matmul_i4_idot, matmul_i4g_from_f32, matmul_i4g_idot,

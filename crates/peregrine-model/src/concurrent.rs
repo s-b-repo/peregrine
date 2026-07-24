@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use peregrine_core::{Cfg, Context, Error, QtInfo, SafeTensors};
 use peregrine_io::{Reactor, ReadReq, WarmCache};
 
-use crate::gpu::GpuTier;
+use crate::gpu::{GpuTier, HeatTable};
 use crate::mlp::Mlp;
 use crate::router::{batch_union, route};
 use crate::weight::{QtWeight, QuantFmt};
@@ -50,6 +50,10 @@ pub struct ForwardCtx<'a> {
     /// opened O_DIRECT fds. Bytes are identical to the buffered path; only the
     /// cache behavior differs. `false` disables (buffered reads).
     pub direct: bool,
+    /// Routing-frequency accumulator for heat-ranked VRAM residency: bumped once
+    /// per routed expert per layer so [`crate::gpu::GpuTier::reheat`] can migrate
+    /// hot experts into VRAM. `None` disables accumulation (no GPU tier / drafts).
+    pub heat: Option<&'a HeatTable>,
 }
 
 /// Default CPU-lane width: the machine's parallelism, capped so a huge core
@@ -187,7 +191,7 @@ fn read_expert(r: &mut Reactor, gate: &TPlan, up: &TPlan, down: &TPlan, direct: 
 /// one expert at a time — the colibrì deep-queue model) while bounding the transient
 /// landing-buffer memory to ~`16 × 18.9 MB ≈ 300 MB` (this box is RAM-contended, so
 /// a bounded batch matters; a reusable slab arena would remove the ceiling entirely).
-const EXPERTS_PER_BATCH: usize = 16;
+pub const EXPERTS_PER_BATCH: usize = 16;
 
 /// Stream a *batch* of experts' gate/up/down (six weight+scale regions each) through
 /// the ring in **one deep `read_many` submit**, so the disk queue stays full across
@@ -524,6 +528,15 @@ pub fn moe_forward_concurrent(
         let hs = sh.swiglu(x, s_n);
         for z in 0..s_n * hidden {
             out[z] += hs[z];
+        }
+    }
+
+    // Accumulate routing frequency so the GPU tier can migrate hot experts into
+    // VRAM (heat-ranked residency). Union hotness is the batched-relevant signal;
+    // single-threaded here (after the reduce), so the lock-free bumps never race.
+    if let Some(heat) = ctx.heat {
+        for &e in &uniq {
+            heat.bump(layer, e as usize);
         }
     }
 
