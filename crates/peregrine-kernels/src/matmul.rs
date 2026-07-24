@@ -9,7 +9,7 @@
 //! Single-threaded and deterministic here — the CPU-lane threading arrives with
 //! the M4 scheduler; correctness and reproducibility come first.
 
-use crate::idot::{dot_i4i8, dot_i8i8};
+use crate::idot::{dot_i4i8, dot_i4i8_grouped, dot_i8i8};
 use crate::quant::qrow_i8;
 
 /// Plain f32 matmul `y[S,O] = x[S,D] · wᵀ` where weights `w` are row-major
@@ -56,6 +56,55 @@ pub fn matmul_i4_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q4: &[u8], scale: &[
             y[s * o_n + o] = d * sc * sx[s];
         }
     }
+}
+
+/// grouped packed-int4 weights `q4[O*ceil(I/2)]` with group scales
+/// `scale[O*ng]` (`ng = ceil(I/gs)`, row `o` group `g` at `scale[o*ng + g]`),
+/// int8 activations `xq[S*I]` → `y[S*O]`. The weight group scales are folded in
+/// by [`dot_i4i8_grouped`]; only the per-row activation scale `sx[s]` remains.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_i4g_idot(
+    y: &mut [f32],
+    xq: &[i8],
+    sx: &[f32],
+    q4: &[u8],
+    scale: &[f32],
+    s_n: usize,
+    i_n: usize,
+    o_n: usize,
+    gs: usize,
+) {
+    let rb = i_n.div_ceil(2);
+    let ng = i_n.div_ceil(gs);
+    for o in 0..o_n {
+        let w = &q4[o * rb..o * rb + rb];
+        let sc = &scale[o * ng..o * ng + ng];
+        for s in 0..s_n {
+            let xs = &xq[s * i_n..s * i_n + i_n];
+            let d = dot_i4i8_grouped(w, xs, sc, i_n, gs);
+            y[s * o_n + o] = d * sx[s];
+        }
+    }
+}
+
+/// Convenience: same as [`matmul_i4_from_f32`] for grouped packed-int4 weights.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_i4g_from_f32(
+    y: &mut [f32],
+    x: &[f32],
+    q4: &[u8],
+    scale: &[f32],
+    s_n: usize,
+    i_n: usize,
+    o_n: usize,
+    gs: usize,
+    xq: &mut [i8],
+    sx: &mut [f32],
+) {
+    for s in 0..s_n {
+        sx[s] = qrow_i8(&x[s * i_n..s * i_n + i_n], &mut xq[s * i_n..s * i_n + i_n]);
+    }
+    matmul_i4g_idot(y, xq, sx, q4, scale, s_n, i_n, o_n, gs);
 }
 
 /// Convenience: quantize f32 activations row-wise (`qrow_i8`) into `xq`/`sx`
@@ -196,6 +245,80 @@ mod tests {
                 assert_eq!(y[s * o_n + o], expect, "int4 s={s} o={o}");
             }
         }
+    }
+
+    /// Grouped int4 quantizer (test helper), matching colibrì
+    /// `convert_fp8_to_int4.py::quant_int4_grouped`: one scale per `gs`-element
+    /// group along the input dim, laid out `sc[o*ng + g]`.
+    fn quant_i4_grouped(w: &[f32], o_n: usize, i_n: usize, gs: usize) -> (Vec<u8>, Vec<f32>) {
+        let rb = i_n.div_ceil(2);
+        let ng = i_n.div_ceil(gs);
+        let mut q = vec![0u8; o_n * rb];
+        let mut sc = vec![0f32; o_n * ng];
+        for o in 0..o_n {
+            let row = &w[o * i_n..o * i_n + i_n];
+            for g in 0..ng {
+                let (s, e) = (g * gs, ((g + 1) * gs).min(i_n));
+                let amax = row[s..e].iter().fold(0f32, |m, &v| m.max(v.abs()));
+                let scale = (amax / 7.0).max(1e-12);
+                sc[o * ng + g] = scale;
+                for i in s..e {
+                    let v = (row[i] / scale).round_ties_even().clamp(-8.0, 7.0) as i32;
+                    let bias = (v + 8) as u8 & 0x0F;
+                    if i & 1 == 0 {
+                        q[o * rb + (i >> 1)] |= bias;
+                    } else {
+                        q[o * rb + (i >> 1)] |= bias << 4;
+                    }
+                }
+            }
+        }
+        (q, sc)
+    }
+
+    #[test]
+    fn i4_grouped_matmul_matches_dot_defn_and_beats_perrow() {
+        let (s_n, i_n, o_n, gs) = (2usize, 128usize, 4usize, 32usize);
+        let mut rng = Lcg(0x6d6d);
+        let xf: Vec<f32> = (0..s_n * i_n).map(|_| rng.f()).collect();
+        let wf: Vec<f32> = (0..o_n * i_n).map(|_| rng.f()).collect();
+        let (q4, sc4) = quant_i4_grouped(&wf, o_n, i_n, gs);
+        let ng = i_n.div_ceil(gs);
+
+        let mut xq = vec![0i8; s_n * i_n];
+        let mut sx = vec![0f32; s_n];
+        let mut y = vec![0f32; s_n * o_n];
+        matmul_i4g_from_f32(&mut y, &xf, &q4, &sc4, s_n, i_n, o_n, gs, &mut xq, &mut sx);
+
+        // exact vs by-definition grouped scalar dot
+        for s in 0..s_n {
+            for o in 0..o_n {
+                let d = crate::idot::dot_i4i8_grouped_scalar(
+                    &q4[o * (i_n / 2)..o * (i_n / 2) + i_n / 2],
+                    &xq[s * i_n..s * i_n + i_n],
+                    &sc4[o * ng..o * ng + ng],
+                    i_n,
+                    gs,
+                );
+                assert_eq!(y[s * o_n + o], d * sx[s], "grouped s={s} o={o}");
+            }
+        }
+
+        // grouped int4 must approximate the f32 matmul at least as well as per-row
+        // int4 — the whole point of grouped scales (issue_grouped_quant.md).
+        let (q4r, sc4r) = quant_i4_rows(&wf, o_n, i_n);
+        let mut yr = vec![0f32; s_n * o_n];
+        let (mut xqr, mut sxr) = (vec![0i8; s_n * i_n], vec![0f32; s_n]);
+        matmul_i4_from_f32(&mut yr, &xf, &q4r, &sc4r, s_n, i_n, o_n, &mut xqr, &mut sxr);
+        let (mut eg, mut er) = (0f32, 0f32);
+        for s in 0..s_n {
+            for o in 0..o_n {
+                let r: f32 = (0..i_n).map(|i| wf[o * i_n + i] * xf[s * i_n + i]).sum();
+                eg += (y[s * o_n + o] - r).abs();
+                er += (yr[s * o_n + o] - r).abs();
+            }
+        }
+        assert!(eg <= er, "grouped err {eg} should be <= per-row err {er}");
     }
 
     #[test]

@@ -6,11 +6,13 @@
 //! (`peregrine-io`); this crate is the index plus straightforward converting reads.
 
 use crate::dtype::{bf16_to_f32, f16_to_f32, Dtype};
-use crate::Error;
+use crate::{Context, Error};
+use parking_lot::Mutex;
+use peregrine_io::Reactor;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 /// Cap on the safetensors header size — real headers are KB..a few MB. A crafted
@@ -35,36 +37,67 @@ pub struct SafeTensors {
     tensors: Vec<TensorInfo>,
     index: HashMap<String, usize>,
     files: Vec<File>,
+    /// O_DIRECT twin of `files[i]` for bulk expert streaming (bypasses the page
+    /// cache). `None` when O_DIRECT is unavailable for that shard (filesystem
+    /// rejects the open or aligned reads); callers then use the buffered fd.
+    direct_files: Vec<Option<File>>,
     paths: Vec<PathBuf>,
+    /// The io_uring lane every read goes through (interior mutability keeps the
+    /// read methods `&self`). Serialized: one positioned read at a time.
+    reactor: Mutex<Reactor>,
+}
+
+impl SafeTensors {
+    /// Read exactly `buf.len()` bytes at `off` from shard `file_idx` through the
+    /// io_uring reactor. The single choke point for every disk read here.
+    fn read_at(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> Result<(), Error> {
+        let fd = self.files[file_idx].as_raw_fd();
+        // parking_lot mutex does not poison, so the lock never fails
+        self.reactor
+            .lock()
+            .read_exact(fd, off, buf)
+            .ctx(|| format!("{}: io_uring read @ {off}", self.paths[file_idx].display()))
+    }
 }
 
 impl SafeTensors {
     /// Index every `model*.safetensors` shard in `dir` (sorted by name, matching
     /// the C engine's ordering so fused-expert offsets line up across shards).
     pub fn open(dir: &Path) -> Result<SafeTensors, Error> {
-        let mut shard_paths: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(|e| Error::Format(format!("{}: {e}", dir.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
-            .collect();
+        let mut shard_paths: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(dir).ctx(|| dir.display().to_string())? {
+            // a failed directory entry is surfaced, not silently dropped
+            let path = entry.ctx(|| dir.display().to_string())?.path();
+            if path.extension().is_some_and(|x| x == "safetensors") {
+                shard_paths.push(path);
+            }
+        }
         shard_paths.sort();
         if shard_paths.is_empty() {
             return Err(Error::Format(format!("no .safetensors shards in {}", dir.display())));
         }
 
-        let mut st = SafeTensors {
-            tensors: Vec::new(),
-            index: HashMap::new(),
-            files: Vec::with_capacity(shard_paths.len()),
-            paths: shard_paths.clone(),
-        };
+        // one io_uring lane for every read: the shard headers here at open time
+        // and all tensor data later. Depth covers a per-layer expert batch.
+        let mut reactor = Reactor::new(256).ctx(|| "io_uring reactor init".to_string())?;
+
+        let mut tensors: Vec<TensorInfo> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut files: Vec<File> = Vec::with_capacity(shard_paths.len());
+        let mut direct_files: Vec<Option<File>> = Vec::with_capacity(shard_paths.len());
 
         for (file_idx, path) in shard_paths.iter().enumerate() {
-            let f = File::open(path).map_err(|e| Error::Format(format!("{}: {e}", path.display())))?;
-            let fsz = f.metadata().map_err(Error::Io)?.len();
+            let f = File::open(path).ctx(|| path.display().to_string())?;
+            // O_DIRECT twin for bulk expert streaming; kept only if a probe aligned
+            // read succeeds. Any failure → buffered fallback (never fatal).
+            let direct = open_direct(path);
+            let fsz = f.metadata().ctx(|| path.display().to_string())?.len();
+            let read = |reactor: &mut Reactor, off: u64, buf: &mut [u8]| -> Result<(), Error> {
+                reactor.read_exact(f.as_raw_fd(), off, buf).ctx(|| format!("{}: io_uring read @ {off}", path.display()))
+            };
 
             let mut lenbuf = [0u8; 8];
-            read_exact_at(&f, &mut lenbuf, 0, path)?;
+            read(&mut reactor, 0, &mut lenbuf)?;
             let hlen = u64::from_le_bytes(lenbuf);
             if fsz < 8 || hlen > fsz - 8 || hlen > ST_MAX_HEADER {
                 return Err(Error::Format(format!(
@@ -74,10 +107,9 @@ impl SafeTensors {
             }
 
             let mut hdr = vec![0u8; hlen as usize];
-            read_exact_at(&f, &mut hdr, 8, path)?;
+            read(&mut reactor, 8, &mut hdr)?;
             let data_start: u64 = 8 + hlen;
-            let root: Value = serde_json::from_slice(&hdr)
-                .map_err(|e| Error::Format(format!("{}: header not JSON: {e}", path.display())))?;
+            let root: Value = serde_json::from_slice(&hdr).ctx(|| format!("{}: header not JSON", path.display()))?;
             let obj = root
                 .as_object()
                 .ok_or_else(|| Error::Format(format!("{}: header not a JSON object", path.display())))?;
@@ -110,8 +142,8 @@ impl SafeTensors {
                 }
                 let shape: Vec<i64> = shp.iter().map(|v| v.as_i64().unwrap_or(0)).collect();
                 let numel: i64 = shape.iter().product::<i64>().max(if shape.is_empty() { 1 } else { 0 });
-                let idx = st.tensors.len();
-                st.tensors.push(TensorInfo {
+                let idx = tensors.len();
+                tensors.push(TensorInfo {
                     name: name.clone(),
                     file_idx,
                     off: data_start + a0 as u64,
@@ -120,11 +152,12 @@ impl SafeTensors {
                     numel,
                     shape,
                 });
-                st.index.insert(name.clone(), idx);
+                index.insert(name.clone(), idx);
             }
-            st.files.push(f);
+            files.push(f);
+            direct_files.push(direct);
         }
-        Ok(st)
+        Ok(SafeTensors { tensors, index, files, direct_files, paths: shard_paths, reactor: Mutex::new(reactor) })
     }
 
     pub fn len(&self) -> usize {
@@ -153,6 +186,29 @@ impl SafeTensors {
         self.find(name).map(|t| t.nbytes)
     }
 
+    /// Raw on-disk location of a tensor's data: `(fd, absolute_offset, nbytes)`.
+    /// Lets the I/O lane stream the tensor **in place** from the checkpoint (no
+    /// re-coalescing to a sidecar file). The `fd` stays valid as long as this
+    /// `SafeTensors` is alive, so a streaming `Model` must keep it resident.
+    pub fn region(&self, name: &str) -> Option<(RawFd, u64, usize)> {
+        self.find(name).map(|t| (self.files[t.file_idx].as_raw_fd(), t.off, t.nbytes as usize))
+    }
+
+    /// Like [`Self::region`] but returns the shard's **O_DIRECT** fd (same offset
+    /// and length), or `None` when O_DIRECT is unavailable for that shard — the
+    /// caller then falls back to [`Self::region`]. The block alignment O_DIRECT
+    /// requires is applied by the reader ([`peregrine_io::Reactor::read_direct_many`]).
+    pub fn region_direct(&self, name: &str) -> Option<(RawFd, u64, usize)> {
+        let t = self.find(name)?;
+        let df = self.direct_files.get(t.file_idx)?.as_ref()?;
+        Some((df.as_raw_fd(), t.off, t.nbytes as usize))
+    }
+
+    /// Whether any shard opened a working O_DIRECT fd (so the direct path is usable).
+    pub fn has_any_direct(&self) -> bool {
+        self.direct_files.iter().any(Option::is_some)
+    }
+
     /// Read a tensor as f32, converting BF16/F16/F32. `out` must hold `numel`
     /// floats. Errors on a U8 (quantized) tensor — use [`Self::read_raw`].
     pub fn read_f32(&self, name: &str, out: &mut [f32]) -> Result<i64, Error> {
@@ -167,10 +223,11 @@ impl SafeTensors {
                 out.len()
             )));
         }
-        let mut raw = vec![0u8; t.nbytes as usize];
-        read_exact_at(&self.files[t.file_idx], &mut raw, t.off, &self.paths[t.file_idx])?;
-        convert_f32(t.dtype, &raw, &mut out[..need]);
-        Ok(t.numel)
+        let (dtype, off, nbytes, fidx) = (t.dtype, t.off, t.nbytes as usize, t.file_idx);
+        let mut raw = vec![0u8; nbytes];
+        self.read_at(fidx, off, &mut raw)?;
+        convert_f32(dtype, &raw, &mut out[..need])?;
+        Ok(need as i64)
     }
 
     /// Read the raw bytes of a tensor (no dtype conversion) — for the already
@@ -184,7 +241,8 @@ impl SafeTensors {
                 out.len()
             )));
         }
-        read_exact_at(&self.files[t.file_idx], &mut out[..need], t.off, &self.paths[t.file_idx])
+        let (off, fidx) = (t.off, t.file_idx);
+        self.read_at(fidx, off, &mut out[..need])
     }
 
     /// Read `n_elems` starting at element `elem_off` (converted to f32). Used for
@@ -207,9 +265,10 @@ impl SafeTensors {
         if out.len() < n_elems as usize {
             return Err(Error::Format(format!("read_slice_f32 '{name}': out buffer too small")));
         }
+        let (dtype, fidx) = (t.dtype, t.file_idx);
         let mut raw = vec![0u8; nb];
-        read_exact_at(&self.files[t.file_idx], &mut raw, boff, &self.paths[t.file_idx])?;
-        convert_f32(t.dtype, &raw, &mut out[..n_elems as usize]);
+        self.read_at(fidx, boff, &mut raw)?;
+        convert_f32(dtype, &raw, &mut out[..n_elems as usize])?;
         Ok(())
     }
 
@@ -218,7 +277,7 @@ impl SafeTensors {
     }
 }
 
-fn convert_f32(dtype: Dtype, raw: &[u8], out: &mut [f32]) {
+fn convert_f32(dtype: Dtype, raw: &[u8], out: &mut [f32]) -> Result<(), Error> {
     match dtype {
         Dtype::F32 => {
             for (o, c) in out.iter_mut().zip(raw.chunks_exact(4)) {
@@ -235,13 +294,28 @@ fn convert_f32(dtype: Dtype, raw: &[u8], out: &mut [f32]) {
                 *o = f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
             }
         }
-        Dtype::U8 => unreachable!("convert_f32 called on U8"),
+        // Callers (read_f32/read_slice_f32) reject U8 before converting; keep this
+        // total (no `unreachable!`) so a misuse is a surfaced error, not a panic.
+        Dtype::U8 => return Err(Error::Format("convert_f32 called on a U8 tensor".into())),
     }
+    Ok(())
 }
 
-fn read_exact_at(f: &File, buf: &mut [u8], off: u64, path: &Path) -> Result<(), Error> {
-    f.read_exact_at(buf, off)
-        .map_err(|e| Error::Format(format!("{}: read {} bytes @ {off}: {e}", path.display(), buf.len())))
+/// Open a second, O_DIRECT fd for `path`, kept only if a probe aligned read
+/// succeeds (some filesystems accept the open but reject aligned reads with
+/// EINVAL). `None` on any failure — the caller falls back to the buffered fd.
+/// All-safe: the `O_DIRECT` open is std, and the probe's `unsafe` lives in
+/// `peregrine-io` (this crate is `#![forbid(unsafe_code)]`).
+#[cfg(target_os = "linux")]
+fn open_direct(path: &Path) -> Option<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let df = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path).ok()?;
+    peregrine_io::probe_direct(df.as_raw_fd()).then_some(df)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_direct(_path: &Path) -> Option<File> {
+    None
 }
 
 #[cfg(test)]
@@ -259,7 +333,7 @@ pub(crate) mod test_support {
     }
 
     /// Write a single-shard `model.safetensors` into `dir`.
-    pub fn write_safetensors(dir: &Path, blobs: &[Blob]) {
+    pub fn write_safetensors(dir: &Path, blobs: &[Blob]) -> Result<(), crate::Error> {
         let mut header = serde_json::Map::new();
         let mut cursor: i64 = 0;
         let mut data: Vec<u8> = Vec::new();
@@ -273,13 +347,14 @@ pub(crate) mod test_support {
             data.extend_from_slice(&b.bytes);
             cursor = end;
         }
-        let hdr = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let hdr = serde_json::to_vec(&serde_json::Value::Object(header))?;
         let mut out = Vec::new();
         out.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
         out.extend_from_slice(&hdr);
         out.extend_from_slice(&data);
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("model.safetensors"), out).unwrap();
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("model.safetensors"), out)?;
+        Ok(())
     }
 
     pub fn f32_bytes(vals: &[f32]) -> Vec<u8> {
@@ -302,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn index_and_read_roundtrip() {
+    fn index_and_read_roundtrip() -> Result<(), Error> {
         let dir = tmpdir("roundtrip");
         write_safetensors(
             &dir,
@@ -311,55 +386,80 @@ mod tests {
                 Blob { name: "b", dtype: "BF16", shape: vec![3], bytes: bf16_bytes(&[1.0, 2.0, -4.0]) },
                 Blob { name: "w.qs", dtype: "U8", shape: vec![4], bytes: vec![10, 20, 30, 40] },
             ],
-        );
-        let st = SafeTensors::open(&dir).unwrap();
+        )?;
+        let st = SafeTensors::open(&dir)?;
         assert_eq!(st.len(), 3);
         assert!(st.has("a") && st.has("b") && st.has("w.qs"));
         assert_eq!(st.numel("b"), Some(3));
 
         let mut a = [0f32; 2];
-        st.read_f32("a", &mut a).unwrap();
+        st.read_f32("a", &mut a)?;
         assert_eq!(a, [1.0, 2.0]);
 
         let mut b = [0f32; 3];
-        st.read_f32("b", &mut b).unwrap();
+        st.read_f32("b", &mut b)?;
         assert_eq!(b, [1.0, 2.0, -4.0]);
 
         let mut raw = [0u8; 4];
-        st.read_raw("w.qs", &mut raw).unwrap();
+        st.read_raw("w.qs", &mut raw)?;
         assert_eq!(raw, [10, 20, 30, 40]);
 
         // reading a U8 tensor as f32 is an error
         let mut junk = [0f32; 4];
         assert!(st.read_f32("w.qs", &mut junk).is_err());
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
-    fn slice_read() {
+    fn region_direct_matches_region_or_none() -> Result<(), Error> {
+        // The O_DIRECT twin must expose the same (offset, length) as the buffered
+        // region on a different fd — or be `None` (consistent with has_any_direct)
+        // when the filesystem rejects O_DIRECT.
+        let dir = tmpdir("regiondirect");
+        write_safetensors(&dir, &[Blob { name: "w.qs", dtype: "U8", shape: vec![8], bytes: vec![1, 2, 3, 4, 5, 6, 7, 8] }])?;
+        let st = SafeTensors::open(&dir)?;
+        let buf = st.region("w.qs").ok_or_else(|| Error::Format("no region".into()))?;
+        match st.region_direct("w.qs") {
+            None => assert!(!st.has_any_direct(), "None region_direct ⇒ no direct fds"),
+            Some(d) => {
+                assert!(st.has_any_direct());
+                assert_eq!(d.1, buf.1, "same offset");
+                assert_eq!(d.2, buf.2, "same length");
+                assert_ne!(d.0, buf.0, "twin uses a different fd");
+            }
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn slice_read() -> Result<(), Error> {
         let dir = tmpdir("slice");
         write_safetensors(
             &dir,
             &[Blob { name: "x", dtype: "F32", shape: vec![6], bytes: f32_bytes(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]) }],
-        );
-        let st = SafeTensors::open(&dir).unwrap();
+        )?;
+        let st = SafeTensors::open(&dir)?;
         let mut slice = [0f32; 3];
-        st.read_slice_f32("x", 2, 3, &mut slice).unwrap();
+        st.read_slice_f32("x", 2, 3, &mut slice)?;
         assert_eq!(slice, [2.0, 3.0, 4.0]);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
-    fn rejects_truncated_header() {
+    fn rejects_truncated_header() -> Result<(), Error> {
         let dir = tmpdir("bad");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir)?;
         // declare an 8 GB header in a tiny file
         let mut out = Vec::new();
         out.extend_from_slice(&(8u64 << 30).to_le_bytes());
         out.extend_from_slice(b"{}");
-        std::fs::write(dir.join("model.safetensors"), out).unwrap();
+        std::fs::write(dir.join("model.safetensors"), out)?;
         assert!(SafeTensors::open(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

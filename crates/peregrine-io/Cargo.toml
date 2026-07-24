@@ -8,3 +8,4 @@ description = "colibrì expert streaming: io_uring reactor (I/O lane), slab aren
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+libc = "0.2"

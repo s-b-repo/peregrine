@@ -64,6 +64,64 @@ pub fn dot_i4i8(w4: &[u8], x: &[i8], n: usize) -> i32 {
     dot_i4i8_scalar(w4, x, n)
 }
 
+/// grouped packed-int4·int8 dot → f32. The weight row is split into groups of
+/// `gs` input elements, each with its own f32 scale `scales[g]`; the result is
+/// `Σ_g scales[g] · (int4·int8 dot of group g)`. This is the coherence-critical
+/// path for GLM-5.2: 128-block scales preserve the fine-grained weight structure
+/// per-row scales crush (see colibrì `issue_grouped_quant.md`).
+///
+/// Every valid group size is a multiple of 16 (see [`detect_group_size`]), so a
+/// group starts at an even element index and its packed nibbles begin on a byte
+/// boundary (`start >> 1`) — the same alignment invariant [`dot_i4i8`] relies on.
+/// Reference version: uses the scalar inner dot.
+#[inline]
+pub fn dot_i4i8_grouped_scalar(w4: &[u8], x: &[i8], scales: &[f32], n: usize, gs: usize) -> f32 {
+    let mut acc = 0f32;
+    let mut start = 0usize;
+    let mut g = 0usize;
+    while start < n {
+        let len = gs.min(n - start);
+        let d = dot_i4i8_scalar(&w4[start >> 1..], &x[start..], len);
+        acc += scales[g] * d as f32;
+        start += gs;
+        g += 1;
+    }
+    acc
+}
+
+/// grouped packed-int4·int8 dot → f32, using the best available inner dot.
+///
+/// The per-group integer dot is bit-identical between scalar and SIMD (integer
+/// addition is associative), and the f32 group-scale accumulation runs in fixed
+/// group order, so this equals [`dot_i4i8_grouped_scalar`] exactly.
+#[inline]
+pub fn dot_i4i8_grouped(w4: &[u8], x: &[i8], scales: &[f32], n: usize, gs: usize) -> f32 {
+    let mut acc = 0f32;
+    let mut start = 0usize;
+    let mut g = 0usize;
+    while start < n {
+        let len = gs.min(n - start);
+        let d = dot_i4i8(&w4[start >> 1..], &x[start..], len);
+        acc += scales[g] * d as f32;
+        start += gs;
+        g += 1;
+    }
+    acc
+}
+
+/// packed-int2·int8 dot → i32. Reference implementation. Element `i` is the
+/// `2·(i&3)`-shifted 2-bit field of byte `i>>2`, biased by −2 into `[-2, 1]`.
+#[inline]
+pub fn dot_i2i8_scalar(w2: &[u8], x: &[i8], n: usize) -> i32 {
+    let mut sum = 0i32;
+    for i in 0..n {
+        let byte = w2[i >> 2];
+        let field = ((byte >> (2 * (i & 3))) & 0x03) as i32;
+        sum += (field - 2) * x[i] as i32;
+    }
+    sum
+}
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86 {
     //! AVX2 (maddubs sign-trick) and AVX-VNNI (`vpdpbusd`) dot kernels. Each
@@ -223,6 +281,47 @@ mod tests {
                 }
             }
             assert_eq!(dot_i8i8(&w, &x, n), reference, "dispatch n={n}");
+        }
+    }
+
+    #[test]
+    fn i4_grouped_scalar_matches_dispatch_and_hand() {
+        let mut rng = Lcg(0xdead_beef);
+        // (n, gs) pairs: exact multiples and ragged tails, gs>n, single group.
+        for &(n, gs) in &[(32usize, 16usize), (96, 32), (128, 128), (70, 16), (10, 16), (256, 64)] {
+            let vals: Vec<i32> = (0..n).map(|_| rng.nib()).collect();
+            let w4 = pack_i4(&vals);
+            let x: Vec<i8> = (0..n).map(|_| rng.i8_127()).collect();
+            let ng = n.div_ceil(gs);
+            let scales: Vec<f32> = (0..ng).map(|g| 0.01 + 0.05 * g as f32).collect();
+
+            // hand reference: Σ_g scale[g] · Σ_{i in g} val[i]·x[i]
+            let mut hand = 0f32;
+            for g in 0..ng {
+                let (s, e) = (g * gs, ((g + 1) * gs).min(n));
+                let d: i32 = (s..e).map(|i| vals[i] * x[i] as i32).sum();
+                hand += scales[g] * d as f32;
+            }
+            let scal = dot_i4i8_grouped_scalar(&w4, &x, &scales, n, gs);
+            let disp = dot_i4i8_grouped(&w4, &x, &scales, n, gs);
+            assert_eq!(scal, hand, "grouped scalar n={n} gs={gs}");
+            assert_eq!(disp, scal, "grouped dispatch==scalar n={n} gs={gs}");
+        }
+    }
+
+    #[test]
+    fn i2_scalar_matches_hand() {
+        let mut rng = Lcg(0x2222_2222);
+        for &n in &LENS {
+            let vals: Vec<i32> = (0..n).map(|_| (rng.next() >> 40) as i32 % 4 - 2).collect(); // [-2,1]
+            // pack 4 fields/byte, field i in bits [2*(i&3) .. +2)
+            let mut w2 = vec![0u8; n.div_ceil(4)];
+            for (i, &v) in vals.iter().enumerate() {
+                w2[i >> 2] |= (((v + 2) as u8) & 0x03) << (2 * (i & 3));
+            }
+            let x: Vec<i8> = (0..n).map(|_| rng.i8_127()).collect();
+            let hand: i32 = vals.iter().zip(&x).map(|(&v, &xi)| v * xi as i32).sum();
+            assert_eq!(dot_i2i8_scalar(&w2, &x, n), hand, "int2 n={n}");
         }
     }
 

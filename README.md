@@ -63,8 +63,9 @@ cuda/                vendored CUDA kernels from colibrì (backend_cuda.cu / .h)
 ## Build & test
 
 ```bash
-cargo test --workspace          # 62 tests, CPU-only, no GPU needed
+cargo test --workspace          # CPU-only, no GPU needed
 cargo build --release           # optimized (fat LTO)
+scripts/audit-bad-patterns.sh --strict   # quality gate: no panic-vectors/UB (see docs/BAD_PATTERNS.md)
 
 # GPU lane (on an NVIDIA host with CUDA installed):
 cargo build -p peregrine-cuda --features cuda
@@ -86,6 +87,27 @@ COLI_MODEL=/tmp/demo-model cargo run --bin peregrine    # emits READY, then:
 `Model::load` accepts any real int4/int8 container model directory in the GLM-5.2
 weight-naming scheme (`model.layers.N.self_attn.*`, `mlp.experts.M.*`, …). The
 `COLI_MODEL` env var name is kept from colibrì for drop-in compatibility.
+
+## Benchmarks & comparison
+
+[**docs/peregrine-vs-colibri.md**](docs/peregrine-vs-colibri.md) is a same-hardware
+study of peregrine (Rust) vs colibrì (C) running the real **GLM-5.2 744B** int4
+model, with architecture comparison, the full catalogue of improvements, and
+measured token specs. Headline (single RTX 3060 / Ryzen 5 5500 / 46 GB box,
+CPU-streaming decode):
+
+| | peregrine (Rust) | colibrì (C) |
+|---|---|---|
+| Decode (steady state) | 0.054 tok/s | **0.077 tok/s** |
+| Warm cache on a repeated forward | **3.58×** (100 % hit, 0 disk) | learned pin |
+| Cross-token expert locality | 0.6 % (measured) | — |
+
+Both are **disk-bandwidth-bound** (600 experts ≈ 11 GB/token); colibrì is currently
+~1.4× faster at raw streaming (deeper io_uring queue), while peregrine adds a
+verified warm-cache/scheduler stack and memory safety. The scheduler's advantage is
+latent without expert residency — colibrì reaches **6.84 tok/s on 6× RTX 5090**
+(full residency), the regime that motivates peregrine's concurrent design. See the
+document for methodology, all numbers, and limitations.
 
 ## Lineage & references
 
