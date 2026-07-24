@@ -38,6 +38,16 @@ impl LayerKv {
         self.rc.extend_from_slice(rc_row);
         self.len += 1;
     }
+
+    /// Drop cached positions back to `new_len` — the speculative-decode rewind
+    /// after rejected draft tokens. A no-op when `new_len >= len`.
+    pub fn truncate(&mut self, new_len: usize) {
+        if new_len < self.len {
+            self.lc.truncate(new_len * self.kv_lora);
+            self.rc.truncate(new_len * self.qk_rope);
+            self.len = new_len;
+        }
+    }
 }
 
 /// The five projection weights of one attention block.
@@ -96,7 +106,11 @@ fn project(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut 
 
 /// Dense core: reconstruct `[k_nope|v]` for all cached positions via `kv_b`,
 /// then causal scored attention. Returns `ctx[s_n, H*v_head]`.
-fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: &LayerKv, c: &Cfg) -> Vec<f32> {
+///
+/// `sel`, when `Some`, restricts each query `s` to attend only the cached key
+/// indices in `sel[s]` (the DSA lightning-indexer selection); `None` attends all
+/// causal keys (dense). Selecting every causal key is identical to dense.
+fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: &LayerKv, c: &Cfg, sel: Option<&[Vec<usize>]>) -> Vec<f32> {
     let h_n = c.n_heads as usize;
     let qk_nope = c.qk_nope as usize;
     let qk_rope = c.qk_rope as usize;
@@ -111,23 +125,27 @@ fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: 
     let mut ctx = vec![0f32; s_n * h_n * vh];
     for s in 0..s_n {
         let pos = pos_base + s;
+        // keys this query attends: the DSA selection (clamped causal), or all 0..=pos
+        let keys: Vec<usize> = match sel {
+            Some(sets) => sets[s].iter().copied().filter(|&t| t <= pos).collect(),
+            None => (0..=pos).collect(),
+        };
         for h in 0..h_n {
             let qp = &q[s * h_n * qh + h * qh..s * h_n * qh + h * qh + qh];
             let (q_nope, q_rope) = qp.split_at(qk_nope);
-            let nt = pos + 1;
-            let mut sc = vec![0f32; nt];
-            for t in 0..nt {
+            let mut sc = vec![0f32; keys.len()];
+            for (i, &t) in keys.iter().enumerate() {
                 let base = t * h_n * kvb_head + h * kvb_head;
                 let kn = &kvb_all[base..base + qk_nope];
                 let kr = &cache.rc[t * qk_rope..t * qk_rope + qk_rope];
-                sc[t] = (dot(q_nope, kn) + dot(q_rope, kr)) * c.attn_scale;
+                sc[i] = (dot(q_nope, kn) + dot(q_rope, kr)) * c.attn_scale;
             }
             softmax(&mut sc);
             let cx = &mut ctx[(s * h_n + h) * vh..(s * h_n + h) * vh + vh];
-            for t in 0..nt {
+            for (i, &t) in keys.iter().enumerate() {
                 let base = t * h_n * kvb_head + h * kvb_head + qk_nope;
                 let vv = &kvb_all[base..base + vh];
-                let a = sc[t];
+                let a = sc[i];
                 for d in 0..vh {
                     cx[d] += a * vv[d];
                 }
@@ -196,7 +214,16 @@ fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache:
 /// appended to `cache`; returns `out[s_n, hidden]`.
 pub fn mla_attention(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut LayerKv, c: &Cfg) -> Vec<f32> {
     let q = project(w, x, s_n, pos_base, cache, c);
-    let ctx = attend_dense(w, &q, s_n, pos_base, cache, c);
+    let ctx = attend_dense(w, &q, s_n, pos_base, cache, c, None);
+    w.o.apply_vec(&ctx, s_n)
+}
+
+/// MLA attention with a DSA lightning-indexer selection: each new query attends
+/// only the `sel[s]` cached keys (top-`index_topk`) instead of all — the sparse
+/// path for long context. Selecting every causal key reproduces [`mla_attention`].
+pub fn mla_attention_dsa(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut LayerKv, c: &Cfg, sel: &[Vec<usize>]) -> Vec<f32> {
+    let q = project(w, x, s_n, pos_base, cache, c);
+    let ctx = attend_dense(w, &q, s_n, pos_base, cache, c, Some(sel));
     w.o.apply_vec(&ctx, s_n)
 }
 
@@ -221,7 +248,7 @@ mod tests {
         }
     }
 
-    fn cfg() -> Cfg {
+    fn cfg() -> Result<Cfg, peregrine_core::Error> {
         let j = serde_json::json!({
             "hidden_size": 16, "num_hidden_layers": 2, "num_attention_heads": 2,
             "n_routed_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 8,
@@ -230,7 +257,7 @@ mod tests {
             "v_head_dim": 6, "n_shared_experts": 1, "vocab_size": 32, "n_group": 1,
             "topk_group": 1, "rope_parameters": {"rope_theta": 10000.0}, "rms_norm_eps": 1e-5
         });
-        Cfg::from_json(&j).unwrap()
+        Cfg::from_json(&j)
     }
 
     struct Weights {
@@ -277,8 +304,8 @@ mod tests {
     }
 
     #[test]
-    fn single_token_is_value_projection() {
-        let c = cfg();
+    fn single_token_is_value_projection() -> Result<(), peregrine_core::Error> {
+        let c = cfg()?;
         let w = make_weights(&c, 1);
         let (h, qkn, vh, kvl) = (c.n_heads as usize, c.qk_nope as usize, c.v_head as usize, c.kv_lora as usize);
         let mut r = Lcg(555);
@@ -296,11 +323,12 @@ mod tests {
         for d in 0..c.hidden as usize {
             assert!((out[d] - expect[d]).abs() < 1e-4);
         }
+        Ok(())
     }
 
     #[test]
-    fn attention_is_causal() {
-        let c = cfg();
+    fn attention_is_causal() -> Result<(), peregrine_core::Error> {
+        let c = cfg()?;
         let w = make_weights(&c, 2);
         let hidden = c.hidden as usize;
         let s_n = 4;
@@ -318,11 +346,12 @@ mod tests {
                 assert!((out_a[p * hidden + d] - out_b[p * hidden + d]).abs() < 1e-6);
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn decode_step_matches_prefill() {
-        let c = cfg();
+    fn decode_step_matches_prefill() -> Result<(), peregrine_core::Error> {
+        let c = cfg()?;
         let w = make_weights(&c, 3);
         let hidden = c.hidden as usize;
         let mut r = Lcg(24680);
@@ -335,13 +364,14 @@ mod tests {
         for d in 0..hidden {
             assert!((out_full[3 * hidden + d] - out_dec[d]).abs() < 1e-4);
         }
+        Ok(())
     }
 
     #[test]
-    fn absorb_approximates_dense() {
+    fn absorb_approximates_dense() -> Result<(), peregrine_core::Error> {
         // absorb is an algebraic rearrangement of dense; they differ only by
         // kv_b activation quantization in the dense reconstruction.
-        let c = cfg();
+        let c = cfg()?;
         let w = make_weights(&c, 7);
         let hidden = c.hidden as usize;
         let s_n = 5;
@@ -355,12 +385,34 @@ mod tests {
             let scale = dense[z].abs().max(1.0);
             assert!((dense[z] - absorb[z]).abs() < 0.1 * scale, "z={z} dense={} absorb={}", dense[z], absorb[z]);
         }
+        Ok(())
     }
 
     #[test]
-    fn absorb_is_causal() {
+    fn dsa_selecting_all_keys_equals_dense() -> Result<(), peregrine_core::Error> {
+        // The DSA sparse path must reproduce dense attention when the selection
+        // covers every causal key (the indexer's "select everything" case).
+        let c = cfg()?;
+        let w = make_weights(&c, 11);
+        let hidden = c.hidden as usize;
+        let s_n = 4;
+        let mut r = Lcg(0x5A5A);
+        let x: Vec<f32> = (0..s_n * hidden).map(|_| r.f()).collect();
+        let mut cd = new_cache(&c);
+        let dense = mla_attention(&w.view(), &x, s_n, 0, &mut cd, &c);
+        let sel: Vec<Vec<usize>> = (0..s_n).map(|s| (0..=s).collect()).collect();
+        let mut cs = new_cache(&c);
+        let sparse = mla_attention_dsa(&w.view(), &x, s_n, 0, &mut cs, &c, &sel);
+        for z in 0..s_n * hidden {
+            assert!((dense[z] - sparse[z]).abs() < 1e-6, "z={z} dense={} sparse={}", dense[z], sparse[z]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn absorb_is_causal() -> Result<(), peregrine_core::Error> {
         // the absorb core must be causal too (exact, no tolerance)
-        let c = cfg();
+        let c = cfg()?;
         let w = make_weights(&c, 8);
         let hidden = c.hidden as usize;
         let s_n = 4;
@@ -378,5 +430,6 @@ mod tests {
                 assert!((a[p * hidden + d] - b[p * hidden + d]).abs() < 1e-6);
             }
         }
+        Ok(())
     }
 }

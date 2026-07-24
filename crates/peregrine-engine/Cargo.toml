@@ -10,5 +10,10 @@ description = "peregrine engine binary: stdio serve protocol (drop-in for colibr
 name = "peregrine"
 path = "src/main.rs"
 
+[features]
+# Enables the GPU VRAM expert lane (opt-in at runtime via COLI_GPU).
+cuda = ["peregrine-model/cuda"]
+
 [dependencies]
 peregrine-model = { path = "../peregrine-model" }
+peregrine-core = { path = "../peregrine-core" }

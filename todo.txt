@@ -1,0 +1,857 @@
+If your goal is maximizing tokens/sec for giant streamed MoE models, you're already attacking one of the biggest bottlenecks with io_uring. Beyond that, there are several architectural improvements that can yield substantial gains. Some are widely used in production inference engines, while others are less common.
+
+1. Layer look-ahead (one of the biggest remaining wins)
+
+Instead of waiting until layer N requests experts:
+
+Layer N
+    ↓
+Need experts
+    ↓
+Read SSD
+    ↓
+Compute
+
+
+predict the likely experts for layer N+1 (or even N+2) while computing layer N.
+
+Layer N compute
+ ├── GPU
+ ├── CPU
+ └── prefetch layer N+1 experts
+
+
+For top-k routers (e.g. k=8), you only need to fetch a handful of experts.
+
+Benefit: hides SSD latency almost entirely.
+
+2. Persistent CUDA kernels
+
+Most inference launches thousands of CUDA kernels.
+
+Instead:
+
+launch once
+
+GPU threadblock:
+    loop forever
+        dequeue expert
+        compute
+        enqueue result
+
+
+Advantages:
+
+almost zero launch overhead
+much lower CPU involvement
+ideal for MoE dispatch
+
+This is similar in spirit to NVIDIA's persistent kernels.
+
+3. Lock-free work stealing
+
+Instead of
+
+CPU queue
+GPU queue
+SSD queue
+
+
+have
+
+global deque
+
+CPU steals work
+GPU steals work
+IO completion steals work
+
+
+Workers never idle.
+
+This scales much better with heterogeneous hardware.
+
+4. NUMA-aware scheduling
+
+On larger systems:
+
+SSD
+ ↓
+RAM node 0
+ ↓
+CPU node 0
+
+
+Avoid moving expert weights across NUMA domains.
+
+Even on consumer systems, binding threads and memory can reduce latency.
+
+5. Huge pages
+
+Expert weights are streamed constantly.
+
+Using 2 MB or 1 GB huge pages reduces:
+
+TLB misses
+page walks
+kernel overhead
+
+This can produce a measurable improvement for large working sets.
+
+6. Register more buffers with io_uring
+
+If you're already using:
+
+registered files
+IOSQE_FIXED_FILE
+
+also register frequently used memory buffers.
+
+This removes repeated pinning and mapping costs.
+
+7. Double or triple buffering
+
+Instead of
+
+read
+compute
+read
+compute
+
+
+maintain multiple buffers:
+
+buffer A computing
+
+buffer B reading
+
+buffer C decompressing
+
+
+Everything overlaps.
+
+8. Fused MoE pipeline
+
+Instead of
+
+router
+
+↓
+
+gather experts
+
+↓
+
+launch expert
+
+↓
+
+scatter
+
+
+fuse them into a single pipeline:
+
+router
+ ↓
+immediately enqueue expert
+ ↓
+expert finishes
+ ↓
+accumulate output
+
+
+Avoid intermediate allocations and synchronization.
+
+9. Adaptive expert cache
+
+Instead of a simple LRU:
+
+Track:
+
+routing frequency
+recent frequency
+reuse distance
+SSD cost
+expert size
+
+Then rank experts with a score like:
+
+score =
+0.6 * frequency
++0.3 * recency
++0.1 * load_cost
+
+
+Large MoEs often have "hot" experts that are selected disproportionately.
+
+10. Quantized RAM cache
+
+For example:
+
+SSD: INT4
+
+↓
+
+RAM cache: INT4
+
+↓
+
+GPU upload: INT8 or FP16 only when needed
+
+
+Or even:
+
+SSD FP4
+
+↓
+
+RAM FP4
+
+↓
+
+GPU dequantize
+
+
+Moving fewer bytes is often more valuable than faster computation.
+
+11. CPU/GPU split GEMM
+
+Instead of assigning entire experts to one device:
+
+Expert 127
+
+GPU computes rows 0–8191
+
+CPU computes rows 8192–16383
+
+merge
+
+
+Useful when GPU would otherwise sit idle waiting for CPU-heavy experts.
+
+12. Speculative expert prefetch
+
+The router is often stable across adjacent tokens.
+
+If the previous token activated:
+
+12
+77
+301
+450
+
+
+the next token is likely to reuse several of them.
+
+Start fetching probable experts before routing completes.
+
+13. Batch I/O intelligently
+
+Rather than many small reads:
+
+expert 17
+expert 22
+expert 301
+
+
+merge them into a single large request when they are contiguous on disk.
+
+NVMe SSDs typically perform much better with larger sequential transfers.
+
+14. Zero-copy GPU uploads
+
+Use pinned memory:
+
+SSD
+ ↓
+pinned RAM
+ ↓
+cudaMemcpyAsync
+
+
+No extra copy through pageable memory.
+
+15. CUDA Graphs
+
+Instead of launching:
+
+router
+
+expert
+
+activation
+
+reduction
+
+
+thousands of times, capture the graph once:
+
+capture
+
+↓
+
+instantiate
+
+↓
+
+replay every token
+
+
+This can significantly reduce CPU overhead during decode.
+
+Less common but interesting ideas
+Compressed expert storage: Store experts in a compressed format (e.g. Zstd) and decompress in parallel if storage bandwidth is the bottleneck. Whether this helps depends on the CPU cost versus the SSD bandwidth available.
+Expert clustering: Place experts that are frequently co-selected adjacent on disk to improve sequential reads and cache locality.
+Dynamic GPU residency: Periodically identify the hottest experts and migrate them into VRAM while evicting colder ones, adapting to the prompt's routing behavior.
+Asynchronous page-cache warming: While decoding, proactively touch files that are likely to be needed soon so the kernel begins loading them before they're requested.
+Where the biggest gains usually come from
+
+If I were prioritizing work on peregrine, I'd rank potential improvements roughly as:
+
+Improvement	Expected gain	Difficulty
+Layer look-ahead prefetch	★★★★★	Medium
+Persistent CUDA kernels	★★★★★	Hard
+CUDA Graphs	★★★★☆	Medium
+Dynamic expert VRAM cache	★★★★☆	Hard
+Triple-buffered pipeline	★★★★☆	Medium
+Adaptive expert cache	★★★★☆	Medium
+Pinned memory + async copies	★★★☆☆	Easy
+Huge pages	★★★☆☆	Easy
+Lock-free work stealing	★★★☆☆	Medium
+Expert clustering on disk	★★★☆☆	Hard
+
+For a project like peregrine, the combination of look-ahead expert prefetching, dynamic VRAM residency, and persistent GPU execution is likely to deliver the largest additional improvements beyond the concurrent CPU/GPU/SSD scheduling you already have. Those changes target the remaining major sources of idle time: storage latency, GPU launch overhead, and suboptimal placement of frequently used experts.
+
+That's a much higher bar. The reality is that almost every broad optimization idea for inference (prefetching, caching, pipelining, scheduling, compression, batching, etc.) has been explored somewhere in HPC, databases, GPU computing, or ML systems. No one can honestly claim an idea has never been used by humans.
+
+That said, there are some research directions that, to my knowledge, are not established techniques in LLM inference and could be genuinely novel combinations or architectures worth investigating.
+
+1. Expert "momentum" prediction
+
+Instead of predicting the next expert from only the current router, maintain a short history of routing decisions.
+
+Token n-3 → experts
+Token n-2 → experts
+Token n-1 → experts
+
+↓
+
+Predict experts for token n
+
+
+Natural language changes gradually, so expert transitions may have temporal patterns. If predictions are accurate enough, you can prefetch before the router finishes.
+
+2. Cooperative expert execution
+
+Today an expert is usually assigned wholly to one processor.
+
+Instead, split each expert into small tiles.
+
+Expert 37
+
+Tile 1 → GPU
+Tile 2 → CPU
+Tile 3 → GPU
+Tile 4 → CPU
+
+
+A completion scheduler dispatches whichever processor becomes free first.
+
+This treats the CPU and GPU as one heterogeneous SIMD machine rather than separate devices.
+
+3. Routing-aware physical disk layout
+
+Instead of storing experts in numerical order:
+
+0
+1
+2
+3
+...
+
+
+learn which experts are frequently activated together and physically colocate them.
+
+17
+83
+140
+301
+
+
+If routing often selects these together, a single sequential read can replace multiple random reads.
+
+4. Self-reorganizing models
+
+Imagine the runtime continuously tracking statistics:
+
+hottest experts
+expert transitions
+SSD latency
+VRAM residency
+
+After a long session, it rewrites the on-disk model layout automatically.
+
+The model becomes progressively better optimized for its own workload.
+
+5. Idle-cycle computation
+
+If the GPU finishes early while waiting on CPU experts, have it perform useful speculative work such as:
+
+dequantizing likely future experts
+computing future rotary embeddings
+preparing attention metadata
+precomputing quantization scales
+
+Instead of idle time, every cycle performs work that is probably needed.
+
+6. Routing locality optimization
+
+During training, add a small penalty encouraging experts that are physically close in storage to be selected together.
+
+Inference becomes faster without changing the runtime.
+
+This is analogous to cache-aware data layout in traditional computing.
+
+7. Runtime expert fusion
+
+If two experts are frequently selected together:
+
+Expert 42
+Expert 97
+
+
+merge them in RAM into one larger computation.
+
+Rather than launching twice:
+
+42
+97
+
+
+run
+
+42+97
+
+
+and split the outputs afterward.
+
+Whether this is worthwhile depends on the cost of the merge versus the reduced launch and scheduling overhead.
+
+8. Heat-wave scheduling
+
+Instead of keeping experts resident until evicted, treat routing as waves.
+
+Topic A
+
+↓
+
+Experts 20–40 become hot
+
+↓
+
+Immediately migrate them to VRAM
+
+↓
+
+Evict cold experts
+
+
+The runtime predicts topic shifts and reorganizes memory before they're needed.
+
+9. "Negative" caching
+
+Most caches remember what was used.
+
+Also remember what has not been used for a long time.
+
+If an expert hasn't appeared in a million routing decisions, deprioritize it aggressively and use its space for speculative candidates.
+
+10. Token-shape scheduling
+
+Instead of routing by token ID, classify tokens into coarse "shapes":
+
+code
+numbers
+punctuation
+identifiers
+English prose
+JSON
+markdown
+
+Different token classes often activate different expert subsets.
+
+The scheduler can begin prefetching based on token class before the router executes.
+
+A more speculative idea
+
+One idea I haven't seen described in the literature is what I'd call a living inference engine.
+
+Instead of treating inference as executing a fixed model, the runtime continuously learns its own execution characteristics:
+
+builds a graph of expert transitions,
+predicts future routing,
+reorganizes the disk layout,
+adjusts VRAM residency,
+retunes thread affinities,
+updates prefetch distances,
+and evolves these policies over weeks or months of use.
+
+The neural network weights never change, but the execution engine itself adapts to the workload over time, almost like a self-optimizing database. Modern inference engines already implement pieces of this (adaptive caches, heuristics), but a fully self-reorganizing runtime driven by long-term routing statistics would be a more ambitious research direction.
+
+The challenge with any of these ideas is empirical validation: they may sound promising but only careful benchmarking can show whether they outperform simpler scheduling and caching strategies. The biggest opportunities often emerge from combining several modest improvements into a coherent runtime rather than relying on a single dramatic optimization.
+
+
+1. Fast matrix multiplication
+
+Large GEMMs dominate inference. Algorithms like:
+
+    Strassen
+    Coppersmith–Winograd
+    Williams' algorithms
+
+reduce asymptotic complexity compared with the standard O(n3) approach.
+
+In practice, though, they are almost never used for LLM inference because:
+
+    matrices are often not large enough,
+    they increase memory traffic,
+    numerical stability can be worse,
+    GPUs are highly optimized for conventional tiled GEMMs.
+
+So they're generally slower in real deployments.
+2. Offline optimization as a galactic step
+
+If loading a model once is acceptable, you could perform an expensive preprocessing pass that computes metadata such as:
+
+    expert co-occurrence graphs,
+    routing transition probabilities,
+    optimal disk layouts,
+    ideal VRAM placement.
+
+That preprocessing might take hours but improve inference thereafter. This follows the "pay a huge upfront cost, save time forever" philosophy often seen in galactic algorithms.
+3. Graph optimization
+
+Your scheduler can be viewed as a graph:
+
+SSD read
+      \
+CPU expert ----> reduction
+      /
+GPU expert
+
+A sophisticated graph optimizer could search for near-optimal schedules. While exact scheduling algorithms can be expensive, they may be worthwhile if the resulting schedule is reused many times.
+4. Learning-based schedulers
+
+Instead of hand-written heuristics, train a policy that decides:
+
+    which experts to prefetch,
+    which to keep in VRAM,
+    how to assign work to CPU vs GPU,
+    when to overlap transfers.
+
+The training phase could be computationally expensive, but inference with the learned policy would be fast.
+A more unusual direction
+
+If you're looking for something genuinely unconventional, consider framing MoE inference as an online optimization problem rather than a sequence of independent computations.
+
+Imagine the runtime maintaining a continually updated weighted graph:
+
+Expert 17 ───── Expert 42
+      │             │
+      │             │
+Expert 103 ─── Expert 301
+
+The edges encode how often experts are selected together or in succession. Over time, the runtime could:
+
+    reorder experts on disk,
+    cluster them in RAM,
+    migrate frequently used groups into VRAM,
+    adjust prefetching based on observed transitions.
+
+The longer the engine runs, the more it optimizes itself for its workload. This borrows ideas from self-tuning databases and adaptive operating systems rather than classical LLM runtimes.
+
+1. Global Expert Transition Automaton
+
+Instead of predicting the next experts from only the previous token, build a finite-state transition graph over expert sets.
+
+{17,42}
+   │0.91
+   ▼
+{42,301}
+   │0.84
+   ▼
+{301,77}
+
+Offline preprocessing:
+
+observe billions of routing decisions
+compress into a deterministic automaton
+store transition probabilities
+
+Runtime:
+
+advance automaton state
+issue speculative SSD reads immediately
+router simply confirms or corrects prediction
+
+This treats routing almost like branch prediction in CPUs.
+
+2. Hierarchical Disk Space-Filling Layout
+
+Rather than clustering experts by pairwise co-occurrence, optimize their physical locations using a space-filling curve.
+
+Objective:
+
+minimize
+
+Σ routing_probability(i,j)
+× disk_distance(i,j)
+
+Instead of greedy clustering, solve globally.
+
+Result:
+
+Experts frequently used together become physically adjacent.
+
+Large contiguous NVMe reads replace scattered random reads.
+
+3. Whole-Model Execution Compiler
+
+Compile an entire MoE checkpoint into an optimized executable.
+
+Instead of
+
+router
+launch
+launch
+copy
+launch
+
+compile
+
+routing graph
+
+↓
+
+SSA IR
+
+↓
+
+optimized execution graph
+
+↓
+
+machine-specific binary
+
+Similar to ahead-of-time compilation, but targeting inference scheduling instead of kernels.
+
+4. Persistent Expert Residency Solver
+
+Rather than LRU or LFU caches, formulate residency as a long-horizon optimization.
+
+Example objective:
+
+maximize
+
+expected throughput
+
+subject to
+
+VRAM
+RAM
+PCIe bandwidth
+SSD bandwidth
+
+Solve periodically using integer programming or approximate optimization.
+
+The runtime follows the computed policy.
+
+5. Temporal Compression of Routing
+
+Store routing as sequences rather than independent decisions.
+
+17
+
+↓
+
+17
+
+↓
+
+17
+
+↓
+
+42
+
+↓
+
+42
+
+↓
+
+301
+
+Compress repeated routing patterns into macro states.
+
+Inference can prefetch an entire routing episode rather than individual experts.
+
+6. Speculative Multi-Path Execution
+
+Instead of predicting one routing path:
+
+A (60%)
+
+B (25%)
+
+C (10%)
+
+D (5%)
+
+Allocate bandwidth proportionally.
+
+If A is wrong, B may already be partially loaded.
+
+This resembles speculative execution in CPUs.
+
+7. Self-Rewriting Runtime
+
+Every million tokens:
+
+rebuild transition graph
+recompute disk layout
+update VRAM policy
+retune prefetch depth
+regenerate CUDA Graphs
+
+Eventually the runtime becomes specialized for its workload.
+
+This borrows ideas from adaptive databases.
+
+8. Execution Entropy Minimization
+
+Treat scheduling as minimizing entropy.
+
+Define
+
+H =
+
+routing uncertainty
++ IO uncertainty
++ cache uncertainty
+
+Choose execution policies minimizing expected entropy rather than latency directly.
+
+This reframes inference as an information-theoretic optimization problem.
+
+9. Expert Hypergraph Scheduling
+
+Current schedulers often consider experts individually.
+
+Instead, represent routing as a hypergraph.
+
+{17,42,301}
+
+{22,45}
+
+{17,301}
+
+Partition the hypergraph so each partition maps efficiently to:
+
+GPU
+CPU
+SSD
+RAM
+
+The scheduler operates on hyperedges rather than experts.
+
+10. Inference Phase Detection
+
+Many prompts exhibit phases:
+
+English
+
+↓
+
+Python
+
+↓
+
+Markdown
+
+↓
+
+JSON
+
+↓
+
+English
+
+Detect phase transitions and swap caches accordingly.
+
+This is analogous to phase detection in CPU branch predictors.
+Runtime expert replication in VRAM
+Multi-GPU expert ownership with work migration
+Dynamic PCIe bandwidth scheduler
+GPU memory defragmentation during decode
+NUMA-aware RAM allocation and thread placement
+Automatic huge-page allocation and promotion
+Transparent expert compression in RAM
+Background expert recompression when idle
+Learned SSD read scheduler
+Disk queue-depth autotuning
+Adaptive io_uring SQ/CQ sizing
+GPU direct storage (GPUDirect Storage) support where available
+NVLink-aware multi-GPU expert placement
+Persistent GPU memory pools to eliminate allocation overhead
+Online kernel autotuning for GEMM tile sizes
+Runtime SIMD kernel selection based on measured throughput
+Hardware performance counter feedback (cache misses, bandwidth, occupancy)
+Adaptive CPU/GPU work balancing based on observed execution time
+Thermal-aware scheduling to avoid GPU or CPU throttling
+Energy-aware scheduling (maximize tokens per watt)
+Pipeline bubble detection with automatic rebalance
+Dynamic prefetch distance tuning
+Runtime expert duplication based on routing frequency
+Bloom filter or probabilistic cache lookup to reduce metadata overhead
+Lock-free slab allocator with recycling by generation
+Hierarchical task scheduler (socket → core → worker)
+Priority inheritance for latency-critical decode requests
+Adaptive batching window based on latency SLA
+Continuous prompt-phase detection (prefill vs decode optimization)
+Automatic workload classification (code, prose, JSON, math) with scheduler adaptation
+Cross-session routing statistics database
+Offline expert graph partitioning using graph optimization
+Hypergraph-based expert placement across storage tiers
+Automatic checkpoint re-layout based on routing history
+Profile-guided inference compilation (PGO for execution plans)
+Runtime specialization of hot execution paths (JIT or code generation)
+Tensor layout auto-conversion for cache locality
+Mixed-precision execution chosen dynamically per expert
+Fault-tolerant I/O recovery and degraded-mode execution
+Distributed inference across multiple hosts with expert sharding
+
+A few more ambitious research directions:
+
+Reinforcement learning scheduler for expert placement
+Predictive cache eviction using sequence models
+Expert graph clustering using community detection
+Automatic expert fusion based on long-term co-activation
+Live execution-plan optimization from telemetry
+Runtime topology discovery (PCIe/NVLink/NUMA) with automatic optimization
+Cache admission policies based on estimated future reuse
+Background verification of speculative expert loads
+Memory bandwidth governor that shifts work between CPU and GPU
+Full self-optimizing runtime that periodically rebuilds scheduling, storage layout, cache policy, and placement from accumulated routing statistics
+
+Of these, the ones most likely to produce measurable throughput improvements without overlapping your current design are:
+
+Adaptive CPU/GPU work balancing.
+Runtime expert replication for hot experts.
+GPUDirect Storage support.
+Dynamic prefetch distance tuning.
+Learned cache admission and eviction.
+Hardware-counter-driven scheduler feedback.
+Offline checkpoint re-layout from routing traces.
+Online kernel autotuning.
+Pipeline bubble detection and rebalancing.
+Multi-GPU expert ownership and migration.

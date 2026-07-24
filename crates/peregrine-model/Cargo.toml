@@ -6,7 +6,16 @@ license.workspace = true
 repository.workspace = true
 description = "colibrì GLM-5.2 forward pass: MLA attention, sigmoid router, MoE, and (later) the concurrent scheduler"
 
+[features]
+# Enables the GPU lane (VRAM-resident f32 expert tier via peregrine-cuda).
+cuda = ["dep:peregrine-cuda", "peregrine-cuda/cuda"]
+
 [dependencies]
 peregrine-core = { path = "../peregrine-core" }
 peregrine-kernels = { path = "../peregrine-kernels" }
+peregrine-io = { path = "../peregrine-io" }
+peregrine-cuda = { path = "../peregrine-cuda", optional = true }
 serde_json.workspace = true
+bytemuck = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
