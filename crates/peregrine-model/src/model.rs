@@ -12,9 +12,9 @@ use parking_lot::Mutex;
 use peregrine_core::{Cfg, Context, Error, SafeTensors};
 use peregrine_io::{Reactor, WarmCache};
 
-use crate::attention::{mla_attention, AttnWeights, LayerKv};
-use crate::concurrent::{default_workers, moe_forward_concurrent, ForwardCtx};
-use crate::gpu::GpuTier;
+use crate::attention::{mla_attention, mla_attention_batched, AttnWeights, LayerKv};
+use crate::concurrent::{default_workers, moe_forward_concurrent, ForwardCtx, EXPERTS_PER_BATCH};
+use crate::gpu::{GpuTier, HeatTable};
 use crate::math::rmsnorm;
 use crate::mlp::{moe_forward, Mlp};
 use crate::sample::Sampler;
@@ -107,6 +107,43 @@ pub struct Model {
     /// Optional MTP head for speculative decode; `None` unless the checkpoint has
     /// the `model.layers.{n_layers}.eh_proj` tensors.
     mtp: Option<MtpHead>,
+    /// Routing-frequency accumulator driving heat-ranked VRAM residency; `Some`
+    /// only when a GPU tier exists (bumped during the forward, read by `reheat`).
+    heat: Option<HeatTable>,
+}
+
+/// Per-sequence KV cache: one [`LayerKv`] per layer. Owned by the batching
+/// scheduler rather than the [`Model`], so a single resident model can decode
+/// many independent sequences concurrently via [`Model::forward_step_batched`].
+/// (A paged/block-pooled variant that bounds many-sequence RAM is a follow-up;
+/// this per-sequence layout is the correct, bit-identical foundation.)
+pub struct SeqKv {
+    layers: Vec<LayerKv>,
+}
+
+impl SeqKv {
+    /// A fresh, empty cache sized for a model with `cfg`'s dimensions.
+    pub fn new(cfg: &Cfg) -> SeqKv {
+        let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
+        SeqKv { layers: (0..cfg.n_layers).map(|_| LayerKv::new(kvl, qkr)).collect() }
+    }
+
+    /// Positions cached so far (the sequence length); all layers share it.
+    pub fn len(&self) -> usize {
+        self.layers.first().map_or(0, |k| k.len)
+    }
+
+    /// Whether no positions are cached yet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Rewind every layer to `new_len` (speculative-decode reject cleanup).
+    pub fn truncate(&mut self, new_len: usize) {
+        for k in &mut self.layers {
+            k.truncate(new_len);
+        }
+    }
 }
 
 /// `MemAvailable` from `/proc/meminfo`, in bytes (0 if unreadable).
@@ -133,6 +170,28 @@ fn ecache_budget_bytes() -> usize {
     }
     let avail = mem_available_bytes() as f64;
     (0.10 * avail).min(2.0 * GIB) as usize
+}
+
+/// Conservative peak transient RAM the streaming lanes hold at once: up to
+/// `io_rings × EXPERTS_PER_BATCH` experts have landing buffers in flight, plus
+/// `workers` being reconstructed/computed, each roughly one full expert
+/// (`per_expert_bytes`). Used to keep the warm cache from claiming RAM the
+/// streaming path needs, so batched prefill/decode can't OOM.
+fn stream_transient_reserve(io_rings: usize, workers: usize, per_expert_bytes: usize) -> usize {
+    io_rings
+        .saturating_mul(EXPERTS_PER_BATCH)
+        .saturating_add(workers)
+        .saturating_mul(per_expert_bytes)
+}
+
+/// Cap a requested warm-cache budget so the cache + the streaming lanes' transient
+/// buffers + a safety margin fit in `mem_available` (already net of the resident
+/// model, since it is read after load). Returns `min(requested, headroom)`, or `0`
+/// when RAM is too tight (cache disabled rather than risking OOM). Pure arithmetic
+/// (inputs injected) so the policy is unit-testable without a specific machine.
+fn cap_ecache_budget(requested: usize, mem_available: usize, transient_reserve: usize, safety: usize) -> usize {
+    let headroom = mem_available.saturating_sub(transient_reserve.saturating_add(safety));
+    requested.min(headroom)
 }
 
 /// Whether O_DIRECT streaming is requested via `COLI_DIRECT`. Default **off** —
@@ -346,6 +405,60 @@ fn forward_layer(
     Ok(())
 }
 
+/// Forward one transformer layer over B **independent sequences** (one new token
+/// each): batched MLA decode attention into each row's own `caches[s]`, then the
+/// row-agnostic MoE (resident or the concurrent streaming lane) over all B rows.
+/// Mirrors [`forward_layer`]; the MoE half is byte-for-byte the same call — it
+/// already batch-unions experts across rows regardless of which sequence a row
+/// belongs to, so B sequences share one set of expert reads (the amortization).
+fn forward_layer_batched(
+    l: &LayerW,
+    li: usize,
+    caches: &mut [&mut LayerKv],
+    ctx: &ForwardCtx,
+    x: &mut [f32],
+    s_n: usize,
+    pos_of: &[usize],
+) -> Result<(), Error> {
+    let cfg = ctx.cfg;
+    let d = cfg.hidden as usize;
+    let eps = cfg.eps;
+    let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
+    let attn = mla_attention_batched(&l.attn(), &nrm, pos_of, caches, cfg);
+    for z in 0..s_n * d {
+        x[z] += attn[z];
+    }
+    let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
+    let ffn: Vec<f32> = if l.sparse {
+        if ctx.stream_experts {
+            moe_forward_concurrent(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
+        } else {
+            moe_forward(
+                &nrm2,
+                &l.router,
+                &l.router_bias,
+                &l.experts,
+                l.shared.as_ref(),
+                s_n,
+                d,
+                cfg.topk as usize,
+                cfg.norm_topk,
+                cfg.routed_scale,
+            )
+        }
+    } else {
+        let dense = l
+            .dense
+            .as_ref()
+            .ok_or_else(|| Error::Format(format!("layer {li}: dense MLP weights missing")))?;
+        dense.swiglu(&nrm2, s_n)
+    };
+    for z in 0..s_n * d {
+        x[z] += ffn[z];
+    }
+    Ok(())
+}
+
 impl Model {
     /// Load a model directory (config.json + `*.safetensors` in the int4/int8
     /// container format).
@@ -456,7 +569,26 @@ impl Model {
         // unset, `COLI_ECACHE_GB` / an auto fraction of MemAvailable. Only built
         // when experts stream from disk and the budget is non-zero.
         let ecache = {
-            let budget = force_ecache.unwrap_or_else(ecache_budget_bytes);
+            let requested = force_ecache.unwrap_or_else(ecache_budget_bytes);
+            // Cap the warm cache so it + the streaming lanes' transient landing/compute
+            // buffers + a safety margin fit in available RAM (already net of the
+            // resident model), so batched prefill/decode can't OOM. This is the peak-RAM
+            // auto-budget; bounding the per-read allocation churn itself is the slab arena.
+            let budget = if stream_experts && requested > 0 {
+                let per_expert = 4 * max_expert_region_bytes(&st);
+                let reserve = stream_transient_reserve(io_reactors.len(), workers, per_expert);
+                let capped = cap_ecache_budget(requested, mem_available_bytes() as usize, reserve, 1usize << 30);
+                if capped < requested {
+                    eprintln!(
+                        "peregrine: warm cache capped {} MiB -> {} MiB to keep RAM headroom for streaming buffers",
+                        requested >> 20,
+                        capped >> 20
+                    );
+                }
+                capped
+            } else {
+                requested
+            };
             if stream_experts && budget > 0 {
                 Some(Arc::new(Mutex::new(WarmCache::new(budget))))
             } else {
@@ -496,6 +628,9 @@ impl Model {
         } else {
             None
         };
+        // Heat accumulator for dynamic VRAM residency — only useful (and only built)
+        // when there is a GPU tier to migrate hot experts into.
+        let heat = gpu.as_ref().map(|_| HeatTable::new(cfg.n_layers as usize, cfg.n_experts as usize));
 
         // Optional MTP head (checkpoints converted with --mtp): a full layer at
         // index n_layers plus the embed/hidden projection and norms.
@@ -529,6 +664,7 @@ impl Model {
             prefetch,
             gpu,
             mtp,
+            heat,
         })
     }
 
@@ -663,7 +799,7 @@ impl Model {
         // re-borrow `self` to enqueue prefetch.
         {
             // split disjoint fields so attention can borrow layers (imm) + kv (mut)
-            let Model { cfg, layers, kv, st, stream_experts, direct, io_reactors, workers, ecache, route_hist, gpu, .. } =
+            let Model { cfg, layers, kv, st, stream_experts, direct, io_reactors, workers, ecache, route_hist, gpu, heat, .. } =
                 self;
             let ctx = ForwardCtx {
                 st,
@@ -675,6 +811,7 @@ impl Model {
                 ecache: ecache.as_deref(),
                 route_log: route_hist.as_ref(),
                 direct: *direct,
+                heat: heat.as_ref(),
             };
             for (li, l) in layers.iter().enumerate() {
                 forward_layer(l, li, &mut kv[li], &ctx, &mut x, s_n, pos_base)?;
@@ -693,6 +830,100 @@ impl Model {
         let x = self.forward_hidden(tokens, pos_base)?;
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
         Ok(self.lm_head.apply_vec(&xf, s_n))
+    }
+
+    /// Build the per-forward compute context from the resident model state with
+    /// prefetch/route-logging **disabled** — the shape the external-KV batched and
+    /// prefill paths use (the B-way expert union is not a useful next-token
+    /// predictor, so prefetch is gated off under batching).
+    fn forward_ctx(&self) -> ForwardCtx<'_> {
+        ForwardCtx {
+            st: &self.st,
+            reactors: &self.io_reactors,
+            gpu: self.gpu.as_ref(),
+            workers: self.workers,
+            cfg: &self.cfg,
+            stream_experts: self.stream_experts,
+            ecache: self.ecache.as_deref(),
+            route_log: None,
+            direct: self.direct,
+            heat: self.heat.as_ref(),
+        }
+    }
+
+    /// Prefill one sequence's prompt into an **external** per-sequence KV (`seq`),
+    /// returning logits `[S, vocab]`. Same dense path as [`Self::forward_step`] but
+    /// writing to caller-owned KV via `&self`, so the batching scheduler can
+    /// prefill each new sequence before batching its decode steps. Bit-identical to
+    /// `forward_step` on a fresh model (external vs internal cache is the only diff).
+    pub fn forward_prefill_seq(&self, tokens: &[i32], seq: &mut SeqKv, pos_base: usize) -> Result<Vec<f32>, Error> {
+        let s_n = tokens.len();
+        let d = self.cfg.hidden as usize;
+        let eps = self.cfg.eps;
+        let vocab = self.cfg.vocab as usize;
+        let mut x = vec![0f32; s_n * d];
+        for (s, &t) in tokens.iter().enumerate() {
+            let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
+            x[s * d..s * d + d].copy_from_slice(&self.embed[tid * d..tid * d + d]);
+        }
+        let ctx = self.forward_ctx();
+        for (li, l) in self.layers.iter().enumerate() {
+            forward_layer(l, li, &mut seq.layers[li], &ctx, &mut x, s_n, pos_base)?;
+        }
+        let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
+        Ok(self.lm_head.apply_vec(&xf, s_n))
+    }
+
+    /// Batched decode step over B **independent sequences** (one new token each):
+    /// `tokens[s]` is sequence `s`'s next token at absolute position `pos_of[s]`,
+    /// and `seqs[s]` is that sequence's KV (the new latent is appended in place).
+    /// Returns logits `[B, vocab]`. The MoE lane reads each routed expert once and
+    /// serves every row routing to it, so B sequences share one set of expert reads
+    /// — the batching amortization. Row `s`'s logits are identical to decoding
+    /// sequence `s` alone (guarded by `batched_decode_matches_per_sequence`).
+    ///
+    /// `&self`: per-sequence KV is caller-owned, so one resident model drives many
+    /// concurrent sequences from a single scheduler thread. Prefetch/route-logging
+    /// are off ([`Self::forward_ctx`]); MTP speculation stays a B==1 path.
+    pub fn forward_step_batched(&self, tokens: &[i32], seqs: &mut [&mut SeqKv], pos_of: &[usize]) -> Result<Vec<f32>, Error> {
+        let s_n = tokens.len();
+        if seqs.len() != s_n || pos_of.len() != s_n {
+            return Err(Error::Format(format!(
+                "forward_step_batched: {s_n} tokens but {} seqs / {} positions",
+                seqs.len(),
+                pos_of.len()
+            )));
+        }
+        let d = self.cfg.hidden as usize;
+        let eps = self.cfg.eps;
+        let vocab = self.cfg.vocab as usize;
+        let mut x = vec![0f32; s_n * d];
+        for (s, &t) in tokens.iter().enumerate() {
+            let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
+            x[s * d..s * d + d].copy_from_slice(&self.embed[tid * d..tid * d + d]);
+        }
+        let ctx = self.forward_ctx();
+        for (li, l) in self.layers.iter().enumerate() {
+            let mut caches: Vec<&mut LayerKv> = seqs.iter_mut().map(|sk| &mut sk.layers[li]).collect();
+            forward_layer_batched(l, li, &mut caches, &ctx, &mut x, s_n, pos_of)?;
+        }
+        let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
+        Ok(self.lm_head.apply_vec(&xf, s_n))
+    }
+
+    /// Re-select the GPU tier's resident experts as the current hottest set (by
+    /// accumulated routing frequency), migrating cooled experts out of VRAM and hot
+    /// ones in. A no-op without a GPU tier (or the `cuda` feature). Call between
+    /// forwards (`&mut self`); the batch engine invokes it periodically so residency
+    /// adapts to the workload without a rewrite.
+    pub fn reheat(&mut self) -> Result<(), Error> {
+        let Some(counts) = self.heat.as_ref().map(|h| h.snapshot()) else {
+            return Ok(());
+        };
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.reheat(&self.st, &self.cfg, &counts)?;
+        }
+        Ok(())
     }
 
     /// Greedy/sampled generation: prefill `prompt`, then decode `n_new` tokens.
@@ -752,6 +983,7 @@ impl Model {
             ecache: ecache.as_deref(),
             route_log: None, // drafts must not overwrite the main-stream prediction
             direct: *direct,
+            heat: None, // speculative drafts must not skew residency heat
         };
         let mut kv = LayerKv::new(kvl, qkr);
         let mut h = hlast.to_vec(); // pre-final-norm hidden
@@ -1074,6 +1306,81 @@ mod tests {
         let logits = m.forward_step(&[9999, -3, 0], 0)?;
         assert_eq!(logits.len(), 3 * m.cfg.vocab as usize);
         assert!(logits.iter().all(|v| v.is_finite()));
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cap_ecache_budget_leaves_ram_headroom() {
+        // plenty of RAM → the requested budget is unchanged
+        assert_eq!(cap_ecache_budget(4 << 30, 32 << 30, 2 << 30, 1 << 30), 4 << 30);
+        // tight RAM → capped to (available - transient reserve - safety)
+        assert_eq!(cap_ecache_budget(10 << 30, 12 << 30, 2 << 30, 1 << 30), 9 << 30);
+        // no headroom left → 0 disables the cache rather than risking OOM
+        assert_eq!(cap_ecache_budget(4 << 30, 2 << 30, 2 << 30, 1 << 30), 0);
+    }
+
+    #[test]
+    fn stream_transient_reserve_scales_with_lanes() {
+        assert_eq!(stream_transient_reserve(4, 8, 1000), (4 * EXPERTS_PER_BATCH + 8) * 1000);
+        assert_eq!(stream_transient_reserve(0, 0, 1000), 0); // no lanes → no reserve
+    }
+
+    #[test]
+    fn prefill_seq_matches_forward_step() -> Result<(), peregrine_core::Error> {
+        // forward_prefill_seq into an external SeqKv must equal the internal
+        // forward_step (same dense path; external vs internal cache is the only
+        // difference), so the scheduler's prefill produces identical state.
+        let dir = tmp_model_dir("prefill_seq")?;
+        let mut m = Model::load(&dir)?;
+        let toks = [1, 5, 9, 2, 7];
+        let internal = m.forward_step(&toks, 0)?;
+        let mut seq = SeqKv::new(&m.cfg);
+        let external = m.forward_prefill_seq(&toks, &mut seq, 0)?;
+        assert_eq!(internal, external, "external-KV prefill must equal internal forward_step");
+        assert_eq!(seq.len(), toks.len());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn batched_decode_matches_per_sequence() -> Result<(), peregrine_core::Error> {
+        // Three sequences prefilled to different lengths, then one batched decode
+        // step. Row s of the batched step must equal decoding sequence s alone
+        // (B==1) — both via the absorb core — so batching many sequences through
+        // one forward is bit-identical to decoding them separately.
+        let dir = tmp_model_dir("batched_decode")?;
+        let m = Model::load(&dir)?;
+        let vocab = m.cfg.vocab as usize;
+        let prompts: [&[i32]; 3] = [&[1, 5, 9], &[2, 7], &[3, 8, 4, 6]];
+        let newtok = [4i32, 6, 2];
+
+        // reference: prefill each sequence, then decode it alone (B==1)
+        let mut ref_logits = vec![0f32; 3 * vocab];
+        for (s, p) in prompts.iter().enumerate() {
+            let mut sk = SeqKv::new(&m.cfg);
+            let _ = m.forward_prefill_seq(p, &mut sk, 0)?;
+            let mut one: [&mut SeqKv; 1] = [&mut sk];
+            let pos = [p.len()];
+            let lg = m.forward_step_batched(&[newtok[s]], &mut one, &pos)?;
+            ref_logits[s * vocab..s * vocab + vocab].copy_from_slice(&lg);
+        }
+
+        // batched: prefill all three into fresh caches, then ONE batched decode
+        let mut seqs: Vec<SeqKv> = Vec::new();
+        for p in prompts.iter() {
+            let mut sk = SeqKv::new(&m.cfg);
+            let _ = m.forward_prefill_seq(p, &mut sk, 0)?;
+            seqs.push(sk);
+        }
+        let mut refs: Vec<&mut SeqKv> = seqs.iter_mut().collect();
+        let toks: Vec<i32> = newtok.to_vec();
+        let pos_of: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+        let bat = m.forward_step_batched(&toks, &mut refs, &pos_of)?;
+
+        for z in 0..3 * vocab {
+            assert!((ref_logits[z] - bat[z]).abs() < 1e-4, "z={z} ref={} bat={}", ref_logits[z], bat[z]);
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

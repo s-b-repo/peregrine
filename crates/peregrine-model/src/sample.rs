@@ -17,6 +17,17 @@ pub fn argmax(lo: &[f32]) -> usize {
     b
 }
 
+/// Greedy argmax over a batch of `out.len()` logit rows `logits[n, vocab]`, one
+/// token per row into `out`. The all-greedy fast path for batched decode
+/// (`temp <= 0`) — skips per-sequence `Sampler` dispatch. Sampled decode keeps a
+/// per-sequence [`Sampler`] and calls [`Sampler::pick`] on each row instead, so
+/// each sequence draws from its own RNG stream.
+pub fn pick_batch_greedy(logits: &[f32], vocab: usize, out: &mut [i32]) {
+    for (s, o) in out.iter_mut().enumerate() {
+        *o = argmax(&logits[s * vocab..s * vocab + vocab]) as i32;
+    }
+}
+
 /// Stateful sampler: holds the RNG stream and reused distribution buffers so a
 /// decode loop is single-threaded and reproducible from `seed`.
 pub struct Sampler {
@@ -141,6 +152,15 @@ mod tests {
     fn greedy_is_argmax() {
         let mut s = Sampler::new(0.0, 0.9, 1);
         assert_eq!(s.pick(&[0.1, 0.9, 0.3, 0.2], -1), 1);
+    }
+
+    #[test]
+    fn pick_batch_greedy_argmaxes_each_row() {
+        // three rows of vocab=4; each row's token is its own argmax
+        let logits = [0.1, 0.9, 0.3, 0.2, /**/ 5.0, 1.0, 2.0, 3.0, /**/ 0.0, 0.0, 0.0, 1.0];
+        let mut out = [0i32; 3];
+        pick_batch_greedy(&logits, 4, &mut out);
+        assert_eq!(out, [1, 0, 3]);
     }
 
     #[test]

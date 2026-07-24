@@ -50,6 +50,15 @@ impl LayerKv {
     }
 }
 
+/// A view of one row's KV history for batched MLA decode: that row's own cached
+/// latents (`lc[len, kv_lora]`, `rc[len, qk_rope]`) and causal length `len`.
+/// Rows come from independent sequences, so each carries its own view.
+pub struct RowAttn<'a> {
+    pub len: usize,
+    pub lc: &'a [f32],
+    pub rc: &'a [f32],
+}
+
 /// The five projection weights of one attention block.
 pub struct AttnWeights<'a> {
     pub q_a: &'a QtWeight,
@@ -66,10 +75,14 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(&x, &y)| x * y).sum()
 }
 
-/// Shared front end: q/kv projections, per-head query RoPE, and appending the
-/// compressed KV (`Lc` normalized latent, `Rc` roped key) for the new tokens.
-/// Returns the roped queries `Q[s_n, H*qk_head]`.
-fn project(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut LayerKv, c: &Cfg) -> Vec<f32> {
+/// Batched q/kv projection front end for `s_n` independent rows (one new token
+/// per sequence): the q_a/q_b/kv_a matmuls stay batched across all rows, while
+/// per-head query RoPE and the compressed KV (`Lc` normalized latent, `Rc` roped
+/// key) use each row's own position `pos_of[s]`. Returns the roped queries
+/// `Q[s_n, H*qk_head]` plus the per-row latents to append to each row's own
+/// cache (`lc_rows[s_n, kv_lora]`, `rc_rows[s_n, qk_rope]`). Performs no cache
+/// mutation, so it is storage-agnostic (single cache or per-sequence caches).
+fn project_batched(w: &AttnWeights, x: &[f32], s_n: usize, pos_of: &[usize], c: &Cfg) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let h_n = c.n_heads as usize;
     let qk_nope = c.qk_nope as usize;
     let qk_rope = c.qk_rope as usize;
@@ -87,19 +100,37 @@ fn project(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut 
     let mut q = w.q_b.apply_vec(&qr, s_n);
     let comp = w.kv_a.apply_vec(x, s_n);
 
+    let mut lc_rows = vec![0f32; s_n * kvl];
+    let mut rc_rows = vec![0f32; s_n * qk_rope];
     for s in 0..s_n {
-        let pos = pos_base + s;
+        let pos = pos_of[s];
         for h in 0..h_n {
             let off = s * h_n * qh + h * qh + qk_nope;
             rope_interleave(&mut q[off..off + qk_rope], pos, c);
         }
         let cs = &comp[s * cw..s * cw + cw];
-        let mut lc_row = cs[..kvl].to_vec();
-        let tmp = lc_row.clone();
-        rmsnorm(&mut lc_row, &tmp, w.kv_a_ln, c.eps);
-        let mut rc_row = cs[kvl..cw].to_vec();
-        rope_interleave(&mut rc_row, pos, c);
-        cache.append(pos, &lc_row, &rc_row);
+        let dst_lc = &mut lc_rows[s * kvl..s * kvl + kvl];
+        dst_lc.copy_from_slice(&cs[..kvl]);
+        let tmp = dst_lc.to_vec();
+        rmsnorm(dst_lc, &tmp, w.kv_a_ln, c.eps);
+        let dst_rc = &mut rc_rows[s * qk_rope..s * qk_rope + qk_rope];
+        dst_rc.copy_from_slice(&cs[kvl..cw]);
+        rope_interleave(dst_rc, pos, c);
+    }
+    (q, lc_rows, rc_rows)
+}
+
+/// Shared single-sequence front end: [`project_batched`] over the consecutive
+/// positions `pos_base..pos_base+s_n`, appending each new latent to the one
+/// `cache` in order. Bit-identical to the pre-batching projection (the appends
+/// are independent of the query/latent arithmetic, so hoisting them is exact).
+fn project(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut LayerKv, c: &Cfg) -> Vec<f32> {
+    let kvl = c.kv_lora as usize;
+    let qk_rope = c.qk_rope as usize;
+    let pos_of: Vec<usize> = (0..s_n).map(|s| pos_base + s).collect();
+    let (q, lc_rows, rc_rows) = project_batched(w, x, s_n, &pos_of, c);
+    for s in 0..s_n {
+        cache.append(pos_base + s, &lc_rows[s * kvl..s * kvl + kvl], &rc_rows[s * qk_rope..s * qk_rope + qk_rope]);
     }
     q
 }
@@ -155,9 +186,13 @@ fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: 
     ctx
 }
 
-/// Absorb core: fold `kv_b`'s k_nope rows into the query, score against `Lc`
-/// directly, and project the latent average through `kv_b`'s value rows.
-fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: &LayerKv, c: &Cfg) -> Vec<f32> {
+/// Absorb core over `s_n` independent rows: row `s` folds `kv_b`'s k_nope rows
+/// into its query, scores against its own `rows[s].lc` (0..len), and projects the
+/// latent average through `kv_b`'s value rows. Row `s` depends only on `q[s]` and
+/// its own KV view, so a batched decode step is arithmetically identical to
+/// running each sequence's decode alone (the `batched_matches_sequential` guard).
+fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg) -> Vec<f32> {
+    let s_n = rows.len();
     let h_n = c.n_heads as usize;
     let qk_nope = c.qk_nope as usize;
     let qk_rope = c.qk_rope as usize;
@@ -167,7 +202,9 @@ fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache:
 
     let mut ctx = vec![0f32; s_n * h_n * vh];
     for s in 0..s_n {
-        let pos = pos_base + s;
+        let cache_lc = rows[s].lc;
+        let cache_rc = rows[s].rc;
+        let nt = rows[s].len;
         for h in 0..h_n {
             let qp = &q[s * h_n * qh + h * qh..s * h_n * qh + h * qh + qh];
             let (q_nope, q_rope) = qp.split_at(qk_nope);
@@ -182,11 +219,10 @@ fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache:
                 }
             }
 
-            let nt = pos + 1;
             let mut sc = vec![0f32; nt];
             for t in 0..nt {
-                let lt = &cache.lc[t * kvl..t * kvl + kvl];
-                let kr = &cache.rc[t * qk_rope..t * qk_rope + qk_rope];
+                let lt = &cache_lc[t * kvl..t * kvl + kvl];
+                let kr = &cache_rc[t * qk_rope..t * qk_rope + qk_rope];
                 sc[t] = (dot(&qabs, lt) + dot(q_rope, kr)) * c.attn_scale;
             }
             softmax(&mut sc);
@@ -194,7 +230,7 @@ fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache:
             // clat = Σ_t sc[t] · Lc[t]; ctx = kv_b value rows · clat
             let mut clat = vec![0f32; kvl];
             for t in 0..nt {
-                let lt = &cache.lc[t * kvl..t * kvl + kvl];
+                let lt = &cache_lc[t * kvl..t * kvl + kvl];
                 let a = sc[t];
                 for i in 0..kvl {
                     clat[i] += a * lt[i];
@@ -208,6 +244,22 @@ fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache:
         }
     }
     ctx
+}
+
+/// Absorb core (single sequence): the `s_n` new tokens each attend their own
+/// causal prefix of the shared `cache`. A thin wrapper over
+/// [`attend_absorb_batched`] with per-row prefix views — bit-identical to the
+/// pre-batching core (same `nt`, same slices, same arithmetic).
+fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: &LayerKv, c: &Cfg) -> Vec<f32> {
+    let kvl = c.kv_lora as usize;
+    let qk_rope = c.qk_rope as usize;
+    let rows: Vec<RowAttn> = (0..s_n)
+        .map(|s| {
+            let nt = pos_base + s + 1;
+            RowAttn { len: nt, lc: &cache.lc[..nt * kvl], rc: &cache.rc[..nt * qk_rope] }
+        })
+        .collect();
+    attend_absorb_batched(w, q, &rows, c)
 }
 
 /// MLA attention (dense reconstruction). `s_n` new tokens from `pos_base`,
@@ -232,6 +284,32 @@ pub fn mla_attention_dsa(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize
 pub fn mla_attention_absorb(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut LayerKv, c: &Cfg) -> Vec<f32> {
     let q = project(w, x, s_n, pos_base, cache, c);
     let ctx = attend_absorb(w, &q, s_n, pos_base, cache, c);
+    w.o.apply_vec(&ctx, s_n)
+}
+
+/// Batched MLA decode attention (absorb core) over `s_n` **independent
+/// sequences**: `x[s_n, hidden]` are one new token each, `pos_of[s]` is that
+/// token's absolute position in its sequence, and `caches[s]` is that sequence's
+/// per-layer KV (the new latent is appended in place). Returns `out[s_n, hidden]`.
+///
+/// Precondition: exactly one new token per sequence (pure decode), so after the
+/// append each row attends its sequence's whole causal cache. Output row `s` is
+/// identical to running [`mla_attention_absorb`] on sequence `s` alone — the
+/// property the `batched_matches_sequential` test guards. The MoE lane needs no
+/// change: it is already row-batch-union'd over `s_n` rows regardless of which
+/// sequence each row belongs to, so B sequences share one set of expert reads.
+pub fn mla_attention_batched(w: &AttnWeights, x: &[f32], pos_of: &[usize], caches: &mut [&mut LayerKv], c: &Cfg) -> Vec<f32> {
+    let s_n = pos_of.len();
+    let kvl = c.kv_lora as usize;
+    let qk_rope = c.qk_rope as usize;
+    let (q, lc_rows, rc_rows) = project_batched(w, x, s_n, pos_of, c);
+    for s in 0..s_n {
+        caches[s].append(pos_of[s], &lc_rows[s * kvl..s * kvl + kvl], &rc_rows[s * qk_rope..s * qk_rope + qk_rope]);
+    }
+    let rows: Vec<RowAttn> = (0..s_n)
+        .map(|s| RowAttn { len: caches[s].len, lc: caches[s].lc.as_slice(), rc: caches[s].rc.as_slice() })
+        .collect();
+    let ctx = attend_absorb_batched(w, &q, &rows, c);
     w.o.apply_vec(&ctx, s_n)
 }
 
@@ -429,6 +507,52 @@ mod tests {
             for d in 0..hidden {
                 assert!((a[p * hidden + d] - b[p * hidden + d]).abs() < 1e-6);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batched_matches_sequential() -> Result<(), peregrine_core::Error> {
+        // B independent sequences, each prefilled to a different length, then one
+        // decode step. The batched absorb output for row s must equal running the
+        // single-sequence absorb decode on sequence s alone — the amortization the
+        // whole batching design rides on is only valid if this holds.
+        let c = cfg()?;
+        let w = make_weights(&c, 5);
+        let hidden = c.hidden as usize;
+        let b = 3usize;
+        let lens = [2usize, 1, 3]; // prior context length per sequence
+        let mut r = Lcg(13579);
+
+        // per-sequence caches, prefilled with `lens[s]` tokens via the absorb path
+        let mut seq_caches: Vec<LayerKv> = (0..b).map(|_| new_cache(&c)).collect();
+        for (s, cache) in seq_caches.iter_mut().enumerate() {
+            let pre: Vec<f32> = (0..lens[s] * hidden).map(|_| r.f()).collect();
+            let _ = mla_attention_absorb(&w.view(), &pre, lens[s], 0, cache, &c);
+        }
+
+        // one new decode token per sequence
+        let newtok: Vec<Vec<f32>> = (0..b).map(|_| (0..hidden).map(|_| r.f()).collect()).collect();
+
+        // sequential reference: decode each sequence on a clone of its cache
+        let mut seq_out = vec![0f32; b * hidden];
+        for s in 0..b {
+            let mut refc = new_cache(&c);
+            refc.lc = seq_caches[s].lc.clone();
+            refc.rc = seq_caches[s].rc.clone();
+            refc.len = seq_caches[s].len;
+            let o = mla_attention_absorb(&w.view(), &newtok[s], 1, lens[s], &mut refc, &c);
+            seq_out[s * hidden..s * hidden + hidden].copy_from_slice(&o);
+        }
+
+        // batched: all b tokens in one call, each with its own pos + cache
+        let x: Vec<f32> = (0..b).flat_map(|s| newtok[s].clone()).collect();
+        let pos_of: Vec<usize> = lens.iter().take(b).copied().collect();
+        let mut refs: Vec<&mut LayerKv> = seq_caches.iter_mut().collect();
+        let bat_out = mla_attention_batched(&w.view(), &x, &pos_of, &mut refs, &c);
+
+        for z in 0..b * hidden {
+            assert!((seq_out[z] - bat_out[z]).abs() < 1e-6, "z={z} seq={} bat={}", seq_out[z], bat_out[z]);
         }
         Ok(())
     }

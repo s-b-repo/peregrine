@@ -450,6 +450,51 @@ extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64
     if(d2h_ms) *d2h_ms=g_group_d2h_ms;
 }
 
+/* ---- CUDA Graphs: capture a device's managed stream once, replay it many times.
+ * The steady-state decode step (stable shapes) is captured between begin/end;
+ * every replay skips the per-op launch cost. Ops to capture must run on
+ * `ctx->stream` (the `pipe_*` primitives) — synchronous copies break capture. */
+struct ColiCudaGraph { cudaGraph_t graph; cudaGraphExec_t exec; int device; };
+
+extern "C" int coli_cuda_graph_begin(int device) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    return cuda_ok(cudaStreamBeginCapture(ctx->stream, cudaStreamCaptureModeThreadLocal),
+                   "graph begin capture");
+}
+
+extern "C" int coli_cuda_graph_end(int device, ColiCudaGraph **out) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!out || !select_ctx(ctx)) return 0;
+    cudaGraph_t graph = NULL;
+    if (!cuda_ok(cudaStreamEndCapture(ctx->stream, &graph), "graph end capture")) return 0;
+    cudaGraphExec_t exec = NULL;
+    if (!cuda_ok(cudaGraphInstantiate(&exec, graph, 0), "graph instantiate")) {
+        cudaGraphDestroy(graph);
+        return 0;
+    }
+    ColiCudaGraph *g = (ColiCudaGraph *)std::calloc(1, sizeof(*g));
+    if (!g) { cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); return 0; }
+    g->graph = graph; g->exec = exec; g->device = device;
+    *out = g;
+    return 1;
+}
+
+extern "C" int coli_cuda_graph_launch(ColiCudaGraph *g) {
+    if (!g) return 0;
+    DeviceContext *ctx = find_ctx(g->device);
+    if (!select_ctx(ctx)) return 0;
+    if (!cuda_ok(cudaGraphLaunch(g->exec, ctx->stream), "graph launch")) return 0;
+    return cuda_ok(cudaStreamSynchronize(ctx->stream), "graph synchronize");
+}
+
+extern "C" void coli_cuda_graph_free(ColiCudaGraph *g) {
+    if (!g) return;
+    if (g->exec) cudaGraphExecDestroy(g->exec);
+    if (g->graph) cudaGraphDestroy(g->graph);
+    std::free(g);
+}
+
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
@@ -587,7 +632,9 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
-    GroupDesc host[64]; if(count>64) return 0;
+    // At batch saturation a layer's routed union can reach all 256 experts, so a
+    // saturated union dispatches in one launch instead of chunking into ≤64 groups.
+    GroupDesc host[256]; if(count>256) return 0;
     int all_s4=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
@@ -932,12 +979,13 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
 extern "C" int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *up_dev,
                                        size_t n){
     DeviceContext *ctx=find_ctx(device); if(!n||!select_ctx(ctx)) return 0;
-    silu_mul<<<(unsigned)((n+255)/256),256>>>(gate_dev,up_dev,n);
+    // on ctx->stream so it composes into an overlapped / graph-captured chain
+    silu_mul<<<(unsigned)((n+255)/256),256,0,ctx->stream>>>(gate_dev,up_dev,n);
     return cuda_ok(cudaGetLastError(),"pipe silu mul");
 }
 extern "C" int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n){
     DeviceContext *ctx=find_ctx(device); if(!n||!select_ctx(ctx)) return 0;
-    pipe_add_n<<<(unsigned)((n+255)/256),256>>>(x_dev,t_dev,n);
+    pipe_add_n<<<(unsigned)((n+255)/256),256,0,ctx->stream>>>(x_dev,t_dev,n);
     return cuda_ok(cudaGetLastError(),"pipe add");
 }
 extern "C" int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *partial_dev,

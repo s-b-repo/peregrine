@@ -122,12 +122,26 @@ pub fn dot_i2i8_scalar(w2: &[u8], x: &[i8], n: usize) -> i32 {
     sum
 }
 
+/// Best available packed-int2·int8 dot for this CPU. Bit-identical to
+/// [`dot_i2i8_scalar`] (integer addition is associative).
+#[inline]
+pub fn dot_i2i8(w2: &[u8], x: &[i8], n: usize) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the avx2 kernel is only called after detecting avx2 at runtime.
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { x86::dot_i2i8_avx2(w2, x, n) };
+        }
+    }
+    dot_i2i8_scalar(w2, x, n)
+}
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86 {
     //! AVX2 (maddubs sign-trick) and AVX-VNNI (`vpdpbusd`) dot kernels. Each
     //! processes vector-width chunks then falls through to a scalar tail, so any
     //! `n` is handled and the result equals the scalar reference exactly.
-    use super::{dot_i4i8_scalar, dot_i8i8_scalar};
+    use super::{dot_i2i8_scalar, dot_i4i8_scalar, dot_i8i8_scalar};
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
@@ -220,6 +234,46 @@ pub mod x86 {
             // `i` is a multiple of 32 (even), so element `i` is the low nibble of
             // byte `i/2` — slicing both w4 (by byte) and x (by element) stays aligned.
             sum += dot_i4i8_scalar(&w4[i >> 1..], &x[i..], n - i);
+        }
+        sum
+    }
+
+    /// packed-int2·int8 via AVX2. Unpacks 8 bytes → 32 fields in order: extract the
+    /// four 2-bit fields (`&3`, `>>2&3`, `>>4&3`, `>>6&3`) into byte lanes, then a
+    /// two-level `unpack` interleaves them so lane `4k+j` holds byte `k`'s field
+    /// `j`; bias by −2 into `[-2,1]` and run the same `maddubs` sign-trick as int4.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2. [`super::dot_i2i8`] verifies this before calling.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn dot_i2i8_avx2(w2: &[u8], x: &[i8], n: usize) -> i32 {
+        let m2 = _mm_set1_epi8(0x03);
+        let b2 = _mm256_set1_epi8(2);
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = _mm256_setzero_si256();
+        let mut i = 0usize;
+        while i + 32 <= n {
+            let by = _mm_loadl_epi64(w2.as_ptr().add(i >> 2) as *const __m128i); // 8B = 32 fields
+            // f_j[k] = field j of byte k (>>2 clears higher bits before the mask)
+            let f0 = _mm_and_si128(by, m2);
+            let f1 = _mm_and_si128(_mm_srli_epi16::<2>(by), m2);
+            let f2 = _mm_and_si128(_mm_srli_epi16::<4>(by), m2);
+            let f3 = _mm_and_si128(_mm_srli_epi16::<6>(by), m2);
+            // interleave to [f0[0],f1[0],f2[0],f3[0], f0[1],...] = elements in order
+            let lo01 = _mm_unpacklo_epi8(f0, f1);
+            let lo23 = _mm_unpacklo_epi8(f2, f3);
+            let r_lo = _mm_unpacklo_epi16(lo01, lo23); // elements 0..15
+            let r_hi = _mm_unpackhi_epi16(lo01, lo23); // elements 16..31
+            let wv = _mm256_sub_epi8(_mm256_set_m128i(r_hi, r_lo), b2); // → [-2,1]
+            let xv = _mm256_loadu_si256(x.as_ptr().add(i) as *const __m256i);
+            let p = _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(xv, wv));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, ones));
+            i += 32;
+        }
+        let mut sum = hsum256(acc);
+        if i < n {
+            // `i` is a multiple of 32, so element `i` is field 0 of byte `i/4`.
+            sum += dot_i2i8_scalar(&w2[i >> 2..], &x[i..], n - i);
         }
         sum
     }
@@ -322,6 +376,27 @@ mod tests {
             let x: Vec<i8> = (0..n).map(|_| rng.i8_127()).collect();
             let hand: i32 = vals.iter().zip(&x).map(|(&v, &xi)| v * xi as i32).sum();
             assert_eq!(dot_i2i8_scalar(&w2, &x, n), hand, "int2 n={n}");
+        }
+    }
+
+    #[test]
+    fn i2_simd_matches_scalar() {
+        let mut rng = Lcg(0x1357_2468);
+        for &n in &LENS {
+            let vals: Vec<i32> = (0..n).map(|_| (rng.next() >> 40) as i32 % 4 - 2).collect(); // [-2,1]
+            let mut w2 = vec![0u8; n.div_ceil(4)];
+            for (i, &v) in vals.iter().enumerate() {
+                w2[i >> 2] |= (((v + 2) as u8) & 0x03) << (2 * (i & 3));
+            }
+            let x: Vec<i8> = (0..n).map(|_| rng.i8_127()).collect();
+            let reference = dot_i2i8_scalar(&w2, &x, n);
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("avx2") {
+                    assert_eq!(unsafe { x86::dot_i2i8_avx2(&w2, &x, n) }, reference, "avx2 i2 n={n}");
+                }
+            }
+            assert_eq!(dot_i2i8(&w2, &x, n), reference, "dispatch i2 n={n}");
         }
     }
 

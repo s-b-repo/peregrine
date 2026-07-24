@@ -23,6 +23,9 @@ extern "C" {
 /* Opaque, persistent device copy of one resident quantized tensor. */
 typedef struct ColiCudaTensor ColiCudaTensor;
 
+/* Opaque captured+instantiated CUDA graph of a device's managed stream. */
+typedef struct ColiCudaGraph ColiCudaGraph;
+
 /* Devices are CUDA ordinals, not positions in the input list. */
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
@@ -137,6 +140,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sync(int device);
+
+/* CUDA Graphs: capture a device's managed stream between begin/end, then replay
+ * the instantiated graph many times to skip per-op launch cost. Ops captured
+ * must run on ctx->stream (the pipe_* primitives). */
+COLI_CUDA_DLLEXPORT int coli_cuda_graph_begin(int device);
+COLI_CUDA_DLLEXPORT int coli_cuda_graph_end(int device, ColiCudaGraph **out);
+COLI_CUDA_DLLEXPORT int coli_cuda_graph_launch(ColiCudaGraph *g);
+COLI_CUDA_DLLEXPORT void coli_cuda_graph_free(ColiCudaGraph *g);
 
 #ifdef __cplusplus
 }
