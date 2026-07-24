@@ -8,3 +8,10 @@ description = "colibrì engine core: config, safetensors index, quantized-tensor
 
 [dependencies]
 serde_json.workspace = true
+peregrine-io = { path = "../peregrine-io" }
+thiserror = "2"
+parking_lot = "0.12"
+
+# O_DIRECT flag is architecture-specific — don't hardcode it. Linux-only.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

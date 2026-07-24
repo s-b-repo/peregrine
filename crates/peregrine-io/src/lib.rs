@@ -4,6 +4,9 @@
 //!   of expert-slab reads with one enter syscall (the "reduce syscalls" goal);
 //!   [`ring::pread_many`] is the portable fallback and correctness oracle.
 //! - [`cache`] — the per-layer LRU expert cache (RAM warm tier).
+//! - [`warmcache`] — the byte-budgeted `(layer,expert)` warm cache the concurrent
+//!   scheduler consults before streaming (holds raw quantized bytes → hits are
+//!   bit-identical to a fresh stream).
 //! - [`tier`] — the LFRU hot-store eviction/promotion policy (`c/tier.h`).
 //!
 //! The concurrent hand-off between this lane and the CPU/GPU compute lanes is
@@ -11,14 +14,18 @@
 
 // tier.h is ported with explicit expert-index loops for line-by-line parity.
 #![allow(clippy::needless_range_loop)]
+// Quality gates: io_uring submission is the only (irreducible) `unsafe` here; no
+// panicking error handling in library code.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod cache;
 pub mod ring;
+pub mod slab;
 pub mod tier;
+pub mod warmcache;
 
 pub use cache::ExpertCache;
-pub use ring::{pread_many, ReadReq};
+pub use ring::{pread_many, probe_direct, read_file, Reactor, ReadReq};
+pub use slab::{align_down, align_up, AlignedBuf, SlabPool, ALIGN};
 pub use tier::{decay, lfru_score, pick_lfru, pick_swap, Swap};
-
-#[cfg(target_os = "linux")]
-pub use ring::Reactor;
+pub use warmcache::{ExpertSlab, WarmCache};
