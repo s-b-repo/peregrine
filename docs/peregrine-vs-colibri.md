@@ -48,6 +48,11 @@ headline findings:
   this hardware**: it pays off only under full/partial expert *residency* (multi-GPU or large RAM),
   which is exactly where colibrì reports **6.84 tok/s on 6× RTX 5090**. On a single RTX 3060 (12 GB),
   only ~66 of 19,200 experts fit in VRAM, so neither engine can demonstrate the residency regime.
+- **Continuous batching now realizes part of that advantage on the streaming path.** Decoding B
+  sequences together shares each expert read across the batch, a **measured 4.4× aggregate gain at
+  B=16** (0.064 → 0.280 tok/s) on the real 744B model — per-step disk cost grows sub-linearly as the
+  expert union is read once and shared (§5.4). Absolute throughput stays disk-bound; the win is
+  amortization of the byte budget, not a faster drive.
 
 Net: on a single box the dominant limit is the **memory-vs-working-set wall**, and within that regime
 **colibrì is currently ~1.4× faster** thanks to a more mature streaming path. The Rust rewrite lands in
@@ -285,6 +290,43 @@ peregrine's concurrent scheduler targets:
 | `CUDA_DENSE`, 150 GB expert tier | 1.650 → **2.157 tok/s** (+30.8 %) | README CUDA section |
 | Metal, M5 Max (128 GB) | **2.24 tok/s** | `docs/METAL-M5MAX-PERF-REPORT.md` |
 | MTP speculation on MoE decode | **net loss** (−5 % @ 79 % acceptance) | 6×5090 experiment |
+
+### 5.4 Batched decode — aggregate throughput (this session, measured)
+
+Continuous batching (the concurrent scheduler's `forward_step_batched`) reads each routed expert **once
+per step and shares it across all B sequences**, so per-step disk cost grows *sub-linearly* with B while
+tokens grow linearly — aggregate throughput rises. Measured on the real 744B model (release build,
+O_DIRECT, cache off, one decode step per B):
+
+| Batch B | step wall | **agg tok/s** | per-seq tok/s | vs B=1 |
+|---|---|---|---|---|
+| 1 | 15.7 s | **0.064** | 0.064 | 1.0× |
+| 4 | 25.6 s | **0.156** | 0.039 | 2.4× |
+| 16 | 57.2 s | **0.280** | 0.018 | **4.4×** |
+
+**Batching delivers a measured 4.4× aggregate gain at B=16** (0.064 → 0.280 tok/s): step time grows only
+3.6× for 16× the tokens because the expert union is read once and shared. Per-sequence latency drops (the
+batch tradeoff). The B=1 point (0.064) corroborates the §5.1 single-seq 0.054 tok/s. A simple
+independent-uniform coupon-collector *overstates* the union (it predicts ~1.65 tok/s at B=16); real
+routing from related prompts **overlaps heavily** (the B=16 union measured ~29 experts/layer, not ~103),
+so the true gain sits above that pessimistic model — but the absolute ceiling stays disk-bound
+(extrapolating to ~0.7 tok/s near the union-saturation knee, where each step approaches reading the full
+358 GB). **The win is amortization of the byte budget, not a faster drive.**
+
+**Resident compute path (tiny model, no disk):** aggregate 44.8k → 69.5k → 80.3k tok/s at B=1/16/256 —
+compute-bound, so batching amortizes fixed per-step overhead (~1.8×) while per-seq drops. This isolates
+the regime where the concurrent scheduler (and a compute-parallel worker pool) pay off.
+
+**Compute-parallel worker pool (`peregrine-par`):** rmsnorm, resident MoE experts, per-row attention, and
+every matmul (`apply_vec`) now run on a persistent scoped thread pool, **bit-identical** to serial
+(`f32::to_bits`-exact tests). On the tiny model it lifts B=256 aggregate to **79.6k vs serial 66.3k
+(1.2×)** with **no small-batch regression** (work-aware gates keep trivially-small matrices serial). The
+win scales with per-op work, so a real hidden-6144 resident model parallelizes far more; it is hidden
+under disk on the streaming path (compute already overlaps I/O), exactly as expected — a residency-regime
+lever. A/B via `COLI_PAR_THREADS=1` (serial) vs default.
+
+**I/O mode:** O_DIRECT vs buffered was within run-to-run noise at B=1/4 on this contended LUKS box —
+consistent with §6's finding that O_DIRECT's benefit shows only on cold/uncontended runs.
 
 ---
 

@@ -17,13 +17,16 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 
 use peregrine_core::Error;
-use peregrine_model::{Model, Sampler};
+use peregrine_model::{pick_batch_greedy, Model, Sampler, SeqKv};
 
 // Match c/openai_server.py's framing sentinels.
 const READY: &[u8] = b"\x01\x01READY\x01\x01\n";
 const END: &[u8] = b"\x01\x01END\x01\x01\n";
 
 fn main() {
+    // Cap glibc arenas before spawning the streaming/compute worker pools, so the
+    // engine no longer needs `MALLOC_ARENA_MAX=2` in the environment to stay flat.
+    peregrine_model::cap_malloc_arenas();
     if let Err(e) = run() {
         eprintln!("peregrine: {e}");
         std::process::exit(1);
@@ -34,11 +37,41 @@ fn run() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("demo") => run_demo(),
+        // `bench [B ...]`: aggregate decode-throughput sweep over batch sizes,
+        // driving forward_step_batched on COLI_MODEL. Shows the batching
+        // amortization (streaming) or compute scaling (resident).
+        Some("bench") => run_bench(&args[2..]),
         // `build <dir>`: write a tiny synthetic model to <dir> (for serve testing).
         Some("build") => {
             let dir = args.get(2).ok_or_else(|| Error::Format("usage: peregrine build <dir>".into()))?;
             peregrine_model::testkit::build_tiny_model(Path::new(dir))?;
             eprintln!("wrote demo model to {dir}");
+            Ok(())
+        }
+        // `build-automaton <model-dir> [corpus-len]`: offline pass that runs a corpus
+        // through the model, accumulates the expert-transition automaton, and writes
+        // `<model-dir>/automaton.json` (auto-loaded on the next model load).
+        Some("build-automaton") => {
+            let dir = args.get(2).ok_or_else(|| Error::Format("usage: peregrine build-automaton <model-dir> [corpus-len]".into()))?;
+            let len = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(256);
+            let mut model = Model::load_streaming(Path::new(dir), true)?;
+            let corpus = synth_corpus(model.cfg.vocab as usize, len);
+            let table = model.build_automaton(&corpus)?;
+            let out = Path::new(dir).join("automaton.json");
+            peregrine_model::save_automaton(&table, &out)?;
+            eprintln!("wrote automaton ({len}-token corpus) to {}", out.display());
+            Ok(())
+        }
+        // `dump-routes <model-dir> <out.json> [corpus-len]`: write the raw per-forward
+        // routing trace (for offline inspection / custom automaton building).
+        Some("dump-routes") => {
+            let dir = args.get(2).ok_or_else(|| Error::Format("usage: peregrine dump-routes <model-dir> <out.json> [corpus-len]".into()))?;
+            let out = args.get(3).ok_or_else(|| Error::Format("usage: peregrine dump-routes <model-dir> <out.json> [corpus-len]".into()))?;
+            let len = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(256);
+            let mut model = Model::load_streaming(Path::new(dir), true)?;
+            let corpus = synth_corpus(model.cfg.vocab as usize, len);
+            let n = model.dump_routes_to(&corpus, Path::new(out))?;
+            eprintln!("wrote {n} forwards of routing trace to {out}");
             Ok(())
         }
         _ => {
@@ -53,6 +86,20 @@ fn run() -> Result<(), Error> {
             }
         }
     }
+}
+
+/// A deterministic pseudo-random token stream for offline automaton building — there
+/// is no real prompt corpus in this environment, so an LCG stands in. Same seed →
+/// same corpus → reproducible automaton.
+fn synth_corpus(vocab: usize, n: usize) -> Vec<i32> {
+    let vocab = vocab.max(1) as u64;
+    let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) % vocab) as i32
+        })
+        .collect()
 }
 
 /// stdio serve loop. Requests (one per line):
@@ -101,6 +148,13 @@ fn serve(model: &mut Model) -> Result<(), Error> {
                         let hr = 100.0 * h as f64 / (h + m).max(1) as f64;
                         let pf = model.ecache_prefetch_reads().unwrap_or(0);
                         eprintln!("[ecache] hits={h} misses={m} disk_reads={d} prefetch_reads={pf} hit_rate={hr:.1}%");
+                        // prefetch effectiveness: how many speculative reads paid off,
+                        // plus fadvise hints and (opt-in) verify mismatches.
+                        let (used, wasted) = model.ecache_prefetch_effectiveness().unwrap_or((0, 0));
+                        let acc = 100.0 * model.prefetch_accuracy().unwrap_or(0.0);
+                        let fadv = model.ecache_fadvise_hints().unwrap_or(0);
+                        let vm = model.ecache_verify_mismatch().unwrap_or(0);
+                        eprintln!("[prefetch] used={used} wasted={wasted} accuracy={acc:.1}% fadvise={fadv} verify_mismatch={vm}");
                     }
                 }
                 Ok(_) => {}
@@ -129,6 +183,52 @@ fn parse_gen<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<(usize, Vec<i
         }
     }
     Ok((ngen, prompt))
+}
+
+/// Aggregate decode-throughput sweep. For each batch size B, run `COLI_BENCH_STEPS`
+/// batched decode steps over B independent sequences (via `forward_step_batched`)
+/// and report aggregate tokens/sec. On a streaming model this shows the disk
+/// amortization (experts read once per step, shared across B); on a resident model
+/// it shows compute scaling. `COLI_MODEL` selects the model; args override the B set.
+fn run_bench(batch_args: &[String]) -> Result<(), Error> {
+    let dir = std::env::var("COLI_MODEL")
+        .ok()
+        .ok_or_else(|| Error::Format("bench needs COLI_MODEL=<dir>  (e.g. a tiny model from `peregrine build`)".into()))?;
+    let steps: usize =
+        std::env::var("COLI_BENCH_STEPS").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(3);
+    let batches: Vec<usize> = if batch_args.is_empty() {
+        vec![1, 4, 16]
+    } else {
+        batch_args.iter().filter_map(|s| s.parse().ok()).filter(|&b| b > 0).collect()
+    };
+
+    let t0 = std::time::Instant::now();
+    let model = Model::load(Path::new(&dir))?;
+    let vocab = model.cfg.vocab as usize;
+    eprintln!("peregrine bench: loaded {} layers, vocab {}, in {:.1}s", model.cfg.n_layers, vocab, t0.elapsed().as_secs_f64());
+    println!("  batch   steps   tokens    seconds     agg tok/s   per-seq tok/s");
+    for &b in &batches {
+        let mut seqs: Vec<SeqKv> = (0..b).map(|_| SeqKv::new(&model.cfg)).collect();
+        // distinct starting token per sequence so their routing diverges
+        let mut toks: Vec<i32> = (0..b).map(|i| (i as i32 * 7 + 1) % vocab.max(1) as i32).collect();
+        let (d0, _) = model.ecache_stats().map(|(_, _, d)| (d, ())).unwrap_or((0, ()));
+
+        let t = std::time::Instant::now();
+        for step in 0..steps {
+            let pos_of: Vec<usize> = vec![step; b];
+            let mut refs: Vec<&mut SeqKv> = seqs.iter_mut().collect();
+            let logits = model.forward_step_batched(&toks, &mut refs, &pos_of, None)?;
+            pick_batch_greedy(&logits, vocab, &mut toks); // next tokens feed the following step
+        }
+        let dt = t.elapsed().as_secs_f64().max(1e-9);
+        let tokens = b * steps;
+        let agg = tokens as f64 / dt;
+        println!("  {b:5}   {steps:5}   {tokens:6}   {dt:8.2}   {agg:11.3}   {:13.4}", agg / b as f64);
+        if let Some((_, _, d)) = model.ecache_stats() {
+            eprintln!("    [ecache] disk_reads this batch: {}", d.saturating_sub(d0));
+        }
+    }
+    Ok(())
 }
 
 fn run_demo() -> Result<(), Error> {

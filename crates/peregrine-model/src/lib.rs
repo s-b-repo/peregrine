@@ -23,6 +23,7 @@ pub mod math;
 pub mod mlp;
 pub mod model;
 pub mod mtp;
+pub mod predict;
 pub mod router;
 pub mod sample;
 pub mod testkit;
@@ -31,8 +32,13 @@ pub mod weight;
 pub use attention::{mla_attention, mla_attention_absorb, mla_attention_batched, AttnWeights, LayerKv, RowAttn};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoidf, siluf, silu_mul, softmax};
 pub use mlp::{moe_forward, Mlp};
-pub use model::{Model, SeqKv};
+pub use model::{save_automaton, Model, SeqKv};
+pub use predict::{Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 pub use mtp::speculative_sample;
 pub use router::{batch_union, route, Routed};
 pub use sample::{argmax, pick_batch_greedy, Sampler};
 pub use weight::{QtWeight, QuantFmt};
+
+/// Re-exported so the binaries can cap glibc malloc arenas at startup (drops the
+/// `MALLOC_ARENA_MAX=2` requirement). See [`peregrine_io::cap_malloc_arenas`].
+pub use peregrine_io::cap_malloc_arenas;

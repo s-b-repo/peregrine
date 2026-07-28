@@ -48,9 +48,15 @@ pub fn moe_forward(
     let r = route(x, router_w, router_bias, s_n, hidden, e_n, k, norm_topk, routed_scale);
     let mut out = vec![0f32; s_n * hidden];
 
+    // Gather each routed expert's positions (+ gate weights) in batch-union order.
+    struct Plan {
+        e: usize,
+        rows: Vec<usize>,
+        rw: Vec<f32>,
+    }
+    let mut plans: Vec<Plan> = Vec::new();
     for &e in batch_union(&r, s_n).iter() {
         let e = e as usize;
-        // gather the positions routing to expert e (+ their gate weights)
         let mut rows: Vec<usize> = Vec::new();
         let mut rw: Vec<f32> = Vec::new();
         for s in 0..s_n {
@@ -62,16 +68,26 @@ pub fn moe_forward(
                 }
             }
         }
-        if rows.is_empty() {
-            continue;
+        if !rows.is_empty() {
+            plans.push(Plan { e, rows, rw });
         }
-        let nr = rows.len();
+    }
+
+    // Compute each expert's SwiGLU on the pool (disjoint scratch), then scatter
+    // SERIALLY in batch-union order — a row hit by two experts accumulates in the
+    // same order as the serial loop, so the result is bit-identical (f32 `+=` is not
+    // associative). This mirrors the concurrent streaming lane's post-scope reduce.
+    let hs: Vec<Vec<f32>> = peregrine_par::par_map(plans.len(), peregrine_par::PAR_MOE_MIN, |i| {
+        let p = &plans[i];
+        let nr = p.rows.len();
         let mut xg = vec![0f32; nr * hidden];
-        for (ri, &s) in rows.iter().enumerate() {
+        for (ri, &s) in p.rows.iter().enumerate() {
             xg[ri * hidden..ri * hidden + hidden].copy_from_slice(&x[s * hidden..s * hidden + hidden]);
         }
-        let h = experts[e].swiglu(&xg, nr);
-        for (ri, (&s, &wgt)) in rows.iter().zip(&rw).enumerate() {
+        experts[p.e].swiglu(&xg, nr)
+    });
+    for (p, h) in plans.iter().zip(&hs) {
+        for (ri, (&s, &wgt)) in p.rows.iter().zip(&p.rw).enumerate() {
             let dst = &mut out[s * hidden..s * hidden + hidden];
             let src = &h[ri * hidden..ri * hidden + hidden];
             for d in 0..hidden {
@@ -164,6 +180,58 @@ mod tests {
             let tol = 0.05 * (inter + hidden) as f32;
             assert!((out[z] - refout[z]).abs() < tol, "z={z} out={} ref={}", out[z], refout[z]);
         }
+    }
+
+    #[test]
+    fn moe_forward_parallel_matches_serial() {
+        // moe_forward now computes experts on the pool and scatters serially; it must
+        // be bit-identical to a hand-serial gather→swiglu→scatter in batch-union order.
+        let (hidden, inter, e_n, k, s_n) = (16usize, 8usize, 6usize, 2usize, 9usize);
+        let mut rng = Lcg(0x9a1e);
+        let x: Vec<f32> = (0..s_n * hidden).map(|_| rng.f()).collect();
+        let router_w: Vec<f32> = (0..e_n * hidden).map(|_| rng.f()).collect();
+        let router_bias: Vec<f32> = (0..e_n).map(|_| rng.f() * 0.1).collect();
+        let experts: Vec<Mlp> = (0..e_n).map(|_| make_mlp(&mut rng, hidden, inter)).collect();
+        let shared = make_mlp(&mut rng, hidden, inter);
+
+        let par = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), s_n, hidden, k, true, 2.5);
+
+        // serial oracle: gather → swiglu → scatter, in batch-union order
+        let r = route(&x, &router_w, &router_bias, s_n, hidden, e_n, k, true, 2.5);
+        let mut ser = vec![0f32; s_n * hidden];
+        for &e in batch_union(&r, s_n).iter() {
+            let e = e as usize;
+            let (mut rows, mut rw): (Vec<usize>, Vec<f32>) = (Vec::new(), Vec::new());
+            for s in 0..s_n {
+                for kk in 0..r.keff[s] as usize {
+                    if r.idx[s * r.k + kk] as usize == e {
+                        rows.push(s);
+                        rw.push(r.w[s * r.k + kk]);
+                        break;
+                    }
+                }
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            let nr = rows.len();
+            let mut xg = vec![0f32; nr * hidden];
+            for (ri, &s) in rows.iter().enumerate() {
+                xg[ri * hidden..ri * hidden + hidden].copy_from_slice(&x[s * hidden..s * hidden + hidden]);
+            }
+            let h = experts[e].swiglu(&xg, nr);
+            for (ri, (&s, &wgt)) in rows.iter().zip(&rw).enumerate() {
+                for d in 0..hidden {
+                    ser[s * hidden + d] += wgt * h[ri * hidden + d];
+                }
+            }
+        }
+        let sh = shared.swiglu(&x, s_n);
+        for z in 0..s_n * hidden {
+            ser[z] += sh[z];
+        }
+
+        assert!(par.iter().zip(&ser).all(|(a, b)| a.to_bits() == b.to_bits()), "moe_forward must be bit-identical parallel vs serial");
     }
 
     #[test]

@@ -48,6 +48,13 @@ pub struct AlignedBuf {
 // buffers around within one locked call, so it must be `Send`.
 unsafe impl Send for AlignedBuf {}
 
+// SAFETY: a shared `&AlignedBuf` only exposes `as_slice()` (immutable bytes) — the
+// uniquely-owned allocation has no interior mutability, so concurrent shared reads
+// from multiple threads are sound, exactly like `Box<[u8]>: Sync`. Needed so a
+// streamed `QtWeight` holding an aligned `Bytes` stays `Sync` for the data-parallel
+// matmul pool (`peregrine-par`).
+unsafe impl Sync for AlignedBuf {}
+
 impl AlignedBuf {
     /// Allocate an [`ALIGN`]-aligned buffer of at least `cap` bytes (rounded up to
     /// a multiple of `ALIGN`). Returns `None` on a bad layout or allocation
@@ -88,6 +95,91 @@ impl Drop for AlignedBuf {
         // SAFETY: `ptr` came from `alloc_zeroed` with exactly `self.layout` and is
         // freed exactly once here.
         unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+/// Owned read-landing bytes that dereference to `[u8]`. Two shapes:
+///
+/// - [`Bytes::Vec`] — a plain heap `Vec` (buffered reads, resident weight loads,
+///   and the warm cache's clones).
+/// - [`Bytes::Aligned`] — an O_DIRECT [`AlignedBuf`] that exposes only its interior
+///   region `[head, head+len)`. The kernel DMAs the 4096-aligned superset straight
+///   into this buffer and the consumer reads the sub-slice through `Deref`, so the
+///   O_DIRECT path needs **no realignment copy** — the bytes the matmul reads are
+///   the bytes the disk wrote. `head` is the wanted region's offset inside the
+///   aligned window (`0 <= head < ALIGN`); `head + len <= buf.capacity()`.
+///
+/// `Bytes` backs both a streamed `QtWeight` and an `ExpertSlab` region, so it must
+/// be `Send` (it crosses the MoE worker channel) — both variants already are.
+pub enum Bytes {
+    Vec(Vec<u8>),
+    Aligned { buf: AlignedBuf, head: usize, len: usize },
+}
+
+impl Bytes {
+    /// The exposed byte length (the logical region, not the aligned window).
+    pub fn len(&self) -> usize {
+        match self {
+            Bytes::Vec(v) => v.len(),
+            Bytes::Aligned { len, .. } => *len,
+        }
+    }
+
+    /// Whether the exposed region is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The exposed bytes as a shared slice (identical to `&self[..]`).
+    pub fn as_slice(&self) -> &[u8] {
+        self
+    }
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Bytes::Vec(v) => v,
+            // head+len <= capacity by construction (the aligned window covers the region)
+            Bytes::Aligned { buf, head, len } => &buf.as_slice()[*head..*head + *len],
+        }
+    }
+}
+
+impl std::ops::DerefMut for Bytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Bytes::Vec(v) => v,
+            Bytes::Aligned { buf, head, len } => &mut buf.as_mut_slice()[*head..*head + *len],
+        }
+    }
+}
+
+impl Clone for Bytes {
+    /// Cloning always yields an owned [`Bytes::Vec`] of the exposed region. The warm
+    /// cache stores clones and never needs O_DIRECT alignment, so this keeps
+    /// [`AlignedBuf`] non-cloneable while staying byte-identical to the original.
+    fn clone(&self) -> Self {
+        Bytes::Vec(self.to_vec())
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(v: Vec<u8>) -> Self {
+        Bytes::Vec(v)
+    }
+}
+
+impl PartialEq for Bytes {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bytes({} bytes)", self.len())
     }
 }
 

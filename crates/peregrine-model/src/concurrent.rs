@@ -16,11 +16,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use peregrine_core::{Cfg, Context, Error, QtInfo, SafeTensors};
-use peregrine_io::{Reactor, ReadReq, WarmCache};
+use peregrine_io::{Bytes, Reactor, ReadReq, WarmCache};
 
 use crate::gpu::{GpuTier, HeatTable};
 use crate::mlp::Mlp;
-use crate::router::{batch_union, route};
+use crate::predict::RouteHistory;
+use crate::router::{batch_union, route, routed_at};
 use crate::weight::{QtWeight, QuantFmt};
 
 /// Shared per-forward state threaded through the layer/MoE compute: the
@@ -41,11 +42,17 @@ pub struct ForwardCtx<'a> {
     /// only). A hit returns the exact previously-streamed bytes, so output is
     /// bit-identical; a miss streams then inserts. `None` disables caching.
     pub ecache: Option<&'a Mutex<WarmCache>>,
-    /// Per-layer routing history written after each layer's reduce: `route_log[layer]`
-    /// = this forward's batch-union of routed experts. The prefetch lane reads it
-    /// to predict the next token's experts. `None` on speculative-draft forwards
-    /// (so drafts don't pollute the main-stream prediction) and when prefetch is off.
-    pub route_log: Option<&'a Mutex<Vec<Vec<i32>>>>,
+    /// Per-layer routing history: after each layer's reduce, this forward's
+    /// batch-union of routed experts is pushed as the newest frame. The prefetch
+    /// lane's predictor reads it to guess the next token's experts. `None` on
+    /// speculative-draft forwards (so drafts don't pollute the main-stream
+    /// prediction) and when prefetch is off.
+    pub route_log: Option<&'a Mutex<RouteHistory>>,
+    /// Per-**sequence** routing history for batched decode: `route_log_multi[s]` is
+    /// sequence `s`'s own history (position `s` ↔ sequence `s`), so each concurrent
+    /// stream predicts and prefetches from its *own* routing rather than the weak
+    /// cross-sequence union. `None` on the single-stream path (which uses `route_log`).
+    pub route_log_multi: Option<&'a [&'a Mutex<RouteHistory>]>,
     /// Stream expert reads via O_DIRECT (bypass the page cache) when the shards
     /// opened O_DIRECT fds. Bytes are identical to the buffered path; only the
     /// cache behavior differs. `false` disables (buffered reads).
@@ -125,65 +132,72 @@ fn tplan(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<TPlan, Erro
     Ok(TPlan { w_fd, w_off, w_len, s_fd, s_off, s_len, w_fd_direct, s_fd_direct, fmt, o, i, gs: info.gs as usize })
 }
 
-/// Stream one expert's gate/up/down (six weight+scale regions) through the ring
-/// in a **single batched submit** — one `submit_and_wait` for all six instead of
-/// six sequential `read_exact`s (each its own enter syscall). Any short read (a
-/// positioned read may legally return fewer bytes) is completed individually, so
-/// the returned bytes are identical to six `read_exact`s — the streamed output
-/// stays bit-identical to the resident path.
-fn read_expert(r: &mut Reactor, gate: &TPlan, up: &TPlan, down: &TPlan, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
-    let mut gw = vec![0u8; gate.w_len];
-    let mut gs = vec![0u8; gate.s_len];
-    let mut uw = vec![0u8; up.w_len];
-    let mut us = vec![0u8; up.s_len];
-    let mut dw = vec![0u8; down.w_len];
-    let mut ds = vec![0u8; down.s_len];
-
-    // pick the weight/scale fd for a tensor: O_DIRECT twin when `direct`, else buffered.
-    let wfd = |t: &TPlan| if direct { t.w_fd_direct.unwrap_or(t.w_fd) } else { t.w_fd };
-    let sfd = |t: &TPlan| if direct { t.s_fd_direct.unwrap_or(t.s_fd) } else { t.s_fd };
-
-    let mut done = [0usize; 6];
+/// Read a flat list of `(fd, offset, len)` regions and return one [`Bytes`] per
+/// region, in order. Two lanes, both byte-identical to the resident path:
+///
+/// - **direct** — [`Reactor::read_direct_aligned`] DMAs each region's 4096-aligned
+///   superset straight into an owned aligned buffer and returns it as an aligned
+///   [`Bytes`] view, so the streamed `QtWeight` reads out of the DMA target with
+///   **no realignment copy** (zero-copy O_DIRECT).
+/// - **buffered** — one deep `read_many` submit fills plain landing `Vec`s directly
+///   (the kernel writes the caller's buffer, so this is already zero userspace copy);
+///   any short read is completed per region.
+fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) -> Result<Vec<Bytes>, Error> {
+    if direct {
+        return r
+            .read_direct_aligned(regions)
+            .ctx(|| "io_uring O_DIRECT zero-copy expert read".to_string());
+    }
+    let mut bufs: Vec<Vec<u8>> = regions.iter().map(|&(_, _, len)| vec![0u8; len]).collect();
     {
-        let mut reqs = [
-            ReadReq { fd: wfd(gate), offset: gate.w_off, buf: &mut gw, tag: 0 },
-            ReadReq { fd: sfd(gate), offset: gate.s_off, buf: &mut gs, tag: 1 },
-            ReadReq { fd: wfd(up), offset: up.w_off, buf: &mut uw, tag: 2 },
-            ReadReq { fd: sfd(up), offset: up.s_off, buf: &mut us, tag: 3 },
-            ReadReq { fd: wfd(down), offset: down.w_off, buf: &mut dw, tag: 4 },
-            ReadReq { fd: sfd(down), offset: down.s_off, buf: &mut ds, tag: 5 },
-        ];
-        let res = if direct {
-            r.read_direct_many(&mut reqs).ctx(|| "io_uring O_DIRECT expert read".to_string())?
-        } else {
-            r.read_many(&mut reqs).ctx(|| "io_uring batched expert read".to_string())?
-        };
+        let mut reqs: Vec<ReadReq> = bufs
+            .iter_mut()
+            .zip(regions)
+            .map(|(b, &(fd, off, _))| ReadReq { fd, offset: off, buf: b.as_mut_slice(), tag: 0 })
+            .collect();
+        let res = r.read_many(&mut reqs).ctx(|| "io_uring batched expert read".to_string())?;
         for (i, &n) in res.iter().enumerate() {
             if n < 0 {
                 return Err(Error::Io(std::io::Error::from_raw_os_error((-n) as i32)));
             }
-            done[i] = n as usize;
+            let done = n as usize;
+            if done < bufs[i].len() {
+                let (fd, off, _) = regions[i];
+                r.read_exact(fd, off + done as u64, &mut bufs[i][done..])
+                    .ctx(|| "io_uring short-read completion".to_string())?;
+            }
         }
     }
-    // Complete any short reads (buffered path only; the direct reader returns full
-    // length, so `done == len` and this is a no-op) — byte-identical to read_exact.
-    for (i, (fd, off, buf)) in [
-        (wfd(gate), gate.w_off, &mut gw),
-        (sfd(gate), gate.s_off, &mut gs),
-        (wfd(up), up.w_off, &mut uw),
-        (sfd(up), up.s_off, &mut us),
-        (wfd(down), down.w_off, &mut dw),
-        (sfd(down), down.s_off, &mut ds),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        if done[i] < buf.len() {
-            r.read_exact(fd, off + done[i] as u64, &mut buf[done[i]..])
-                .ctx(|| "io_uring short-read completion".to_string())?;
-        }
-    }
+    Ok(bufs.into_iter().map(Bytes::from).collect())
+}
+
+/// Pack six in-order region [`Bytes`] into an [`ExpertSlab`] (gate/up/down ×
+/// weight+scale). Errors (rather than panics) if the reader returned the wrong
+/// count — keeps the no-unwrap gate satisfied.
+fn pack_slab(six: Vec<Bytes>) -> Result<peregrine_io::ExpertSlab, Error> {
+    let [gw, gs, uw, us, dw, ds]: [Bytes; 6] = six
+        .try_into()
+        .map_err(|_| Error::Format("expert read returned wrong region count".into()))?;
     Ok([(gw, gs), (uw, us), (dw, ds)])
+}
+
+/// Stream one expert's gate/up/down (six weight+scale regions) through the ring in
+/// a **single batched submit**. Zero-copy on the O_DIRECT lane (see [`read_regions`]);
+/// byte-identical to six `read_exact`s either way, so the streamed output stays
+/// bit-identical to the resident path.
+fn read_expert(r: &mut Reactor, gate: &TPlan, up: &TPlan, down: &TPlan, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
+    // pick the weight/scale fd for a tensor: O_DIRECT twin when `direct`, else buffered.
+    let wfd = |t: &TPlan| if direct { t.w_fd_direct.unwrap_or(t.w_fd) } else { t.w_fd };
+    let sfd = |t: &TPlan| if direct { t.s_fd_direct.unwrap_or(t.s_fd) } else { t.s_fd };
+    let regions = [
+        (wfd(gate), gate.w_off, gate.w_len),
+        (sfd(gate), gate.s_off, gate.s_len),
+        (wfd(up), up.w_off, up.w_len),
+        (sfd(up), up.s_off, up.s_len),
+        (wfd(down), down.w_off, down.w_len),
+        (sfd(down), down.s_off, down.s_len),
+    ];
+    pack_slab(read_regions(r, &regions, direct)?)
 }
 
 /// How many experts' reads to submit to the ring at once. 6 regions/expert, so
@@ -192,6 +206,22 @@ fn read_expert(r: &mut Reactor, gate: &TPlan, up: &TPlan, down: &TPlan, direct: 
 /// landing-buffer memory to ~`16 × 18.9 MB ≈ 300 MB` (this box is RAM-contended, so
 /// a bounded batch matters; a reusable slab arena would remove the ceiling entirely).
 pub const EXPERTS_PER_BATCH: usize = 16;
+
+/// Runtime I/O queue depth: `COLI_IO_BATCH` experts per ring claim (default
+/// [`EXPERTS_PER_BATCH`] = 16 → 96 in-flight reads). Deeper queues can help on
+/// faster storage (this LUKS box is already disk-saturated at 2 rings, so it's a
+/// marginal lever here). Cached once, so the hot loop pays a single atomic load.
+pub fn experts_per_batch() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_IO_BATCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(EXPERTS_PER_BATCH)
+    })
+}
 
 /// Stream a *batch* of experts' gate/up/down (six weight+scale regions each) through
 /// the ring in **one deep `read_many` submit**, so the disk queue stays full across
@@ -204,11 +234,10 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
     if n == 0 {
         return Ok(Vec::new());
     }
-    // one (fd, offset) + landing buffer per region, in gate/up/down × (weight,scale)
-    // order. In direct mode use the O_DIRECT twin fd (falling back per-region if a
-    // twin is somehow missing); the reader applies the block alignment.
-    let mut regions: Vec<(RawFd, u64)> = Vec::with_capacity(6 * n);
-    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(6 * n);
+    // one (fd, offset, len) per region, in gate/up/down × (weight, scale) order. In
+    // direct mode use the O_DIRECT twin fd (falling back per-region if a twin is
+    // somehow missing); the reader applies the block alignment.
+    let mut regions: Vec<(RawFd, u64, usize)> = Vec::with_capacity(6 * n);
     for p in plans {
         for t in [&p.gate, &p.up, &p.down] {
             let (wfd, sfd) = if direct {
@@ -216,54 +245,25 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
             } else {
                 (t.w_fd, t.s_fd)
             };
-            regions.push((wfd, t.w_off));
-            bufs.push(vec![0u8; t.w_len]);
-            regions.push((sfd, t.s_off));
-            bufs.push(vec![0u8; t.s_len]);
+            regions.push((wfd, t.w_off, t.w_len));
+            regions.push((sfd, t.s_off, t.s_len));
         }
     }
-    // one deep submit for all 6·n regions. Direct: O_DIRECT (page-cache-bypassing)
-    // aligned reads that complete each region internally (results = full length).
-    let results = {
-        let mut reqs: Vec<ReadReq> = bufs
-            .iter_mut()
-            .zip(&regions)
-            .map(|(b, &(fd, off))| ReadReq { fd, offset: off, buf: b.as_mut_slice(), tag: 0 })
-            .collect();
-        if direct {
-            r.read_direct_many(&mut reqs).ctx(|| "io_uring O_DIRECT layer read".to_string())?
-        } else {
-            r.read_many(&mut reqs).ctx(|| "io_uring batched layer read".to_string())?
-        }
-    };
-    // surface errors + complete any short reads individually (byte-identical result)
-    for (i, &(fd, off)) in regions.iter().enumerate() {
-        let got = results[i];
-        if got < 0 {
-            return Err(Error::Io(std::io::Error::from_raw_os_error((-got) as i32)));
-        }
-        let done = got as usize;
-        if done < bufs[i].len() {
-            r.read_exact(fd, off + done as u64, &mut bufs[i][done..])
-                .ctx(|| "io_uring batched short-read completion".to_string())?;
-        }
-    }
-    // assemble the six buffers of each expert into its slab
+    // one deep submit for all 6·n regions (buffered) or per-region aligned DMA
+    // (direct, zero-copy); bytes come back in region order, six per expert.
+    let mut bytes = read_regions(r, &regions, direct)?.into_iter();
     let mut slabs: Vec<peregrine_io::ExpertSlab> = Vec::with_capacity(n);
-    for e in 0..n {
-        let b = e * 6;
-        let gw = std::mem::take(&mut bufs[b]);
-        let gs = std::mem::take(&mut bufs[b + 1]);
-        let uw = std::mem::take(&mut bufs[b + 2]);
-        let us = std::mem::take(&mut bufs[b + 3]);
-        let dw = std::mem::take(&mut bufs[b + 4]);
-        let ds = std::mem::take(&mut bufs[b + 5]);
-        slabs.push([(gw, gs), (uw, us), (dw, ds)]);
+    for _ in 0..n {
+        let six: Vec<Bytes> = bytes.by_ref().take(6).collect();
+        slabs.push(pack_slab(six)?);
     }
     Ok(slabs)
 }
 
-fn rebuild(t: &TPlan, wb: Vec<u8>, sb: Vec<u8>) -> QtWeight {
+fn rebuild(t: &TPlan, wb: Bytes, sb: Bytes) -> QtWeight {
+    // scale bytes → f32 (a copy inherent to the reinterpret; scales are tiny). The
+    // weight bytes `wb` move into the QtWeight with no copy — zero-copy end to end
+    // when `wb` is an O_DIRECT aligned region.
     let scale: Vec<f32> = sb.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     match t.fmt {
         QuantFmt::Int4Grouped => QtWeight::new_grouped(t.o, t.i, wb, scale, t.gs),
@@ -348,8 +348,10 @@ pub fn moe_forward_concurrent(
     }
     let n = pos;
 
-    // job: (disk-plan index, streamed gate/up/down bytes) from I/O lane → CPU pool
-    type Bytes3 = [(Vec<u8>, Vec<u8>); 3];
+    // job: (disk-plan index, streamed gate/up/down bytes) from I/O lane → CPU pool.
+    // `Bytes` regions so an O_DIRECT read can hand its aligned DMA buffer over the
+    // channel with no copy (== peregrine_io::ExpertSlab).
+    type Bytes3 = [(Bytes, Bytes); 3];
     let (job_tx, job_rx) = crossbeam_channel::bounded::<(usize, Bytes3)>(workers.max(1) * 2);
     // result: (pos, computed expert) from any lane → main reducer
     let (res_tx, res_rx) = crossbeam_channel::bounded::<Result<(usize, EOut), Error>>(workers.max(1) * 2);
@@ -378,11 +380,12 @@ pub fn moe_forward_concurrent(
             let res_tx = res_tx.clone();
             scope.spawn(move || {
                 loop {
-                    let start = io_work_ref.fetch_add(EXPERTS_PER_BATCH, Ordering::Relaxed);
+                    let batch = experts_per_batch();
+                    let start = io_work_ref.fetch_add(batch, Ordering::Relaxed);
                     if start >= n_plans {
                         break; // no work left for this ring
                     }
-                    let end = (start + EXPERTS_PER_BATCH).min(n_plans);
+                    let end = (start + batch).min(n_plans);
                     // split the claimed range into warm-tier hits (dispatch now) and
                     // misses (one deep async submit on this ring)
                     let mut miss: Vec<usize> = Vec::new();
@@ -540,12 +543,17 @@ pub fn moe_forward_concurrent(
         }
     }
 
-    // Record this layer's routed set so the prefetch lane can predict the next
-    // token's experts. Single-threaded here (after the reduce) — no race.
+    // Record this layer's routed set as the newest history frame so the prefetch
+    // lane can predict the next token's experts. Single-threaded here (after the
+    // reduce) — exactly one writer, no race.
     if let Some(rl) = ctx.route_log {
-        let mut h = rl.lock();
-        if layer < h.len() {
-            h[layer] = uniq;
+        rl.lock().push_layer(layer, uniq);
+    }
+    // Batched decode: record each sequence's *own* routed set (position s ↔ sequence
+    // s) into its per-sequence history, for per-stream prediction.
+    if let Some(multi) = ctx.route_log_multi {
+        for (s, rh) in multi.iter().enumerate().take(s_n) {
+            rh.lock().push_layer(layer, routed_at(&r, s));
         }
     }
     Ok(out)
@@ -583,6 +591,42 @@ pub fn prefetch_item(st: &SafeTensors, cfg: &Cfg, layer: usize, expert: usize) -
 /// is bit-identical.
 pub fn prefetch_read(reactor: &mut Reactor, item: &PrefetchItem, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
     read_expert(reactor, &item.plans[0], &item.plans[1], &item.plans[2], direct)
+}
+
+/// One expert queued for a page-cache *hint* (`fadvise(WILLNEED)`): its six
+/// `(fd, offset, len)` regions to warm without streaming into the cache. Used for
+/// low-confidence multi-path predictions, where a full prefetch isn't worth the
+/// bandwidth but a cheap page-cache hint may still help a later miss.
+pub struct HintItem {
+    regions: [(RawFd, u64, usize); 6],
+}
+
+impl HintItem {
+    /// The six `(fd, offset, len)` regions (gate/up/down × weight+scale) to hint.
+    pub fn regions(&self) -> &[(RawFd, u64, usize); 6] {
+        &self.regions
+    }
+}
+
+/// Build a [`HintItem`] for one expert's six regions. Uses the **buffered** fds:
+/// `fadvise` only populates the page cache, so it's a no-op for O_DIRECT reads and
+/// the caller gates hints off under direct I/O.
+pub fn prefetch_hint_item(st: &SafeTensors, cfg: &Cfg, layer: usize, expert: usize) -> Result<HintItem, Error> {
+    let hidden = cfg.hidden as usize;
+    let mi = cfg.moe_inter as usize;
+    let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{expert}.{t}");
+    let gate = tplan(st, &p("gate_proj.weight"), mi, hidden)?;
+    let up = tplan(st, &p("up_proj.weight"), mi, hidden)?;
+    let down = tplan(st, &p("down_proj.weight"), hidden, mi)?;
+    let regions = [
+        (gate.w_fd, gate.w_off, gate.w_len),
+        (gate.s_fd, gate.s_off, gate.s_len),
+        (up.w_fd, up.w_off, up.w_len),
+        (up.s_fd, up.s_off, up.s_len),
+        (down.w_fd, down.w_off, down.w_len),
+        (down.s_fd, down.s_off, down.s_len),
+    ];
+    Ok(HintItem { regions })
 }
 
 #[cfg(test)]
@@ -637,12 +681,13 @@ mod tests {
             }
         };
         let slab = read_expert(&mut reactor, &gate, &up, &down, false)?;
-        assert_eq!(slab[0].0, regions[0]);
-        assert_eq!(slab[0].1, regions[1]);
-        assert_eq!(slab[1].0, regions[2]);
-        assert_eq!(slab[1].1, regions[3]);
-        assert_eq!(slab[2].0, regions[4]);
-        assert_eq!(slab[2].1, regions[5]);
+        // slab regions are `Bytes`; compare their exposed byte slices to the source
+        assert_eq!(&slab[0].0[..], &regions[0][..]);
+        assert_eq!(&slab[0].1[..], &regions[1][..]);
+        assert_eq!(&slab[1].0[..], &regions[2][..]);
+        assert_eq!(&slab[1].1[..], &regions[3][..]);
+        assert_eq!(&slab[2].0[..], &regions[4][..]);
+        assert_eq!(&slab[2].1[..], &regions[5][..]);
         std::fs::remove_file(&path)?;
         Ok(())
     }

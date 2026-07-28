@@ -26,6 +26,41 @@ pub mod warmcache;
 
 pub use cache::ExpertCache;
 pub use ring::{pread_many, probe_direct, read_file, Reactor, ReadReq};
-pub use slab::{align_down, align_up, AlignedBuf, SlabPool, ALIGN};
+pub use slab::{align_down, align_up, AlignedBuf, Bytes, SlabPool, ALIGN};
 pub use tier::{decay, lfru_score, pick_lfru, pick_swap, Swap};
 pub use warmcache::{ExpertSlab, WarmCache};
+
+/// Cap glibc's per-thread malloc arenas (`M_ARENA_MAX=2`) so the many worker
+/// threads streaming ~18.9 MB expert buffers don't inflate RSS through arena
+/// fragmentation — the reason the engine otherwise needs `MALLOC_ARENA_MAX=2` in
+/// the environment. Call **once at process start**, before spawning the I/O and
+/// compute worker pools. Returns whether the cap was applied; a no-op (`false`)
+/// when the user already set `MALLOC_ARENA_MAX`, set `COLI_NO_ARENA_CAP`, or off
+/// glibc. This is the pragmatic form of B2's goal; a reusable landing-buffer pool
+/// (bounding the allocations themselves) is blocked by expert bytes being consumed
+/// into `QtWeight`, and buys little on top of this arena cap.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn cap_malloc_arenas() -> bool {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() || std::env::var_os("COLI_NO_ARENA_CAP").is_some() {
+        return false; // respect an explicit user setting / opt-out
+    }
+    // SAFETY: `mallopt` is a thread-safe glibc tuning call; `M_ARENA_MAX` bounds the
+    // number of allocation arenas. Returns 1 on success.
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, 2) == 1 }
+}
+
+/// Non-glibc: no per-thread arenas to cap.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn cap_malloc_arenas() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod arena_tests {
+    #[test]
+    fn cap_malloc_arenas_runs() {
+        // Must link and run without panicking; the boolean result depends on the
+        // platform and environment (so it is not asserted).
+        let _ = super::cap_malloc_arenas();
+    }
+}

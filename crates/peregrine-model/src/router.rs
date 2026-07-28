@@ -103,6 +103,13 @@ pub fn batch_union(r: &Routed, s_n: usize) -> Vec<i32> {
     uniq
 }
 
+/// The experts routed at a single position `s` (its top-k selection), in selection
+/// order. For per-sequence prefetch prediction in batched decode, where position `s`
+/// maps to sequence `s`.
+pub fn routed_at(r: &Routed, s: usize) -> Vec<i32> {
+    (0..r.keff[s] as usize).map(|kk| r.idx[s * r.k + kk]).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
