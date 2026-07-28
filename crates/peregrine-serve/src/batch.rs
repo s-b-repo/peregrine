@@ -14,15 +14,34 @@
 //! the engine has no tokenizer dependency and one code path serves streaming and
 //! non-streaming requests.
 
+use std::collections::VecDeque;
 use std::thread::JoinHandle;
 
+use parking_lot::Mutex;
 use peregrine_core::Error;
-use peregrine_model::{Model, Sampler, SeqKv};
+use peregrine_model::{Model, RouteHistory, Sampler, SeqKv};
 use tokio::sync::mpsc;
 
 /// Batched decode steps between heat-ranked VRAM re-selections ([`Model::reheat`]).
 /// A no-op without a GPU tier, so it is harmless in CPU-only deployments.
 const REHEAT_EVERY: usize = 256;
+
+/// Prompt tokens prefilled per engine step for an admitting sequence. Bounding the
+/// chunk lets active sequences keep decoding while a new long prompt prefills, so a
+/// big admission doesn't stall the batch for its whole prefill.
+const PREFILL_CHUNK: usize = 64;
+
+/// A sequence being prefilled incrementally (chunked) before it joins `active`.
+/// Chunked prefill is bit-identical to a whole-prompt prefill — the KV is built up
+/// the same way, each token attending its causal prefix.
+struct Prefilling {
+    seq: SeqKv,
+    prompt: Vec<i32>,
+    pos: usize, // next prompt position to prefill
+    sampler: Sampler,
+    out: mpsc::Sender<EngineOut>,
+    max_new: usize,
+}
 
 /// A generation request handed to the engine. The engine prefills `prompt`, then
 /// emits sampled token ids on `out` until a stop id, `max_new` tokens, or the
@@ -75,6 +94,10 @@ pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle
 /// pos`, and `next_tok` is an already-emitted token to be fed at `pos` next.
 struct SeqState {
     seq: SeqKv,
+    /// This stream's own routing history — the per-sequence prefetch predictor, so
+    /// each concurrent stream prefetches from its own routing (not the cross-sequence
+    /// union). Wrapped in a `Mutex` because the batched forward records into it.
+    hist: Mutex<RouteHistory>,
     pos: usize,
     next_tok: i32,
     sampler: Sampler,
@@ -90,34 +113,51 @@ fn run(mut model: Model, mut rx: mpsc::UnboundedReceiver<EngineRequest>, max_bat
     let vocab = model.cfg.vocab as usize;
     let stop_ids = model.cfg.stop_ids.clone();
     let mut active: Vec<SeqState> = Vec::new();
+    let mut pending: VecDeque<Prefilling> = VecDeque::new();
     let mut steps = 0usize;
 
     loop {
-        // Idle: block for the next request (or exit when every handle is dropped).
-        if active.is_empty() {
+        // Drain queued requests into the prefill queue, capped so total in-flight
+        // (prefilling + decoding) stays within `max_batch`.
+        while active.len() + pending.len() < max_batch {
+            match rx.try_recv() {
+                Ok(req) => admit_pending(&model, &mut pending, req),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break, // drain, then exit
+            }
+        }
+        // Nothing in flight → block for the next request (or exit when all dropped).
+        if active.is_empty() && pending.is_empty() {
             match rx.blocking_recv() {
-                Some(req) => admit(&model, &mut active, req, vocab, &stop_ids),
+                Some(req) => {
+                    admit_pending(&model, &mut pending, req);
+                    continue;
+                }
                 None => break, // all senders dropped and nothing in flight → shutdown
             }
         }
-        // Fill the batch with any already-queued requests (non-blocking).
-        while active.len() < max_batch {
-            match rx.try_recv() {
-                Ok(req) => admit(&model, &mut active, req, vocab, &stop_ids),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break, // drain active, then exit
-            }
-        }
+
+        // Advance one prefill chunk (a finished prefill joins `active`), interleaved
+        // with decode so a long admission never stalls the batch for its whole prefill.
+        prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids);
         if active.is_empty() {
-            continue; // admission may have retired everything (immediate stop / one-token request)
+            continue; // only prefilling so far (or everything retired) — no decode yet
         }
 
         // One batched decode step: feed each active sequence's pending token.
         let tokens: Vec<i32> = active.iter().map(|s| s.next_tok).collect();
         let pos_of: Vec<usize> = active.iter().map(|s| s.pos).collect();
         let logits = {
-            let mut refs: Vec<&mut SeqKv> = active.iter_mut().map(|s| &mut s.seq).collect();
-            match model.forward_step_batched(&tokens, &mut refs, &pos_of) {
+            // Split each SeqState into (KV, history) disjoint borrows so the batched
+            // forward records each sequence's *own* routed set into its own history.
+            let (mut refs, hists): (Vec<&mut SeqKv>, Vec<&Mutex<RouteHistory>>) = active
+                .iter_mut()
+                .map(|s| {
+                    let SeqState { seq, hist, .. } = s;
+                    (seq, &*hist)
+                })
+                .unzip();
+            match model.forward_step_batched(&tokens, &mut refs, &pos_of, Some(&hists)) {
                 Ok(l) => l,
                 Err(e) => {
                     for s in &active {
@@ -128,6 +168,11 @@ fn run(mut model: Model, mut rx: mpsc::UnboundedReceiver<EngineRequest>, max_bat
                 }
             }
         };
+        // Per-sequence, parallel-async prefetch: warm each stream's predicted next
+        // experts onto its assigned lane (round-robin) while sampling proceeds.
+        for (i, s) in active.iter().enumerate() {
+            model.enqueue_seq_prefetch(&s.hist, i);
+        }
 
         // Sample the next token per sequence, emit it, and decide who continues.
         let mut keep: Vec<bool> = Vec::with_capacity(active.len());
@@ -162,40 +207,65 @@ fn run(mut model: Model, mut rx: mpsc::UnboundedReceiver<EngineRequest>, max_bat
     }
 }
 
-/// Prefill one request's prompt into a fresh per-sequence KV, emit its first
-/// sampled token, and (unless it already finished) push it onto `active`.
-fn admit(model: &Model, active: &mut Vec<SeqState>, req: EngineRequest, vocab: usize, stop_ids: &[i32]) {
+/// Queue a request for chunked prefill. Validates it (empty prompt / zero budget is
+/// a clean no-op); the forward happens in [`prefill_step`], interleaved with decode.
+fn admit_pending(model: &Model, pending: &mut VecDeque<Prefilling>, req: EngineRequest) {
     if req.prompt.is_empty() || req.max_new == 0 {
         return; // nothing to generate; dropping req.out closes the stream cleanly
     }
-    let mut seq = SeqKv::new(&model.cfg);
-    let logits = match model.forward_prefill_seq(&req.prompt, &mut seq, 0) {
+    pending.push_back(Prefilling {
+        seq: SeqKv::new(&model.cfg),
+        prompt: req.prompt,
+        pos: 0,
+        sampler: req.sampler,
+        out: req.out,
+        max_new: req.max_new,
+    });
+}
+
+/// Advance the front prefilling sequence by up to `PREFILL_CHUNK` tokens. When its
+/// prompt is fully prefilled, sample the first token and move it to `active` (or
+/// retire it). Round-robins the queue so no one prefill monopolizes the engine.
+fn prefill_step(model: &Model, pending: &mut VecDeque<Prefilling>, active: &mut Vec<SeqState>, vocab: usize, stop_ids: &[i32]) {
+    let Some(mut p) = pending.pop_front() else {
+        return;
+    };
+    let end = (p.pos + PREFILL_CHUNK).min(p.prompt.len());
+    // clone the chunk so `p.prompt` isn't borrowed while `p.seq` is borrowed mut
+    let chunk = p.prompt[p.pos..end].to_vec();
+    let logits = match model.forward_prefill_seq(&chunk, &mut p.seq, p.pos) {
         Ok(l) => l,
         Err(e) => {
-            let _ = req.out.blocking_send(EngineOut::Error(e.to_string()));
-            return;
+            let _ = p.out.blocking_send(EngineOut::Error(e.to_string()));
+            return; // drop this sequence
         }
     };
-    let mut sampler = req.sampler;
-    let last = (req.prompt.len() - 1) * vocab;
-    let t0 = sampler.pick(&logits[last..last + vocab], -1) as i32;
+    p.pos = end;
+    if p.pos < p.prompt.len() {
+        pending.push_back(p); // more chunks to go — round-robin with the others
+        return;
+    }
+    // Prefill complete: sample the first token from the last prompt position.
+    let last = (chunk.len() - 1) * vocab;
+    let t0 = p.sampler.pick(&logits[last..last + vocab], -1) as i32;
     if stop_ids.contains(&t0) {
         return; // first token is a stop → emit nothing
     }
-    if req.out.blocking_send(EngineOut::Token(t0 as u32)).is_err() {
+    if p.out.blocking_send(EngineOut::Token(t0 as u32)).is_err() {
         return; // client already gone
     }
-    if req.max_new <= 1 {
+    if p.max_new <= 1 {
         return; // only one token requested
     }
     active.push(SeqState {
-        seq,
-        pos: req.prompt.len(),
+        seq: p.seq,
+        hist: Mutex::new(model.new_route_history()),
+        pos: p.prompt.len(),
         next_tok: t0,
-        sampler,
-        out: req.out,
+        sampler: p.sampler,
+        out: p.out,
         produced: 1,
-        max_new: req.max_new,
+        max_new: p.max_new,
     });
 }
 
@@ -234,7 +304,7 @@ mod tests {
                 break;
             }
             let mut one: [&mut SeqKv; 1] = [&mut seq];
-            let lg = model.forward_step_batched(&[tok], &mut one, &[pos])?;
+            let lg = model.forward_step_batched(&[tok], &mut one, &[pos], None)?;
             pos += 1;
             tok = argmax(&lg[..vocab]) as i32;
         }
@@ -285,6 +355,36 @@ mod tests {
         for (i, o) in outs.iter().enumerate() {
             assert_eq!(o, &want, "batched request {i} must match the reference decode");
         }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn engine_chunked_prefill_matches_reference() -> Result<(), Error> {
+        // A prompt longer than PREFILL_CHUNK is prefilled in chunks interleaved with
+        // decode; the output must still equal the whole-prompt reference decode
+        // (chunked prefill is bit-identical — the KV is built the same way).
+        let dir = tiny_dir("chunked")?;
+        let prompt: Vec<i32> = (0..80).map(|k| (k * 3 + 1) % 32).collect(); // 80 > PREFILL_CHUNK (64)
+        let n = 6usize;
+        let want = {
+            let m = Model::load(&dir)?;
+            ref_decode(&m, &prompt, n)?
+        };
+
+        let (handle, join) = spawn(Model::load(&dir)?, 8)?;
+        let (tx, mut rx) = mpsc::channel::<EngineOut>(64);
+        handle.submit(EngineRequest { prompt: prompt.clone(), max_new: n, sampler: Sampler::new(0.0, 0.9, 1), out: tx })?;
+        let mut got = Vec::new();
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                EngineOut::Token(t) => got.push(t),
+                EngineOut::Error(e) => return Err(Error::Format(e)),
+            }
+        }
+        drop(handle);
+        let _ = join.join();
+        assert_eq!(got, want, "chunked-prefill engine output must match whole-prefill reference");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

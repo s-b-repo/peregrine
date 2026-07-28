@@ -13,10 +13,11 @@ use peregrine_core::{Cfg, Context, Error, SafeTensors};
 use peregrine_io::{Reactor, WarmCache};
 
 use crate::attention::{mla_attention, mla_attention_batched, AttnWeights, LayerKv};
-use crate::concurrent::{default_workers, moe_forward_concurrent, ForwardCtx, EXPERTS_PER_BATCH};
+use crate::concurrent::{default_workers, experts_per_batch, moe_forward_concurrent, ForwardCtx};
 use crate::gpu::{GpuTier, HeatTable};
 use crate::math::rmsnorm;
 use crate::mlp::{moe_forward, Mlp};
+use crate::predict::{Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 use crate::sample::Sampler;
 use crate::weight::QtWeight;
 
@@ -95,12 +96,21 @@ pub struct Model {
     /// with a non-zero budget; persists across `reset` (a warm tier is
     /// per-process, not per-sequence).
     ecache: Option<Arc<Mutex<WarmCache>>>,
-    /// Per-layer routed-expert history from the last main forward — the prefetch
-    /// predictor ("next token routes like this one"). `Some` alongside `prefetch`.
-    route_hist: Option<Mutex<Vec<Vec<i32>>>>,
+    /// Per-layer routed-expert history (K-deep) from recent main forwards — the
+    /// prefetch predictor's substrate. `Some` alongside `prefetch`.
+    route_hist: Option<Mutex<RouteHistory>>,
+    /// Strategy that turns [`Self::route_hist`] into a ranked list of experts to
+    /// prefetch for the next forward. Defaults to recency-weighted momentum.
+    predictor: PredictSource,
+    /// Multi-path tiering: how many ranked candidates per layer to fully stream vs.
+    /// merely page-cache-hint.
+    prefetch_policy: PrefetchPolicy,
+    /// Optional adaptive controller: when present, it overrides the warm-tier breadth
+    /// each forward from observed prefetch used/wasted rates. `None` = static policy.
+    prefetch_tuner: Option<PrefetchTuner>,
     /// Background prefetch lane: warms the next token's predicted experts into
     /// `ecache` on its own ring, off the critical path. `Some` alongside `ecache`.
-    prefetch: Option<PrefetchHandle>,
+    prefetch: Option<PrefetchPool>,
     /// Optional GPU VRAM expert tier (the 3rd lane). Built only when `COLI_GPU`
     /// is set and the `cuda` backend is available; `None` otherwise.
     gpu: Option<GpuTier>,
@@ -179,7 +189,7 @@ fn ecache_budget_bytes() -> usize {
 /// streaming path needs, so batched prefill/decode can't OOM.
 fn stream_transient_reserve(io_rings: usize, workers: usize, per_expert_bytes: usize) -> usize {
     io_rings
-        .saturating_mul(EXPERTS_PER_BATCH)
+        .saturating_mul(experts_per_batch())
         .saturating_add(workers)
         .saturating_mul(per_expert_bytes)
 }
@@ -230,6 +240,9 @@ fn max_expert_region_bytes(st: &SafeTensors) -> usize {
 enum PrefetchMsg {
     /// Warm these experts into the shared cache (skipping ones already resident).
     Warm(Vec<crate::concurrent::PrefetchItem>),
+    /// Page-cache-hint these low-confidence experts via `fadvise(WILLNEED)` — no
+    /// streaming, no cache insert (multi-path tier 2).
+    Hint(Vec<crate::concurrent::HintItem>),
     /// Barrier: reply once every earlier message has been processed (tests).
     Sync(crossbeam_channel::Sender<()>),
     /// Drain and exit.
@@ -242,10 +255,248 @@ struct PrefetchHandle {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
+/// A pool of background prefetch lanes, each with its own io_uring ring, so per-stream
+/// prefetch proceeds in parallel. Lane 0 serves the single-stream path; batched serving
+/// spreads sequences across lanes by `seq_id % lanes` for parallel-async prefetch.
+struct PrefetchPool {
+    lanes: Vec<PrefetchHandle>,
+}
+
+impl PrefetchPool {
+    /// The lane assigned to work item `i` (round-robin). Never empty.
+    fn lane(&self, i: usize) -> &PrefetchHandle {
+        &self.lanes[i % self.lanes.len()]
+    }
+
+    /// Block until every lane has drained its queue (FIFO barrier across the pool).
+    fn barrier(&self) {
+        for l in &self.lanes {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            if l.tx.send(PrefetchMsg::Sync(tx)).is_ok() {
+                let _ = rx.recv();
+            }
+        }
+    }
+
+    /// Drain and join every lane (called on `Model` drop).
+    fn stop(&mut self) {
+        for l in &mut self.lanes {
+            let _ = l.tx.send(PrefetchMsg::Stop);
+            if let Some(j) = l.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+}
+
+/// Number of parallel prefetch lanes. `COLI_PREFETCH_LANES` (default 1, floored at 1).
+fn prefetch_lanes() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| env_usize("COLI_PREFETCH_LANES", 1).max(1))
+}
+
+/// Spawn `lanes` prefetch workers sharing `cache`, each on its own ring. Read
+/// `COLI_PREFETCH_VERIFY` fresh here (not a process-global) so it can be toggled at
+/// load time: when set, each worker re-reads and byte-compares its speculative loads.
+fn spawn_prefetch_pool(cache: &Arc<Mutex<WarmCache>>, st: &SafeTensors, direct: bool, lanes: usize) -> Result<PrefetchPool, Error> {
+    let lanes = lanes.max(1);
+    let verify = matches!(std::env::var("COLI_PREFETCH_VERIFY").as_deref(), Ok("1") | Ok("true"));
+    let mut handles = Vec::with_capacity(lanes);
+    for i in 0..lanes {
+        let mut reactor = Reactor::new(64).ctx(|| "prefetch io_uring reactor init".to_string())?;
+        if direct {
+            reactor.configure_slab(max_expert_region_bytes(st), 2);
+        }
+        let cache = Arc::clone(cache);
+        let (tx, rx) = crossbeam_channel::unbounded::<PrefetchMsg>();
+        let join = std::thread::Builder::new()
+            .name(format!("peregrine-prefetch-{i}"))
+            .spawn(move || prefetch_worker(reactor, cache, rx, direct, verify))
+            .map_err(|e| Error::Format(format!("spawn prefetch thread: {e}")))?;
+        handles.push(PrefetchHandle { tx, join: Some(join) });
+    }
+    Ok(PrefetchPool { lanes: handles })
+}
+
+/// Depth of the per-layer routing history (how many recent routed sets the momentum
+/// predictor votes over). Tunable via `COLI_ROUTE_HIST_DEPTH` (default 4, floored at
+/// 1); read once. Tests construct [`RouteHistory`] directly with an explicit depth,
+/// so they never depend on this process-global.
+fn route_hist_depth() -> usize {
+    use std::sync::OnceLock;
+    static DEPTH: OnceLock<usize> = OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("COLI_ROUTE_HIST_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&d| d >= 1)
+            .unwrap_or(4)
+    })
+}
+
+/// Whether the prefetch lane emits per-layer *during* the forward (look-ahead) so a
+/// layer's read overlaps later layers' compute, vs. one bulk enqueue at the end of
+/// the forward. On by default; disable with `COLI_PREFETCH_LOOKAHEAD=0`.
+fn prefetch_lookahead() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_PREFETCH_LOOKAHEAD").as_deref(), Ok("0") | Ok("false")))
+}
+
+/// Multi-path tiering: per layer, the top `warm_paths` ranked candidates are fully
+/// streamed and the next `hint_paths` get a page-cache `fadvise` hint. The default
+/// (`warm_paths = MAX`, `hint_paths = 0`) reproduces "warm everything predicted".
+/// Env overrides: `COLI_PREFETCH_WARM_PATHS`, `COLI_PREFETCH_HINT_PATHS`.
+#[derive(Clone, Copy)]
+struct PrefetchPolicy {
+    warm_paths: usize,
+    hint_paths: usize,
+}
+
+impl PrefetchPolicy {
+    fn from_env() -> PrefetchPolicy {
+        PrefetchPolicy {
+            warm_paths: env_usize("COLI_PREFETCH_WARM_PATHS", usize::MAX),
+            hint_paths: env_usize("COLI_PREFETCH_HINT_PATHS", 0),
+        }
+    }
+}
+
+/// Parse a `usize` env knob, falling back to `default` when unset or unparseable.
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default)
+}
+
+/// Build the adaptive prefetch-distance controller when `COLI_PREFETCH_TUNE=1`.
+/// Initial/max distance from `COLI_PREFETCH_DIST` (default 4) / `COLI_PREFETCH_DIST_MAX`
+/// (default 16). `None` (the default) leaves the static [`PrefetchPolicy`] in charge.
+fn prefetch_tuner_init() -> Option<PrefetchTuner> {
+    if !matches!(std::env::var("COLI_PREFETCH_TUNE").as_deref(), Ok("1") | Ok("true")) {
+        return None;
+    }
+    Some(PrefetchTuner::new(env_usize("COLI_PREFETCH_DIST", 4), env_usize("COLI_PREFETCH_DIST_MAX", 16)))
+}
+
+/// Whether predictive eviction is active: after each forward, resident experts the
+/// predictor expects to be reused are protected from eviction. On by default (it only
+/// reorders eviction victims, never output); disable with `COLI_PREFETCH_PROTECT=0`.
+fn prefetch_protect() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_PREFETCH_PROTECT").as_deref(), Ok("0") | Ok("false")))
+}
+
+/// Pack an eviction-protection score: predictor likelihood in the high bits, routing
+/// heat as a low-bits tiebreak, `+1` so any predicted expert outranks an unprotected
+/// slot (priority 0). Saturating — never wraps back to 0.
+fn pack_prio(score: u32, heat: u32) -> u32 {
+    ((score.min(0xFFFF) << 16) | heat.min(0xFFFF)).saturating_add(1)
+}
+
+/// A coarse fingerprint of the model's shape, stamped into a built automaton so an
+/// artifact from a different checkpoint is ignored on load.
+fn config_tag(cfg: &Cfg) -> String {
+    format!(
+        "L{}E{}H{}I{}D{}V{}",
+        cfg.n_layers, cfg.n_experts, cfg.hidden, cfg.moe_inter, cfg.first_dense, cfg.vocab
+    )
+}
+
+/// Write a built automaton to `path` as JSON — the `automaton.json` artifact a model
+/// auto-loads from its checkpoint directory.
+pub fn save_automaton(table: &TransitionTable, path: &std::path::Path) -> Result<(), Error> {
+    let json = serde_json::to_vec(&table.to_json()).map_err(|e| Error::Format(format!("serialize automaton: {e}")))?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+/// The borrowed state the prefetch emitter needs, bundled so [`PrefetchCtx::emit_layer`]
+/// takes a single receiver (and so `forward_hidden` can build one from its destructured
+/// field borrows to emit mid-forward). Holds shared borrows only.
+struct PrefetchCtx<'a> {
+    prefetch: &'a PrefetchHandle,
+    predictor: &'a PredictSource,
+    hist: &'a Mutex<RouteHistory>,
+    cache: &'a Mutex<WarmCache>,
+    gpu: Option<&'a GpuTier>,
+    st: &'a SafeTensors,
+    cfg: &'a Cfg,
+    /// Multi-path tiering: the top `warm_paths` ranked candidates per layer are fully
+    /// streamed (tier 1); the next `hint_paths` get a page-cache `fadvise` hint (tier 2).
+    warm_paths: usize,
+    hint_paths: usize,
+    /// Under O_DIRECT the page cache is bypassed, so tier-2 hints are pointless and
+    /// suppressed.
+    direct: bool,
+}
+
+impl PrefetchCtx<'_> {
+    /// Emit prefetch work for one layer's predicted next-token experts. The predictor
+    /// ranks candidates; among the not-already-warm, non-GPU ones, the top
+    /// `warm_paths` are fully streamed (tier 1) and the next `hint_paths` get a cheap
+    /// page-cache `fadvise` hint (tier 2, suppressed under O_DIRECT) — this is the
+    /// multi-path bandwidth allocation. Locks history then cache in turn (never
+    /// nested), so it can't invert lock order against the I/O lane. A dense layer, or
+    /// one with no fresh candidates, is a no-op.
+    fn emit_layer(&self, layer: usize) {
+        if layer < self.cfg.first_dense as usize {
+            return; // dense layer — no routed experts
+        }
+        let candidates = {
+            let hist = self.hist.lock();
+            self.predictor.predict_layer(layer, &hist)
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let hint_cutoff = self.warm_paths.saturating_add(self.hint_paths);
+        let mut warms = Vec::new();
+        let mut hints = Vec::new();
+        {
+            let cache = self.cache.lock();
+            let mut rank = 0usize; // rank among fresh (not-warm, non-GPU) candidates
+            for (e, _score) in candidates {
+                let key = (layer as u32, e);
+                if cache.contains(key) {
+                    continue; // already warm
+                }
+                if self.gpu.is_some_and(|g| g.has(layer, e as usize)) {
+                    continue; // computed on the GPU lane, never streamed
+                }
+                if rank < self.warm_paths {
+                    if let Ok(item) = crate::concurrent::prefetch_item(self.st, self.cfg, layer, e as usize) {
+                        warms.push(item);
+                    }
+                } else if rank < hint_cutoff && !self.direct {
+                    if let Ok(item) = crate::concurrent::prefetch_hint_item(self.st, self.cfg, layer, e as usize) {
+                        hints.push(item);
+                    }
+                } else {
+                    break; // beyond both tiers — lower-ranked candidates ignored
+                }
+                rank += 1;
+            }
+        }
+        if !warms.is_empty() {
+            let _ = self.prefetch.tx.send(PrefetchMsg::Warm(warms));
+        }
+        if !hints.is_empty() {
+            let _ = self.prefetch.tx.send(PrefetchMsg::Hint(hints));
+        }
+    }
+}
+
 /// The prefetch lane: stream predicted experts into the shared warm cache on this
 /// lane's *own* ring (no contention with the critical I/O lane). Best-effort — a
 /// failed speculative read is dropped (the real forward will stream it normally).
-fn prefetch_worker(mut reactor: Reactor, cache: Arc<Mutex<WarmCache>>, rx: crossbeam_channel::Receiver<PrefetchMsg>, direct: bool) {
+fn prefetch_worker(
+    mut reactor: Reactor,
+    cache: Arc<Mutex<WarmCache>>,
+    rx: crossbeam_channel::Receiver<PrefetchMsg>,
+    direct: bool,
+    verify: bool,
+) {
     while let Ok(msg) = rx.recv() {
         match msg {
             PrefetchMsg::Warm(items) => {
@@ -255,10 +506,29 @@ fn prefetch_worker(mut reactor: Reactor, cache: Arc<Mutex<WarmCache>>, rx: cross
                         continue; // already warm — don't re-read
                     }
                     if let Ok(slab) = crate::concurrent::prefetch_read(&mut reactor, &item, direct) {
+                        if verify {
+                            // re-read and byte-compare — a mismatch means a real I/O bug,
+                            // recorded as a counter (never a panic — lint-forbidden).
+                            if let Ok(check) = crate::concurrent::prefetch_read(&mut reactor, &item, direct) {
+                                if check != slab {
+                                    cache.lock().note_verify_mismatch();
+                                }
+                            }
+                        }
                         let mut c = cache.lock();
-                        c.note_prefetch_read();
-                        c.insert(key, slab);
+                        c.note_prefetch_read(key.0);
+                        c.insert_prefetched(key, slab);
                     }
+                }
+            }
+            PrefetchMsg::Hint(items) => {
+                for item in items {
+                    for &(fd, off, len) in item.regions() {
+                        // advisory only — moves no bytes, can't affect output; a soft
+                        // failure (unsupported fs) is simply ignored.
+                        let _ = reactor.fadvise_willneed(fd, off, len);
+                    }
+                    cache.lock().note_fadvise();
                 }
             }
             PrefetchMsg::Sync(reply) => {
@@ -344,13 +614,21 @@ fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Re
     })
 }
 
-/// Row-wise RMSNorm of `x[s_n, d]` with weight `w`, into a fresh buffer.
+/// Row-wise RMSNorm of `x[s_n, d]` with weight `w`, into a fresh buffer. Rows are
+/// independent, so they run on the persistent compute pool above `PAR_ROWS_MIN`
+/// (serial below it); the per-row math is untouched, so the result is bit-identical
+/// to the serial loop (guarded by `rmsnorm_rows_parallel_matches_serial`). This is
+/// the highest-frequency hotspot — 2× per layer + the final norm.
 fn rmsnorm_rows(x: &[f32], w: &[f32], s_n: usize, d: usize, eps: f32) -> Vec<f32> {
     let mut out = vec![0f32; s_n * d];
-    for s in 0..s_n {
+    // Only parallelize when the row is wide enough that per-row work covers the pool
+    // dispatch; narrow rows (the tiny test model, d=16) stay serial. Real GLM-5.2
+    // (d=6144) clears this comfortably.
+    let gate = if d >= 256 { peregrine_par::PAR_ROWS_MIN } else { usize::MAX };
+    peregrine_par::par_rows_mut(&mut out, d, s_n, gate, |s, row| {
         let src = x[s * d..s * d + d].to_vec();
-        rmsnorm(&mut out[s * d..s * d + d], &src, w, eps);
-    }
+        rmsnorm(row, &src, w, eps);
+    });
     out
 }
 
@@ -599,22 +877,10 @@ impl Model {
         // experts into the shared cache via its own ring. Spawned only when the
         // cache exists (streaming mode). `route_hist` is the predictor's state.
         let (route_hist, prefetch) = match &ecache {
-            Some(cache) => {
-                let mut reactor = Reactor::new(64).ctx(|| "prefetch io_uring reactor init".to_string())?;
-                if direct {
-                    reactor.configure_slab(max_expert_region_bytes(&st), 2);
-                }
-                let cache = Arc::clone(cache);
-                let (tx, rx) = crossbeam_channel::unbounded::<PrefetchMsg>();
-                let join = std::thread::Builder::new()
-                    .name("peregrine-prefetch".to_string())
-                    .spawn(move || prefetch_worker(reactor, cache, rx, direct))
-                    .map_err(|e| Error::Format(format!("spawn prefetch thread: {e}")))?;
-                (
-                    Some(Mutex::new(vec![Vec::new(); cfg.n_layers as usize])),
-                    Some(PrefetchHandle { tx, join: Some(join) }),
-                )
-            }
+            Some(cache) => (
+                Some(Mutex::new(RouteHistory::new(cfg.n_layers as usize, route_hist_depth()))),
+                Some(spawn_prefetch_pool(cache, &st, direct, prefetch_lanes())?),
+            ),
             None => (None, None),
         };
         // Optional GPU VRAM tier (opt-in via COLI_GPU): dequantize as many experts
@@ -647,7 +913,7 @@ impl Model {
             None
         };
 
-        Ok(Model {
+        let mut model = Model {
             cfg,
             embed,
             layers,
@@ -661,11 +927,18 @@ impl Model {
             workers,
             ecache,
             route_hist,
+            predictor: PredictSource::default(),
+            prefetch_policy: PrefetchPolicy::from_env(),
+            prefetch_tuner: prefetch_tuner_init(),
             prefetch,
             gpu,
             mtp,
             heat,
-        })
+        };
+        // Upgrade the predictor to the offline transition automaton if a matching
+        // `automaton.json` sits next to the checkpoint (else stay on momentum).
+        model.try_attach_automaton(dir);
+        Ok(model)
     }
 
     /// Clear the KV cache to start a fresh sequence. Also clears the prefetch
@@ -677,45 +950,75 @@ impl Model {
             *k = LayerKv::new(kvl, qkr);
         }
         if let Some(h) = &self.route_hist {
-            for v in h.lock().iter_mut() {
-                v.clear();
+            h.lock().clear();
+        }
+        // A new sequence starts from pure LRU until its predictor re-protects experts.
+        if let Some(c) = &self.ecache {
+            c.lock().clear_priorities();
+        }
+    }
+
+    /// Borrow `self`'s prefetch lane, predictor, history, cache and tensor handles as
+    /// a [`PrefetchCtx`]. `None` unless both the prefetch lane and warm cache exist.
+    fn prefetch_ctx(&self) -> Option<PrefetchCtx<'_>> {
+        match (&self.prefetch, &self.route_hist, &self.ecache) {
+            (Some(pool), Some(hist), Some(cache)) => Some(PrefetchCtx {
+                prefetch: pool.lane(0),
+                predictor: &self.predictor,
+                hist,
+                cache,
+                gpu: self.gpu.as_ref(),
+                st: &self.st,
+                cfg: &self.cfg,
+                warm_paths: self.prefetch_policy.warm_paths,
+                hint_paths: self.prefetch_policy.hint_paths,
+                direct: self.direct,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Predictive eviction: protect the experts the predictor expects to be reused
+    /// next. For each sparse layer, set a priority on the *resident* predicted experts
+    /// (higher predictor score → higher priority, routing heat breaking ties). Experts
+    /// not predicted keep priority 0 and are evicted first. Correctness-neutral —
+    /// priority only reorders eviction victims, never what `get`/`insert` return. A
+    /// no-op without both history and cache.
+    fn update_cache_protection(&self) {
+        if let Some(hist) = &self.route_hist {
+            self.protect_from(hist);
+        }
+    }
+
+    /// Protect the experts predicted from `hist` (a single stream's routing) in the
+    /// shared cache. Shared by the single-stream path and per-sequence batched prefetch.
+    fn protect_from(&self, hist: &Mutex<RouteHistory>) {
+        let Some(cache) = &self.ecache else {
+            return;
+        };
+        let heat = self.heat.as_ref().map(|h| h.snapshot());
+        let n_experts = self.cfg.n_experts as usize;
+        let first_dense = self.cfg.first_dense as usize;
+        let n_layers = self.cfg.n_layers as usize;
+        let hist = hist.lock();
+        let mut cache = cache.lock();
+        for layer in first_dense..n_layers {
+            for (e, score) in self.predictor.predict_layer(layer, &hist) {
+                let h = heat.as_ref().and_then(|c| c.get(layer * n_experts + e as usize).copied()).unwrap_or(0);
+                cache.set_priority((layer as u32, e), pack_prio(score, h));
             }
         }
     }
 
-    /// Enqueue a speculative prefetch of the next token's likely experts: predict
-    /// each sparse layer's experts as the ones this forward just routed, and warm
-    /// the not-yet-resident, non-GPU ones into the cache on the background lane.
-    /// A no-op without a prefetch lane, or on the first forward (empty history).
+    /// Whole-forward next-token prefetch: emit every sparse layer's prediction in one
+    /// pass at the end of the forward. Used by tests, and as the fallback when layer
+    /// look-ahead is disabled (`COLI_PREFETCH_LOOKAHEAD=0`).
     fn enqueue_prefetch(&self) {
-        let (Some(prefetch), Some(hist), Some(cache)) = (&self.prefetch, &self.route_hist, &self.ecache) else {
+        let Some(ctx) = self.prefetch_ctx() else {
             return;
         };
-        let first_dense = self.cfg.first_dense as usize;
-        let mut items = Vec::new();
-        {
-            let hist = hist.lock();
-            let cache = cache.lock();
-            for (layer, experts) in hist.iter().enumerate() {
-                if layer < first_dense {
-                    continue; // dense layer — no routed experts
-                }
-                for &e in experts {
-                    let key = (layer as u32, e as u32);
-                    if cache.contains(key) {
-                        continue; // already warm
-                    }
-                    if self.gpu.as_ref().is_some_and(|g| g.has(layer, e as usize)) {
-                        continue; // computed on the GPU lane, never streamed
-                    }
-                    if let Ok(item) = crate::concurrent::prefetch_item(&self.st, &self.cfg, layer, e as usize) {
-                        items.push(item);
-                    }
-                }
-            }
-        }
-        if !items.is_empty() {
-            let _ = prefetch.tx.send(PrefetchMsg::Warm(items));
+        for layer in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
+            ctx.emit_layer(layer);
         }
     }
 
@@ -753,6 +1056,48 @@ impl Model {
         self.ecache.as_ref().map(|c| c.lock().prefetch_reads)
     }
 
+    /// Prefetch-lane reads the warm tier has attributed to `layer` (lets the
+    /// look-ahead test confirm early layers were warmed mid-forward).
+    pub fn ecache_prefetch_reads_for_layer(&self, layer: usize) -> Option<u64> {
+        self.ecache.as_ref().map(|c| c.lock().prefetch_reads_for_layer(layer as u32))
+    }
+
+    /// Low-confidence experts the prefetch lane hinted to the page cache via
+    /// `fadvise` (multi-path tier 2).
+    pub fn ecache_fadvise_hints(&self) -> Option<u64> {
+        self.ecache.as_ref().map(|c| c.lock().fadvise_hints)
+    }
+
+    /// Speculative reads whose opt-in verification re-read differed (always 0 in a
+    /// correct system; nonzero signals an I/O bug).
+    pub fn ecache_verify_mismatch(&self) -> Option<u64> {
+        self.ecache.as_ref().map(|c| c.lock().verify_mismatch)
+    }
+
+    /// Prefetch accuracy = `used / (used + wasted)` — the share of speculative reads
+    /// that paid off. `None` without a cache; `0.0` before any prefetch settled.
+    pub fn prefetch_accuracy(&self) -> Option<f64> {
+        self.ecache.as_ref().map(|c| {
+            let c = c.lock();
+            let total = c.prefetch_used + c.prefetch_wasted;
+            if total == 0 {
+                0.0
+            } else {
+                c.prefetch_used as f64 / total as f64
+            }
+        })
+    }
+
+    /// Prefetch effectiveness: `(used, wasted)` — slabs warmed by the prefetch lane
+    /// that were later hit vs. evicted before any use. The signal the distance tuner
+    /// (`PrefetchTuner`) and shutdown accuracy log read.
+    pub fn ecache_prefetch_effectiveness(&self) -> Option<(u64, u64)> {
+        self.ecache.as_ref().map(|c| {
+            let c = c.lock();
+            (c.prefetch_used, c.prefetch_wasted)
+        })
+    }
+
     /// Drop all warm-tier entries and zero its counters (forces a cold cache;
     /// used by the prefetch test to isolate the prefetch lane's contribution).
     pub fn ecache_clear(&self) {
@@ -766,10 +1111,7 @@ impl Model {
     /// without racing the background thread. A no-op without a prefetch lane.
     pub fn prefetch_barrier(&self) {
         if let Some(p) = &self.prefetch {
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            if p.tx.send(PrefetchMsg::Sync(tx)).is_ok() {
-                let _ = rx.recv();
-            }
+            p.barrier();
         }
     }
 
@@ -777,6 +1119,172 @@ impl Model {
     /// Exposed for tests that warm a deliberately-cleared cache from history.
     pub fn prefetch_from_history(&self) {
         self.enqueue_prefetch();
+    }
+
+    /// Trigger the per-layer look-ahead prefetch for a single `layer` (the mid-forward
+    /// path in isolation). Exposed for tests that observe one layer's warming.
+    pub fn prefetch_layer_from_history(&self, layer: usize) {
+        if let Some(ctx) = self.prefetch_ctx() {
+            ctx.emit_layer(layer);
+        }
+    }
+
+    /// Enqueue per-sequence prefetch for the batched serving engine: warm the experts
+    /// predicted from one sequence's own routing history onto prefetch lane `lane`
+    /// (round-robin across the pool → parallel-async streaming), and protect them from
+    /// eviction. Correctness-neutral. No-op without a prefetch pool + cache.
+    pub fn enqueue_seq_prefetch(&self, hist: &Mutex<RouteHistory>, lane: usize) {
+        let (Some(pool), Some(cache)) = (&self.prefetch, &self.ecache) else {
+            return;
+        };
+        let ctx = PrefetchCtx {
+            prefetch: pool.lane(lane),
+            predictor: &self.predictor,
+            hist,
+            cache,
+            gpu: self.gpu.as_ref(),
+            st: &self.st,
+            cfg: &self.cfg,
+            warm_paths: self.prefetch_policy.warm_paths,
+            hint_paths: self.prefetch_policy.hint_paths,
+            direct: self.direct,
+        };
+        for layer in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
+            ctx.emit_layer(layer);
+        }
+        if prefetch_protect() {
+            self.protect_from(hist);
+        }
+    }
+
+    /// A fresh per-sequence routing history sized to this model (for the batched
+    /// engine to give each stream its own predictor state).
+    pub fn new_route_history(&self) -> RouteHistory {
+        RouteHistory::new(self.cfg.n_layers as usize, route_hist_depth())
+    }
+
+    /// Load a matching `automaton.json` next to the checkpoint and, if its tag matches
+    /// this model's config, switch the predictor to the transition automaton (with a
+    /// momentum fallback). A missing, malformed, or stale artifact is silently ignored
+    /// (the model stays on momentum). Correctness-neutral.
+    fn try_attach_automaton(&mut self, dir: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(dir.join("automaton.json")) else {
+            return;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        let Some(table) = TransitionTable::from_json(&v) else {
+            return;
+        };
+        if table.tag() == config_tag(&self.cfg) {
+            self.predictor = PredictSource::Automaton { table: Arc::new(table), fallback: Momentum::default() };
+        }
+    }
+
+    /// Build a transition automaton by running `corpus` through the model token by
+    /// token and accumulating each layer's consecutive routed-set transitions. Requires
+    /// streaming mode (the routing history the accumulation reads). Tagged with this
+    /// model's config fingerprint. Resets the KV cache first.
+    pub fn build_automaton(&mut self, corpus: &[i32]) -> Result<TransitionTable, Error> {
+        if self.route_hist.is_none() {
+            return Err(Error::Format("build_automaton requires streaming mode (COLI_STREAM=1)".into()));
+        }
+        let n_layers = self.cfg.n_layers as usize;
+        let first_dense = self.cfg.first_dense as usize;
+        let mut table = TransitionTable::new(n_layers, config_tag(&self.cfg));
+        self.reset();
+        let mut prev: Option<Vec<Vec<i32>>> = None;
+        for (i, &tok) in corpus.iter().enumerate() {
+            let _ = self.forward_step(&[tok], i)?;
+            let cur = self.route_snapshot(n_layers);
+            if let Some(p) = &prev {
+                for layer in first_dense..n_layers {
+                    table.observe(layer, &p[layer], &cur[layer]);
+                }
+            }
+            prev = Some(cur);
+        }
+        Ok(table)
+    }
+
+    /// Capture the raw per-forward routed sets for `corpus` (each entry is one forward's
+    /// per-layer routed experts) — the trace `build-automaton` aggregates. Streaming
+    /// mode only. Resets the KV cache first.
+    pub fn dump_routes(&mut self, corpus: &[i32]) -> Result<Vec<Vec<Vec<i32>>>, Error> {
+        if self.route_hist.is_none() {
+            return Err(Error::Format("dump_routes requires streaming mode (COLI_STREAM=1)".into()));
+        }
+        let n_layers = self.cfg.n_layers as usize;
+        let mut trace = Vec::with_capacity(corpus.len());
+        self.reset();
+        for (i, &tok) in corpus.iter().enumerate() {
+            let _ = self.forward_step(&[tok], i)?;
+            trace.push(self.route_snapshot(n_layers));
+        }
+        Ok(trace)
+    }
+
+    /// Run `dump_routes` and write the trace to `path` as JSON, returning the number
+    /// of forwards captured. Keeps trace serialization inside this crate.
+    pub fn dump_routes_to(&mut self, corpus: &[i32], path: &std::path::Path) -> Result<usize, Error> {
+        let trace = self.dump_routes(corpus)?;
+        let json = serde_json::to_vec(&trace).map_err(|e| Error::Format(format!("serialize trace: {e}")))?;
+        std::fs::write(path, json)?;
+        Ok(trace.len())
+    }
+
+    /// Snapshot the current per-layer routed sets from the routing history (newest
+    /// frame per layer). Empty vecs for layers with no history (dense / not yet routed).
+    fn route_snapshot(&self, n_layers: usize) -> Vec<Vec<i32>> {
+        match &self.route_hist {
+            Some(h) => {
+                let h = h.lock();
+                (0..n_layers).map(|l| h.latest(l).cloned().unwrap_or_default()).collect()
+            }
+            None => vec![Vec::new(); n_layers],
+        }
+    }
+
+    /// Replace the prefetch predictor (tests / advanced callers).
+    pub fn set_predictor(&mut self, predictor: PredictSource) {
+        self.predictor = predictor;
+    }
+
+    /// Whether the prefetch predictor is the transition automaton (introspection/tests).
+    pub fn predictor_is_automaton(&self) -> bool {
+        matches!(self.predictor, PredictSource::Automaton { .. })
+    }
+
+    /// Override multi-path tiering: fully stream the top `warm_paths` predicted
+    /// experts per layer and page-cache-hint the next `hint_paths` (suppressed under
+    /// O_DIRECT). Overrides the `COLI_PREFETCH_*_PATHS` env defaults.
+    pub fn set_prefetch_policy(&mut self, warm_paths: usize, hint_paths: usize) {
+        self.prefetch_policy = PrefetchPolicy { warm_paths, hint_paths };
+    }
+
+    /// Enable the adaptive prefetch-distance controller (bypasses `COLI_PREFETCH_TUNE`).
+    /// It re-tunes the warm-tier breadth each forward within `[1, d_max]` from observed
+    /// prefetch used/wasted rates, starting at `initial`.
+    pub fn enable_prefetch_tuner(&mut self, initial: usize, d_max: usize) {
+        self.prefetch_tuner = Some(PrefetchTuner::new(initial, d_max));
+    }
+
+    /// Current adaptive prefetch distance, if the tuner is enabled (introspection/tests).
+    pub fn prefetch_distance(&self) -> Option<usize> {
+        self.prefetch_tuner.as_ref().map(|t| t.distance())
+    }
+
+    /// Recompute eviction protection from the current routing history (same path
+    /// `forward_hidden` uses). Exposed for tests.
+    pub fn protect_cache_from_history(&self) {
+        self.update_cache_protection();
+    }
+
+    /// A resident expert's eviction-protection score (0 if unprotected / not resident).
+    /// For tests/introspection.
+    pub fn ecache_priority(&self, layer: usize, expert: usize) -> Option<u32> {
+        self.ecache.as_ref().map(|c| c.lock().priority((layer as u32, expert as u32)))
     }
 
     /// Run `tokens` (new positions from `pos_base`) through all layers, appending
@@ -795,12 +1303,18 @@ impl Model {
             x[s * d..s * d + d].copy_from_slice(&self.embed[tid * d..tid * d + d]);
         }
 
+        let lookahead = prefetch_lookahead();
+        let mut policy = self.prefetch_policy; // Copy; read before the disjoint destructure
+        if let Some(t) = &self.prefetch_tuner {
+            policy.warm_paths = t.distance(); // adaptive controller caps the warm tier
+        }
         // Run the stack in a block so the split borrows of `self` end before we
         // re-borrow `self` to enqueue prefetch.
         {
             // split disjoint fields so attention can borrow layers (imm) + kv (mut)
-            let Model { cfg, layers, kv, st, stream_experts, direct, io_reactors, workers, ecache, route_hist, gpu, heat, .. } =
-                self;
+            let Model {
+                cfg, layers, kv, st, stream_experts, direct, io_reactors, workers, ecache, route_hist, predictor, prefetch, gpu, heat, ..
+            } = self;
             let ctx = ForwardCtx {
                 st,
                 reactors: io_reactors,
@@ -810,15 +1324,58 @@ impl Model {
                 stream_experts: *stream_experts,
                 ecache: ecache.as_deref(),
                 route_log: route_hist.as_ref(),
+                route_log_multi: None,
                 direct: *direct,
                 heat: heat.as_ref(),
             };
+            // Layer look-ahead: a shared prefetch view over the same field borrows, so
+            // each layer's next-token prefetch is emitted the moment that layer
+            // finishes (its read then overlaps later layers' compute). `None` when
+            // look-ahead is off or the prefetch lane/cache is absent — the bulk
+            // enqueue below runs instead. Mutually exclusive, so no double-enqueue.
+            let pfc = match (lookahead, prefetch.as_ref(), route_hist.as_ref(), ecache.as_ref()) {
+                (true, Some(pool), Some(rh), Some(ec)) => Some(PrefetchCtx {
+                    prefetch: pool.lane(0),
+                    predictor,
+                    hist: rh,
+                    cache: ec,
+                    gpu: gpu.as_ref(),
+                    st,
+                    cfg,
+                    warm_paths: policy.warm_paths,
+                    hint_paths: policy.hint_paths,
+                    direct: *direct,
+                }),
+                _ => None,
+            };
             for (li, l) in layers.iter().enumerate() {
                 forward_layer(l, li, &mut kv[li], &ctx, &mut x, s_n, pos_base)?;
+                if let Some(pfc) = &pfc {
+                    pfc.emit_layer(li);
+                }
             }
         }
-        // Predict + prefetch the next token's experts (main forward only).
-        self.enqueue_prefetch();
+        // When look-ahead is off, fall back to one bulk next-token enqueue after the
+        // forward (main forward only).
+        if !lookahead {
+            self.enqueue_prefetch();
+        }
+        // Predictive eviction: protect the experts we expect to reuse next.
+        if prefetch_protect() {
+            self.update_cache_protection();
+        }
+        // Feed the adaptive controller this forward's prefetch effectiveness so it can
+        // re-tune the warm-tier breadth for the next forward. Read the counters first
+        // (shared borrow), then update the tuner (disjoint mut borrow).
+        if self.prefetch_tuner.is_some() {
+            let obs = self.ecache.as_ref().map(|c| {
+                let c = c.lock();
+                (c.prefetch_used, c.prefetch_wasted)
+            });
+            if let (Some(t), Some((used, wasted))) = (self.prefetch_tuner.as_mut(), obs) {
+                t.observe(used, wasted);
+            }
+        }
         Ok(x)
     }
 
@@ -846,6 +1403,7 @@ impl Model {
             stream_experts: self.stream_experts,
             ecache: self.ecache.as_deref(),
             route_log: None,
+            route_log_multi: None,
             direct: self.direct,
             heat: self.heat.as_ref(),
         }
@@ -883,9 +1441,17 @@ impl Model {
     /// sequence `s` alone (guarded by `batched_decode_matches_per_sequence`).
     ///
     /// `&self`: per-sequence KV is caller-owned, so one resident model drives many
-    /// concurrent sequences from a single scheduler thread. Prefetch/route-logging
-    /// are off ([`Self::forward_ctx`]); MTP speculation stays a B==1 path.
-    pub fn forward_step_batched(&self, tokens: &[i32], seqs: &mut [&mut SeqKv], pos_of: &[usize]) -> Result<Vec<f32>, Error> {
+    /// concurrent sequences from a single scheduler thread. MTP speculation stays a
+    /// B==1 path. When `histories` is `Some`, each sequence's own routed set (position
+    /// `s` ↔ sequence `s`) is recorded into `histories[s]` for per-stream prefetch;
+    /// `None` disables per-sequence route logging (bit-identical either way).
+    pub fn forward_step_batched(
+        &self,
+        tokens: &[i32],
+        seqs: &mut [&mut SeqKv],
+        pos_of: &[usize],
+        histories: Option<&[&Mutex<RouteHistory>]>,
+    ) -> Result<Vec<f32>, Error> {
         let s_n = tokens.len();
         if seqs.len() != s_n || pos_of.len() != s_n {
             return Err(Error::Format(format!(
@@ -893,6 +1459,11 @@ impl Model {
                 seqs.len(),
                 pos_of.len()
             )));
+        }
+        if let Some(h) = histories {
+            if h.len() != s_n {
+                return Err(Error::Format(format!("forward_step_batched: {s_n} tokens but {} histories", h.len())));
+            }
         }
         let d = self.cfg.hidden as usize;
         let eps = self.cfg.eps;
@@ -902,7 +1473,21 @@ impl Model {
             let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
             x[s * d..s * d + d].copy_from_slice(&self.embed[tid * d..tid * d + d]);
         }
-        let ctx = self.forward_ctx();
+        // Built inline (not via `forward_ctx`) so the per-sequence history borrow and
+        // the model borrows share one inferred lifetime.
+        let ctx = ForwardCtx {
+            st: &self.st,
+            reactors: &self.io_reactors,
+            gpu: self.gpu.as_ref(),
+            workers: self.workers,
+            cfg: &self.cfg,
+            stream_experts: self.stream_experts,
+            ecache: self.ecache.as_deref(),
+            route_log: None,
+            route_log_multi: histories,
+            direct: self.direct,
+            heat: self.heat.as_ref(),
+        };
         for (li, l) in self.layers.iter().enumerate() {
             let mut caches: Vec<&mut LayerKv> = seqs.iter_mut().map(|sk| &mut sk.layers[li]).collect();
             forward_layer_batched(l, li, &mut caches, &ctx, &mut x, s_n, pos_of)?;
@@ -982,6 +1567,7 @@ impl Model {
             stream_experts: *stream_experts,
             ecache: ecache.as_deref(),
             route_log: None, // drafts must not overwrite the main-stream prediction
+            route_log_multi: None,
             direct: *direct,
             heat: None, // speculative drafts must not skew residency heat
         };
@@ -1097,12 +1683,9 @@ impl Model {
 
 impl Drop for Model {
     fn drop(&mut self) {
-        // Stop and join the prefetch lane before `st` (its shard fds) is dropped.
+        // Stop and join every prefetch lane before `st` (its shard fds) is dropped.
         if let Some(mut p) = self.prefetch.take() {
-            let _ = p.tx.send(PrefetchMsg::Stop);
-            if let Some(j) = p.join.take() {
-                let _ = j.join();
-            }
+            p.stop();
         }
     }
 }
@@ -1249,6 +1832,233 @@ mod tests {
     }
 
     #[test]
+    fn layer_lookahead_warms_named_layer_in_isolation() -> Result<(), peregrine_core::Error> {
+        // The per-layer look-ahead path warms exactly the requested sparse layer off
+        // the critical path, leaving other layers (and dense layers) untouched — the
+        // evidence that prefetch is emitted per layer, not one bulk dump.
+        let dir = tmp_model_dir("lookahead_layer")?;
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        let toks = [1, 5, 9, 2, 7];
+        let _ = m.forward_step(&toks, 0)?; // fill routing history
+        m.prefetch_barrier();
+        m.ecache_clear(); // cold cache, history retained
+        let first_sparse = m.cfg.first_dense as usize;
+        let n_layers = m.cfg.n_layers as usize;
+        m.prefetch_layer_from_history(first_sparse);
+        m.prefetch_barrier();
+        let warmed =
+            m.ecache_prefetch_reads_for_layer(first_sparse).ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert!(warmed > 0, "look-ahead must warm the requested sparse layer (got {warmed})");
+        // a different sparse layer was not warmed by this single-layer emission
+        let other = first_sparse + 1;
+        if other < n_layers {
+            let untouched =
+                m.ecache_prefetch_reads_for_layer(other).ok_or_else(|| Error::Format("no ecache".into()))?;
+            assert_eq!(untouched, 0, "one-layer look-ahead must not warm another layer");
+        }
+        // a dense layer (below first_dense) is always a no-op
+        if first_sparse > 0 {
+            m.prefetch_layer_from_history(first_sparse - 1);
+            m.prefetch_barrier();
+            let dense =
+                m.ecache_prefetch_reads_for_layer(first_sparse - 1).ok_or_else(|| Error::Format("no ecache".into()))?;
+            assert_eq!(dense, 0, "dense-layer look-ahead is a no-op");
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn multipath_hint_tier_issues_fadvise() -> Result<(), peregrine_core::Error> {
+        // With warm_paths=0, every fresh predicted expert falls into the fadvise hint
+        // tier: the lane issues page-cache hints and streams nothing into the cache.
+        let dir = tmp_model_dir("multipath_hint")?;
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        let toks = [1, 5, 9, 2, 7];
+        let _ = m.forward_step(&toks, 0)?; // fill history + warm cache
+        m.prefetch_barrier();
+        m.ecache_clear();
+        m.set_prefetch_policy(0, usize::MAX); // warm nothing, hint everything
+        let first_sparse = m.cfg.first_dense as usize;
+        m.prefetch_layer_from_history(first_sparse);
+        m.prefetch_barrier();
+        let hints = m.ecache_fadvise_hints().ok_or_else(|| Error::Format("no ecache".into()))?;
+        let streamed = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        let (_, _, disk) = m.ecache_stats().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert!(hints > 0, "hint tier must issue fadvise hints (got {hints})");
+        assert_eq!(streamed, 0, "warm_paths=0 must stream nothing into the cache");
+        assert_eq!(disk, 0, "hints are off the critical path");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn multipath_warm_tier_streams_not_hints() -> Result<(), peregrine_core::Error> {
+        // warm-all policy streams predicted experts and issues no fadvise hints.
+        let dir = tmp_model_dir("multipath_warm")?;
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        let toks = [1, 5, 9, 2, 7];
+        let _ = m.forward_step(&toks, 0)?;
+        m.prefetch_barrier();
+        m.ecache_clear();
+        m.set_prefetch_policy(usize::MAX, 0); // warm all, hint none
+        let first_sparse = m.cfg.first_dense as usize;
+        m.prefetch_layer_from_history(first_sparse);
+        m.prefetch_barrier();
+        let hints = m.ecache_fadvise_hints().ok_or_else(|| Error::Format("no ecache".into()))?;
+        let streamed = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert_eq!(hints, 0, "warm-all policy issues no hints");
+        assert!(streamed > 0, "warm tier must stream experts (got {streamed})");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prefetch_tuner_observes_and_stays_in_bounds() -> Result<(), peregrine_core::Error> {
+        // Wiring smoke test: the tuner is consulted before and updated after each
+        // forward, and stays within [1, d_max] while observing real prefetch activity.
+        // (Direction of adaptation is covered by the control-law unit tests.) Uses the
+        // cold-cache pattern so a prefetched expert is actually hit — in steady decode
+        // the predicted experts are already cached from the current forward.
+        let dir = tmp_model_dir("tuner_wire")?;
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        m.enable_prefetch_tuner(2, 6);
+        assert_eq!(m.prefetch_distance(), Some(2));
+        let toks = [1, 5, 9, 2, 7];
+        let _ = m.forward_step(&toks, 0)?; // fill history + warm cache
+        m.prefetch_barrier();
+        m.ecache_clear(); // cold cache, history retained
+        m.prefetch_from_history(); // warm the predicted experts into the empty cache
+        m.prefetch_barrier();
+        m.reset(); // KV reset; the prefetched slabs persist in the cache
+        let _ = m.forward_step(&toks, 0)?; // identical routing → hits the prefetched slabs
+        m.prefetch_barrier();
+        let (used, _wasted) =
+            m.ecache_prefetch_effectiveness().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert!(used > 0, "prefetched experts must be used, so the tuner observes activity (got {used})");
+        let dist = m.prefetch_distance().ok_or_else(|| Error::Format("no tuner".into()))?;
+        assert!((1..=6).contains(&dist), "distance {dist} must stay within [1, d_max]");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn predictive_eviction_protects_predicted_experts() -> Result<(), peregrine_core::Error> {
+        // After a forward, the model must protect the resident experts it predicts
+        // will be reused (priority > 0), leaving unpredicted slots at priority 0. The
+        // WarmCache unit tests already prove priority reorders eviction; this proves
+        // the model populates it. (Priority never affects output — see the bit-identical
+        // tests, which run with protection on by default.)
+        let dir = tmp_model_dir("protect")?;
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        let toks = [1, 5, 9, 2, 7];
+        let _ = m.forward_step(&toks, 0)?; // route + cache experts, fill history
+        m.prefetch_barrier();
+        m.protect_cache_from_history(); // set priorities from the prediction
+        let first_sparse = m.cfg.first_dense as usize;
+        let n_experts = m.cfg.n_experts as usize;
+        let protected = (0..n_experts)
+            .filter(|&e| m.ecache_priority(first_sparse, e).unwrap_or(0) > 0)
+            .count();
+        assert!(protected > 0, "at least one predicted, resident expert must be protected");
+        // a non-resident key always reports priority 0 (never protected).
+        assert_eq!(m.ecache_priority(first_sparse, n_experts + 100), Some(0), "non-resident key is unprotected");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn per_sequence_prefetch_records_and_warms() -> Result<(), peregrine_core::Error> {
+        // Batched decode must record each stream's *own* routed set into its own
+        // history (position s ↔ sequence s), and per-sequence prefetch must warm that
+        // stream's experts. Two streams with different prompts are recorded separately.
+        let dir = tmp_model_dir("per_seq")?;
+        let m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        let mut s0 = SeqKv::new(&m.cfg);
+        let mut s1 = SeqKv::new(&m.cfg);
+        let _ = m.forward_prefill_seq(&[1, 5, 9], &mut s0, 0)?;
+        let _ = m.forward_prefill_seq(&[2, 6, 3], &mut s1, 0)?;
+        let h0 = Mutex::new(m.new_route_history());
+        let h1 = Mutex::new(m.new_route_history());
+        {
+            let hists = [&h0, &h1];
+            let mut refs = [&mut s0, &mut s1];
+            let _ = m.forward_step_batched(&[4, 7], &mut refs, &[3, 3], Some(&hists))?;
+        }
+        let first_sparse = m.cfg.first_dense as usize;
+        assert!(h0.lock().frames(first_sparse).count() > 0, "seq 0 recorded its own routing");
+        assert!(h1.lock().frames(first_sparse).count() > 0, "seq 1 recorded its own routing");
+        // Per-sequence prefetch into a cold cache streams that stream's predicted experts.
+        m.ecache_clear();
+        m.enqueue_seq_prefetch(&h0, 0);
+        m.prefetch_barrier();
+        let pf = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert!(pf > 0, "per-sequence prefetch must warm the stream's experts (got {pf})");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn automaton_builds_saves_and_reloads() -> Result<(), peregrine_core::Error> {
+        // Offline pipeline round-trip: build an automaton from a corpus, save it next
+        // to the checkpoint, and confirm the next load auto-attaches it (predictor
+        // becomes the automaton) — and that output stays bit-identical either way.
+        let dir = tmp_model_dir("automaton")?;
+        let corpus: Vec<i32> = (0..40i32).map(|i| (i * 7 + 3) % 32).collect();
+        // reference output on a plain (momentum) model
+        let want = {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            let mut s = Sampler::new(0.0, 0.9, 1);
+            m.generate(&[3, 7, 1, 4], 6, &mut s)?
+        };
+        // build + save the automaton
+        {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            let table = m.build_automaton(&corpus)?;
+            save_automaton(&table, &dir.join("automaton.json"))?;
+        }
+        // reload: the predictor must now be the automaton, and output unchanged
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        assert!(m.predictor_is_automaton(), "reload must auto-attach the matching automaton");
+        let mut s = Sampler::new(0.0, 0.9, 1);
+        let got = m.generate(&[3, 7, 1, 4], 6, &mut s)?;
+        assert_eq!(got, want, "automaton predictor must not change output (prefetch only)");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prefetch_verify_reports_no_mismatch() -> Result<(), peregrine_core::Error> {
+        // With verification on, the prefetch lane re-reads each speculative slab and
+        // byte-compares it; deterministic reads mean zero mismatches. Also confirms the
+        // verify path actually ran (prefetch reads happened). Accuracy counters populate.
+        std::env::set_var("COLI_PREFETCH_VERIFY", "1");
+        let dir = tmp_model_dir("verify")?;
+        let load = Model::load_streaming_ecache(&dir, true, 8 << 20); // pool spawns with verify
+        std::env::remove_var("COLI_PREFETCH_VERIFY");
+        let mut m = load?;
+        let toks = [1, 5, 9, 2, 7];
+        let _ = m.forward_step(&toks, 0)?; // history
+        m.prefetch_barrier();
+        m.ecache_clear();
+        m.prefetch_from_history(); // real speculative reads → each re-read + compared
+        m.prefetch_barrier();
+        let pf = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        let mm = m.ecache_verify_mismatch().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert!(pf > 0, "verify path must run on real prefetch reads (got {pf})");
+        assert_eq!(mm, 0, "deterministic reads → zero verify mismatches");
+        // reset() then a matching forward makes the prefetched slabs count as used.
+        m.reset();
+        let _ = m.forward_step(&toks, 0)?;
+        m.prefetch_barrier();
+        let (used, _) = m.ecache_prefetch_effectiveness().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert!(used > 0, "accuracy counters must populate (used={used})");
+        assert!(m.prefetch_accuracy().unwrap_or(-1.0) >= 0.0, "accuracy is well-defined");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn generate_is_deterministic_greedy() -> Result<(), peregrine_core::Error> {
         let dir = tmp_model_dir("gen")?;
         let mut m = Model::load(&dir)?;
@@ -1322,8 +2132,29 @@ mod tests {
 
     #[test]
     fn stream_transient_reserve_scales_with_lanes() {
-        assert_eq!(stream_transient_reserve(4, 8, 1000), (4 * EXPERTS_PER_BATCH + 8) * 1000);
+        assert_eq!(stream_transient_reserve(4, 8, 1000), (4 * experts_per_batch() + 8) * 1000);
         assert_eq!(stream_transient_reserve(0, 0, 1000), 0); // no lanes → no reserve
+    }
+
+    #[test]
+    fn rmsnorm_rows_parallel_matches_serial() {
+        // rmsnorm_rows runs rows on the compute pool when the row is wide enough
+        // (d >= 256); use d=512 so the parallel path engages, and assert it stays
+        // bit-identical to a plain serial loop (rows are independent).
+        let (s_n, d) = (17usize, 512usize);
+        let x: Vec<f32> = (0..s_n * d).map(|k| ((k * 7 + 3) as f32 * 0.01).sin()).collect();
+        let w: Vec<f32> = (0..d).map(|j| 0.5 + j as f32 * 0.01).collect();
+        let eps = 1e-5;
+        let par = rmsnorm_rows(&x, &w, s_n, d, eps);
+        let mut serial = vec![0f32; s_n * d];
+        for s in 0..s_n {
+            let src = x[s * d..s * d + d].to_vec();
+            rmsnorm(&mut serial[s * d..s * d + d], &src, &w, eps);
+        }
+        assert!(
+            par.iter().zip(&serial).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "rmsnorm_rows must be bit-identical parallel vs serial"
+        );
     }
 
     #[test]
@@ -1362,7 +2193,7 @@ mod tests {
             let _ = m.forward_prefill_seq(p, &mut sk, 0)?;
             let mut one: [&mut SeqKv; 1] = [&mut sk];
             let pos = [p.len()];
-            let lg = m.forward_step_batched(&[newtok[s]], &mut one, &pos)?;
+            let lg = m.forward_step_batched(&[newtok[s]], &mut one, &pos, None)?;
             ref_logits[s * vocab..s * vocab + vocab].copy_from_slice(&lg);
         }
 
@@ -1376,7 +2207,7 @@ mod tests {
         let mut refs: Vec<&mut SeqKv> = seqs.iter_mut().collect();
         let toks: Vec<i32> = newtok.to_vec();
         let pos_of: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
-        let bat = m.forward_step_batched(&toks, &mut refs, &pos_of)?;
+        let bat = m.forward_step_batched(&toks, &mut refs, &pos_of, None)?;
 
         for z in 0..3 * vocab {
             assert!((ref_logits[z] - bat[z]).abs() < 1e-4, "z={z} ref={} bat={}", ref_logits[z], bat[z]);

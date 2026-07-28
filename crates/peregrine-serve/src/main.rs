@@ -329,6 +329,9 @@ fn sse_error(message: &str) -> Event {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Cap glibc arenas before the model spawns its worker pools, so the server no
+    // longer needs `MALLOC_ARENA_MAX=2` in the environment to keep RSS flat.
+    peregrine_model::cap_malloc_arenas();
     let args = Args::parse();
     let dir = std::path::PathBuf::from(&args.model);
     let model = Model::load(&dir)?;
