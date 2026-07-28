@@ -191,7 +191,7 @@ fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: 
 /// latent average through `kv_b`'s value rows. Row `s` depends only on `q[s]` and
 /// its own KV view, so a batched decode step is arithmetically identical to
 /// running each sequence's decode alone (the `batched_matches_sequential` guard).
-fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg) -> Vec<f32> {
+fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg, par_min: usize) -> Vec<f32> {
     let s_n = rows.len();
     let h_n = c.n_heads as usize;
     let qk_nope = c.qk_nope as usize;
@@ -200,8 +200,12 @@ fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg) 
     let vh = c.v_head as usize;
     let kvl = c.kv_lora as usize;
 
+    // Row `s` reads only its own KV view + `q[s]` and writes only its own head-block
+    // of `ctx` (stride `h_n*vh`), so rows run on the pool above `par_min` with a
+    // result bit-identical to the serial loop. `par_min` is a parameter only so the
+    // `attend_absorb_parallel_matches_serial` test can force each branch.
     let mut ctx = vec![0f32; s_n * h_n * vh];
-    for s in 0..s_n {
+    peregrine_par::par_rows_mut(&mut ctx, h_n * vh, s_n, par_min, |s, ctx_row| {
         let cache_lc = rows[s].lc;
         let cache_rc = rows[s].rc;
         let nt = rows[s].len;
@@ -236,13 +240,13 @@ fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg) 
                     clat[i] += a * lt[i];
                 }
             }
-            let cx = &mut ctx[(s * h_n + h) * vh..(s * h_n + h) * vh + vh];
+            let cx = &mut ctx_row[h * vh..h * vh + vh];
             for j in 0..vh {
                 let row = w.kv_b.dequant_row(rbase + qk_nope + j);
                 cx[j] = dot(&row, &clat);
             }
         }
-    }
+    });
     ctx
 }
 
@@ -259,7 +263,7 @@ fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache:
             RowAttn { len: nt, lc: &cache.lc[..nt * kvl], rc: &cache.rc[..nt * qk_rope] }
         })
         .collect();
-    attend_absorb_batched(w, q, &rows, c)
+    attend_absorb_batched(w, q, &rows, c, peregrine_par::PAR_ATTN_MIN)
 }
 
 /// MLA attention (dense reconstruction). `s_n` new tokens from `pos_base`,
@@ -309,7 +313,7 @@ pub fn mla_attention_batched(w: &AttnWeights, x: &[f32], pos_of: &[usize], cache
     let rows: Vec<RowAttn> = (0..s_n)
         .map(|s| RowAttn { len: caches[s].len, lc: caches[s].lc.as_slice(), rc: caches[s].rc.as_slice() })
         .collect();
-    let ctx = attend_absorb_batched(w, &q, &rows, c);
+    let ctx = attend_absorb_batched(w, &q, &rows, c, peregrine_par::PAR_ATTN_MIN);
     w.o.apply_vec(&ctx, s_n)
 }
 
@@ -554,6 +558,28 @@ mod tests {
         for z in 0..b * hidden {
             assert!((seq_out[z] - bat_out[z]).abs() < 1e-6, "z={z} seq={} bat={}", seq_out[z], bat_out[z]);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn attend_absorb_parallel_matches_serial() -> Result<(), peregrine_core::Error> {
+        // attend_absorb_batched runs rows on the pool above its gate; the parallel
+        // and forced-serial branches must be bit-identical (rows are independent).
+        // Synthetic q + per-row KV caches suffice — the arithmetic is the same.
+        let c = cfg()?;
+        let w = make_weights(&c, 9);
+        let (h_n, qh, kvl, qkr) = (c.n_heads as usize, c.qk_head as usize, c.kv_lora as usize, c.qk_rope as usize);
+        let s_n = 8usize;
+        let lens = [1usize, 2, 3, 1, 4, 2, 5, 3]; // varied causal lengths per row
+        let mut r = Lcg(0x5eed);
+        let q: Vec<f32> = (0..s_n * h_n * qh).map(|_| r.f()).collect();
+        let lcs: Vec<Vec<f32>> = (0..s_n).map(|s| (0..lens[s] * kvl).map(|_| r.f()).collect()).collect();
+        let rcs: Vec<Vec<f32>> = (0..s_n).map(|s| (0..lens[s] * qkr).map(|_| r.f()).collect()).collect();
+        let rows: Vec<RowAttn> = (0..s_n).map(|s| RowAttn { len: lens[s], lc: &lcs[s], rc: &rcs[s] }).collect();
+
+        let par = attend_absorb_batched(&w.view(), &q, &rows, &c, 2); // parallel (s_n >= 2)
+        let ser = attend_absorb_batched(&w.view(), &q, &rows, &c, usize::MAX); // forced serial
+        assert!(par.iter().zip(&ser).all(|(a, b)| a.to_bits() == b.to_bits()), "attend_absorb must be bit-identical parallel vs serial");
         Ok(())
     }
 }

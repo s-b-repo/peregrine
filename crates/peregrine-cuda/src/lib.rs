@@ -82,6 +82,7 @@ mod ffi {
         pub fn coli_cuda_pipe_upload(device: c_int, dst: *mut c_void, src: *const c_void, bytes: usize) -> c_int;
         pub fn coli_cuda_pipe_download(device: c_int, src: *const c_void, dst: *mut c_void, bytes: usize) -> c_int;
         pub fn coli_cuda_pipe_silu_mul(device: c_int, gate_dev: *mut f32, up_dev: *const f32, n: usize) -> c_int;
+        pub fn coli_cuda_pipe_add(device: c_int, x_dev: *mut f32, t_dev: *const f32, n: usize) -> c_int;
     }
 }
 
@@ -630,6 +631,71 @@ mod gpu_tests {
         unsafe {
             ffi::coli_cuda_pipe_free(0, gate_dev as *mut c_void);
             ffi::coli_cuda_pipe_free(0, up_dev as *mut c_void);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn graph_capture_multi_kernel() -> Result<(), Error> {
+        // A real decode step is many kernels; capture TWO dependent ops (silu_mul
+        // then add) into one graph and confirm replay == eager for the composite —
+        // proving the capture mechanism scales past a single kernel (the step toward
+        // capturing a full resident decode step; that needs an on-device forward).
+        use std::os::raw::c_void;
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let n = 256usize;
+        let mut r = Lcg(0xA8FF);
+        let gate: Vec<f32> = (0..n).map(|_| r.f()).collect();
+        let up: Vec<f32> = (0..n).map(|_| r.f()).collect();
+        let bias: Vec<f32> = (0..n).map(|_| r.f() * 0.5).collect();
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        let want: Vec<f32> = (0..n).map(|k| silu(gate[k]) * up[k] + bias[k]).collect();
+        let nb = n * 4;
+
+        // SAFETY: three n-float device buffers on device 0.
+        let (g_dev, u_dev, b_dev) = unsafe {
+            (
+                ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32,
+                ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32,
+                ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32,
+            )
+        };
+        assert!(!g_dev.is_null() && !u_dev.is_null() && !b_dev.is_null(), "device alloc");
+        let upload = |dst: *mut f32, src: &[f32]| {
+            // SAFETY: `dst` has `nb` bytes; `src` has `n` f32.
+            unsafe { ffi::coli_cuda_pipe_upload(0, dst as *mut c_void, src.as_ptr() as *const c_void, nb) };
+        };
+        upload(u_dev, &up);
+        upload(b_dev, &bias);
+        upload(g_dev, &gate);
+
+        let graph = capture(0, || {
+            // SAFETY: g_dev = silu(g_dev)*u_dev, then g_dev += b_dev — two kernels on the stream.
+            let a = unsafe { ffi::coli_cuda_pipe_silu_mul(0, g_dev, u_dev, n) };
+            let b = unsafe { ffi::coli_cuda_pipe_add(0, g_dev, b_dev, n) };
+            if a == 1 && b == 1 {
+                Ok(())
+            } else {
+                Err(Error::Format("multi-kernel capture".into()))
+            }
+        })?;
+
+        graph.launch()?;
+        let mut out = vec![0f32; n];
+        // SAFETY: `g_dev` has `nb` bytes; `out` has `n` f32.
+        unsafe { ffi::coli_cuda_pipe_download(0, g_dev as *const c_void, out.as_mut_ptr() as *mut c_void, nb) };
+        for k in 0..n {
+            let tol = 1e-4 * want[k].abs().max(1.0);
+            assert!((out[k] - want[k]).abs() < tol, "k={k} got={} want={}", out[k], want[k]);
+        }
+        // SAFETY: all three came from pipe_alloc; free is null-safe.
+        unsafe {
+            ffi::coli_cuda_pipe_free(0, g_dev as *mut c_void);
+            ffi::coli_cuda_pipe_free(0, u_dev as *mut c_void);
+            ffi::coli_cuda_pipe_free(0, b_dev as *mut c_void);
         }
         Ok(())
     }

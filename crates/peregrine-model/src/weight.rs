@@ -8,6 +8,7 @@
 //! coherence-critical format for GLM-5.2), and packed int2 (fmt 3).
 
 use peregrine_core::{Error, QtFmt, QtInfo, SafeTensors};
+use peregrine_io::Bytes;
 use peregrine_kernels::{
     dot_i2i8, matmul_i4_from_f32, matmul_i4g_from_f32, matmul_i8_from_f32, qrow_i8,
 };
@@ -43,8 +44,11 @@ pub struct QtWeight {
     pub o: usize,
     pub i: usize,
     /// packed weight bytes: int8 as u8 (reinterpreted), int4 as nibbles, int2 as
-    /// 2-bit fields (4/byte)
-    q: Vec<u8>,
+    /// 2-bit fields (4/byte). A [`Bytes`] region so a streamed expert can own its
+    /// O_DIRECT aligned DMA buffer directly (zero-copy); resident loads use a plain
+    /// `Vec`. Every kernel reads it as `&[u8]` via `Deref`, so the shape is invisible
+    /// to the compute path.
+    q: Bytes,
     /// scales: `O` per-row (int8/int4/int2) or `O*ceil(I/gs)` grouped (fmt 4),
     /// laid out `scale[o*ng + g]`
     scale: Vec<f32>,
@@ -55,19 +59,19 @@ pub struct QtWeight {
 impl QtWeight {
     /// Build from already-quantized per-row data (also the test constructor).
     /// For grouped-int4 use [`Self::new_grouped`].
-    pub fn new(fmt: QuantFmt, o: usize, i: usize, q: Vec<u8>, scale: Vec<f32>) -> QtWeight {
+    pub fn new(fmt: QuantFmt, o: usize, i: usize, q: impl Into<Bytes>, scale: Vec<f32>) -> QtWeight {
         debug_assert!(
             matches!(fmt, QuantFmt::Int8 | QuantFmt::Int4 | QuantFmt::Int2),
             "QtWeight::new is for per-row formats (got {fmt:?}); use new_grouped for grouped int4"
         );
-        QtWeight { fmt, o, i, q, scale, gs: 0 }
+        QtWeight { fmt, o, i, q: q.into(), scale, gs: 0 }
     }
 
     /// Build a grouped-int4 weight: `scale` holds `o*ceil(i/gs)` entries laid out
     /// `scale[o*ng + g]`.
-    pub fn new_grouped(o: usize, i: usize, q: Vec<u8>, scale: Vec<f32>, gs: usize) -> QtWeight {
+    pub fn new_grouped(o: usize, i: usize, q: impl Into<Bytes>, scale: Vec<f32>, gs: usize) -> QtWeight {
         debug_assert!(gs > 0 && gs.is_multiple_of(16), "grouped-int4 gs must be a positive multiple of 16");
-        QtWeight { fmt: QuantFmt::Int4Grouped, o, i, q, scale, gs }
+        QtWeight { fmt: QuantFmt::Int4Grouped, o, i, q: q.into(), scale, gs }
     }
 
     /// Load a container weight `[O, I]` (`name` + `name.qs`) from a model dir.
@@ -88,21 +92,21 @@ impl QtWeight {
         st.read_raw(name, &mut q)?;
         let mut scale = vec![0f32; info.scale_count as usize];
         st.read_f32(&format!("{name}.qs"), &mut scale)?;
-        Ok(QtWeight { fmt, o, i, q, scale, gs: info.gs as usize })
+        Ok(QtWeight { fmt, o, i, q: q.into(), scale, gs: info.gs as usize })
     }
 
     /// Raw quantized payload: `(packed_bytes, per_row_scales)`. Lets the
     /// scheduler serialize a resident expert to a disk blob and reconstruct it
     /// after streaming (`QtWeight::new`).
     pub fn raw(&self) -> (&[u8], &[f32]) {
-        (&self.q, &self.scale)
+        (&self.q[..], &self.scale)
     }
 
     /// `q` viewed as int8 (only meaningful for [`QuantFmt::Int8`]). `u8` and `i8`
     /// are both `Pod` with identical layout, so `bytemuck` reinterprets the slice
     /// with no `unsafe` and no copy.
     fn as_i8(&self) -> &[i8] {
-        bytemuck::cast_slice::<u8, i8>(&self.q)
+        bytemuck::cast_slice::<u8, i8>(&self.q[..])
     }
 
     /// `y[s_n, O] = apply(self, x[s_n, I])`. Caller provides int8 activation
@@ -110,9 +114,9 @@ impl QtWeight {
     pub fn apply(&self, x: &[f32], s_n: usize, xq: &mut [i8], sx: &mut [f32], y: &mut [f32]) {
         match self.fmt {
             QuantFmt::Int8 => matmul_i8_from_f32(y, x, self.as_i8(), &self.scale, s_n, self.i, self.o, xq, sx),
-            QuantFmt::Int4 => matmul_i4_from_f32(y, x, &self.q, &self.scale, s_n, self.i, self.o, xq, sx),
+            QuantFmt::Int4 => matmul_i4_from_f32(y, x, &self.q[..], &self.scale, s_n, self.i, self.o, xq, sx),
             QuantFmt::Int4Grouped => {
-                matmul_i4g_from_f32(y, x, &self.q, &self.scale, s_n, self.i, self.o, self.gs, xq, sx)
+                matmul_i4g_from_f32(y, x, &self.q[..], &self.scale, s_n, self.i, self.o, self.gs, xq, sx)
             }
             QuantFmt::Int2 => {
                 // Quantize activations, then int2·int8 dot each row (AVX2 when
@@ -134,12 +138,26 @@ impl QtWeight {
         }
     }
 
-    /// Allocating convenience over [`Self::apply`].
+    /// Allocating convenience over [`Self::apply`]. Output rows are independent, so
+    /// the matmul runs as batched row-chunks on the persistent compute pool above
+    /// `PAR_MATMUL_MIN` — each chunk does one batched `apply` with its own quantized
+    /// scratch, so the result is bit-identical to the serial whole-matrix call
+    /// (guarded by `apply_vec_parallel_matches_serial`). Serial below the gate or
+    /// when nested (e.g. an expert matmul inside a parallel MoE), so no
+    /// oversubscription. This parallelizes every projection, lm_head, and expert.
     pub fn apply_vec(&self, x: &[f32], s_n: usize) -> Vec<f32> {
-        let mut xq = vec![0i8; s_n * self.i];
-        let mut sx = vec![0f32; s_n];
         let mut y = vec![0f32; s_n * self.o];
-        self.apply(x, s_n, &mut xq, &mut sx, &mut y);
+        // Only parallelize when the per-row matmul work (`i·o` MACs) is large enough
+        // that the pool dispatch pays off; tiny matrices (e.g. the test model) stay
+        // serial regardless of batch, avoiding overhead-dominated slowdowns. Real
+        // GLM-5.2 projections (6144×6144 ≈ 38M) clear this by ~36×.
+        let gate = if self.i * self.o >= 1 << 20 { peregrine_par::PAR_MATMUL_MIN } else { usize::MAX };
+        peregrine_par::par_chunks_mut(&mut y, self.o, s_n, gate, |start, end, y_chunk| {
+            let n = end - start;
+            let mut xq = vec![0i8; n * self.i];
+            let mut sx = vec![0f32; n];
+            self.apply(&x[start * self.i..end * self.i], n, &mut xq, &mut sx, y_chunk);
+        });
         y
     }
 
@@ -340,6 +358,30 @@ mod tests {
                 let tol = 0.03 * i as f32;
                 assert!((y[k] - yref[k]).abs() < tol, "fmt {:?} k={k} y={} ref={}", w.fmt, y[k], yref[k]);
             }
+        }
+    }
+
+    #[test]
+    fn apply_vec_parallel_matches_serial() {
+        // apply_vec runs batched row-chunks on the pool when the matrix is large
+        // enough (i·o ≥ 1<<20) and s_n ≥ PAR_MATMUL_MIN. Use 1024×1024 so the parallel
+        // path actually engages, and assert it is bit-identical to one whole serial
+        // `apply` for every format.
+        let (o, i, s_n) = (1024usize, 1024usize, 16usize);
+        let mut rng = Lcg(0x1234);
+        let wf: Vec<f32> = (0..o * i).map(|_| rng.f()).collect();
+        let xf: Vec<f32> = (0..s_n * i).map(|_| rng.f()).collect();
+        for w in [quant_i8(&wf, o, i), quant_i4(&wf, o, i), quant_i4_grouped(&wf, o, i, 16)] {
+            let par = w.apply_vec(&xf, s_n);
+            let mut xq = vec![0i8; s_n * i];
+            let mut sx = vec![0f32; s_n];
+            let mut ser = vec![0f32; s_n * o];
+            w.apply(&xf, s_n, &mut xq, &mut sx, &mut ser);
+            assert!(
+                par.iter().zip(&ser).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "apply_vec parallel must match serial for {:?}",
+                w.fmt
+            );
         }
     }
 }

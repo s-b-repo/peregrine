@@ -14,6 +14,7 @@ cuda = ["dep:peregrine-cuda", "peregrine-cuda/cuda"]
 peregrine-core = { path = "../peregrine-core" }
 peregrine-kernels = { path = "../peregrine-kernels" }
 peregrine-io = { path = "../peregrine-io" }
+peregrine-par = { path = "../peregrine-par" }
 peregrine-cuda = { path = "../peregrine-cuda", optional = true }
 serde_json.workspace = true
 bytemuck = "1"

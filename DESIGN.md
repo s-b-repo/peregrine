@@ -84,6 +84,40 @@ slab.
 wall-clock ≈ `max(disk_chain, cpu_5_experts) + gpu_3_experts` (GPU idle during the CPU phase); the
 Rust wall-clock ≈ `max(gpu_lane, cpu_lane, disk_lane)` — the slowest single lane, not the sum.
 
+### Concurrency & parallelism map (where the threads are)
+
+Five independent layers of concurrency, so this isn't re-requested:
+
+- **I/O is io_uring everywhere.** Config, safetensors headers, and *all* weight loading go through the
+  reactor (`peregrine-core/src/safetensors.rs::read_at` → `Mutex<Reactor>`); per-token expert streaming
+  is the hot path. Only `tokenizer.json` + `/proc/meminfo` are synchronous (one-time, negligible).
+- **The streaming MoE lane is N parallel io_uring rings with lock-free work-stealing.**
+  `peregrine-model/src/concurrent.rs` runs `COLI_IO_RINGS` rings (default 4), each on its own thread,
+  atomically claiming expert batches off an `AtomicUsize` cursor (`io_work.fetch_add`) and issuing a deep
+  batched submit (~96 in-flight reads). A CPU worker pool computes SwiGLU as bytes land; an optional GPU
+  lane runs one batched `expert_group`; a single deterministic fixed-order reduce merges them
+  (bit-identical to serial). This *already is* "multiple io_uring reading multiple experts in parallel."
+- **Expert reads are zero-copy into the weight.** A landing region is a `peregrine_io::Bytes` that the
+  streamed `QtWeight` *moves* in (no copy), and every kernel reads it as `&[u8]` via `Deref`. The buffered
+  lane has the kernel fill the caller's `Vec` directly; the O_DIRECT lane (`COLI_DIRECT`) DMAs each
+  region's 4096-aligned superset straight into an owned `AlignedBuf` and exposes the exact
+  `[off, off+len)` sub-slice (`Reactor::read_direct_aligned`) — so bulk weight bytes are never memcpy'd in
+  userspace on either path, and O_DIRECT bypasses the page cache with no realignment copy.
+- **The resident compute path is data-parallel on a persistent pool** (`peregrine-par`): `rmsnorm_rows`,
+  resident `moe_forward` (per-expert compute, serial scatter), per-row attention, and every matmul
+  (`QtWeight::apply_vec`) run on a process-global scoped thread pool. It is **bit-identical** to serial
+  (row/expert-independent + fixed-order reduces; `f32::to_bits`-exact tests), **work-gated** (tiny
+  matrices stay serial — no small-batch regression), and **nesting-safe** (an expert's matmul inside a
+  parallel MoE runs serial via a thread-local guard, so the fixed pool can't deadlock). `COLI_PAR_THREADS`
+  overrides the size (`1` = fully serial).
+- **The GPU backend is async**: `expert_group` uses pinned staging + a persistent non-blocking stream,
+  with CUDA graph capture/replay available (`peregrine-cuda`).
+- **The serving engine interleaves prefill with decode.** `peregrine-serve/src/batch.rs` queues a new
+  request and advances its prompt one `PREFILL_CHUNK` (64 tokens) at a time, round-robin, *between*
+  batched decode steps — so admitting a long prompt never stalls the in-flight batch for the whole
+  prefill. Chunked prefill is bit-identical to whole-prompt prefill (same causal KV build), asserted by
+  `engine_chunked_prefill_matches_reference`.
+
 ---
 
 ## Crate & toolchain choices (Linux + CUDA + io_uring)
@@ -113,16 +147,22 @@ Rust wall-clock ≈ `max(gpu_lane, cpu_lane, disk_lane)` — the slowest single 
 
 ## Repo layout & build
 
-New cargo workspace `rust/`, sibling of `c/` and `desktop/` (keeps the flat `c/` runtime intact):
+Standalone cargo workspace (the C runtime stays intact upstream in colibrì's `c/`; its CUDA
+kernels are vendored here under `cuda/`):
 
 ```
-rust/crates/
+crates/
   peregrine-core/     # QT formats (fmt 0..4), Cfg, safetensors index      (↔ c/st.h)
   peregrine-kernels/  # std::arch int4/int8/int2 + f32 matmul, token-exact  (↔ matmul_qt_ex, glm.c:978)
-  peregrine-io/       # io-uring reactor (I/O lane), slab arena, LRU/pin    (↔ c/uring.h, tier.h)
+  peregrine-io/       # io-uring reactor (I/O lane, O_DIRECT), slab arena, LRU/pin (↔ c/uring.h, tier.h)
   peregrine-cuda/     # -sys FFI to backend_cuda.h + build.rs(nvcc) + wrapper
-  peregrine-model/    # MLA, router, MoE, DSA, MTP + the 3-lane scheduler   (↔ glm.c forward)
-  peregrine-engine/   # binary: clap CLI + stdio serve protocol (drop-in for c/glm)
+  peregrine-model/    # MLA, router, MoE, DSA, MTP, prefetch prediction (predict.rs)
+                      #   + the N-ring 3-lane scheduler (concurrent.rs)   (↔ glm.c forward)
+  peregrine-sched/    # CPU∥SSD streaming core (moe_streamed) + reconstruct
+  peregrine-par/      # persistent scoped worker pool, bit-identical to serial (std-only)
+  peregrine-engine/   # binary `peregrine`: CLI (demo/build/bench/build-automaton/dump-routes)
+                      #   + stdio serve protocol (drop-in for c/glm)
+  peregrine-serve/    # binary `peregrine-serve`: OpenAI HTTP (axum/tokio) + continuous batching
 ```
 
 - Build: `cargo build --release --features cuda`; CPU-only drops the `cuda` feature (pure-CPU,

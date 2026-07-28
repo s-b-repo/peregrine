@@ -51,15 +51,29 @@ P_PATTERNS=(
   '\.unwrap_err\(\)' '\.expect_err\('
   'panic!\(' 'unreachable!\(' 'todo!\(' 'unimplemented!\('
 )
-# U: undefined-behavior / concurrency footguns.
-U_PATTERNS=('\bstatic[[:space:]]+mut\b' '\btransmute\b' '\bmem::forget\b' 'assume_init\(\)')
+# U: undefined-behavior / concurrency footguns. `transmute` is handled separately
+# below so peregrine-par's single documented lifetime-erasure can be exempted.
+U_PATTERNS=('\bstatic[[:space:]]+mut\b' '\bmem::forget\b' 'assume_init\(\)')
 
 echo "== peregrine bad-patterns audit (${#FILES[@]} files) =="
 echo "[P] panicking error handling  (STRICT)"; run_section P_TOTAL "${P_PATTERNS[@]}"
 echo "[U] UB / concurrency footguns (STRICT)"; run_section U_TOTAL "${U_PATTERNS[@]}"
+# transmute is a strict footgun everywhere EXCEPT peregrine-par, which encapsulates
+# one documented lifetime-erasure (borrowed closure → persistent worker pool, made
+# sound by a fork-join barrier) behind a safe API — the same tolerance granted to
+# `unsafe` in io/cuda/kernels.
+TRANSMUTE="$(scan '\btransmute\b' | grep -vE 'crates/peregrine-par/' || true)"
+TM_C="$(printf '%s' "$TRANSMUTE" | grep -c . || true)"
+if [ "$TM_C" -gt 0 ]; then
+  printf '  %-40s %d\n' '\btransmute\b (outside peregrine-par)' "$TM_C"
+  [ "$STRICT" -eq 0 ] && printf '%s\n' "$TRANSMUTE" | sed 's/^/      /'
+  U_TOTAL=$((U_TOTAL + TM_C))
+fi
 
 # I: unsafe outside the crates where it's expected (informational, not a gate).
-UNSAFE="$(scan '\bunsafe\b' | grep -vE 'crates/peregrine-(io|cuda|kernels)/' || true)"
+# peregrine-par encapsulates one pattern: sending a borrowed closure pointer to a
+# persistent worker pool behind a fork-join barrier (safe API, `#SAFETY`-documented).
+UNSAFE="$(scan '\bunsafe\b' | grep -vE 'crates/peregrine-(io|cuda|kernels|par)/' || true)"
 I_TOTAL="$(printf '%s' "$UNSAFE" | grep -c . || true)"
 echo "[I] unsafe outside peregrine-io/cuda/kernels (INFO): $I_TOTAL"
 [ "$I_TOTAL" -gt 0 ] && [ "$STRICT" -eq 0 ] && printf '%s\n' "$UNSAFE" | sed 's/^/      /'

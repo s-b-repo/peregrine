@@ -41,7 +41,7 @@ pub fn pread_many(reqs: &mut [ReadReq]) -> Vec<i64> {
 #[cfg(target_os = "linux")]
 mod uring {
     use super::ReadReq;
-    use crate::slab::{align_down, align_up, AlignedBuf, SlabPool, ALIGN};
+    use crate::slab::{align_down, align_up, AlignedBuf, Bytes, SlabPool, ALIGN};
     use io_uring::{opcode, squeue, types, IoUring};
     use std::io;
     use std::os::unix::io::RawFd;
@@ -364,6 +364,58 @@ mod uring {
             }
             Ok(results)
         }
+
+        /// **Zero-copy** O_DIRECT reads. For each `(fd, off, len)` it DMAs the
+        /// 4096-aligned superset `[align_down(off), align_up(off+len))` into a freshly
+        /// allocated [`AlignedBuf`] and returns it as [`Bytes::Aligned`] exposing
+        /// exactly `[off, off+len)`. Unlike [`Reactor::read_direct_many`] there is
+        /// **no realignment copy-out** — the consumer (a streamed `QtWeight`) reads
+        /// straight out of the DMA target, so an O_DIRECT stream costs zero userspace
+        /// copies of the bulk weight bytes (matching the buffered path, which already
+        /// has the kernel fill the caller's buffer directly). The delivered bytes are
+        /// byte-for-byte identical to a buffered read. Requires each `fd` opened
+        /// `O_DIRECT`; the buffer/offset/length alignment is handled here. Each buffer
+        /// is owned by its returned `Bytes` (it outlives the read into the weight), so
+        /// this path allocates per region rather than using the reusable slab pool.
+        pub fn read_direct_aligned(&mut self, reqs: &[(RawFd, u64, usize)]) -> io::Result<Vec<Bytes>> {
+            let mut out: Vec<Bytes> = Vec::with_capacity(reqs.len());
+            for &(fd, off, want) in reqs {
+                if want == 0 {
+                    out.push(Bytes::Vec(Vec::new()));
+                    continue;
+                }
+                let a = ALIGN as u64;
+                let a_off = align_down(off, a);
+                let head = (off - a_off) as usize;
+                let a_len = (align_up(off + want as u64, a) - a_off) as usize;
+                let need = head + want; // bytes present before the region is complete
+                let mut buf =
+                    AlignedBuf::with_capacity(a_len).ok_or_else(|| io::Error::other("aligned alloc failed"))?;
+                // Read the aligned window to completion. A positioned read may return
+                // short; the final aligned read of a shard may legally EOF-short once
+                // `need` is covered (the tail padding past the file end is never read).
+                let mut done = 0usize;
+                while done < need {
+                    let n = {
+                        let mut sub =
+                            [ReadReq { fd, offset: a_off + done as u64, buf: &mut buf.as_mut_slice()[done..a_len], tag: 0 }];
+                        self.read_many(&mut sub)?[0]
+                    };
+                    if n < 0 {
+                        return Err(io::Error::from_raw_os_error((-n) as i32));
+                    }
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "O_DIRECT read hit EOF before covering the region",
+                        ));
+                    }
+                    done += n as usize;
+                }
+                out.push(Bytes::Aligned { buf, head, len: want });
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -435,6 +487,9 @@ impl Reactor {
     }
     pub fn configure_slab(&mut self, _buf_cap: usize, _max_bufs: usize) {}
     pub fn read_direct_many(&mut self, _reqs: &mut [ReadReq]) -> std::io::Result<Vec<i64>> {
+        Self::unsupported()
+    }
+    pub fn read_direct_aligned(&mut self, _reqs: &[(RawFd, u64, usize)]) -> std::io::Result<Vec<crate::Bytes>> {
         Self::unsupported()
     }
 }
@@ -671,6 +726,58 @@ mod tests {
             }
             let o = off as usize;
             assert_eq!(&got[..], &data[o..o + len], "direct off={off} len={len} bytes mismatch");
+        }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_aligned_matches_pread() -> std::io::Result<()> {
+        // Zero-copy O_DIRECT: `read_direct_aligned` must expose exactly [off,off+len)
+        // of each region (unaligned head, block-spanning, exact block, big span, EOF
+        // tail), byte-identical to the source — proving the aligned DMA buffer + its
+        // head/len view need no realignment copy. Skips when the temp FS rejects
+        // O_DIRECT (overlayfs/tmpfs in CI containers).
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        // unique size ⇒ unique temp path (avoids colliding with other tests).
+        let (f, path, data) = temp_file_with(b"zero-copy-aligned-DMA-payload!", 41000)?;
+        let _ = f; // buffered fd unused; we read through the O_DIRECT fd below
+        let df = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&path) {
+            Ok(df) => df,
+            Err(_) => {
+                std::fs::remove_file(&path)?;
+                return Ok(()); // filesystem rejects the O_DIRECT open → skip
+            }
+        };
+        let dfd = df.as_raw_fd();
+        if !super::probe_direct(dfd) {
+            std::fs::remove_file(&path)?;
+            return Ok(()); // open ok but aligned reads rejected (EINVAL) → skip
+        }
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(_) => {
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        // (offset, len): unaligned head, block-spanning, exact block, big span, EOF tail
+        let cases = [(100u64, 7usize), (4090, 20), (0, 4096), (8191, 4098), (40997, 3)];
+        let reqs: Vec<_> = cases.iter().map(|&(off, len)| (dfd, off, len)).collect();
+        let got = match reactor.read_direct_aligned(&reqs) {
+            Ok(g) => g,
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                std::fs::remove_file(&path)?;
+                return Ok(()); // late EINVAL → skip
+            }
+            Err(e) => return Err(e),
+        };
+        for (k, &(off, len)) in cases.iter().enumerate() {
+            assert_eq!(got[k].len(), len, "region {k} wrong len");
+            let o = off as usize;
+            assert_eq!(&got[k][..], &data[o..o + len], "aligned off={off} len={len} bytes mismatch");
         }
         std::fs::remove_file(&path)?;
         Ok(())
