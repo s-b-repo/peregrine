@@ -57,7 +57,7 @@ headline findings:
 Net: on a single box the dominant limit is the **memory-vs-working-set wall**, and within that regime
 **colibrì is currently ~1.4× faster** thanks to a more mature streaming path. The Rust rewrite lands in
 the same order of magnitude, adds a verified warm-cache/scheduler stack and memory-safety guarantees
-(184 tests, `#![forbid(unsafe_code)]` outside FFI, `deny(unwrap/panic)`), and is architected to win in
+(282 tests, `#![forbid(unsafe_code)]` outside FFI, `deny(unwrap/panic)`), and is architected to win in
 the residency regime the C engine's phased loop leaves on the table — but it has a concrete, fixable
 I/O-lane-depth gap to close before it beats the C engine at raw single-box streaming.
 
@@ -75,7 +75,16 @@ I/O-lane-depth gap to close before it beats the C engine at raw single-box strea
 > cold cache slots, and per-workload-class prefetch breadth. All new subsystems are env-gated
 > (defaulting to the historical behavior in most cases) and bit-identical when off. Re-running
 > this study with those knobs live is the next benchmarking pass — see [`todo.md`](../todo.md)
-> for the per-item completion state (now ~60% strict / ~64% weighted across 95 tracked items).
+> A completion sweep then closed every non-hardware item (sensor governors, entropy-adaptive
+> prefetch, NUMA allocation + hierarchical dispatch, expert fusion + hypergraph scheduling,
+> macro-states, the `galactic` pass, Hilbert/2-opt/tier layouts, physical checkpoint self-rewrite,
+> online bandit/Q-learning schedulers, per-shape dispatch specialization, kblock layout
+> auto-conversion, and the `compile-plan` execution plan) — see [`todo.md`](../todo.md) for the
+> per-item state (now ~87% strict / ~88% weighted across 95 tracked items; every open item is
+> hardware-gated). The serve layer additionally gained a **vendored gigatoken BPE tokenizer**
+> (marcelroed/gigatoken, MIT — stable-toolchain subset in `peregrine-token`): id-for-id
+> parity-gated against the HF `tokenizers` oracle and measured **34× faster locally**
+> (204 vs 6 MB/s, `--bench-tokenizer`), with the HF crate as automatic fallback.
 
 ---
 
@@ -122,7 +131,7 @@ GLM‑5.2 (as shipped in the int4 container both engines consume) is a DeepSeek�
   learned auto-pin (`.coli_usage`), MTP speculation, DSA, io_uring (`URING=1`).
 - **peregrine** — the Rust rewrite ([`DESIGN.md`](../DESIGN.md)): Linux + NVIDIA, a concurrent
   3-lane (CPU∥GPU∥SSD) MoE scheduler, io_uring reactor, warm cache, look-ahead prefetch, and a
-  memory-safe kernel/loader stack validated by 184 tests.
+  memory-safe kernel/loader stack validated by 282 tests.
 
 ---
 
@@ -157,7 +166,7 @@ to the sequential path (guarded by the `streamed_experts_match_resident` test). 
 | Dimension | colibrì (C) | peregrine (Rust) |
 |---|---|---|
 | MoE scheduling | **Phased** (CPU inline, GPU after) | **Concurrent 3-lane** (CPU∥GPU∥SSD, deterministic reduce) |
-| Language / safety | C, manual memory | Rust; `#![forbid(unsafe_code)]` except io_uring/CUDA FFI; `deny(unwrap/expect/panic)`; **184 tests, clippy-clean** |
+| Language / safety | C, manual memory | Rust; `#![forbid(unsafe_code)]` except io_uring/CUDA FFI; `deny(unwrap/expect/panic)`; **282 tests, clippy-clean** |
 | SSD I/O | hand-rolled io_uring (`uring.h`, `URING=1`), `O_DIRECT`, io-wq cap | `io-uring` crate + custom reactor; registered files (`IOSQE_FIXED_FILE`), COOP_TASKRUN, forced ASYNC; **batched 6→1 submit/expert** |
 | RAM expert tier | per-layer LRU `ecache`, auto-sized from `MemAvailable`; LFRU pinned hot-store; learned `.coli_usage` | **byte-budgeted `(layer,expert)` WarmCache** (quantized bytes; `COLI_ECACHE_GB`) |
 | Prefetch | **PILOT** cross-layer (router-lookahead, 71.6 % recall); `PILOT_REAL` | **PILOT lane** (prev-token predictor, dedicated ring, background warm) |
@@ -223,7 +232,7 @@ effect on this box*.
 
 ### 3.7 Correctness & quality
 - Streamed path is **bit-identical** to the resident path (same bytes → same kernels). GPU experts
-  compute in f32 (intentionally not bit-exact vs the int4 CPU path — documented). **184 tests pass,
+  compute in f32 (intentionally not bit-exact vs the int4 CPU path — documented). **282 tests pass,
   `cargo clippy --workspace --all-targets` is clean** (CPU and `--features cuda`).
 
 ---

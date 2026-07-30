@@ -85,34 +85,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn none_is_verbatim() {
+    fn none_is_verbatim() -> Result<(), String> {
         let raw = b"hello world".to_vec();
-        let enc = encode(&raw, Compression::None, 0).unwrap_or_default();
+        let enc = encode(&raw, Compression::None, 0)?;
         assert_eq!(enc, raw);
-        let back = decode(&enc, Compression::None, raw.len()).unwrap_or_default();
+        let back = decode(&enc, Compression::None, raw.len())?;
         assert_eq!(back, raw);
+        Ok(())
     }
 
     #[test]
-    fn zstd_round_trip() {
+    fn zstd_round_trip() -> Result<(), String> {
         // Real weight-shaped bytes: repetitive quantized nibbles compress well.
         let mut raw = Vec::with_capacity(1 << 16);
         for i in 0..(1 << 16) {
             raw.push((i % 251) as u8);
         }
-        let enc = encode(&raw, Compression::Zstd, 3).unwrap_or_default();
+        let enc = encode(&raw, Compression::Zstd, 3)?;
         assert!(!enc.is_empty());
         // Compression ratio is a byproduct — assert on round-trip only.
-        let back = decode(&enc, Compression::Zstd, raw.len()).unwrap_or_default();
+        let back = decode(&enc, Compression::Zstd, raw.len())?;
         assert_eq!(back, raw);
+        Ok(())
     }
 
     #[test]
-    fn zstd_truncation_is_error() {
+    fn zstd_truncation_is_error() -> Result<(), String> {
         let raw = vec![7u8; 4096];
-        let enc = encode(&raw, Compression::Zstd, 3).unwrap_or_default();
+        let enc = encode(&raw, Compression::Zstd, 3)?;
         // Wrong `orig_len` must fail rather than silently produce a truncated buffer.
         assert!(decode(&enc, Compression::Zstd, 1000).is_err());
+        Ok(())
     }
 
     #[test]

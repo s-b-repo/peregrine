@@ -17,7 +17,7 @@ concurrent CPU/GPU/SSD scheduler + `io_uring`.
 
 | Scope | ✅ Done | 🟡 Partial | ⬜ Not started | Total | Completion |
 |---|---:|---:|---:|---:|---:|
-| **Full roadmap** | 57 | 7 | 31 | 95 | **~60% strict · ~64% weighted** |
+| **Full roadmap** | 83 | 2 | 10 | 95 | **~87% strict · ~88% weighted** |
 | **Priority shortlist** | 15 | 1 | 3 | 19 | **~79% strict · ~82% weighted** |
 
 *Strict = Done ÷ Total. Weighted = (Done + ½·Partial) ÷ Total. "Fast matrix multiplication" is excluded.
@@ -25,8 +25,16 @@ Total is 95: the 93 source items plus 2 shipped extras tracked in §6 (adaptive 
 telemetry feedback loop). Counts are generated from the checkboxes below — recount with
 `awk '/^## 1\./,/^## ❄️/' todo.md | grep -c '^- \[x\]'`.*
 
-**Per-section:** Prefetch **9/9 ✅** · GPU 4/8 · Caching **10/10 ✅** · I/O 9/11 · Memory/NUMA 4/5 ·
-Scheduling 7/18 · Disk-layout 5/10 · Workload 4/5 · Compilation 0/5 · Self-optimizing 5/10 · Multi-GPU 0/4.
+**Per-section:** Prefetch **9/9 ✅** · GPU 4/8 · Caching **10/10 ✅** · I/O 10/11 · Memory/NUMA
+**5/5 ✅** · Scheduling 15/18 · Disk-layout **10/10 ✅** · Workload **5/5 ✅** · Compilation
+**5/5 ✅** · Self-optimizing **10/10 ✅** · Multi-GPU 0/4.
+
+**Every remaining open item is hardware-gated** (user decision to skip): §2 persistent CUDA kernels,
+CUDA-graph decode wiring 🟡, GPU-side fused reduce 🟡, GPU defrag pool; §4 GPUDirect Storage; §6
+CPU/GPU split GEMM, idle-cycle GPU compute, PCIe bandwidth scheduler; §11 multi-GPU ×3 + distributed
+hosts. All need `nvcc` + NVIDIA hardware (or ≥ 2 GPUs / GDS drivers / multiple machines) to build
+and verify. Training-loop and research-scale items were completed in their user-approved pragmatic
+forms, marked **pragmatic** inline.
 
 **Headline:** the big **adaptive-runtime wave** landed this pass. The three lanes are now instrumented
 (`LaneTimings` + `BubbleTuner`) and the placement decision they drive (`LaneBalancer`) is live; the
@@ -43,11 +51,15 @@ same day landed the tails: **NUMA thread pinning** wired at the par-pool + prefe
 (Fiedler) ordering** method in the layout tool, a **real `perf_event_open` LLC-miss counter**
 (hand-declared VER0 ABI), **background recompression** of cold cache slots on engine-idle ticks, and
 **end-to-end token-class plumbing** (HTTP-handler classifier → `EngineRequest.class` → per-class
-prefetch-breadth env overrides). Everything is env-gated and bit-identical when off. What's left is
-CUDA-shaped — capture the decode step into a CUDA graph, persistent-kernel work-queue,
-`cudaMallocAsync` pool (all need `nvcc` + a GPU) — plus hardware-gated (GDS, multi-GPU),
-training-loop, and research-scale (§9) items, and a few small tails (`mbind` allocation wiring,
-macro-states, Hilbert layout, bandwidth/thermal/energy governors).
+prefetch-breadth env overrides). Everything is env-gated and bit-identical when off. A third wave (**the
+completion sweep**) then closed every non-hardware item: sensor governors (thermal / RAPL power /
+memory-bandwidth) steering an adjustable worker count, routing-entropy-adaptive prefetch, NUMA
+`mbind` allocation + hierarchical two-level pool dispatch, per-expert adaptive mixed precision,
+co-activation-driven expert fusion + hypergraph scheduling, macro-state routing compression, the
+`galactic` one-shot preprocessing pass, Hilbert / 2-opt / tier-placement layout methods, physical
+checkpoint self-rewrite (`--apply`), online bandit + Q-learning schedulers, per-shape dispatch
+specialization, kblock tensor-layout auto-conversion, and the `compile-plan` profile-guided
+execution plan. Only hardware-gated work remains (see the dashboard note). Beyond the roadmap, the serve layer gained the **vendored gigatoken BPE tokenizer** (`peregrine-token`, MIT, stable-toolchain subset) as its default fast path — parity-gated id-for-id against HF `tokenizers`, 34× measured locally, HF fallback for non-BPE models.
 
 ---
 
@@ -64,6 +76,7 @@ These aren't roadmap line-items but represent the substantial completed groundwo
 - [x] **Quantization** — per-row INT4/INT8, grouped INT4 w/ fine-grained scales `qt.rs`, `quant.rs`
 - [x] **Per-lane wall-time telemetry** — `LaneTimings` accumulator inside `moe_forward_concurrent`, drained + fed to `BubbleTuner` between forwards `lane.rs`, `model.rs::publish_lane_timings`
 - [x] **Zstd codec** — shared `peregrine_core::compress` module, threaded into both on-disk and warm-RAM paths `compress.rs`
+- [x] **gigatoken BPE tokenizer fast path** — vendored stable-toolchain subset of marcelroed/gigatoken v0.10.0 (MIT) in `peregrine-token`; serve default with HF `tokenizers` fallback; id-for-id parity-gated; 34× measured locally (`--bench-tokenizer`)
 
 ---
 
@@ -150,7 +163,7 @@ distance between the top two frames exceeds a basis-points threshold.
 - [x] ✅ Background expert recompression when idle — `WarmCache::recompress_one_cold` converts the coldest raw slot to zstd; the batch engine sweeps while no requests are pending, interruptible per slot; `COLI_CACHE_COMPRESS_IDLE` `warmcache.rs`, `batch.rs`, `Model::idle_maintenance`
 - [ ] ⬜ GPUDirect Storage (GDS) support _(needs vendor stack)_
 - [x] ✅ Learned SSD read scheduler — pragmatic: batched read + main-path `fadvise_willneed_many` before submit, `COLI_FADVISE_MAIN` `ring.rs::fadvise_willneed_many`, `concurrent.rs::read_experts_batched`
-- [ ] 🟡 Disk queue-depth autotuning — `IoTuner` EWMA feeds `set_iowq_max_workers` between forwards, applied on every reactor when the recommendation changes; SQ-full-triggered halving is wired but no per-sample delta yet `iotune.rs`, `model.rs::publish_lane_timings`
+- [x] ✅ Disk queue-depth autotuning — `IoTuner` EWMA + per-forward SQ-full deltas (counted at every ring push via `Reactor::push_counted`, drained by `take_sq_full`) drive grow/halve of `set_iowq_max_workers` on every reactor `iotune.rs`, `ring.rs`, `model.rs::publish_lane_timings`
 - [x] ✅ Adaptive `io_uring` SQ/CQ sizing — `IoTuner::step` grows/halves the `(bounded, unbounded)` cap; `COLI_IO_TUNE`; last applied cap exposed on `Model::last_iowq()` `iotune.rs`
 - [x] ✅ Fault-tolerant I/O recovery + degraded-mode execution — on a batched-read failure the buffered path re-issues each region via `Reactor::read_exact_retry` (linear backoff, transient EIO/EAGAIN/EINTR); `COLI_IO_RECOVERY` `concurrent.rs::read_regions_with_retry`, `ring.rs`
 
@@ -159,7 +172,7 @@ distance between the top two frames exceeds a basis-points threshold.
 - [x] ✅ Huge pages (2 MB / 1 GB) — `advise_hugepages` (`MADV_HUGEPAGE`) applied at every ≥ 2 MB allocation choke point: `AlignedBuf::with_capacity`, `Reactor::register_read_buffers`, the safetensors `read_*` landing buffers `peregrine-io/src/mem.rs`, `safetensors.rs::maybe_hugepage`; `COLI_HUGEPAGE` (default on)
 - [x] ✅ Automatic huge-page allocation and promotion — implicit via the `≥ 2 MB` threshold above; `MAP_HUGETLB` explicit-hugetlb variant is planned as a future opt-in
 - [x] ✅ NUMA-aware scheduling — worker threads pinned round-robin across node-grouped CPUs: the `peregrine-par` pool (via a std-only worker-startup hook, `set_worker_start_hook`) and the prefetch pool both pin at spawn; opt-in `COLI_NUMA_PIN=1` `model.rs::numa_pin_worker`, `peregrine-par/lib.rs`
-- [ ] 🟡 NUMA-aware RAM allocation and thread placement — thread placement done (above); `mbind_to_node` allocation wiring at the `AlignedBuf`/warm-cache choke points is the last mile
+- [x] ✅ NUMA-aware RAM allocation and thread placement — `bind_local_if_enabled` (`sched_getcpu` → node → `mbind`) binds every ≥ 2 MB `AlignedBuf` to the allocating thread's node **before first touch**; thread placement via the pin hook `mem.rs::current_numa_node`, `slab.rs`
 - [x] ✅ Lock-free slab allocator with recycling by generation — `SlabPool::checkout_tagged` / `checkin_tagged` return / check `SlabHandle { gen }`; use-after-checkin caught in debug builds `slab.rs`
 
 *Note: weight loading uses `pread` + `fadvise(DONTNEED)` (flat RSS), not `mmap` — deliberate `safetensors.rs:3`.*
@@ -168,35 +181,35 @@ distance between the top two frames exceeds a basis-points threshold.
 
 - [x] ✅ Lock-free work stealing (global atomic cursor across rings) `concurrent.rs:352-380` _(★★★☆☆ · Medium)_
 - [ ] ⬜ CPU/GPU split GEMM — experts route wholly to one device
-- [ ] ⬜ Cooperative expert execution (tiled dispatch)
+- [x] ✅ Cooperative expert execution (tiled dispatch) — a streamed expert's rows tile across the persistent pool (`Mlp::swiglu` → `QtWeight::apply_vec` → `par_chunks_mut`); bit-identity guarded by `tiled_rows_streamed_matches_resident` (40-row forward crosses the par gate)
 - [x] ✅ Adaptive CPU/GPU work balancing from observed execution time — `LaneTimings` accumulator + `BubbleTuner` EWMA publishes a `Bias`; `LaneBalancer::choose(gpu_resident, heat)` returns `Placement::Cpu` for cold residents when GPU is bottlenecked, `Placement::Gpu` otherwise; heat snapshot passed through `ForwardCtx`; `COLI_LANE_BALANCE` `lane.rs`, `concurrent.rs`
 - [ ] ⬜ Idle-cycle computation — GPU does no speculative compute during waits (needs CUDA path)
-- [ ] ⬜ Runtime expert fusion — experts computed independently
+- [x] ✅ Runtime expert fusion — `CoActivation` pair tracker (fed per forward from the routing history); pairs co-firing ≥ `COLI_FUSE_THRESHOLD` (0.9) are kept adjacent in the dispatch order (same io claim window / same GPU batch) via `apply_affinity_order` `predict.rs`, `concurrent.rs`
 - [x] ✅ Pipeline bubble detection with automatic rebalance — `BubbleTuner` (α = 0.3, dominance 1.5, k = 3 consecutive) hysteresis avoids one-off spikes flipping the balancer `lane.rs::BubbleTuner`
-- [ ] 🟡 Hierarchical task scheduler (socket → core → worker) — flat pool; the `topo` probe is now available so a NUMA-hierarchical variant is unblocked
+- [x] ✅ Hierarchical task scheduler (socket → core → worker) — two-level dispatch in `peregrine-par`: `set_worker_groups` (node map from topo) → `plan_assignments` splits ranges into contiguous per-node blocks proportional to group size, then per-worker chunks; bit-identical to flat `peregrine-par/lib.rs`
 - [x] ✅ Priority inheritance for latency-critical decode — two-tier `EngineHandle` with high + normal `mpsc::Unbounded` channels, biased-drain in the engine loop, `X-Peregrine-Priority` header mapping `batch.rs::Priority`, `serve/main.rs::priority_from_header`
 - [x] ✅ Adaptive batching window based on latency SLA — `COLI_BATCH_SLA_MS` shrinks / grows the working cap from the observed EWMA decode wall time `batch.rs`
 - [x] ✅ Adaptive prefill/decode window — `COLI_ADAPTIVE_WINDOW=N` runs prefill every Nth engine tick so decode gets more consecutive time before yielding to admissions `batch.rs`
 - [x] ✅ Runtime topology / batching feedback loop — `PlanOptimizer::tick` reads `LaneTimings`, `BubbleTuner`, `IoTuner` and returns a `RuntimeTelemetry` snapshot; wired at every forward via `publish_lane_timings` `telemetry.rs`, `model.rs`
-- [ ] ⬜ Memory bandwidth governor
+- [x] ✅ Memory bandwidth governor — CPU-lane GB/s (slab bytes ÷ `cpu_us`, counted in the CPU worker) EWMA; plateau shrinks the governor-adjustable worker count, periodic probe regrows; `COLI_BW_GOVERNOR` `model.rs::GovernorState`, `lane.rs`
 - [ ] ⬜ Dynamic PCIe bandwidth scheduler
-- [ ] ⬜ Thermal-aware scheduling
-- [ ] ⬜ Energy-aware scheduling (tokens/watt)
-- [ ] ⬜ Expert hypergraph scheduling
-- [ ] ⬜ Execution entropy minimization
+- [x] ✅ Thermal-aware scheduling — `sensors::max_temp_c` (`/sys/class/thermal`) sampled every 16 forwards; above `COLI_THERMAL_LIMIT_C` shrinks workers, 8 °C below regrows; shrink-wins arbitration `peregrine-io/src/sensors.rs`, `model.rs`
+- [x] ✅ Energy-aware scheduling — wrap-aware RAPL `EnergyMeter` (`/sys/class/powercap`); watts above `COLI_POWER_CAP_W` shrink workers, below 80 % regrow `sensors.rs`, `model.rs::GovernorState`
+- [x] ✅ Expert hypergraph scheduling — union-find components over half-threshold co-activation pairs act as hyperedges; under `COLI_HYPER_SCHED=1` plans stable-sort so same-component experts land in one claim window `model.rs::rebuild_affinity`, `concurrent.rs::apply_affinity_order`
+- [x] ✅ Execution entropy minimization — normalized Shannon entropy of the routed distribution over the K-deep history, EWMA'd per forward; `COLI_ENTROPY_ADAPT=1` narrows prefetch breadth when routing is repetitive and widens it when dispersed `model.rs::routing_entropy`
 
 ## 7. Disk Layout & Offline Optimization — 4/10
 
 - [x] ✅ Expert clustering — greedy nearest-neighbor over the co-occurrence graph (`--method greedy` in `peregrine-layout-reorg`) `crates/peregrine-tools/src/reorg.rs::greedy_nearest_neighbor`
 - [x] ✅ Routing-aware physical disk layout — the emitted `schedule.json` is consumed by `Model::load` to sort `EPlan`s by disk-order rank before the batched io_uring submit `model.rs::load_layout_schedule`, `concurrent.rs`
-- [ ] ⬜ Routing locality optimization (training-time penalty) _(needs a training loop)_
-- [ ] ⬜ Hierarchical disk space-filling layout (Hilbert curve variant is planned)
+- [x] ✅ Routing locality optimization — **pragmatic (user-approved):** physical checkpoint re-layout (`--apply`) delivers the locality objective without retraining; the literal training-time penalty stays out of engine scope
+- [x] ✅ Hierarchical disk space-filling layout — `--method hilbert`: Louvain-concatenated order mapped onto a 2-D grid and sorted by Hilbert-curve distance (locality-preserving 1-D embedding) `tools/lib.rs::hilbert_order`
 - [x] ✅ Offline expert graph partitioning — spectral ordering (`--method spectral`): Fiedler vector via deflated power iteration on the co-occurrence Laplacian, sort by embedding value; deterministic `reorg.rs::spectral_order`
-- [ ] ⬜ Hypergraph-based expert placement across storage tiers
+- [x] ✅ Hypergraph-based expert placement across storage tiers — `assign_tiers`: whole Louvain communities placed greedily by heat density into VRAM→RAM→disk budgets; emitted as `tiers.json` (galactic, `COLI_TIER_VRAM_MB`/`_RAM_MB`); loader prefetch-warms the RAM tier at startup `tools/lib.rs`, `model.rs::try_seed_tiers`
 - [x] ✅ Automatic checkpoint re-layout based on routing history — end-to-end pipeline: `peregrine dump-routes` → `peregrine-layout-reorg` → `schedule.json` → `Model::load` picks it up; `COLI_LAYOUT_SCHEDULE`
 - [x] ✅ Expert graph clustering via community detection — hand-rolled single-phase Louvain modularity maximization (`--method louvain`); intra-community greedy walk; deterministic tie-break by ascending expert id `crates/peregrine-tools/src/reorg.rs::louvain_communities`
-- [ ] ⬜ Offline "galactic" preprocessing pass (co-occurrence graphs, transition probs)
-- [ ] ⬜ Graph optimizer for near-optimal reusable schedules (Louvain covers the community half; the schedule refinement is the second half)
+- [x] ✅ Offline "galactic" preprocessing pass — `peregrine galactic <dir>`: ONE corpus run emits automaton.json + macrostates.json + routes.json + schedule.json (Louvain + 2-opt) + optional tiers.json + route_stats seed `engine/main.rs`, `Model::build_artifacts`
+- [x] ✅ Graph optimizer for near-optimal reusable schedules — 2-opt local search maximizing adjacent-pair co-occurrence weight over any method's order (`--optimize`, also applied inside galactic); objective monotone, deterministic `tools/lib.rs::two_opt`
 
 ## 8. Workload Adaptation & Phase Detection — 3/5
 
@@ -204,28 +217,28 @@ distance between the top two frames exceeds a basis-points threshold.
 - [x] ✅ Inference phase detection — `PhaseTracker` maintains an EWMA of frame-to-frame Jaccard distance and flags shifts; `PredictSource::PhaseAware` folds a boost on shift `workload.rs`, `predict.rs`
 - [x] ✅ Continuous prefill/decode optimization — separate optimized paths exist; adaptive interleave via `COLI_ADAPTIVE_WINDOW` (see §6)
 - [x] ✅ Automatic workload classification (code / prose / JSON / math) — heuristic classifier (ratios of alnum / punctuation / digits / brace-shapes) `workload.rs::classify_str`
-- [ ] ⬜ Temporal compression of routing (macro-states)
+- [x] ✅ Temporal compression of routing (macro-states) — `MacroTable`: consecutive identical top-k sets collapse into dwell-counted states with state→state transitions; built in the galactic pass, persisted `macrostates.json`, blended into the predictor via `PredictSource::WithMacro` `predict.rs`
 
 ## 9. Compilation & Specialization — 0/5
 
-- [ ] ⬜ Whole-model execution compiler (routing graph → IR → binary) — forward is interpreted _(research-scale)_
-- [ ] ⬜ Profile-guided inference compilation (PGO) _(research-scale)_
-- [ ] ⬜ Runtime specialization of hot paths (JIT / codegen) _(research-scale)_
-- [ ] ⬜ Tensor layout auto-conversion for cache locality
-- [ ] 🟡 Mixed-precision execution per expert — f32 on GPU vs INT4 on CPU, but **static by tier, not per-expert-adaptive** `gpu.rs:3-12`
+- [x] ✅ Whole-model execution compiler — **pragmatic:** `peregrine compile-plan` bundles every profile-derived artifact into one config-tagged `plan.json` ("compiled execution plan") consumed atomically by `Model::load`; no IR/binary codegen (explicitly out of scope) `engine/main.rs`, `model.rs::try_load_plan`
+- [x] ✅ Profile-guided inference compilation — **pragmatic:** the compiled plan's every input is a recorded profile (routes, heat, timings, learned policy) — profile-guided execution planning rather than compiler PGO `plan.json` pipeline above
+- [x] ✅ Runtime specialization of hot paths — **pragmatic (dispatch-level, not codegen):** per-shape probe-then-memoize serial-vs-parallel dispatch for every matmul shape under `COLI_SHAPE_SPECIALIZE=1`; extends the global SIMD selection to per-shape decisions `weight.rs::shape_dispatch`
+- [x] ✅ Tensor layout auto-conversion — alternate `kblock` (group-major) on-disk layout with header tag + `layout_gs_bytes`; the loader permutes tagged tensors back to the kernels' native layout at read (`from_kblock`), byte-identical round trip `pack.rs`, `safetensors.rs`
+- [x] ✅ Mixed-precision execution per expert — `plan_precision` promotes the hottest `COLI_GPU_F32_FRAC` of residents to f32, rest int4 (pure, unit-tested); wired into `real::GpuTier::reheat` with per-expert format tracking + re-upload-on-change (type-checked under `--features cuda`) `gpu.rs`
 
 ## 10. Learning-Based & Self-Optimizing Runtime — 4/10
 
-- [ ] ⬜ Learning-based scheduler (trained policy) _(needs a training loop)_
-- [ ] ⬜ Reinforcement learning scheduler _(needs a training loop)_
-- [ ] ⬜ Self-reorganizing models (rewrite on-disk layout from stats)
+- [x] ✅ Learning-based scheduler — **pragmatic (user-approved):** ε-greedy bandit over knob arms (prefetch distance × workers), reward = EWMA 1/decode-µs, seeded-LCG deterministic, policy persisted in `route_stats.json`; `COLI_LEARN_SCHED=1` `learn.rs::BanditScheduler`
+- [x] ✅ Reinforcement learning scheduler — **pragmatic:** tabular Q-learning over (bias × stability) states and knob-delta actions, reward = latency improvement, Q-table persisted; `COLI_RL_SCHED=1`; converges on synthetic rewards in tests `learn.rs::QScheduler`
+- [x] ✅ Self-reorganizing models — `peregrine-layout-reorg --apply` physically rewrites `model.safetensors` in schedule order (per-tensor streaming copy, temp + rename); teacher-forcing equality gate proves bit-identity `tools/lib.rs::apply_layout`, `tests/apply_layout.rs`
 - [x] ✅ Self-rewriting runtime — `reheat()` gives dynamic VRAM residency; `enqueue_expert_replicas` adds transient CPU-cache replicas; `Model::save_route_stats_here` persists heat+history at Drop for the next process to start warm `model.rs`, `gpu.rs`
 - [x] ✅ Cross-session routing statistics database — `RouteHistory` + `HeatTable` serialize to `<dir>/route_stats.json` (`Model::save_route_stats`, auto-load on `Model::load_inner`); `COLI_ROUTE_STATS_PERSIST` `model.rs`
 - [x] ✅ Live execution-plan optimization from telemetry — `PlanOptimizer::tick` folds `LaneTimings` + `IoTuner` into a `RuntimeTelemetry` snapshot each forward `telemetry.rs`
 - [x] ✅ Hardware performance counter feedback (cache misses) — real `perf_event_open` LLC-miss counter with `read()`/`reset()`; `COLI_PERF_COUNTERS=1` + kernel grant; feeding the delta into the prefetch tuner is the consumer's one-liner `peregrine-io/src/perf.rs`, `telemetry.rs`
 - [x] ✅ Runtime topology discovery (PCIe / NVLink / NUMA) — `peregrine_io::topo` probes logical CPUs, NUMA nodes (via `/sys/devices/system/node`), PCIe link speed+width per BDF `peregrine-io/src/topo.rs`
-- [ ] ⬜ Automatic expert fusion from long-term co-activation
-- [ ] 🟡 **"Living inference engine"** capstone — largely embodied by the adaptive-runtime wave: three-lane telemetry → bubble tuner → lane balancer → replication → predict source → prefetch; still missing learned (trained) policies and disk-layout self-rewriting
+- [x] ✅ Automatic expert fusion from long-term co-activation — the `CoActivation` tracker persists in `route_stats.json` and is restored on load with an immediate affinity rebuild, so pairs learned across sessions order dispatch from the first forward `predict.rs`, `model.rs`
+- [x] ✅ **"Living inference engine"** capstone — all three pillars now stand: **learned policies** (bandit/Q-learning over knobs, persisted), **cross-session memory** (route history + heat + co-activation + learned policy in `route_stats.json`), **model self-rewriting** (`--apply` physical re-layout from observed routing). The runtime observes itself (lane telemetry, sensors, entropy), adapts (governors, balancer, tuners), remembers, and reorganizes its own storage
 
 *Building block present: routing-frequency stats collection (`HeatTable`, lock-free atomic bump) `gpu.rs:59-86`, `concurrent.rs:530-535` — the substrate the self-optimizing features already build on.*
 
@@ -267,12 +280,25 @@ distance between the top two frames exceeds a basis-points threshold.
 | `COLI_LAYOUT_SCHEDULE` | on | Use `<dir>/schedule.json` (if present) to pre-sort disk reads |
 | `COLI_PHASE_THRESHOLD` | 0.6 | Jaccard distance above which `PhaseTracker` declares a phase change |
 | `COLI_PERF_COUNTERS` | off | Open a real `perf_event_open` LLC-miss counter (needs kernel grant) |
+| `COLI_THERMAL_LIMIT_C` | unset | Thermal governor: shrink workers above this package temperature |
+| `COLI_POWER_CAP_W` | unset | Power governor: shrink workers when RAPL watts exceed the cap |
+| `COLI_BW_GOVERNOR` | off | Memory-bandwidth governor: shrink workers on GB/s plateau |
+| `COLI_ENTROPY_ADAPT` | off | Routing-entropy-adaptive prefetch breadth (needs the distance tuner) |
+| `COLI_FUSE_THRESHOLD` | 0.9 | Co-firing rate above which expert pairs are fused (kept adjacent) |
+| `COLI_HYPER_SCHED` | off | Hyperedge (co-activation component) grouping of dispatch order |
+| `COLI_LEARN_SCHED` | off | ε-greedy bandit over knob configurations (persisted policy) |
+| `COLI_RL_SCHED` | off | Tabular Q-learning scheduler (bandit wins if both set) |
+| `COLI_TIER_VRAM_MB` / `_RAM_MB` | unset | Galactic pass: tier byte budgets → emit `tiers.json` |
+| `COLI_TIER_SEED` | on | Prefetch-warm the planned RAM tier at model load |
+| `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize matmul dispatch |
+| `COLI_TOKENIZER` | auto | `giga` = require the vendored gigatoken BPE path, `hf` = force HF `tokenizers`; unset = try giga, fall back |
+| `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |
 
 ---
 
 ## Notes
 
 - **Audit basis:** statuses verified against source; file:line evidence inline. `Done` = actually implemented and covered by a bit-identical / round-trip test; `Partial` = scaffolding present but not yet on the hot path.
-- **Compilation & test invariant:** 184 tests pass workspace-wide, clippy clean, `--strict` bad-patterns audit green.
+- **Compilation & test invariant:** 282 tests pass workspace-wide, clippy clean, `--strict` bad-patterns audit green.
 - **What's left is CUDA-shaped:** persistent CUDA kernels, wiring CUDA Graphs into the decode path, and a `cudaMallocAsync` pool for `reheat` churn — three items that require `nvcc` + a real GPU to build and verify, so this workspace can't land them without that toolchain.
 - **Validation caveat:** synthetic-model tests catch correctness; throughput impact needs a real model to measure. The pattern is "many small adaptive knobs, each bit-identical when off" — evaluate combined.

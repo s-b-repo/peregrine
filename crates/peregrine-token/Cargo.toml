@@ -1,0 +1,38 @@
+# peregrine-token — vendored stable-toolchain subset of marcelroed/gigatoken
+# v0.10.0 (MIT): the BPE engine, SIMD (std::arch) pretokenizers, and the
+# HuggingFace tokenizer.json loader. The upstream crate is nightly-only
+# (portable_simd in its SentencePiece engine) and links libpython via pyo3;
+# this subset drops SentencePiece + the Python/batch/file layers so peregrine
+# stays on stable with a slim dependency set. See LICENSE-MIT-gigatoken.
+#
+# Edition 2024 is crate-local (upstream code uses let-chains); the rest of the
+# workspace stays on 2021.
+[package]
+name = "peregrine-token"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository.workspace = true
+description = "vendored gigatoken BPE subset: GB/s tokenization for peregrine-serve (HF tokenizers fallback)"
+
+[dependencies]
+eyre = "0.6"
+icu = { version = "2.2", features = ["compiled_data"] }
+itertools = "0.15"
+memchr = "2.8"
+rayon = "1.11"
+rustc-hash = "2.1"
+serde = { version = "1", features = ["derive"] }
+sonic-rs = "0.5"
+winnow = { version = "1", features = ["simd"] }
+base64 = "0.22"
+aho-corasick = "1.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+serde_json.workspace = true
+fancy-regex = "0.16"
+rand = "0.9"
+memmap2 = "0.9"

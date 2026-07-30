@@ -20,7 +20,12 @@ cd "$ROOT" || exit 1
 STRICT=0
 [ "${1:-}" = "--strict" ] && STRICT=1
 
-mapfile -t FILES < <(find crates -path '*/src/*' -name '*.rs' -type f | sort)
+# peregrine-token is vendored third-party code (marcelroed/gigatoken, MIT):
+# it keeps upstream style (unwrap/expect in tests + engine internals, unsafe
+# SIMD), so it is exempt from the engine crates' panic-free gate. The thin
+# facade in its lib.rs is covered by the parity + round-trip test suite
+# instead. See docs/BAD_PATTERNS.md.
+mapfile -t FILES < <(find crates -path '*/src/*' -name '*.rs' -type f ! -path 'crates/peregrine-token/*' | sort)
 
 # scan <regex>: matching non-comment lines as "file:line:code"
 scan() {

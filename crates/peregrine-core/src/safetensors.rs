@@ -40,6 +40,10 @@ pub struct TensorInfo {
     /// Original (post-decompression) size, in bytes. Equals `nbytes` for
     /// uncompressed entries.
     pub uncompressed_nbytes: i64,
+    /// On-disk byte-layout tag + its `gs_bytes` parameter. `None` = the
+    /// kernels' native row-major layout; `Some(("kblock", gs))` = group-block
+    /// transposed, auto-converted back to native by `read_raw`.
+    pub layout: Option<(String, usize)>,
 }
 
 /// Index over all `*.safetensors` shards in a model directory.
@@ -162,6 +166,10 @@ impl SafeTensors {
                         .and_then(|v| v.as_i64())
                         .unwrap_or(on_disk_nbytes),
                 };
+                let layout = match (m.get("layout").and_then(|v| v.as_str()), m.get("layout_gs_bytes").and_then(|v| v.as_u64())) {
+                    (Some(tag), Some(gs)) => Some((tag.to_string(), gs as usize)),
+                    _ => None,
+                };
                 let idx = tensors.len();
                 tensors.push(TensorInfo {
                     name: name.clone(),
@@ -173,6 +181,7 @@ impl SafeTensors {
                     shape,
                     compression,
                     uncompressed_nbytes,
+                    layout,
                 });
                 index.insert(name.clone(), idx);
             }
@@ -273,6 +282,18 @@ impl SafeTensors {
         Ok(need as i64)
     }
 
+    /// Read the raw bytes of tensor number `idx` (index into [`Self::tensors`]).
+    /// Same semantics as [`Self::read_raw`] but addressed positionally — the
+    /// offline relayout tool walks the index, not names.
+    pub fn read_raw_by_index(&self, idx: usize, out: &mut [u8]) -> Result<(), Error> {
+        let name = self
+            .tensors
+            .get(idx)
+            .map(|t| t.name.clone())
+            .ok_or_else(|| Error::Format(format!("tensor index {idx} out of range")))?;
+        self.read_raw(&name, out)
+    }
+
     /// Read the raw bytes of a tensor (no dtype conversion) — for the already
     /// int4/int8/int2-quantized U8 container payloads. `out` must be
     /// `uncompressed_nbytes`.
@@ -288,16 +309,28 @@ impl SafeTensors {
         maybe_hugepage(&mut out[..need]);
         let (off, fidx) = (t.off, t.file_idx);
         match t.compression {
-            Compression::None => self.read_at(fidx, off, &mut out[..need]),
+            Compression::None => self.read_at(fidx, off, &mut out[..need])?,
             other => {
                 let mut disk = vec![0u8; t.nbytes as usize];
                 maybe_hugepage(&mut disk);
                 self.read_at(fidx, off, &mut disk)?;
                 let raw = decode(&disk, other, need).map_err(|e| Error::Format(format!("read_raw '{name}' decompress: {e}")))?;
                 out[..need].copy_from_slice(&raw);
-                Ok(())
             }
         }
+        // Layout auto-conversion: a "kblock"-tagged payload is stored group-major
+        // on disk; permute back to the kernels' native row-major layout so every
+        // consumer sees identical bytes regardless of on-disk tiling.
+        if let Some((tag, gs_bytes)) = &t.layout {
+            if tag == "kblock" {
+                let o = t.shape.first().copied().unwrap_or(0).max(0) as usize;
+                let native = crate::pack::from_kblock(&out[..need], o, *gs_bytes).ok_or_else(|| {
+                    Error::Format(format!("read_raw '{name}': kblock layout does not tile (o={o}, gs_bytes={gs_bytes})"))
+                })?;
+                out[..need].copy_from_slice(&native);
+            }
+        }
+        Ok(())
     }
 
     /// Read `n_elems` starting at element `elem_off` (converted to f32). Used for
