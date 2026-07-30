@@ -46,34 +46,36 @@ impl Compression {
 /// Compress `raw` with the given scheme. `level` is the zstd compression level
 /// (1..=22 typical; 3 is a sensible default for streaming inference). Returns
 /// the raw bytes unchanged for [`Compression::None`].
-pub fn encode(raw: &[u8], scheme: Compression, level: i32) -> Result<Vec<u8>, String> {
+pub fn encode(raw: &[u8], scheme: Compression, level: i32) -> Result<Vec<u8>, crate::Error> {
+    use crate::Context;
     match scheme {
         Compression::None => Ok(raw.to_vec()),
-        Compression::Zstd => zstd::stream::encode_all(raw, level).map_err(|e| format!("zstd encode: {e}")),
+        Compression::Zstd => zstd::stream::encode_all(raw, level).ctx(|| "zstd encode".to_string()),
     }
 }
 
 /// Decompress `payload` into a fresh `Vec<u8>` of at most `orig_len` bytes.
 /// `orig_len` is the pre-compression size stored in the header — used to
 /// preallocate and to detect truncation.
-pub fn decode(payload: &[u8], scheme: Compression, orig_len: usize) -> Result<Vec<u8>, String> {
+pub fn decode(payload: &[u8], scheme: Compression, orig_len: usize) -> Result<Vec<u8>, crate::Error> {
+    use crate::{Context, Error};
     match scheme {
         Compression::None => {
             if payload.len() != orig_len {
-                return Err(format!(
+                return Err(Error::Format(format!(
                     "uncompressed length mismatch: header says {orig_len}, got {}",
                     payload.len()
-                ));
+                )));
             }
             Ok(payload.to_vec())
         }
         Compression::Zstd => {
-            let out = zstd::stream::decode_all(payload).map_err(|e| format!("zstd decode: {e}"))?;
+            let out = zstd::stream::decode_all(payload).ctx(|| "zstd decode".to_string())?;
             if out.len() != orig_len {
-                return Err(format!(
+                return Err(Error::Format(format!(
                     "zstd decompressed length mismatch: header says {orig_len}, got {}",
                     out.len()
-                ));
+                )));
             }
             Ok(out)
         }
@@ -85,7 +87,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn none_is_verbatim() -> Result<(), String> {
+    fn none_is_verbatim() -> Result<(), crate::Error> {
         let raw = b"hello world".to_vec();
         let enc = encode(&raw, Compression::None, 0)?;
         assert_eq!(enc, raw);
@@ -95,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn zstd_round_trip() -> Result<(), String> {
+    fn zstd_round_trip() -> Result<(), crate::Error> {
         // Real weight-shaped bytes: repetitive quantized nibbles compress well.
         let mut raw = Vec::with_capacity(1 << 16);
         for i in 0..(1 << 16) {
@@ -110,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn zstd_truncation_is_error() -> Result<(), String> {
+    fn zstd_truncation_is_error() -> Result<(), crate::Error> {
         let raw = vec![7u8; 4096];
         let enc = encode(&raw, Compression::Zstd, 3)?;
         // Wrong `orig_len` must fail rather than silently produce a truncated buffer.

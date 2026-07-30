@@ -23,7 +23,7 @@ fn apply_layout_is_bit_identical() -> Result<(), peregrine_core::Error> {
     let n_experts = 4i32;
     let n_layers = 2usize;
     let ordered: Vec<Vec<i32>> = (0..n_layers).map(|_| (0..n_experts).rev().collect()).collect();
-    peregrine_tools::apply_layout(&dir, &ordered).map_err(peregrine_core::Error::Format)?;
+    peregrine_tools::apply_layout(&dir, &ordered)?;
 
     // Same predictions from the re-laid checkpoint.
     let got = {

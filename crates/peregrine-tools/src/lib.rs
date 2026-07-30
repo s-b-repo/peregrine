@@ -4,24 +4,25 @@
 //!
 //! Everything is deterministic: same trace → same artifacts.
 
+use peregrine_core::{Context, Error};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-pub fn read_routes(path: &Path) -> Result<Vec<Vec<Vec<i32>>>, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse routes: {e}"))?;
-    let arr = v.as_array().ok_or_else(|| "routes JSON is not an array".to_string())?;
+pub fn read_routes(path: &Path) -> Result<Vec<Vec<Vec<i32>>>, Error> {
+    let bytes = std::fs::read(path).ctx(|| format!("read {}", path.display()))?;
+    let v: Value = serde_json::from_slice(&bytes).ctx(|| "parse routes".to_string())?;
+    let arr = v.as_array().ok_or_else(|| Error::Format("routes JSON is not an array".to_string()))?;
     let mut out: Vec<Vec<Vec<i32>>> = Vec::with_capacity(arr.len());
     for forward in arr {
-        let layers = forward.as_array().ok_or_else(|| "forward is not an array".to_string())?;
+        let layers = forward.as_array().ok_or_else(|| Error::Format("forward is not an array".to_string()))?;
         let mut ls: Vec<Vec<i32>> = Vec::with_capacity(layers.len());
         for layer in layers {
-            let ids = layer.as_array().ok_or_else(|| "layer is not an array".to_string())?;
+            let ids = layer.as_array().ok_or_else(|| Error::Format("layer is not an array".to_string()))?;
             let mut es: Vec<i32> = Vec::with_capacity(ids.len());
             for id in ids {
-                let n = id.as_i64().ok_or_else(|| "expert id is not an integer".to_string())?;
+                let n = id.as_i64().ok_or_else(|| Error::Format("expert id is not an integer".to_string()))?;
                 es.push(n as i32);
             }
             ls.push(es);
@@ -31,7 +32,7 @@ pub fn read_routes(path: &Path) -> Result<Vec<Vec<Vec<i32>>>, String> {
     Ok(out)
 }
 
-pub fn order_experts(trace: &[Vec<Vec<i32>>], method: &str) -> Result<Vec<Vec<i32>>, String> {
+pub fn order_experts(trace: &[Vec<Vec<i32>>], method: &str) -> Result<Vec<Vec<i32>>, Error> {
     // Determine layer count and expert-id upper bound.
     let n_layers = trace.iter().map(|f| f.len()).max().unwrap_or(0);
     let mut layer_order: Vec<Vec<i32>> = vec![Vec::new(); n_layers];
@@ -42,7 +43,7 @@ pub fn order_experts(trace: &[Vec<Vec<i32>>], method: &str) -> Result<Vec<Vec<i3
             "louvain" | "community" => louvain_communities(&matrix),
             "spectral" => spectral_order(&matrix),
             "hilbert" => hilbert_order(&matrix),
-            other => return Err(format!("unknown --method: {other}")),
+            other => return Err(Error::Format(format!("unknown --method: {other}"))),
         };
     }
     Ok(layer_order)
@@ -272,7 +273,6 @@ pub fn spectral_order(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> {
     // the constant component each step makes the iteration converge to the
     // second-smallest — the Fiedler vector.
     let c = deg.iter().fold(0f64, |m, &d| m.max(d)) + 1.0;
-    let inv_sqrt_n = 1.0 / (n as f64).sqrt();
     // Deterministic non-constant start: alternating pattern indexed by position.
     let mut v: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
     for _ in 0..200 {
@@ -299,7 +299,6 @@ pub fn spectral_order(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> {
             *dst = src / norm;
         }
     }
-    let _ = inv_sqrt_n; // kept for clarity of the deflation derivation
     // Order by Fiedler value; ties (including whole disconnected components with
     // near-equal values) break by ascending expert id for determinism.
     let mut order: Vec<(i32, f64)> = nodes.iter().map(|&id| (id, v[index[&id]])).collect();
@@ -457,16 +456,16 @@ pub fn assign_tiers(
 /// [`assign_tiers`] over every layer — `vram`/`ram` as `[layer, expert]` pairs.
 /// The loader seeds GPU residency from the vram list and prefetch-warms the ram
 /// list into the warm cache at startup.
-pub fn write_tiers(dir: &Path, vram: &[(usize, i32)], ram: &[(usize, i32)]) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+pub fn write_tiers(dir: &Path, vram: &[(usize, i32)], ram: &[(usize, i32)]) -> Result<(), Error> {
+    std::fs::create_dir_all(dir).ctx(|| format!("mkdir {}", dir.display()))?;
     let enc = |v: &[(usize, i32)]| -> Vec<serde_json::Value> {
         v.iter().map(|&(l, e)| serde_json::json!([l, e])).collect()
     };
     let doc = serde_json::json!({ "version": 1, "vram": enc(vram), "ram": enc(ram) });
-    let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| format!("serialize: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&doc).ctx(|| "serialize tiers".to_string())?;
     let out = dir.join("tiers.json");
-    let mut f = std::fs::File::create(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
-    f.write_all(&bytes).map_err(|e| format!("write tiers.json: {e}"))?;
+    let mut f = std::fs::File::create(&out).ctx(|| format!("create {}", out.display()))?;
+    f.write_all(&bytes).ctx(|| "write tiers.json".to_string())?;
     Ok(())
 }
 
@@ -496,11 +495,11 @@ pub fn trace_heat(trace: &[Vec<Vec<i32>>], layer: usize) -> HashMap<i32, u64> {
 /// list), and the output is written to `model.safetensors.tmp` then renamed
 /// over the original. Multi-shard checkpoints are rejected (out of scope for
 /// the rewrite; the loader handles them unmodified).
-pub fn apply_layout(model_dir: &Path, ordered: &[Vec<i32>]) -> Result<(), String> {
+pub fn apply_layout(model_dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error> {
     use peregrine_core::{pack, SafeTensors};
-    let st = SafeTensors::open(model_dir).map_err(|e| format!("open {}: {e}", model_dir.display()))?;
+    let st = SafeTensors::open(model_dir).ctx(|| format!("open {}", model_dir.display()))?;
     if st.paths().len() != 1 {
-        return Err("apply_layout supports single-shard checkpoints only".into());
+        return Err(Error::Format("apply_layout supports single-shard checkpoints only".to_string()));
     }
     // Rank map: (layer, expert) → schedule position; unlisted experts keep
     // their relative position after the listed ones.
@@ -536,7 +535,7 @@ pub fn apply_layout(model_dir: &Path, ordered: &[Vec<i32>]) -> Result<(), String
     for &(_, _, _, i) in &keys {
         let t = &st.tensors()[i];
         let mut raw = vec![0u8; t.uncompressed_nbytes as usize];
-        st.read_raw_by_index(i, &mut raw).map_err(|e| format!("read '{}': {e}", t.name))?;
+        st.read_raw_by_index(i, &mut raw).ctx(|| format!("read '{}'", t.name))?;
         let dtype_str = match t.dtype {
             peregrine_core::Dtype::F32 => "F32",
             peregrine_core::Dtype::Bf16 => "BF16",
@@ -550,24 +549,24 @@ pub fn apply_layout(model_dir: &Path, ordered: &[Vec<i32>]) -> Result<(), String
     // Write to a temp dir entry then swap in.
     let tmp = model_dir.join(".relayout.tmp");
     let _ = std::fs::remove_dir_all(&tmp);
-    pack::write_safetensors(&tmp, &blobs).map_err(|e| format!("write relayout: {e}"))?;
+    pack::write_safetensors(&tmp, &blobs).ctx(|| "write relayout".to_string())?;
     std::fs::rename(tmp.join("model.safetensors"), model_dir.join("model.safetensors"))
-        .map_err(|e| format!("swap relayout in: {e}"))?;
+        .ctx(|| "swap relayout in".to_string())?;
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(())
 }
 
-pub fn write_schedule(dir: &Path, ordered: &[Vec<i32>]) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+pub fn write_schedule(dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error> {
+    std::fs::create_dir_all(dir).ctx(|| format!("mkdir {}", dir.display()))?;
     let doc = serde_json::json!({
         "version": 1,
         "n_layers": ordered.len(),
         "order": ordered,
     });
-    let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| format!("serialize: {e}"))?;
+    let bytes = serde_json::to_vec_pretty(&doc).ctx(|| "serialize schedule".to_string())?;
     let out_path = dir.join("schedule.json");
-    let mut f = std::fs::File::create(&out_path).map_err(|e| format!("create {}: {e}", out_path.display()))?;
-    f.write_all(&bytes).map_err(|e| format!("write schedule.json: {e}"))?;
+    let mut f = std::fs::File::create(&out_path).ctx(|| format!("create {}", out_path.display()))?;
+    f.write_all(&bytes).ctx(|| "write schedule.json".to_string())?;
     Ok(())
 }
 

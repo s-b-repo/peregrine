@@ -154,7 +154,6 @@ fn plan_assignments(n: usize, w: usize, groups: Option<&[usize]>) -> Vec<(usize,
                 }
             }
             // proportional block sizes; leading groups absorb the remainder.
-            let n_groups = members.len();
             let mut sizes: Vec<usize> = members.iter().map(|m| n * m.len() / w).collect();
             let assigned: usize = sizes.iter().sum();
             for (k, s) in sizes.iter_mut().enumerate() {
@@ -162,7 +161,6 @@ fn plan_assignments(n: usize, w: usize, groups: Option<&[usize]>) -> Vec<(usize,
                     *s += 1;
                 }
             }
-            let _ = n_groups;
             let mut start = 0usize;
             for (m, &size) in members.iter().zip(&sizes) {
                 if size == 0 {
