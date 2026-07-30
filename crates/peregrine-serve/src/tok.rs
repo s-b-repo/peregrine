@@ -1,10 +1,9 @@
-//! Tokenizer backend selection: the vendored gigatoken BPE fast path
-//! (`peregrine-token`) with the HuggingFace `tokenizers` crate as fallback.
-//!
-//! - `COLI_TOKENIZER=giga` — require gigatoken (hard error if the model's
-//!   tokenizer.json isn't a supported BPE flavor);
-//! - `COLI_TOKENIZER=hf` — force the HF crate;
-//! - unset — try gigatoken, fall back to HF with the reason logged.
+//! Tokenizer: the vendored gigatoken BPE engine (`peregrine-token`) is the
+//! **only** runtime tokenizer. Models whose `tokenizer.json` gigatoken cannot
+//! load (SentencePiece / non-BPE flavors) fail at boot with a descriptive
+//! error rather than silently degrading. Correctness is gated by the id-for-id
+//! parity suite against the HF `tokenizers` oracle (dev-dependency only, see
+//! `tests/tokenizer_parity.rs`).
 //!
 //! The gigatoken instance is process-persistent behind a mutex, so its
 //! pretoken memo cache warms **across requests** — a repeated chat-template
@@ -14,86 +13,46 @@
 
 use peregrine_core::{Context, Error};
 use peregrine_token::GigaTokenizer;
-use tokenizers::Tokenizer as HfTokenizer;
 
-/// The active tokenizer backend.
-pub enum TokenBackend {
-    /// Vendored gigatoken BPE (fast path). `Mutex` because encode is `&mut`
-    /// (the memo cache learns); kept for the process so the cache persists.
-    Giga(Box<parking_lot::Mutex<GigaTokenizer>>),
-    /// HuggingFace `tokenizers` fallback (SentencePiece / non-BPE models, or
-    /// forced via env).
-    Hf(Box<HfTokenizer>),
+/// The process-wide tokenizer. `Mutex` because encode is `&mut` (the memo
+/// cache learns); kept for the process so the cache persists across requests.
+pub struct TokenBackend {
+    giga: Box<parking_lot::Mutex<GigaTokenizer>>,
 }
 
 impl TokenBackend {
-    /// Choose and construct the backend from the model dir's `tokenizer.json`.
-    /// Logs the decision to stderr (a server boots once; the operator should
-    /// see which path is active).
+    /// Construct from the model dir's `tokenizer.json`. Logs the vocab size to
+    /// stderr (a server boots once; the operator should see the tokenizer came
+    /// up). Non-BPE models are a hard boot error by design.
     pub fn load(dir: &std::path::Path) -> Result<TokenBackend, Error> {
         let path = dir.join("tokenizer.json");
         let bytes = std::fs::read(&path).ctx(|| path.display().to_string())?;
-        let forced = std::env::var("COLI_TOKENIZER").ok();
-        match forced.as_deref() {
-            Some("hf") => {
-                eprintln!("[tokenizer] HF tokenizers (forced by COLI_TOKENIZER=hf)");
-                Self::load_hf(&bytes)
+        match GigaTokenizer::from_hf_json_bytes(&bytes) {
+            Ok(t) => {
+                eprintln!("[tokenizer] gigatoken BPE active, vocab={}", t.vocab_size());
+                Ok(TokenBackend { giga: Box::new(parking_lot::Mutex::new(t)) })
             }
-            Some("giga") => match GigaTokenizer::from_hf_json_bytes(&bytes) {
-                Ok(t) => {
-                    eprintln!("[tokenizer] gigatoken BPE active (forced), vocab={}", t.vocab_size());
-                    Ok(TokenBackend::Giga(Box::new(parking_lot::Mutex::new(t))))
-                }
-                Err(e) => Err(Error::Format(format!("COLI_TOKENIZER=giga but gigatoken can't load this model: {e}"))),
-            },
-            _ => match GigaTokenizer::from_hf_json_bytes(&bytes) {
-                Ok(t) => {
-                    eprintln!("[tokenizer] gigatoken BPE active, vocab={}", t.vocab_size());
-                    Ok(TokenBackend::Giga(Box::new(parking_lot::Mutex::new(t))))
-                }
-                Err(e) => {
-                    eprintln!("[tokenizer] falling back to HF tokenizers: {e}");
-                    Self::load_hf(&bytes)
-                }
-            },
+            Err(e) => Err(Error::Format(format!(
+                "gigatoken can't load this model's tokenizer.json \
+                 (SentencePiece/non-BPE models are unsupported): {e}"
+            ))),
         }
-    }
-
-    fn load_hf(bytes: &[u8]) -> Result<TokenBackend, Error> {
-        let t = HfTokenizer::from_bytes(bytes).map_err(|e| Error::Format(format!("HF tokenizer: {e}")))?;
-        Ok(TokenBackend::Hf(Box::new(t)))
     }
 
     /// Encode `text` to token ids.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, Error> {
-        match self {
-            TokenBackend::Giga(t) => Ok(t.lock().encode(text)),
-            TokenBackend::Hf(t) => {
-                let enc = t.encode(text, false).map_err(|e| Error::Format(format!("encode: {e}")))?;
-                Ok(enc.get_ids().to_vec())
-            }
-        }
+        Ok(self.giga.lock().encode(text))
     }
 
-    /// Decode token ids to text. Both backends produce plain text with
-    /// special tokens materialized as their content is; the SSE path diffs
-    /// consecutive decodes, so partial-UTF-8 at a token boundary is handled
-    /// by the lossy conversion the same way for both.
+    /// Decode token ids to text. The SSE path diffs consecutive decodes, so
+    /// partial-UTF-8 at a token boundary is handled by the lossy conversion.
     pub fn decode(&self, ids: &[u32]) -> Result<String, Error> {
-        match self {
-            TokenBackend::Giga(t) => {
-                let bytes = t.lock().decode(ids);
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
-            }
-            TokenBackend::Hf(t) => t.decode(ids, true).map_err(|e| Error::Format(format!("decode: {e}"))),
-        }
+        let bytes = self.giga.lock().decode(ids);
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Which backend is active (for logs / health output).
+    /// The active tokenizer name (for logs / health output).
     pub fn name(&self) -> &'static str {
-        match self {
-            TokenBackend::Giga(_) => "gigatoken",
-            TokenBackend::Hf(_) => "hf-tokenizers",
-        }
+        "gigatoken"
     }
 }

@@ -64,7 +64,7 @@ struct Args {
     #[arg(long, default_value_t = 32)]
     max_batch: usize,
     /// Benchmark the tokenizer backends on a text file and exit: encodes the
-    /// file through gigatoken and HF `tokenizers`, reports MB/s each. Needs
+    /// file through the gigatoken tokenizer, reports MB/s. Needs
     /// `<model>/tokenizer.json`; no model weights are loaded.
     #[arg(long, value_name = "TEXT_FILE")]
     bench_tokenizer: Option<std::path::PathBuf>,
@@ -361,10 +361,11 @@ fn sse_error(message: &str) -> Event {
     Event::default().data(serde_json::json!({ "error": { "message": message } }).to_string())
 }
 
-/// Encode `file` through both tokenizer backends (per-line, mirroring the
-/// serve pattern of many short encodes) and report MB/s + total ids. When the
-/// backends disagree on any line the bench aborts — throughput of wrong ids is
-/// meaningless. Numbers are local to this box; no docs-level claims.
+/// Encode `file` through the gigatoken tokenizer (per-line, mirroring the
+/// serve pattern of many short encodes) and report MB/s + total ids.
+/// Correctness is the parity test suite's job (`tests/tokenizer_parity.rs`,
+/// HF oracle as a dev-dependency); this only measures throughput. Numbers are
+/// local to this box; no docs-level claims.
 fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let json = std::fs::read(model_dir.join("tokenizer.json"))?;
     let text = std::fs::read_to_string(file)?;
@@ -377,15 +378,10 @@ fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Resul
 
     let mut giga = peregrine_token::GigaTokenizer::from_hf_json_bytes(&json)
         .map_err(|e| format!("gigatoken: {e}"))?;
-    let hf = tokenizers::Tokenizer::from_bytes(&json).map_err(|e| format!("hf: {e}"))?;
 
-    // warmup + parity spot-check on a sample
+    // warmup (fills the pretoken memo cache the way a running server would)
     for l in lines.iter().take(64) {
-        let g = giga.encode(l);
-        let h = hf.encode(*l, false).map_err(|e| format!("hf encode: {e}"))?;
-        if g != h.get_ids() {
-            return Err(format!("parity mismatch on line {l:?} — aborting bench").into());
-        }
+        let _ = giga.encode(l);
     }
 
     let t0 = std::time::Instant::now();
@@ -395,17 +391,8 @@ fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Resul
     }
     let giga_s = t0.elapsed().as_secs_f64();
 
-    let t0 = std::time::Instant::now();
-    let mut hf_ids = 0usize;
-    for l in &lines {
-        hf_ids += hf.encode(*l, false).map_err(|e| format!("hf encode: {e}"))?.get_ids().len();
-    }
-    let hf_s = t0.elapsed().as_secs_f64();
-
     let mbs = |s: f64| bytes as f64 / 1e6 / s.max(1e-9);
     println!("gigatoken     : {:8.2} MB/s  ({giga_ids} ids, {giga_s:.3}s)", mbs(giga_s));
-    println!("hf-tokenizers : {:8.2} MB/s  ({hf_ids} ids, {hf_s:.3}s)", mbs(hf_s));
-    println!("speedup       : {:8.2}x", hf_s / giga_s.max(1e-9));
     Ok(())
 }
 

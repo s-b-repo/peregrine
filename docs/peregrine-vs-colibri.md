@@ -84,7 +84,8 @@ I/O-lane-depth gap to close before it beats the C engine at raw single-box strea
 > hardware-gated). The serve layer additionally gained a **vendored gigatoken BPE tokenizer**
 > (marcelroed/gigatoken, MIT — stable-toolchain subset in `peregrine-token`): id-for-id
 > parity-gated against the HF `tokenizers` oracle and measured **34× faster locally**
-> (204 vs 6 MB/s, `--bench-tokenizer`), with the HF crate as automatic fallback.
+> (204 vs 6 MB/s, `--bench-tokenizer`); it is the sole runtime tokenizer (the HF crate
+> remains as a dev-dependency test oracle only).
 
 ---
 

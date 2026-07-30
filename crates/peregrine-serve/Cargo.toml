@@ -24,5 +24,9 @@ axum = "0.7"
 tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
-tokenizers = "0.20"
 clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+# Parity oracle only: tests/tokenizer_parity.rs asserts gigatoken ids match
+# the HF `tokenizers` crate id-for-id. Not linked into the serve binary.
+tokenizers = "0.20"
