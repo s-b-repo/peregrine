@@ -1,2 +1,23 @@
+# Rust build output (workspace-shared target dir; Cargo.lock IS committed — binaries)
 /target
 **/*.rs.bk
+
+# Coverage / profiling artifacts
+*.profraw
+perf.data
+perf.data.old
+flamegraph.svg
+
+# Claude Code machine-local permission grants (shared config would go in .claude/settings.json)
+.claude/settings.local.json
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
