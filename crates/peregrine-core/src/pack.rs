@@ -19,11 +19,16 @@ pub struct Blob {
     /// [`Compression::None`] emits the historical (raw) format so a fresh
     /// writer stays byte-compatible with the reader that predates compression.
     pub compression: Compression,
+    /// Optional on-disk byte-layout tag. `None` = the kernels' native row-major
+    /// layout (historical). `Some(("kblock", gs))` = the group-block transposed
+    /// layout ([`to_kblock`]) with group size `gs`; the loader auto-converts
+    /// back to native at read time ("tensor layout auto-conversion").
+    pub layout: Option<(&'static str, usize)>,
 }
 
 impl Blob {
     pub fn new(name: impl Into<String>, dtype: &str, shape: Vec<i64>, bytes: Vec<u8>) -> Blob {
-        Blob { name: name.into(), dtype: dtype.into(), shape, bytes, compression: Compression::None }
+        Blob { name: name.into(), dtype: dtype.into(), shape, bytes, compression: Compression::None, layout: None }
     }
 
     /// Set the compression scheme for this blob.
@@ -31,6 +36,56 @@ impl Blob {
         self.compression = c;
         self
     }
+
+    /// Re-tile this blob's bytes into the K-block layout (see [`to_kblock`])
+    /// and tag the header accordingly. `o` = rows, `gs_bytes` = bytes per
+    /// group-block per row; `bytes.len()` must be `o * n_groups * gs_bytes`.
+    pub fn with_kblock_layout(mut self, o: usize, gs_bytes: usize) -> Blob {
+        if let Some(t) = to_kblock(&self.bytes, o, gs_bytes) {
+            self.bytes = t;
+            self.layout = Some(("kblock", gs_bytes));
+        }
+        self
+    }
+}
+
+/// Transpose row-major group blocks into group-major order: native layout is
+/// `[o][g]` blocks of `gs_bytes` (each row's groups contiguous); K-block is
+/// `[g][o]` (each *group column* contiguous across all rows) — sequential for
+/// per-group streaming access patterns. Pure byte permutation; its own inverse
+/// is [`from_kblock`]. `None` when the length doesn't tile.
+pub fn to_kblock(bytes: &[u8], o: usize, gs_bytes: usize) -> Option<Vec<u8>> {
+    if o == 0 || gs_bytes == 0 || !bytes.len().is_multiple_of(o * gs_bytes) {
+        return None;
+    }
+    let n_groups = bytes.len() / (o * gs_bytes);
+    let mut out = vec![0u8; bytes.len()];
+    for row in 0..o {
+        for g in 0..n_groups {
+            let src = (row * n_groups + g) * gs_bytes;
+            let dst = (g * o + row) * gs_bytes;
+            out[dst..dst + gs_bytes].copy_from_slice(&bytes[src..src + gs_bytes]);
+        }
+    }
+    Some(out)
+}
+
+/// Inverse of [`to_kblock`]: group-major blocks back to the kernels' native
+/// row-major layout.
+pub fn from_kblock(bytes: &[u8], o: usize, gs_bytes: usize) -> Option<Vec<u8>> {
+    if o == 0 || gs_bytes == 0 || !bytes.len().is_multiple_of(o * gs_bytes) {
+        return None;
+    }
+    let n_groups = bytes.len() / (o * gs_bytes);
+    let mut out = vec![0u8; bytes.len()];
+    for g in 0..n_groups {
+        for row in 0..o {
+            let src = (g * o + row) * gs_bytes;
+            let dst = (row * n_groups + g) * gs_bytes;
+            out[dst..dst + gs_bytes].copy_from_slice(&bytes[src..src + gs_bytes]);
+        }
+    }
+    Some(out)
 }
 
 /// Write a single-shard `model.safetensors` into `dir` (created if needed).
@@ -56,6 +111,10 @@ pub fn write_safetensors(dir: &Path, blobs: &[Blob]) -> std::io::Result<()> {
         if let Some(tag) = b.compression.tag() {
             entry.insert("compression".into(), serde_json::Value::String(tag.to_string()));
             entry.insert("uncompressed_nbytes".into(), serde_json::json!(b.bytes.len()));
+        }
+        if let Some((tag, gs_bytes)) = b.layout {
+            entry.insert("layout".into(), serde_json::Value::String(tag.to_string()));
+            entry.insert("layout_gs_bytes".into(), serde_json::json!(gs_bytes));
         }
         header.insert(b.name.clone(), serde_json::Value::Object(entry));
         data.extend_from_slice(&payload);
@@ -181,6 +240,37 @@ mod tests {
         let mut n = [0f32; 4];
         st.read_f32("norm", &mut n)?;
         assert_eq!(n, [1.0, 2.0, 3.0, 4.0]);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn kblock_layout_round_trips_to_native_bytes() -> Result<(), crate::Error> {
+        // A kblock-tagged tensor must read back byte-identical to its native
+        // form: the writer permutes, the reader inverts — auto-conversion.
+        let dir = std::env::temp_dir().join(format!("coli_pack_kblock_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        // native payload: 4 rows × 3 groups × 8 bytes, recognizable pattern
+        let (o, n_groups, gsb) = (4usize, 3usize, 8usize);
+        let native: Vec<u8> = (0..o * n_groups * gsb).map(|k| (k % 251) as u8).collect();
+        write_safetensors(
+            &dir,
+            &[
+                Blob::new("w", "U8", vec![o as i64, (n_groups * gsb) as i64], native.clone())
+                    .with_kblock_layout(o, gsb),
+            ],
+        )?;
+        let st = SafeTensors::open(&dir)?;
+        let mut got = vec![0u8; native.len()];
+        st.read_raw("w", &mut got)?;
+        assert_eq!(got, native, "reader must undo the kblock permutation");
+        // and pure permutation round-trip
+        let t = to_kblock(&native, o, gsb).ok_or(crate::Error::Format("tile".into()))?;
+        assert_ne!(t, native, "kblock actually permutes");
+        let back = from_kblock(&t, o, gsb).ok_or(crate::Error::Format("untile".into()))?;
+        assert_eq!(back, native);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

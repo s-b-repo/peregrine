@@ -17,3 +17,5 @@ cuda = ["peregrine-model/cuda"]
 [dependencies]
 peregrine-model = { path = "../peregrine-model" }
 peregrine-core = { path = "../peregrine-core" }
+peregrine-tools = { path = "../peregrine-tools" }
+serde_json.workspace = true

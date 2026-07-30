@@ -62,6 +62,110 @@ fn run() -> Result<(), Error> {
             eprintln!("wrote automaton ({len}-token corpus) to {}", out.display());
             Ok(())
         }
+        // `galactic <model-dir> [corpus-len]`: the one-shot offline preprocessing
+        // pass — one corpus run emits EVERY artifact the loader consumes:
+        // automaton.json, macrostates.json, routes.json, schedule.json
+        // (co-occurrence → Louvain communities), and a route_stats.json seed.
+        Some("galactic") => {
+            let dir = args.get(2).ok_or_else(|| Error::Format("usage: peregrine galactic <model-dir> [corpus-len]".into()))?;
+            let len = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(256);
+            let dirp = Path::new(dir);
+            let mut model = Model::load_streaming(dirp, true)?;
+            let corpus = synth_corpus(model.cfg.vocab as usize, len);
+            let (table, macros, trace) = model.build_artifacts(&corpus)?;
+            peregrine_model::save_automaton(&table, &dirp.join("automaton.json"))?;
+            peregrine_model::save_macrostates(&macros, &dirp.join("macrostates.json"))?;
+            let routes_json = serde_json::to_vec(&trace).map_err(|e| Error::Format(format!("serialize trace: {e}")))?;
+            std::fs::write(dirp.join("routes.json"), routes_json)?;
+            // layout schedule from the same trace (Louvain + 2-opt refinement)
+            let mut ordered = peregrine_tools::order_experts(&trace, "louvain")
+                .map_err(Error::Format)?;
+            for (l, row) in ordered.iter_mut().enumerate() {
+                let w = peregrine_tools::build_cooccurrence(&trace, l);
+                peregrine_tools::two_opt(row, &w);
+            }
+            peregrine_tools::write_schedule(dirp, &ordered).map_err(Error::Format)?;
+            // storage-tier placement (hypergraph: whole communities per tier),
+            // emitted when the operator declares tier byte budgets.
+            let vram_mb: u64 = std::env::var("COLI_TIER_VRAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let ram_mb: u64 = std::env::var("COLI_TIER_RAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            if vram_mb > 0 || ram_mb > 0 {
+                let hidden = model.cfg.hidden as u64;
+                let inter = model.cfg.moe_inter as u64;
+                let bytes_per_expert = (3 * inter * hidden) / 2; // int4 nibbles
+                let n_layers = model.cfg.n_layers as usize;
+                let sparse0 = model.cfg.first_dense as usize;
+                let per_layer_v = (vram_mb << 20) / (n_layers.saturating_sub(sparse0).max(1) as u64);
+                let per_layer_r = (ram_mb << 20) / (n_layers.saturating_sub(sparse0).max(1) as u64);
+                let mut vram_all: Vec<(usize, i32)> = Vec::new();
+                let mut ram_all: Vec<(usize, i32)> = Vec::new();
+                for l in sparse0..n_layers {
+                    let w = peregrine_tools::build_cooccurrence(&trace, l);
+                    let heat = peregrine_tools::trace_heat(&trace, l);
+                    let (v, r) = peregrine_tools::assign_tiers(&w, &heat, bytes_per_expert, per_layer_v, per_layer_r);
+                    vram_all.extend(v.into_iter().map(|e| (l, e)));
+                    ram_all.extend(r.into_iter().map(|e| (l, e)));
+                }
+                peregrine_tools::write_tiers(dirp, &vram_all, &ram_all).map_err(Error::Format)?;
+            }
+            // heat + history + co-activation seed for the next session
+            model.save_route_stats(dirp)?;
+            eprintln!(
+                "galactic pass complete ({len}-token corpus): automaton.json, macrostates.json, \
+                 routes.json, schedule.json, route_stats.json written to {dir}"
+            );
+            Ok(())
+        }
+        // `compile-plan <model-dir>`: bundle every offline artifact present in the
+        // model dir (automaton, macrostates, schedule, tiers, learned policy from
+        // route_stats) into one `plan.json` — the "compiled execution plan" the
+        // loader consumes in one shot. Profile-guided: every input is a recorded
+        // profile. Missing artifacts are simply omitted.
+        Some("compile-plan") => {
+            let dir = args.get(2).ok_or_else(|| Error::Format("usage: peregrine compile-plan <model-dir>".into()))?;
+            let dirp = Path::new(dir);
+            let read_json = |name: &str| -> Option<serde_json::Value> {
+                let bytes = std::fs::read(dirp.join(name)).ok()?;
+                serde_json::from_slice(&bytes).ok()
+            };
+            let mut plan = serde_json::Map::new();
+            plan.insert("version".into(), serde_json::json!(1));
+            let mut parts: Vec<&str> = Vec::new();
+            if let Some(v) = read_json("automaton.json") {
+                plan.insert("automaton".into(), v);
+                parts.push("automaton");
+            }
+            if let Some(v) = read_json("macrostates.json") {
+                plan.insert("macrostates".into(), v);
+                parts.push("macrostates");
+            }
+            if let Some(v) = read_json("schedule.json") {
+                plan.insert("schedule".into(), v);
+                parts.push("schedule");
+            }
+            if let Some(v) = read_json("tiers.json") {
+                plan.insert("tiers".into(), v);
+                parts.push("tiers");
+            }
+            if let Some(v) = read_json("route_stats.json") {
+                if let Some(learn) = v.get("learn") {
+                    if !learn.is_null() {
+                        plan.insert("learn".into(), learn.clone());
+                        parts.push("learn");
+                    }
+                }
+            }
+            if parts.is_empty() {
+                return Err(Error::Format(
+                    "no artifacts found — run `peregrine galactic <model-dir>` first".into(),
+                ));
+            }
+            let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(plan))
+                .map_err(|e| Error::Format(format!("serialize plan: {e}")))?;
+            std::fs::write(dirp.join("plan.json"), bytes)?;
+            eprintln!("compiled execution plan ({}) → {dir}/plan.json", parts.join(" + "));
+            Ok(())
+        }
         // `dump-routes <model-dir> <out.json> [corpus-len]`: write the raw per-forward
         // routing trace (for offline inspection / custom automaton building).
         Some("dump-routes") => {

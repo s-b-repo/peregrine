@@ -217,12 +217,39 @@ correctness-neutral (only latency and residency change, never the reduced values
   degrades to `None` when the kernel refuses (CI containers, paranoid ≥ 3, no PMU), so the counter
   is an optimization input, never a dependency.
 
-**Composition.** Each forward: (1) `moe_forward_concurrent` brackets its lanes and consults
-`LaneBalancer` for per-expert placement using a live heat snapshot; (2) after the forward,
-`publish_lane_timings` swap-resets the accumulator, updates the tuners, and applies any changed
-io_uring cap; (3) on the next forward `build_balancer` reads the fresh bias and hands it to
-`ForwardCtx`. Feedback loop closed. All new state lives on `Model` and is safe to expose to a
-`&self` scrape (atomics + `parking_lot::Mutex`).
+**Composition.** Each forward: (1) `moe_forward_concurrent` brackets its lanes, consults
+`LaneBalancer` for per-expert placement using a live heat snapshot, and applies the co-activation
+affinity order (fusion pairs adjacent, hyperedge components grouped); (2) after the forward,
+`publish_lane_timings` swap-resets the accumulator, updates the tuners, steps the sensor governors
+(thermal / RAPL power / bandwidth — all writing one governor-adjustable worker count with
+shrink-wins arbitration), folds the routing-entropy EWMA, rewards + re-chooses the learned
+scheduler (bandit or Q), feeds the co-activation tracker, and applies any changed io_uring cap;
+(3) on the next forward `build_balancer` reads the fresh bias and `forward_hidden` applies the
+staged learned/entropy prefetch-distance nudges. Feedback loop closed. All new state lives on
+`Model` and is safe to expose to a `&self` scrape (atomics + `parking_lot::Mutex`).
+
+**The completion sweep** (same day) finished every non-hardware roadmap item on top of this loop:
+NUMA-bound landing buffers (`bind_local_if_enabled`, first-touch-correct `mbind`), hierarchical
+two-level pool dispatch (`plan_assignments` over a worker→node map), per-expert adaptive mixed
+precision (`plan_precision`, applied in the cuda tier's `reheat`), SQ-full-delta-driven io-wq
+tuning, macro-state routing compression (`MacroTable` + `PredictSource::WithMacro`), the
+`galactic` one-shot preprocessing pass (all artifacts from one corpus run), Hilbert / spectral /
+2-opt layout methods + hypergraph tier placement (`tiers.json`, RAM tier prefetch-warmed at load),
+the physical checkpoint self-rewrite (`apply_layout`, teacher-forcing-equality-gated), online
+bandit and tabular-Q schedulers over the knob envelope (policies persisted in `route_stats.json`),
+per-shape dispatch specialization (`shape_dispatch` probe-then-memoize), kblock tensor-layout
+auto-conversion (header-tagged, loader-normalized), and the `compile-plan` profile-guided
+execution plan (`plan.json`, consumed atomically at load).
+
+**The tokenizer fast path** (gigatoken integration): `peregrine-serve` selects its tokenizer at
+boot via `tok::TokenBackend` — the vendored gigatoken BPE engine when the model's
+`tokenizer.json` is a supported BPE flavor (logged, overridable with `COLI_TOKENIZER=giga|hf`),
+else the HF `tokenizers` crate. The gigatoken instance is process-persistent behind a mutex, so
+its pretoken memo cache warms across requests — repeated chat-template prefixes encode from
+cache. Correctness bar: the parity suite asserts id-for-id equality with the HF oracle over an
+edge-case corpus (unicode, CJK/RTL, chat markup, contractions, empty inputs) plus decode round
+trips; `--bench-tokenizer` measured 204 MB/s vs 6 MB/s (34×) on this box. The vendored subset
+links no libpython and builds on stable (verified: `ldd` clean, `cargo +stable`).
 
 ---
 
@@ -245,8 +272,13 @@ io_uring cap; (3) on the next forward `build_balancer` reads the fresh bias and 
 - **safetensors:** hand-rolled pread-based index (mirror `c/st.h` with `fadvise(DONTNEED)` +
   O_DIRECT to keep RSS flat), header via `serde_json` — **not** the `safetensors` crate (mmaps,
   no DONTNEED/O_DIRECT control). `memmap2` behind a `COLI_MMAP` flag. `half` for bf16/f16→f32.
-- **tokenizer:** `tokenizers` crate to bootstrap, validated id-for-id against `c/tok.h`; hand-port
-  `tok.h` (~400 lines) if the pretokenizer/added-token handling diverges.
+- **tokenizer:** originally the `tokenizers` crate to bootstrap; the serve layer now runs a
+  **vendored gigatoken BPE subset** (`peregrine-token`, from marcelroed/gigatoken v0.10.0, MIT)
+  as the default fast path — SIMD (`std::arch`) pretokenizers with runtime dispatch, a memoizing
+  BPE engine, and the HF `tokenizer.json` loader, all stable-toolchain (upstream is nightly-only
+  via `portable_simd`, which lives solely in its SentencePiece engine — dropped here). The HF
+  `tokenizers` crate stays as the automatic fallback for SentencePiece/non-BPE models and as the
+  id-for-id parity oracle (`crates/peregrine-serve/tests/tokenizer_parity.rs`).
 - **Support:** `crossbeam`, `core_affinity`, `bytemuck`, `parking_lot`, `serde_json`, `clap`.
 
 ---
@@ -277,8 +309,11 @@ crates/
                       #   + stdio serve protocol (drop-in for c/glm)
   peregrine-serve/    # binary `peregrine-serve`: OpenAI HTTP (axum/tokio) + continuous batching
                       #   (two-tier priority queue, adaptive batch cap, adaptive prefill window)
-  peregrine-tools/    # binary `peregrine-layout-reorg`: offline expert re-layout
-                      #   (greedy / Louvain), emits <dir>/schedule.json for the loader
+  peregrine-tools/    # lib + binary `peregrine-layout-reorg`: offline expert re-layout
+                      #   (greedy / Louvain / spectral / Hilbert, --optimize 2-opt), tier
+                      #   placement (tiers.json), physical checkpoint rewrite (--apply)
+  peregrine-token/    # vendored gigatoken v0.10.0 BPE subset (MIT): SIMD pretokenizers,
+                      #   memoizing BPE engine, HF tokenizer.json loader; GigaTokenizer facade
 ```
 
 - Build: `cargo build --release --features cuda`; CPU-only drops the `cuda` feature (pure-CPU,

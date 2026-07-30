@@ -246,6 +246,221 @@ impl TransitionTable {
     }
 }
 
+/// Temporal routing compression: consecutive forwards routing the **same**
+/// top-k set collapse into one *macro-state* with a dwell count; distinct-set
+/// boundaries record a state→state transition. Prediction from a macro-state
+/// is stronger than frame momentum during a dwell (the set repeats) and the
+/// transition table says where routing goes when the dwell breaks. Built
+/// offline alongside the automaton; persisted as `macrostates.json`
+/// (config-tagged like [`TransitionTable`]). Correctness-neutral.
+pub struct MacroTable {
+    tag: String,
+    n_layers: usize,
+    /// per layer: sorted routed set → (dwell count, next-set → count).
+    layers: Vec<MacroLayer>,
+}
+
+/// One layer's macro-states: sorted routed set → (dwell count, exits).
+type MacroLayer = HashMap<Vec<i32>, (u32, HashMap<Vec<i32>, u32>)>;
+
+impl MacroTable {
+    pub fn new(n_layers: usize, tag: String) -> MacroTable {
+        MacroTable { tag, n_layers, layers: (0..n_layers).map(|_| HashMap::new()).collect() }
+    }
+
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn canon(set: &[i32]) -> Vec<i32> {
+        let mut v: Vec<i32> = set.iter().copied().filter(|&e| e >= 0).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Record one step at `layer`: same set as before → dwell; different → a
+    /// state transition `prev → cur`.
+    pub fn observe(&mut self, layer: usize, prev: &[i32], cur: &[i32]) {
+        let Some(map) = self.layers.get_mut(layer) else { return };
+        let (p, c) = (Self::canon(prev), Self::canon(cur));
+        if p.is_empty() {
+            return;
+        }
+        let same = p == c;
+        let entry = map.entry(p).or_insert_with(|| (0, HashMap::new()));
+        if same {
+            entry.0 = entry.0.saturating_add(1);
+        } else {
+            *entry.1.entry(c).or_insert(0) += 1;
+        }
+    }
+
+    /// Ranked next-expert prediction for `layer` given the current routed set:
+    /// while dwelling (the state's dwell count dominates its exits) the state's
+    /// own members are predicted; otherwise the most-likely next state's
+    /// members. Scores are the supporting counts. Empty for unseen states.
+    pub fn predict_layer(&self, layer: usize, current: &[i32]) -> Vec<(u32, u32)> {
+        let Some(map) = self.layers.get(layer) else { return Vec::new() };
+        let cur = Self::canon(current);
+        let Some((dwell, next)) = map.get(&cur) else { return Vec::new() };
+        let best_exit = next.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)));
+        match best_exit {
+            Some((exit_set, &exit_count)) if exit_count > *dwell => {
+                exit_set.iter().map(|&e| (e as u32, exit_count)).collect()
+            }
+            _ => cur.iter().map(|&e| (e as u32, (*dwell).max(1))).collect(),
+        }
+    }
+
+    /// Serialize (deterministic order). Companion to [`Self::from_json`].
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut layers_json: Vec<serde_json::Value> = Vec::with_capacity(self.layers.len());
+        for map in &self.layers {
+            let mut states: Vec<_> = map.iter().collect();
+            states.sort_by(|a, b| a.0.cmp(b.0));
+            let states_json: Vec<serde_json::Value> = states
+                .into_iter()
+                .map(|(set, (dwell, next))| {
+                    let mut exits: Vec<(&Vec<i32>, &u32)> = next.iter().collect();
+                    exits.sort_by(|a, b| a.0.cmp(b.0));
+                    let exits_json: Vec<serde_json::Value> =
+                        exits.into_iter().map(|(s, c)| serde_json::json!([s, c])).collect();
+                    serde_json::json!([set, dwell, exits_json])
+                })
+                .collect();
+            layers_json.push(serde_json::Value::Array(states_json));
+        }
+        serde_json::json!({ "tag": self.tag, "n_layers": self.n_layers, "layers": layers_json })
+    }
+
+    /// Parse [`Self::to_json`] output; `None` on malformed input.
+    pub fn from_json(v: &serde_json::Value) -> Option<MacroTable> {
+        let tag = v.get("tag")?.as_str()?.to_string();
+        let n_layers = v.get("n_layers")?.as_u64()? as usize;
+        let mut t = MacroTable::new(n_layers, tag);
+        for (li, layer) in v.get("layers")?.as_array()?.iter().enumerate() {
+            let map = t.layers.get_mut(li)?;
+            for state in layer.as_array()? {
+                let a = state.as_array()?;
+                if a.len() != 3 {
+                    return None;
+                }
+                let set: Vec<i32> = a[0].as_array()?.iter().filter_map(|x| x.as_i64()).map(|x| x as i32).collect();
+                let dwell = a[1].as_u64()? as u32;
+                let mut next = HashMap::new();
+                for exit in a[2].as_array()? {
+                    let e = exit.as_array()?;
+                    if e.len() != 2 {
+                        return None;
+                    }
+                    let es: Vec<i32> = e[0].as_array()?.iter().filter_map(|x| x.as_i64()).map(|x| x as i32).collect();
+                    next.insert(es, e[1].as_u64()? as u32);
+                }
+                map.insert(set, (dwell, next));
+            }
+        }
+        Some(t)
+    }
+}
+
+/// Long-term expert co-activation tracker: per layer, how often each expert
+/// *pair* was routed together in one forward, plus the total forwards observed.
+/// Feeds two schedulers: **runtime expert fusion** (pairs co-firing ≥ a high
+/// threshold rate are kept adjacent in the dispatch order → same io-batch /
+/// same GPU batch) and **hypergraph scheduling** (connected components at a
+/// lower threshold act as hyperedges → members grouped in one claim window).
+/// Persisted inside `route_stats.json`, so co-activation learned in one session
+/// seeds the next ("automatic expert fusion from long-term co-activation").
+/// Correctness-neutral: consumers only reorder work.
+pub struct CoActivation {
+    n_layers: usize,
+    /// `(layer, lo_expert, hi_expert) -> co-firing count` (lo < hi).
+    pairs: HashMap<(u32, u32, u32), u32>,
+    /// Forwards observed (the denominator of the co-firing rate).
+    pub frames: u32,
+}
+
+impl CoActivation {
+    pub fn new(n_layers: usize) -> CoActivation {
+        CoActivation { n_layers, pairs: HashMap::new(), frames: 0 }
+    }
+
+    /// Record one forward's routed set for `layer`. Call once per layer per
+    /// forward; bump [`Self::note_forward`] once per forward for the denominator.
+    pub fn observe(&mut self, layer: usize, uniq: &[i32]) {
+        if layer >= self.n_layers {
+            return;
+        }
+        for (i, &a) in uniq.iter().enumerate() {
+            if a < 0 {
+                continue;
+            }
+            for &b in &uniq[i + 1..] {
+                if b < 0 {
+                    continue;
+                }
+                let (lo, hi) = if a < b { (a as u32, b as u32) } else { (b as u32, a as u32) };
+                *self.pairs.entry((layer as u32, lo, hi)).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Advance the forward counter (rate denominator).
+    pub fn note_forward(&mut self) {
+        self.frames = self.frames.saturating_add(1);
+    }
+
+    /// Pairs whose co-firing rate ≥ `min_rate`, grouped per layer (sorted for
+    /// determinism). Empty until enough frames accumulated (`frames >= 8` guards
+    /// against noise declaring fusions off two samples).
+    pub fn fused_pairs(&self, min_rate: f32) -> Vec<Vec<(u32, u32)>> {
+        let mut out: Vec<Vec<(u32, u32)>> = vec![Vec::new(); self.n_layers];
+        if self.frames < 8 {
+            return out;
+        }
+        let need = (min_rate.clamp(0.0, 1.0) * self.frames as f32).ceil() as u32;
+        for (&(layer, lo, hi), &c) in &self.pairs {
+            if c >= need.max(1) {
+                if let Some(row) = out.get_mut(layer as usize) {
+                    row.push((lo, hi));
+                }
+            }
+        }
+        for row in &mut out {
+            row.sort_unstable();
+        }
+        out
+    }
+
+    /// Serialize (deterministic order). Companion to [`Self::from_json`].
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut rows: Vec<(u32, u32, u32, u32)> =
+            self.pairs.iter().map(|(&(l, a, b), &c)| (l, a, b, c)).collect();
+        rows.sort_unstable();
+        let rows: Vec<serde_json::Value> = rows.into_iter().map(|(l, a, b, c)| serde_json::json!([l, a, b, c])).collect();
+        serde_json::json!({ "n_layers": self.n_layers, "frames": self.frames, "pairs": rows })
+    }
+
+    /// Parse [`Self::to_json`] output; `None` on malformed input.
+    pub fn from_json(v: &serde_json::Value) -> Option<CoActivation> {
+        let n_layers = v.get("n_layers")?.as_u64()? as usize;
+        let frames = v.get("frames")?.as_u64()? as u32;
+        let mut t = CoActivation::new(n_layers);
+        t.frames = frames;
+        for row in v.get("pairs")?.as_array()? {
+            let a = row.as_array()?;
+            if a.len() != 4 {
+                return None;
+            }
+            let (l, lo, hi, c) =
+                (a[0].as_u64()? as u32, a[1].as_u64()? as u32, a[2].as_u64()? as u32, a[3].as_u64()? as u32);
+            t.pairs.insert((l, lo, hi), c);
+        }
+        Some(t)
+    }
+}
+
 /// Where prefetch candidates come from. New sources (e.g. the offline transition
 /// automaton) are added as variants — a different *source*, not a different ranking —
 /// so consumers stay unchanged.
@@ -261,6 +476,10 @@ pub enum PredictSource {
     /// faster than steady-state momentum would. Correctness-neutral — the
     /// scores are still sorted by (score-desc, expert-asc).
     PhaseAware { inner: Box<PredictSource>, threshold_bp: u32, boost: u32 },
+    /// Macro-state wrapper: blend the offline [`MacroTable`]'s dwell/transition
+    /// prediction (state-level, stronger than per-frame momentum during a dwell)
+    /// into `inner`'s scores. Unseen states fall back to `inner` alone.
+    WithMacro { table: Arc<MacroTable>, inner: Box<PredictSource> },
 }
 
 impl Default for PredictSource {
@@ -280,9 +499,20 @@ impl PredictSource {
             PredictSource::Automaton { table, fallback } => {
                 // automaton prediction from the current set, blended with momentum so
                 // cold/unseen states still predict something.
-                let mut scores = hist.latest(layer).map(|cur| table.predict_layer(layer, cur)).unwrap_or_default();
+                let mut scores = match hist.latest(layer) {
+                    Some(cur) => table.predict_layer(layer, cur),
+                    None => Vec::new(), // no history yet — momentum fallback below still votes
+                };
                 merge_scores(&mut scores, momentum_vote(layer, hist, fallback));
                 scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                scores
+            }
+            PredictSource::WithMacro { table, inner } => {
+                let mut scores = inner.predict_layer(layer, hist);
+                if let Some(cur) = hist.latest(layer) {
+                    merge_scores(&mut scores, table.predict_layer(layer, cur));
+                    scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                }
                 scores
             }
             PredictSource::PhaseAware { inner, threshold_bp, boost } => {
@@ -400,6 +630,18 @@ impl PrefetchTuner {
         self.distance
     }
 
+    /// Widen the breadth by one (clamped at `d_max`). Used by the
+    /// entropy-adaptive controller on dispersed routing.
+    pub fn nudge_up(&mut self) {
+        self.distance = (self.distance + 1).min(self.d_max);
+    }
+
+    /// Narrow the breadth by one (floored at 1). Used by the entropy-adaptive
+    /// controller on repetitive routing.
+    pub fn nudge_down(&mut self) {
+        self.distance = self.distance.saturating_sub(1).max(1);
+    }
+
     /// Feed the *cumulative* used/wasted counters. Updates the EWMA on this forward's
     /// delta and steps `distance` up (recent prefetches mostly used) or down (mostly
     /// wasted), clamped to `[1, d_max]`. Returns the new distance.
@@ -487,6 +729,74 @@ mod tests {
         h.push_layer(0, vec![7]);
         let j = h.to_json("REAL");
         assert!(RouteHistory::from_json(&j, "OTHER").is_none());
+    }
+
+    #[test]
+    fn macro_table_dwell_and_transition_prediction() {
+        let mut t = MacroTable::new(1, "T".into());
+        // Dwell in {1,2} for 5 steps, then transition to {3,4} twice more often
+        // than dwelling would suggest... build: 5 dwells then 6 transitions.
+        for _ in 0..5 {
+            t.observe(0, &[1, 2], &[1, 2]);
+        }
+        // While dwelling dominates, predict the state's own members.
+        let p = t.predict_layer(0, &[1, 2]);
+        let ids: Vec<u32> = p.iter().map(|&(e, _)| e).collect();
+        assert_eq!(ids, vec![1, 2], "dwell → predict own members");
+        for _ in 0..6 {
+            t.observe(0, &[1, 2], &[3, 4]);
+        }
+        // Exits now outnumber the dwell → predict the exit state's members.
+        let p = t.predict_layer(0, &[1, 2]);
+        let ids: Vec<u32> = p.iter().map(|&(e, _)| e).collect();
+        assert_eq!(ids, vec![3, 4], "dominant exit → predict next state");
+        // Unseen state → empty.
+        assert!(t.predict_layer(0, &[9]).is_empty());
+    }
+
+    #[test]
+    fn macro_table_json_round_trip() {
+        let mut t = MacroTable::new(2, "TAG".into());
+        t.observe(1, &[1, 2], &[1, 2]);
+        t.observe(1, &[1, 2], &[3]);
+        let j = t.to_json();
+        let t2 = MacroTable::from_json(&j);
+        assert!(t2.is_some());
+        if let Some(t2) = t2 {
+            assert_eq!(t2.tag(), "TAG");
+            assert_eq!(t2.predict_layer(1, &[1, 2]), t.predict_layer(1, &[1, 2]));
+        }
+    }
+
+    #[test]
+    fn coactivation_rates_and_round_trip() {
+        let mut co = CoActivation::new(2);
+        // 10 forwards: experts 1 & 2 always together on layer 1; 3 joins half the time.
+        for i in 0..10 {
+            let set = if i % 2 == 0 { vec![1, 2, 3] } else { vec![1, 2] };
+            co.observe(1, &set);
+            co.note_forward();
+        }
+        let fused = co.fused_pairs(0.9);
+        assert_eq!(fused[1], vec![(1, 2)], "only the always-pair clears 0.9");
+        let loose = co.fused_pairs(0.4);
+        assert!(loose[1].contains(&(1, 2)) && loose[1].contains(&(1, 3)) && loose[1].contains(&(2, 3)));
+        // round trip
+        let j = co.to_json();
+        let co2 = CoActivation::from_json(&j);
+        assert!(co2.is_some());
+        if let Some(co2) = co2 {
+            assert_eq!(co2.frames, 10);
+            assert_eq!(co2.fused_pairs(0.9)[1], vec![(1, 2)]);
+        }
+    }
+
+    #[test]
+    fn coactivation_needs_min_frames() {
+        let mut co = CoActivation::new(1);
+        co.observe(0, &[1, 2]);
+        co.note_forward();
+        assert!(co.fused_pairs(0.5)[0].is_empty(), "too few frames → no fusion signal");
     }
 
     #[test]

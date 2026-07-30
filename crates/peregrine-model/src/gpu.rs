@@ -161,6 +161,37 @@ pub fn solve_residency_greedy(
     out
 }
 
+/// Per-expert VRAM residency precision. The hottest experts earn the
+/// high-precision f32 residency (better numerics on the most-used weights);
+/// the long tail stays per-row int4 (8× denser → more experts resident).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertPrecision {
+    F32,
+    Int4,
+}
+
+/// Per-expert adaptive precision planner: given the residency set and the heat
+/// table, promote the hottest `f32_frac` of residents to f32 and leave the rest
+/// int4. Deterministic ties (equal heat → lower layer, lower expert first).
+/// Pure — unit-testable without a GPU; the `cuda` tier applies it in `reheat`.
+pub fn plan_precision(
+    counts: &[u32],
+    n_experts: usize,
+    resident: &[(usize, usize)],
+    f32_frac: f32,
+) -> Vec<((usize, usize), ExpertPrecision)> {
+    let f32_frac = f32_frac.clamp(0.0, 1.0);
+    let n_f32 = ((resident.len() as f32) * f32_frac).ceil() as usize;
+    let heat = |&(l, e): &(usize, usize)| counts.get(l * n_experts + e).copied().unwrap_or(0);
+    let mut order: Vec<(usize, usize)> = resident.to_vec();
+    order.sort_by(|a, b| heat(b).cmp(&heat(a)).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    order
+        .into_iter()
+        .enumerate()
+        .map(|(i, k)| (k, if i < n_f32 { ExpertPrecision::F32 } else { ExpertPrecision::Int4 }))
+        .collect()
+}
+
 /// Rank sparse `(layer, expert)` pairs by heat and take the hottest `capacity`.
 /// Ties (equal heat — including a cold all-zero table) keep the round-robin order
 /// of [`plan_residency`], so cold start reproduces the static placement and
@@ -180,6 +211,43 @@ pub fn rank_by_heat(counts: &[u32], n_layers: usize, first_dense: usize, n_exper
     cand.sort_by_key(|c| Reverse(heat(c))); // stable: equal heat keeps round-robin order
     cand.truncate(capacity);
     cand
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::{plan_precision, ExpertPrecision};
+
+    #[test]
+    fn hottest_fraction_promoted_to_f32() {
+        // 4 residents on one layer; heat 30, 10, 20, 0 → frac 0.5 promotes the
+        // top two (experts 0 and 2).
+        let counts = vec![30u32, 10, 20, 0];
+        let resident = vec![(0usize, 0usize), (0, 1), (0, 2), (0, 3)];
+        let plan = plan_precision(&counts, 4, &resident, 0.5);
+        let p = |e: usize| plan.iter().find(|((_, x), _)| *x == e).map(|&(_, p)| p);
+        assert_eq!(p(0), Some(ExpertPrecision::F32));
+        assert_eq!(p(2), Some(ExpertPrecision::F32));
+        assert_eq!(p(1), Some(ExpertPrecision::Int4));
+        assert_eq!(p(3), Some(ExpertPrecision::Int4));
+    }
+
+    #[test]
+    fn frac_zero_and_one_are_uniform() {
+        let counts = vec![5u32; 4];
+        let resident = vec![(0usize, 0usize), (0, 1), (0, 2), (0, 3)];
+        assert!(plan_precision(&counts, 4, &resident, 0.0).iter().all(|&(_, p)| p == ExpertPrecision::Int4));
+        assert!(plan_precision(&counts, 4, &resident, 1.0).iter().all(|&(_, p)| p == ExpertPrecision::F32));
+    }
+
+    #[test]
+    fn ties_break_deterministically() {
+        // equal heat → (layer, expert) ascending decides who gets the f32 slots.
+        let counts = vec![7u32; 4];
+        let resident = vec![(0usize, 3usize), (0, 1), (0, 0), (0, 2)];
+        let plan = plan_precision(&counts, 4, &resident, 0.5);
+        let f32s: Vec<usize> = plan.iter().filter(|&&(_, p)| p == ExpertPrecision::F32).map(|&((_, e), _)| e).collect();
+        assert_eq!(f32s, vec![0, 1], "lowest ids win the tie");
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -349,12 +417,19 @@ mod real {
     /// VRAM-resident experts, keyed by `(layer, expert index)`. `capacity` is how
     /// many fit the VRAM budget (fixed at build), so [`Self::reheat`] re-selects the
     /// same-size hottest set as heat accumulates. `int4` picks the residency format:
-    /// per-row int4 (8× denser) vs dequantized f32.
+    /// per-row int4 (8× denser) vs dequantized f32. When `adaptive_f32_frac` is
+    /// set (`COLI_GPU_F32_FRAC`, int4 tiers only), `reheat` promotes that fraction
+    /// of the hottest residents to f32 per [`super::plan_precision`], tracking each
+    /// expert's current format in `precision` and re-uploading on a change.
     pub struct GpuTier {
         device: i32,
         experts: HashMap<(usize, usize), GpuExpert>,
         capacity: usize,
         int4: bool,
+        adaptive_f32_frac: Option<f32>,
+        /// Current per-expert residency format (`true` = int4). Only consulted
+        /// on the adaptive path; uniform tiers leave it empty.
+        precision: HashMap<(usize, usize), bool>,
     }
 
     /// Load and upload one expert to VRAM: raw per-row int4 (`fmt=2`, ~8× denser)
@@ -427,7 +502,15 @@ mod real {
             if experts.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(GpuTier { device, experts, capacity, int4 }))
+                // Adaptive per-expert precision: COLI_GPU_F32_FRAC=<0..1> promotes
+                // that fraction of the hottest residents to f32 at each reheat.
+                // Meaningful only on an int4 tier (a f32 tier is already all-f32).
+                let adaptive_f32_frac = if int4 {
+                    std::env::var("COLI_GPU_F32_FRAC").ok().and_then(|v| v.trim().parse::<f32>().ok())
+                } else {
+                    None
+                };
+                Ok(Some(GpuTier { device, experts, capacity, int4, adaptive_f32_frac, precision: HashMap::new() }))
             }
         }
 
@@ -447,13 +530,32 @@ mod real {
             let want_set: HashSet<(usize, usize)> = want.iter().copied().collect();
             // evict experts that cooled off — their `Drop` frees the VRAM slot
             self.experts.retain(|k, _| want_set.contains(k));
-            // upload newly-hot experts not already resident (same format as build)
+            self.precision.retain(|k, _| want_set.contains(k));
+            // Per-expert precision for this residency generation: adaptive
+            // (hottest frac → f32) or the tier's uniform format.
+            let precision_of: HashMap<(usize, usize), bool> = match self.adaptive_f32_frac {
+                Some(frac) => super::plan_precision(counts, cfg.n_experts as usize, &want, frac)
+                    .into_iter()
+                    .map(|(k, p)| (k, matches!(p, super::ExpertPrecision::Int4)))
+                    .collect(),
+                None => want.iter().map(|&k| (k, self.int4)).collect(),
+            };
             for (layer, e) in want {
-                if self.experts.contains_key(&(layer, e)) {
+                let key = (layer, e);
+                let want_int4 = precision_of.get(&key).copied().unwrap_or(self.int4);
+                // An expert uploaded by `build` (absent from `precision`) is in the
+                // tier's uniform format — treat missing as that, so a non-adaptive
+                // reheat never re-uploads a format-correct resident.
+                let cur_int4 = self.precision.get(&key).copied().unwrap_or(self.int4);
+                if self.experts.contains_key(&key) && cur_int4 == want_int4 {
                     continue;
                 }
-                let ge = upload_expert(st, cfg, layer, e, self.device, self.int4)?;
-                self.experts.insert((layer, e), ge);
+                // Re-upload on a format change (remove first so the old tensor's
+                // Drop frees its VRAM before the new allocation).
+                self.experts.remove(&key);
+                let ge = upload_expert(st, cfg, layer, e, self.device, want_int4)?;
+                self.experts.insert(key, ge);
+                self.precision.insert(key, want_int4);
             }
             Ok(self.experts.len())
         }

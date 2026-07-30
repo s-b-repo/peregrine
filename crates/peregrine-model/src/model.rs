@@ -141,6 +141,33 @@ pub struct Model {
     /// selects per-class prefetch-breadth overrides. Defaults to `Prose`
     /// (== base policy unless the operator set per-class envs).
     workload_class: Mutex<crate::workload::TokenClass>,
+    /// CPU-lane worker count the governors may adjust at runtime, clamped to
+    /// `[2, workers]`. Read once per forward when building `ForwardCtx`; the
+    /// thermal / power / bandwidth governors write it between forwards.
+    effective_workers: std::sync::atomic::AtomicUsize,
+    /// Sensor-governor state (tick counter, RAPL meter, bandwidth EWMA).
+    governor: Mutex<GovernorState>,
+    /// EWMA of normalized routing entropy (0 = fully repetitive routing,
+    /// 1 = maximally dispersed). Drives the entropy-adaptive prefetch breadth.
+    entropy_ewma: Mutex<f32>,
+    /// Long-term expert co-activation counts (runtime + cross-session fusion
+    /// substrate). Fed from the routing history each forward; persisted in
+    /// `route_stats.json`.
+    coactivation: Mutex<crate::predict::CoActivation>,
+    /// Current affinity ordering hints (fused pairs + hyperedge components),
+    /// rebuilt from `coactivation` every 64 forwards. Arc-swapped so forwards
+    /// borrow a stable snapshot without holding the lock.
+    affinity: Mutex<Arc<crate::concurrent::AffinityHints>>,
+    /// Online learned scheduler (bandit / Q-learning over knob configs), `None`
+    /// unless `COLI_LEARN_SCHED=1` / `COLI_RL_SCHED=1`. Policy persisted in
+    /// `route_stats.json`.
+    learner: Mutex<Option<crate::learn::Learner>>,
+    /// Prefetch-distance target the learner chose (0 = none); applied to the
+    /// tuner in `forward_hidden` where `&mut` is available.
+    learned_prefetch: std::sync::atomic::AtomicUsize,
+    /// Wall-clock of the previous `publish_lane_timings` — the inter-forward
+    /// interval is the decode-latency reward signal for the learners.
+    last_forward_at: Mutex<Option<std::time::Instant>>,
     /// The checkpoint directory this model was loaded from — kept so cross-session
     /// artifacts (route stats, layout hints, kernel tuning) can be re-persisted
     /// without threading the path through the caller each time.
@@ -374,11 +401,41 @@ fn numa_pin_worker(worker: usize) {
 }
 
 /// Install [`numa_pin_worker`] as the `peregrine-par` pool's worker-startup
-/// hook. Idempotent; must run before the global pool's first `par_*` call to
-/// affect its workers (the pool is built lazily), which is why `Model::load`
-/// calls this first thing.
+/// hook, and — when NUMA pinning is on and the box is multi-node — the
+/// worker→node group map that switches the pool to hierarchical (two-level)
+/// dispatch: contiguous per-node blocks, then per-worker chunks, so a node's
+/// workers touch a node-local slice of every parallel range. Idempotent; must
+/// run before the global pool's first `par_*` call to affect its workers (the
+/// pool is built lazily), which is why `Model::load` calls this first thing.
 fn install_numa_pin_hook() {
     let _ = peregrine_par::set_worker_start_hook(numa_pin_worker);
+    if !matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("1") | Ok("true")) {
+        return;
+    }
+    let topo = peregrine_io::topo::snapshot();
+    if !topo.multi_numa() {
+        return; // single node — hierarchical == flat, skip the map
+    }
+    // Mirror `peregrine_par::global()`'s sizing so the map length matches the
+    // pool that will be built (a mismatched map is ignored by the dispatcher).
+    let workers = std::env::var("COLI_PAR_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get().min(16)).unwrap_or(4));
+    // Worker w pins to cpus[w % len] (node-grouped enumeration in
+    // `numa_pin_worker`); its group is that CPU's node.
+    let cpus: Vec<(u32, usize)> = topo
+        .numa
+        .iter()
+        .enumerate()
+        .flat_map(|(node_idx, n)| n.cpus.iter().map(move |&c| (c, node_idx)))
+        .collect();
+    if cpus.is_empty() {
+        return;
+    }
+    let groups: Vec<usize> = (0..workers).map(|w| cpus[w % cpus.len()].1).collect();
+    let _ = peregrine_par::set_worker_groups(groups);
 }
 
 /// Depth of the per-layer routing history (how many recent routed sets the momentum
@@ -493,11 +550,122 @@ pub fn save_automaton(table: &TransitionTable, path: &std::path::Path) -> Result
     Ok(())
 }
 
+/// Write a built macro-state table to `path` — the `macrostates.json` artifact a
+/// model auto-loads (and blends into the predictor) from its checkpoint dir.
+pub fn save_macrostates(table: &crate::predict::MacroTable, path: &std::path::Path) -> Result<(), Error> {
+    let json = serde_json::to_vec(&table.to_json()).map_err(|e| Error::Format(format!("serialize macrostates: {e}")))?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
 /// Whether cross-session routing-history persistence is on. Default on when the
 /// model dir is writable; disable with `COLI_ROUTE_STATS_PERSIST=0`. Correctness-
 /// neutral (heat and route history only affect prefetch/eviction, not output).
 fn route_stats_persist_enabled() -> bool {
     !matches!(std::env::var("COLI_ROUTE_STATS_PERSIST").as_deref(), Ok("0") | Ok("false"))
+}
+
+/// Entropy-adaptive prefetch breadth: when on (`COLI_ENTROPY_ADAPT=1`),
+/// dispersed routing (high entropy) widens the prefetch-distance tuner and
+/// repetitive routing narrows it. Requires the tuner (`COLI_PREFETCH_TUNE=1`)
+/// to have an effect. Correctness-neutral.
+fn entropy_adapt_enabled() -> bool {
+    matches!(std::env::var("COLI_ENTROPY_ADAPT").as_deref(), Ok("1") | Ok("true"))
+}
+
+/// Shared state for the sensor-driven governors (thermal / power / memory
+/// bandwidth). All three adjust the same knob — the effective CPU-lane worker
+/// count — with "any shrink wins over a grow" arbitration, sampled every
+/// [`GovernorState::SENSOR_PERIOD`] forwards to bound sysfs-read overhead.
+struct GovernorState {
+    tick: u64,
+    base_workers: usize,
+    energy: peregrine_io::EnergyMeter,
+    last_sample: Option<std::time::Instant>,
+    ewma_gbps: f32,
+    /// Tick of the last bandwidth +1 probe (periodic regrow attempt).
+    last_probe: u64,
+}
+
+impl GovernorState {
+    const SENSOR_PERIOD: u64 = 16;
+
+    fn new(base_workers: usize) -> GovernorState {
+        GovernorState {
+            tick: 0,
+            base_workers,
+            energy: peregrine_io::EnergyMeter::new(),
+            last_sample: None,
+            ewma_gbps: 0.0,
+            last_probe: 0,
+        }
+    }
+
+    /// One governor step. Returns the worker-count delta to apply (−1, 0, +1).
+    /// Heuristics, all opt-in:
+    /// - `COLI_THERMAL_LIMIT_C=<c>`: above the limit → shrink; 8 °C below → regrow.
+    /// - `COLI_POWER_CAP_W=<w>`: RAPL watts above cap → shrink; below 80 % → regrow.
+    /// - `COLI_BW_GOVERNOR=1`: CPU-lane GB/s EWMA plateau → shrink (bandwidth-bound,
+    ///   extra workers just contend); a periodic +1 probe (every 256 forwards)
+    ///   rediscovers headroom after the workload shifts.
+    fn step(&mut self, sample: crate::lane::LaneTimings, current: usize) -> i32 {
+        self.tick += 1;
+        let thermal: Option<i32> = std::env::var("COLI_THERMAL_LIMIT_C").ok().and_then(|v| v.trim().parse().ok());
+        let power: Option<f32> = std::env::var("COLI_POWER_CAP_W").ok().and_then(|v| v.trim().parse().ok());
+        let bw = matches!(std::env::var("COLI_BW_GOVERNOR").as_deref(), Ok("1") | Ok("true"));
+        if thermal.is_none() && power.is_none() && !bw {
+            return 0;
+        }
+        let mut shrink = false;
+        let mut grow = false;
+        // Bandwidth plateau check runs every forward (numbers already in hand).
+        if bw && sample.cpu_us > 0 && sample.cpu_bytes > 0 {
+            let gbps = sample.cpu_bytes as f32 / sample.cpu_us as f32 / 1000.0; // bytes/µs → GB/s
+            if self.ewma_gbps > 0.0 && gbps < 0.98 * self.ewma_gbps && current > 2 {
+                shrink = true; // more workers stopped buying bandwidth
+            }
+            self.ewma_gbps = if self.ewma_gbps == 0.0 { gbps } else { 0.7 * self.ewma_gbps + 0.3 * gbps };
+            if self.tick.saturating_sub(self.last_probe) >= 256 && current < self.base_workers {
+                grow = true; // periodic probe upward
+                self.last_probe = self.tick;
+            }
+        }
+        // Sensor reads only every SENSOR_PERIOD forwards.
+        if self.tick.is_multiple_of(Self::SENSOR_PERIOD) {
+            if let Some(limit) = thermal {
+                if let Some(t) = peregrine_io::max_temp_c() {
+                    if t > limit {
+                        shrink = true;
+                    } else if t < limit - 8 && current < self.base_workers {
+                        grow = true;
+                    }
+                }
+            }
+            if let Some(cap) = power {
+                let now = std::time::Instant::now();
+                let dt = self.last_sample.map(|p| now.duration_since(p).as_secs_f32()).unwrap_or(0.0);
+                self.last_sample = Some(now);
+                if let Some(uj) = self.energy.delta_uj() {
+                    if dt > 0.0 {
+                        let watts = (uj as f32 / 1e6) / dt;
+                        if watts > cap {
+                            shrink = true;
+                        } else if watts < 0.8 * cap && current < self.base_workers {
+                            grow = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Any shrink wins over any grow — thermal/power safety beats throughput.
+        if shrink {
+            -1
+        } else if grow {
+            1
+        } else {
+            0
+        }
+    }
 }
 
 /// Load `<dir>/schedule.json` if present — the per-layer expert-order hint
@@ -511,6 +679,12 @@ fn load_layout_schedule(dir: &std::path::Path) -> Option<Vec<Vec<u32>>> {
     }
     let bytes = std::fs::read(dir.join("schedule.json")).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    parse_schedule_value(&v)
+}
+
+/// Parse a schedule document (the `schedule.json` shape) — shared by the
+/// standalone file loader and the compiled-plan consumer.
+fn parse_schedule_value(v: &serde_json::Value) -> Option<Vec<Vec<u32>>> {
     // Only version 1 for now.
     if v.get("version").and_then(|x| x.as_u64())? != 1 {
         return None;
@@ -1048,6 +1222,7 @@ impl Model {
             None
         };
 
+        let model_n_layers = cfg.n_layers as usize; // read before `cfg` moves into the struct
         let mut model = Model {
             cfg,
             embed,
@@ -1079,17 +1254,113 @@ impl Model {
             ),
             last_iowq: Mutex::new(None),
             workload_class: Mutex::new(crate::workload::TokenClass::Prose),
+            effective_workers: std::sync::atomic::AtomicUsize::new(workers),
+            governor: Mutex::new(GovernorState::new(workers)),
+            entropy_ewma: Mutex::new(0.5),
+            coactivation: Mutex::new(crate::predict::CoActivation::new(model_n_layers)),
+            affinity: Mutex::new(Arc::new(crate::concurrent::AffinityHints::default())),
+            learner: Mutex::new(crate::learn::Learner::from_env(workers)),
+            learned_prefetch: std::sync::atomic::AtomicUsize::new(0),
+            last_forward_at: Mutex::new(None),
             checkpoint_dir: dir.to_path_buf(),
             layout_schedule: load_layout_schedule(dir),
         };
         // Upgrade the predictor to the offline transition automaton if a matching
-        // `automaton.json` sits next to the checkpoint (else stay on momentum).
+        // `automaton.json` sits next to the checkpoint (else stay on momentum),
+        // then blend in the macro-state table if one is present.
         model.try_attach_automaton(dir);
+        model.try_attach_macrostates(dir);
         // Load any persisted routing history / heat snapshot so a fresh process
         // starts warm on the last session's routing patterns. Correctness-neutral;
         // missing/stale files are silently ignored.
         model.try_load_route_stats(dir);
+        // Storage-tier seed: prefetch-warm the offline-planned RAM tier so the
+        // co-firing communities the planner placed in RAM are resident before
+        // the first token. Best-effort; bounded; `COLI_TIER_SEED=0` disables.
+        model.try_seed_tiers(dir);
+        // Compiled execution plan (plan.json from `compile-plan`) — a single
+        // profile-guided artifact bundling all of the above; applied last so a
+        // plan wins over the standalone files.
+        model.try_load_plan(dir);
         Ok(model)
+    }
+
+    /// Consume a compiled execution plan (`<dir>/plan.json`, from the engine's
+    /// `compile-plan` subcommand): one config-tagged artifact bundling the
+    /// automaton, macro-states, layout schedule, tier placement, and learned
+    /// knob policy — every input a recorded profile, applied in one shot
+    /// ("profile-guided execution planning"). Parts are individually optional;
+    /// each goes through the same validation as its standalone file. Applied
+    /// after the standalone artifacts, so a plan wins where both exist.
+    fn try_load_plan(&mut self, dir: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(dir.join("plan.json")) else { return };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
+        let tag = config_tag(&self.cfg);
+        if let Some(av) = v.get("automaton") {
+            if let Some(table) = TransitionTable::from_json(av) {
+                if table.tag() == tag {
+                    self.predictor =
+                        PredictSource::Automaton { table: Arc::new(table), fallback: Momentum::default() };
+                }
+            }
+        }
+        if let Some(mv) = v.get("macrostates") {
+            if let Some(table) = crate::predict::MacroTable::from_json(mv) {
+                if table.tag() == tag {
+                    let inner = std::mem::take(&mut self.predictor);
+                    self.predictor =
+                        PredictSource::WithMacro { table: Arc::new(table), inner: Box::new(inner) };
+                }
+            }
+        }
+        if let Some(sv) = v.get("schedule") {
+            if let Some(sched) = parse_schedule_value(sv) {
+                self.layout_schedule = Some(sched);
+            }
+        }
+        if let Some(lv) = v.get("learn") {
+            if !lv.is_null() {
+                if let Some(l) = self.learner.lock().as_mut() {
+                    l.restore(lv);
+                }
+            }
+        }
+        if let Some(tv) = v.get("tiers") {
+            self.seed_tiers_from_value(tv);
+        }
+    }
+
+    /// Read `<dir>/tiers.json` (from the galactic pass) and enqueue prefetch
+    /// warms for the RAM-tier experts — bounded at 256 entries so a huge plan
+    /// can't stall load. No-op without a prefetch pool / warm cache.
+    fn try_seed_tiers(&self, dir: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(dir.join("tiers.json")) else { return };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
+        self.seed_tiers_from_value(&v);
+    }
+
+    /// Shared tier-seed application (standalone tiers.json and plan.json both
+    /// land here).
+    fn seed_tiers_from_value(&self, v: &serde_json::Value) {
+        if matches!(std::env::var("COLI_TIER_SEED").as_deref(), Ok("0") | Ok("false")) {
+            return;
+        }
+        let (Some(pool), Some(_)) = (&self.prefetch, &self.ecache) else { return };
+        let Some(ram) = v.get("ram").and_then(|r| r.as_array()) else { return };
+        let mut items = Vec::new();
+        for pair in ram.iter().take(256) {
+            let Some(a) = pair.as_array() else { continue };
+            let (Some(l), Some(e)) = (a.first().and_then(|x| x.as_u64()), a.get(1).and_then(|x| x.as_u64()))
+            else {
+                continue;
+            };
+            if let Ok(item) = crate::concurrent::prefetch_item(&self.st, &self.cfg, l as usize, e as usize) {
+                items.push(item);
+            }
+        }
+        if !items.is_empty() {
+            let _ = pool.lane(0).tx.send(PrefetchMsg::Warm(items));
+        }
     }
 
     /// Clear the KV cache to start a fresh sequence. Also clears the prefetch
@@ -1407,6 +1678,26 @@ impl Model {
         }
     }
 
+    /// Load a matching `macrostates.json` next to the checkpoint and, if its tag
+    /// matches, wrap the current predictor with the macro-state blend. Called
+    /// after [`Self::try_attach_automaton`] so it composes over whichever base
+    /// source won. Missing/stale artifacts are silently ignored.
+    fn try_attach_macrostates(&mut self, dir: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(dir.join("macrostates.json")) else {
+            return;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        let Some(table) = crate::predict::MacroTable::from_json(&v) else {
+            return;
+        };
+        if table.tag() == config_tag(&self.cfg) {
+            let inner = std::mem::take(&mut self.predictor);
+            self.predictor = PredictSource::WithMacro { table: Arc::new(table), inner: Box::new(inner) };
+        }
+    }
+
     /// Load `<dir>/route_stats.json` if present and its config fingerprint matches:
     /// restore the routing history and (when a GPU tier exists) the routing-heat
     /// counters. Missing/malformed/stale files are silently ignored — the model
@@ -1434,6 +1725,25 @@ impl Model {
                 heat.restore(&snap);
             }
         }
+        // Cross-session co-activation ("automatic expert fusion from long-term
+        // co-activation"): restore the pair counts and immediately rebuild the
+        // affinity snapshot so the very first forwards already order fused
+        // pairs adjacently.
+        if let Some(coact_v) = v.get("coact") {
+            if let Some(co) = crate::predict::CoActivation::from_json(coact_v) {
+                *self.coactivation.lock() = co;
+                self.rebuild_affinity();
+            }
+        }
+        // Learned-scheduler policy: restore into whichever learner mode is
+        // active (kind-mismatched policies are ignored inside `restore`).
+        if let Some(learn_v) = v.get("learn") {
+            if !learn_v.is_null() {
+                if let Some(l) = self.learner.lock().as_mut() {
+                    l.restore(learn_v);
+                }
+            }
+        }
     }
 
     /// The checkpoint directory this model was loaded from — the natural home for
@@ -1453,13 +1763,86 @@ impl Model {
         let sample = self.lane_timings.snapshot_and_reset();
         *self.last_lane.lock() = sample;
         self.bubble.lock().observe(sample);
-        // Feed the I/O tuner: sample the batched-read wall time (µs), then step
-        // it (using a static SLA target of 10ms per forward — well above the
-        // per-forward budget of typical MoE inference). When it recommends a
-        // new cap, apply it once across all reactors and remember what we set.
+        // Sensor governors: thermal / power / bandwidth, all writing the one
+        // effective-worker knob with shrink-wins arbitration.
+        {
+            use std::sync::atomic::Ordering;
+            let current = self.effective_workers.load(Ordering::Relaxed);
+            let delta = self.governor.lock().step(sample, current);
+            if delta != 0 {
+                let next = (current as i64 + delta as i64).clamp(2, self.workers as i64) as usize;
+                self.effective_workers.store(next, Ordering::Relaxed);
+            }
+        }
+        // Routing-entropy EWMA (drives entropy-adaptive prefetch breadth; the
+        // nudge itself happens in forward_hidden where the tuner is &mut).
+        if entropy_adapt_enabled() {
+            if let Some(h) = self.routing_entropy() {
+                let mut e = self.entropy_ewma.lock();
+                *e = 0.7 * *e + 0.3 * h;
+            }
+        }
+        // Learned scheduler: reward the last choice with the inter-forward wall
+        // interval (the observable decode latency), then choose the next knob
+        // configuration and stage it (workers applied here; prefetch distance
+        // staged for forward_hidden where the tuner is &mut).
+        {
+            let mut learner = self.learner.lock();
+            if let Some(l) = learner.as_mut() {
+                use std::sync::atomic::Ordering;
+                let now = std::time::Instant::now();
+                let latency_us = {
+                    let mut prev = self.last_forward_at.lock();
+                    let d = prev.map(|p| now.duration_since(p).as_micros() as u64);
+                    *prev = Some(now);
+                    d
+                };
+                let bias = self.bubble.lock().bias();
+                let entropy = *self.entropy_ewma.lock();
+                if let Some(us) = latency_us {
+                    l.reward(us, bias, entropy);
+                }
+                let cur = crate::learn::KnobArm {
+                    prefetch_distance: self.learned_prefetch.load(Ordering::Relaxed).max(4),
+                    workers: self.effective_workers.load(Ordering::Relaxed),
+                };
+                let next = l.choose(bias, entropy, cur, self.workers);
+                self.learned_prefetch.store(next.prefetch_distance, Ordering::Relaxed);
+                let w = next.workers.clamp(2, self.workers);
+                self.effective_workers.store(w, Ordering::Relaxed);
+            }
+        }
+        // Co-activation tracking: fold this forward's routed sets (newest frame
+        // per layer) into the pair counter; every 64 forwards rebuild the
+        // affinity snapshot (fused pairs at the high threshold, hyperedge
+        // components at half that). Single-stream mode only — the batched path
+        // records per-sequence histories the engine owns, not `route_hist`.
+        if let Some(hist) = &self.route_hist {
+            let frames = {
+                let h = hist.lock();
+                let mut co = self.coactivation.lock();
+                for l in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
+                    if let Some(f) = h.latest(l) {
+                        co.observe(l, f);
+                    }
+                }
+                co.note_forward();
+                co.frames
+            };
+            if frames.is_multiple_of(64) {
+                self.rebuild_affinity();
+            }
+        }
+        // Feed the I/O tuner: sample the batched-read wall time (µs) plus this
+        // forward's submission-queue-full rejections (the queue-pressure signal
+        // that triggers worker halving), then step it (static SLA target of
+        // 10ms per forward — well above the per-forward budget of typical MoE
+        // inference). When it recommends a new cap, apply it once across all
+        // reactors and remember what we set.
         if sample.io_us > 0 {
+            let sq_full_delta: u64 = self.io_reactors.iter().map(|r| r.lock().take_sq_full()).sum();
             let before = self.io_tuner.sq_full();
-            self.io_tuner.note_read(sample.io_us, 0);
+            self.io_tuner.note_read(sample.io_us, sq_full_delta);
             self.io_tuner.step(10_000, before);
         }
         if let Some(rec) = self.io_tuner.recommend() {
@@ -1478,6 +1861,107 @@ impl Model {
     /// before the first application). For `/metrics` scrapes and tests.
     pub fn last_iowq(&self) -> Option<crate::iotune::IowqCap> {
         *self.last_iowq.lock()
+    }
+
+    /// The governor-adjusted CPU-lane worker count for the next forward.
+    pub fn effective_workers(&self) -> usize {
+        self.effective_workers.load(std::sync::atomic::Ordering::Relaxed).max(1)
+    }
+
+    /// Rebuild the affinity snapshot from the co-activation tracker: fused
+    /// pairs at `COLI_FUSE_THRESHOLD` (default 0.9 co-rate) and hyperedge
+    /// components (union-find over pairs at half the threshold). Arc-swapped so
+    /// in-flight forwards keep their borrowed snapshot.
+    fn rebuild_affinity(&self) {
+        let threshold: f32 = std::env::var("COLI_FUSE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&t: &f32| (0.0..=1.0).contains(&t))
+            .unwrap_or(0.9);
+        let co = self.coactivation.lock();
+        let pairs = co.fused_pairs(threshold);
+        let loose = co.fused_pairs(threshold * 0.5);
+        drop(co);
+        // Union-find per layer over the loose pairs → expert → component id.
+        let mut groups: Vec<std::collections::HashMap<u32, u32>> = Vec::with_capacity(loose.len());
+        for layer_pairs in &loose {
+            let mut parent: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            fn find(parent: &mut std::collections::HashMap<u32, u32>, x: u32) -> u32 {
+                let p = *parent.entry(x).or_insert(x);
+                if p == x {
+                    return x;
+                }
+                let root = find(parent, p);
+                parent.insert(x, root);
+                root
+            }
+            for &(a, b) in layer_pairs {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent.insert(ra.max(rb), ra.min(rb)); // smaller root wins → deterministic
+                }
+            }
+            let keys: Vec<u32> = parent.keys().copied().collect();
+            let mut map = std::collections::HashMap::new();
+            for k in keys {
+                let root = find(&mut parent, k);
+                map.insert(k, root);
+            }
+            // singleton components carry no grouping signal — drop them
+            let mut sizes: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for &r in map.values() {
+                *sizes.entry(r).or_insert(0) += 1;
+            }
+            map.retain(|_, r| sizes.get(r).copied().unwrap_or(0) >= 2);
+            groups.push(map);
+        }
+        *self.affinity.lock() = Arc::new(crate::concurrent::AffinityHints { pairs, groups });
+    }
+
+    /// The current affinity snapshot (cheap Arc clone).
+    fn affinity_snapshot(&self) -> Arc<crate::concurrent::AffinityHints> {
+        self.affinity.lock().clone()
+    }
+
+    /// Normalized routing entropy over the recent history window: per sparse
+    /// layer, the Shannon entropy of the expert-selection distribution across
+    /// the K-deep frames, normalized by `ln(distinct)` and averaged over layers
+    /// with data. `None` before any routing was recorded. 0 → the same experts
+    /// every token; 1 → maximally dispersed routing.
+    pub fn routing_entropy(&self) -> Option<f32> {
+        let hist = self.route_hist.as_ref()?;
+        let h = hist.lock();
+        let mut sum = 0f32;
+        let mut layers = 0u32;
+        for l in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
+            let mut counts: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+            let mut total = 0u32;
+            for frame in h.frames(l) {
+                for &e in frame {
+                    if e >= 0 {
+                        *counts.entry(e).or_insert(0) += 1;
+                        total += 1;
+                    }
+                }
+            }
+            if total == 0 || counts.len() < 2 {
+                continue;
+            }
+            let mut ent = 0f32;
+            for &c in counts.values() {
+                let p = c as f32 / total as f32;
+                ent -= p * p.ln();
+            }
+            sum += ent / (counts.len() as f32).ln();
+            layers += 1;
+        }
+        (layers > 0).then(|| sum / layers as f32)
+    }
+
+    /// EWMA of [`Self::routing_entropy`] (updated per forward when
+    /// `COLI_ENTROPY_ADAPT=1`). For telemetry scrapes.
+    pub fn routing_entropy_ewma(&self) -> f32 {
+        *self.entropy_ewma.lock()
     }
 
     /// Idle-tick maintenance: recompress one cold warm-cache slot (background
@@ -1548,10 +2032,17 @@ impl Model {
             Some(h) => serde_json::json!(h.snapshot()),
             None => serde_json::Value::Null,
         };
+        let coact_json = self.coactivation.lock().to_json();
+        let learn_json: serde_json::Value = match self.learner.lock().as_ref() {
+            Some(l) => l.to_json(),
+            None => serde_json::Value::Null,
+        };
         let doc = serde_json::json!({
             "tag": tag,
             "hist": hist_json,
             "heat": heat_json,
+            "coact": coact_json,
+            "learn": learn_json,
         });
         let bytes = serde_json::to_vec(&doc).map_err(|e| Error::Format(format!("serialize route stats: {e}")))?;
         // best-effort: a non-writable checkpoint dir is not an error — the model
@@ -1586,6 +2077,41 @@ impl Model {
         Ok(table)
     }
 
+    /// One-pass "galactic" preprocessing: run `corpus` once and produce every
+    /// offline artifact at once — the transition automaton, the macro-state
+    /// table (temporal routing compression), and the raw routing trace (for the
+    /// layout tools). Streaming mode only. Resets the KV cache first.
+    #[allow(clippy::type_complexity)]
+    pub fn build_artifacts(
+        &mut self,
+        corpus: &[i32],
+    ) -> Result<(TransitionTable, crate::predict::MacroTable, Vec<Vec<Vec<i32>>>), Error> {
+        if self.route_hist.is_none() {
+            return Err(Error::Format("build_artifacts requires streaming mode (COLI_STREAM=1)".into()));
+        }
+        let n_layers = self.cfg.n_layers as usize;
+        let first_dense = self.cfg.first_dense as usize;
+        let tag = config_tag(&self.cfg);
+        let mut table = TransitionTable::new(n_layers, tag.clone());
+        let mut macros = crate::predict::MacroTable::new(n_layers, tag);
+        let mut trace: Vec<Vec<Vec<i32>>> = Vec::with_capacity(corpus.len());
+        self.reset();
+        let mut prev: Option<Vec<Vec<i32>>> = None;
+        for (i, &tok) in corpus.iter().enumerate() {
+            let _ = self.forward_step(&[tok], i)?;
+            let cur = self.route_snapshot(n_layers);
+            if let Some(p) = &prev {
+                for layer in first_dense..n_layers {
+                    table.observe(layer, &p[layer], &cur[layer]);
+                    macros.observe(layer, &p[layer], &cur[layer]);
+                }
+            }
+            trace.push(cur.clone());
+            prev = Some(cur);
+        }
+        Ok((table, macros, trace))
+    }
+
     /// Capture the raw per-forward routed sets for `corpus` (each entry is one forward's
     /// per-layer routed experts) — the trace `build-automaton` aggregates. Streaming
     /// mode only. Resets the KV cache first.
@@ -1618,7 +2144,7 @@ impl Model {
         match &self.route_hist {
             Some(h) => {
                 let h = h.lock();
-                (0..n_layers).map(|l| h.latest(l).cloned().unwrap_or_default()).collect()
+                (0..n_layers).map(|l| h.latest(l).cloned().unwrap_or_else(Vec::new)).collect()
             }
             None => vec![Vec::new(); n_layers],
         }
@@ -1694,14 +2220,17 @@ impl Model {
             // split disjoint fields so attention can borrow layers (imm) + kv (mut)
             let balancer = self.build_balancer();
             let heat_snapshot = balancer.as_ref().and_then(|_| self.heat.as_ref().map(|h| h.snapshot()));
+            let eff_workers = self.effective_workers();
+            let aff = self.affinity_snapshot();
             let Model {
                 cfg, layers, kv, st, stream_experts, direct, io_reactors, workers, ecache, route_hist, predictor, prefetch, gpu, heat, lane_timings, layout_schedule, ..
             } = self;
+            let _ = workers; // base count; the governors' adjusted count is used below
             let ctx = ForwardCtx {
                 st,
                 reactors: io_reactors,
                 gpu: gpu.as_ref(),
-                workers: *workers,
+                workers: eff_workers,
                 cfg,
                 stream_experts: *stream_experts,
                 ecache: ecache.as_deref(),
@@ -1713,6 +2242,7 @@ impl Model {
                 balancer: balancer.as_ref(),
                 heat_counts: heat_snapshot.as_deref(),
                 layout_schedule: layout_schedule.as_deref(),
+                affinity: Some(aff.as_ref()),
             };
             // Layer look-ahead: a shared prefetch view over the same field borrows, so
             // each layer's next-token prefetch is emitted the moment that layer
@@ -1762,6 +2292,34 @@ impl Model {
                 t.observe(used, wasted);
             }
         }
+        // Entropy-adaptive breadth: dispersed routing widens the prefetch
+        // distance (more candidates worth warming), repetitive routing narrows
+        // it. Applied here because the tuner needs `&mut`.
+        if entropy_adapt_enabled() {
+            let e = *self.entropy_ewma.lock();
+            if let Some(t) = self.prefetch_tuner.as_mut() {
+                if e >= 0.85 {
+                    t.nudge_up();
+                } else if e <= 0.5 {
+                    t.nudge_down();
+                }
+            }
+        }
+        // Learned prefetch distance (bandit / Q): apply the staged choice to the
+        // tuner. Only meaningful with the tuner on; nudged toward the target one
+        // step per forward so the change stays smooth.
+        {
+            let target = self.learned_prefetch.load(std::sync::atomic::Ordering::Relaxed);
+            if target > 0 {
+                if let Some(t) = self.prefetch_tuner.as_mut() {
+                    match t.distance().cmp(&target) {
+                        std::cmp::Ordering::Less => t.nudge_up(),
+                        std::cmp::Ordering::Greater => t.nudge_down(),
+                        std::cmp::Ordering::Equal => {}
+                    }
+                }
+            }
+        }
         // Snapshot this forward's per-lane wall time and fold it into the bubble
         // tuner. `publish_lane_timings` is idempotent — safe to call from every
         // main-forward path (and the batched one below).
@@ -1788,7 +2346,7 @@ impl Model {
             st: &self.st,
             reactors: &self.io_reactors,
             gpu: self.gpu.as_ref(),
-            workers: self.workers,
+            workers: self.effective_workers(),
             cfg: &self.cfg,
             stream_experts: self.stream_experts,
             ecache: self.ecache.as_deref(),
@@ -1800,6 +2358,7 @@ impl Model {
             balancer: None,
             heat_counts: None,
             layout_schedule: self.layout_schedule.as_deref(),
+            affinity: None,
         }
     }
 
@@ -1871,11 +2430,12 @@ impl Model {
         // the model borrows share one inferred lifetime.
         let balancer = self.build_balancer();
         let heat_snapshot = balancer.as_ref().and_then(|_| self.heat.as_ref().map(|h| h.snapshot()));
+        let aff = self.affinity_snapshot();
         let ctx = ForwardCtx {
             st: &self.st,
             reactors: &self.io_reactors,
             gpu: self.gpu.as_ref(),
-            workers: self.workers,
+            workers: self.effective_workers(),
             cfg: &self.cfg,
             stream_experts: self.stream_experts,
             ecache: self.ecache.as_deref(),
@@ -1887,6 +2447,7 @@ impl Model {
             balancer: balancer.as_ref(),
             heat_counts: heat_snapshot.as_deref(),
             layout_schedule: self.layout_schedule.as_deref(),
+            affinity: Some(aff.as_ref()),
         };
         for (li, l) in self.layers.iter().enumerate() {
             let mut caches: Vec<&mut LayerKv> = seqs.iter_mut().map(|sk| &mut sk.layers[li]).collect();
@@ -1979,6 +2540,7 @@ impl Model {
             balancer: None, // drafts run under the plain static residency policy
             heat_counts: None,
             layout_schedule: None, // drafts benefit less from disk-order tuning
+            affinity: None,
         };
         let mut kv = LayerKv::new(kvl, qkr);
         let mut h = hlast.to_vec(); // pre-final-norm hidden
@@ -2152,6 +2714,46 @@ mod tests {
         assert!(m.layout_schedule.is_some(), "schedule.json must load");
         let got = m.generate(&[3, 7, 1, 4], 6, &mut Sampler::new(0.0, 0.9, 1))?;
         assert_eq!(got, want, "schedule reordering must be bit-identical");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn coactivation_ordering_is_bit_identical() -> Result<(), peregrine_core::Error> {
+        // Run enough forwards for the co-activation snapshot to rebuild (64+
+        // forwards), then confirm the generated stream equals a fresh model's —
+        // affinity ordering only permutes dispatch, never the reduce.
+        let dir = tmp_model_dir("coact")?;
+        let prompt = [3i32, 7, 1, 4];
+        let want = {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            m.generate(&prompt, 70, &mut Sampler::new(0.0, 0.9, 1))?
+        };
+        // Second model with a *pre-seeded* co-activation snapshot: run once to
+        // persist route_stats (includes coact), reload → affinity active from
+        // the first forward.
+        let got = {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            m.generate(&prompt, 70, &mut Sampler::new(0.0, 0.9, 1))?
+        };
+        assert_eq!(got, want, "affinity/fusion ordering must not change tokens");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_rows_streamed_matches_resident() -> Result<(), peregrine_core::Error> {
+        // Cooperative tiled dispatch: a forward whose row count crosses the
+        // par-pool gate computes each streamed expert's rows across the pool
+        // (Mlp::swiglu → QtWeight::apply_vec → par_rows). Output must equal the
+        // resident path bit-for-bit — the tiling is row-disjoint.
+        let dir = tmp_model_dir("tiled")?;
+        let toks: Vec<i32> = (0..40).map(|k| (k * 5 + 2) % 32).collect(); // 40 rows > PAR_ROWS_MIN
+        let mut resident = Model::load_streaming(&dir, false)?;
+        let mut streamed = Model::load_streaming(&dir, true)?;
+        let lr = resident.forward_step(&toks, 0)?;
+        let ls = streamed.forward_step(&toks, 0)?;
+        assert_eq!(lr, ls, "tiled streamed compute must equal resident");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

@@ -100,6 +100,93 @@ pub fn set_worker_start_hook(f: fn(usize)) -> bool {
     WORKER_START_HOOK.set(f).is_ok()
 }
 
+/// Optional worker→group map for **hierarchical (two-level) dispatch**: group =
+/// NUMA node (or socket). When set — `groups[i]` is worker `i`'s group — the
+/// dispatcher splits the index range into contiguous per-group blocks sized
+/// proportionally to each group's worker count, then per-worker chunks within a
+/// block. Combined with node-grouped pinning, a group's block stays node-local.
+/// Bit-identical to flat dispatch (each index still runs exactly once; writes
+/// stay disjoint) — only which worker computes which range changes.
+static WORKER_GROUPS: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+
+/// Install the worker→group map (first caller wins; returns whether set).
+/// Install *before* the first `par_*` call for the map to shape dispatch from
+/// the start (it is consulted per call, so late installation also works).
+pub fn set_worker_groups(groups: Vec<usize>) -> bool {
+    WORKER_GROUPS.set(groups).is_ok()
+}
+
+/// Plan `(worker, start, end)` range assignments over `0..n` for `w` workers.
+///
+/// Flat mode (`groups` absent or mismatched): the historical ceil-chunk split —
+/// worker `i` gets `[i*chunk, (i+1)*chunk)`.
+///
+/// Hierarchical mode (`groups[i]` = worker `i`'s group): the range splits into
+/// one contiguous block per group, sized proportionally to the group's worker
+/// count (remainders spread over the leading groups), then ceil-chunked across
+/// that group's workers. Every index appears in exactly one range either way —
+/// the property the bit-identity of `par_*` rests on.
+fn plan_assignments(n: usize, w: usize, groups: Option<&[usize]>) -> Vec<(usize, usize, usize)> {
+    let mut out: Vec<(usize, usize, usize)> = Vec::with_capacity(w);
+    let flat = |out: &mut Vec<(usize, usize, usize)>| {
+        let chunk = n.div_ceil(w);
+        let mut start = 0usize;
+        let mut worker = 0usize;
+        while start < n && worker < w {
+            let end = (start + chunk).min(n);
+            out.push((worker, start, end));
+            worker += 1;
+            start = end;
+        }
+    };
+    match groups {
+        Some(g) if g.len() == w && w > 0 => {
+            // group id → its workers, in first-appearance order (deterministic).
+            let mut order: Vec<usize> = Vec::new();
+            let mut members: Vec<Vec<usize>> = Vec::new();
+            for (i, &gid) in g.iter().enumerate() {
+                match order.iter().position(|&x| x == gid) {
+                    Some(k) => members[k].push(i),
+                    None => {
+                        order.push(gid);
+                        members.push(vec![i]);
+                    }
+                }
+            }
+            // proportional block sizes; leading groups absorb the remainder.
+            let n_groups = members.len();
+            let mut sizes: Vec<usize> = members.iter().map(|m| n * m.len() / w).collect();
+            let assigned: usize = sizes.iter().sum();
+            for (k, s) in sizes.iter_mut().enumerate() {
+                if k < n - assigned {
+                    *s += 1;
+                }
+            }
+            let _ = n_groups;
+            let mut start = 0usize;
+            for (m, &size) in members.iter().zip(&sizes) {
+                if size == 0 {
+                    continue;
+                }
+                let block_end = start + size;
+                let chunk = size.div_ceil(m.len());
+                let mut s = start;
+                for &worker in m {
+                    if s >= block_end {
+                        break;
+                    }
+                    let e = (s + chunk).min(block_end);
+                    out.push((worker, s, e));
+                    s = e;
+                }
+                start = block_end;
+            }
+        }
+        _ => flat(&mut out),
+    }
+    out
+}
+
 fn worker_loop(index: usize, rx: Receiver<Job>) {
     if let Some(hook) = WORKER_START_HOOK.get() {
         hook(index);
@@ -158,7 +245,6 @@ impl Pool {
             }
             return;
         }
-        let chunk = n.div_ceil(w); // ceil → at most `w` contiguous chunks
         let panicked = Arc::new(AtomicBool::new(false));
         // SAFETY: erase `f`'s borrow lifetime for the channel hop to the persistent
         // workers. The barrier below blocks until every worker has finished
@@ -169,20 +255,32 @@ impl Pool {
             unsafe { std::mem::transmute::<&(dyn Fn(usize) + Sync), _>(f) };
         let task = TaskPtr(erased);
         let (done_tx, done_rx) = channel::<()>();
+        // (worker, start, end) assignments: hierarchical two-level split when a
+        // worker→group map is installed (contiguous per-group blocks proportional
+        // to group size, then per-worker chunks within the block — node-local
+        // ranges under node-grouped pinning), else the flat ceil-chunk split.
+        let assignments = plan_assignments(n, w, WORKER_GROUPS.get().map(|g| g.as_slice()));
         let mut sent = 0usize;
-        let mut start = 0usize;
-        while start < n {
-            let end = (start + chunk).min(n);
+        let mut abort_from: Option<usize> = None;
+        for &(worker, start, end) in &assignments {
             let job = Job { task, start, end, done: done_tx.clone(), panicked: Arc::clone(&panicked) };
-            if self.job_txs[sent].send(job).is_err() {
-                // a worker is gone (shutdown race): finish this and the rest inline
-                for i in start..n {
+            if self.job_txs[worker].send(job).is_err() {
+                // a worker is gone (shutdown race): finish this range inline and
+                // remember to run every not-yet-sent range inline too.
+                for i in start..end {
                     f(i);
                 }
+                abort_from = Some(sent + 1);
                 break;
             }
             sent += 1;
-            start = end;
+        }
+        if let Some(from) = abort_from {
+            for &(_, start, end) in assignments.iter().skip(from) {
+                for i in start..end {
+                    f(i);
+                }
+            }
         }
         // Barrier — the soundness invariant above.
         for _ in 0..sent {
@@ -339,6 +437,41 @@ pub fn par_chunks_mut(out: &mut [f32], stride: usize, n: usize, min_parallel: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_assignments_covers_every_index_exactly_once() {
+        // Flat and hierarchical plans must both partition 0..n: no index missed,
+        // none duplicated — the invariant bit-identity rests on.
+        for (n, w, groups) in [
+            (1000usize, 4usize, None),
+            (1000, 4, Some(vec![0usize, 0, 1, 1])),
+            (7, 4, Some(vec![0, 0, 1, 1])),
+            (3, 6, Some(vec![0, 0, 0, 1, 1, 1])),
+            (1000, 6, Some(vec![0, 0, 0, 0, 1, 1])), // asymmetric groups
+        ] {
+            let plan = plan_assignments(n, w, groups.as_deref());
+            let mut seen = vec![0u8; n];
+            for &(worker, s, e) in &plan {
+                assert!(worker < w);
+                for slot in seen.iter_mut().take(e).skip(s) {
+                    *slot += 1;
+                }
+            }
+            assert!(seen.iter().all(|&c| c == 1), "n={n} w={w} groups={groups:?}: each index exactly once");
+        }
+    }
+
+    #[test]
+    fn hierarchical_blocks_are_group_contiguous() {
+        // Two groups of two workers: group 0's ranges must all precede group 1's
+        // (contiguous per-group blocks — the node-locality property).
+        let plan = plan_assignments(100, 4, Some(&[0, 0, 1, 1]));
+        let g0_max = plan.iter().filter(|&&(w, _, _)| w < 2).map(|&(_, _, e)| e).max().unwrap_or(0);
+        let g1_min = plan.iter().filter(|&&(w, _, _)| w >= 2).map(|&(_, s, _)| s).min().unwrap_or(usize::MAX);
+        assert!(g0_max <= g1_min, "group 0's block ends before group 1's begins: {plan:?}");
+        // Proportional: equal worker counts → ~equal halves.
+        assert_eq!(g0_max, 50);
+    }
 
     #[test]
     fn par_map_matches_serial_and_order() {

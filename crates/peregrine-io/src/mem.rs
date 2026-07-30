@@ -159,6 +159,52 @@ pub fn pin_current_thread(cpu: u32) -> bool {
     }
 }
 
+/// The NUMA node the calling thread is currently running on, from
+/// `sched_getcpu(3)` + the topology probe. `None` on non-Linux, on syscall
+/// failure, or when the CPU isn't in any discovered node (shouldn't happen on
+/// a well-formed sysfs).
+pub fn current_numa_node() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: sched_getcpu takes no pointers; returns the current CPU or -1.
+        let cpu = unsafe { libc::sched_getcpu() };
+        if cpu < 0 {
+            return None;
+        }
+        let cpu = cpu as u32;
+        crate::topo::snapshot().numa.iter().find(|n| n.cpus.contains(&cpu)).map(|n| n.id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// NUMA-bind a freshly-allocated large buffer to the calling thread's current
+/// node — the "first-touch made explicit" policy for the streaming landing
+/// buffers, so a ring thread's DMA targets live on its own node. Opt-in
+/// (`COLI_NUMA_PIN=1`), multi-node only, and only worth it for buffers ≥ 2 MB.
+/// Best-effort: any failure leaves the default first-touch policy in place.
+///
+/// # Safety
+///
+/// Same contract as [`mbind_to_node`]: `[ptr, ptr+len)` must be a live,
+/// caller-owned allocation.
+pub unsafe fn bind_local_if_enabled(ptr: *mut u8, len: usize) -> bool {
+    if len < 2 * 1024 * 1024 {
+        return false;
+    }
+    if !matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("1") | Ok("true")) {
+        return false;
+    }
+    if !crate::topo::snapshot().multi_numa() {
+        return false; // single node — binding is a no-op with syscall cost
+    }
+    let Some(node) = current_numa_node() else { return false };
+    // SAFETY: forwarded caller contract.
+    unsafe { mbind_to_node(ptr, len, node) }
+}
+
 /// Bind `[ptr, ptr+len)` to a specific NUMA node (`MPOL_BIND`). Best-effort;
 /// returns `false` on rejection / non-Linux / disabled.
 ///

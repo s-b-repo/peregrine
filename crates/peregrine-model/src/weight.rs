@@ -151,13 +151,23 @@ impl QtWeight {
         // that the pool dispatch pays off; tiny matrices (e.g. the test model) stay
         // serial regardless of batch, avoiding overhead-dominated slowdowns. Real
         // GLM-5.2 projections (6144×6144 ≈ 38M) clear this by ~36×.
-        let gate = if self.i * self.o >= 1 << 20 { peregrine_par::PAR_MATMUL_MIN } else { usize::MAX };
+        let mut gate = if self.i * self.o >= 1 << 20 { peregrine_par::PAR_MATMUL_MIN } else { usize::MAX };
+        // Per-shape dispatch specialization (`COLI_SHAPE_SPECIALIZE=1`): the
+        // first calls per (fmt, o, i) shape probe serial vs parallel and memoize
+        // whichever measured faster — the heuristic gate above becomes a
+        // measured, shape-specific decision. Dispatch-level specialization, not
+        // codegen; bit-identical either way (both paths already are).
+        let probing = shape_dispatch_pre(self.fmt, self.o, self.i, s_n, &mut gate);
+        let t0 = probing.map(|_| std::time::Instant::now());
         peregrine_par::par_chunks_mut(&mut y, self.o, s_n, gate, |start, end, y_chunk| {
             let n = end - start;
             let mut xq = vec![0i8; n * self.i];
             let mut sx = vec![0f32; n];
             self.apply(&x[start * self.i..end * self.i], n, &mut xq, &mut sx, y_chunk);
         });
+        if let (Some(used_par), Some(t0)) = (probing, t0) {
+            shape_dispatch_post(self.fmt, self.o, self.i, used_par, t0.elapsed().as_nanos() as u64);
+        }
         y
     }
 
@@ -384,4 +394,83 @@ mod tests {
             );
         }
     }
+}
+
+/// Per-shape dispatch specialization (`COLI_SHAPE_SPECIALIZE=1`): the runtime
+/// pendant to the global SIMD selection. For each `(fmt, o, i)` matmul shape,
+/// the first `2 × PROBES` batched calls alternate serial vs parallel dispatch
+/// while timing them; afterwards the measured-faster mode is memoized and used
+/// unconditionally. Dispatch-level "runtime specialization of hot paths" — no
+/// codegen, and bit-identical (both dispatch modes already are).
+mod shape_dispatch {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    const PROBES: u32 = 4;
+
+    #[derive(Default, Clone, Copy)]
+    struct Stat {
+        serial_ns: u64,
+        serial_n: u32,
+        par_ns: u64,
+        par_n: u32,
+    }
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| matches!(std::env::var("COLI_SHAPE_SPECIALIZE").as_deref(), Ok("1") | Ok("true")))
+    }
+
+    /// Shape key → probe statistics.
+    type ShapeTable = Mutex<HashMap<(u8, usize, usize), Stat>>;
+
+    fn table() -> &'static ShapeTable {
+        static T: OnceLock<ShapeTable> = OnceLock::new();
+        T.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Pre-dispatch: overrides `gate` per the memoized (or probing) decision.
+    /// Returns `Some(used_par)` while probing (the caller then reports timing
+    /// via [`post`]), `None` when disabled or already locked in.
+    pub fn pre(fmt: u8, o: usize, i: usize, s_n: usize, gate: &mut usize) -> Option<bool> {
+        if !enabled() || s_n == 0 {
+            return None;
+        }
+        let Ok(mut t) = table().lock() else { return None };
+        let stat = t.entry((fmt, o, i)).or_default();
+        if stat.serial_n >= PROBES && stat.par_n >= PROBES {
+            // locked in: pick the faster measured mean (per call)
+            let s_mean = stat.serial_ns / stat.serial_n.max(1) as u64;
+            let p_mean = stat.par_ns / stat.par_n.max(1) as u64;
+            *gate = if p_mean < s_mean { 1 } else { usize::MAX };
+            return None;
+        }
+        // probing: alternate, filling whichever side has fewer samples
+        let use_par = stat.par_n <= stat.serial_n;
+        *gate = if use_par { 1 } else { usize::MAX };
+        Some(use_par)
+    }
+
+    /// Post-dispatch: record the probe timing.
+    pub fn post(fmt: u8, o: usize, i: usize, used_par: bool, ns: u64) {
+        let Ok(mut t) = table().lock() else { return };
+        let stat = t.entry((fmt, o, i)).or_default();
+        if used_par {
+            stat.par_ns = stat.par_ns.saturating_add(ns);
+            stat.par_n = stat.par_n.saturating_add(1);
+        } else {
+            stat.serial_ns = stat.serial_ns.saturating_add(ns);
+            stat.serial_n = stat.serial_n.saturating_add(1);
+        }
+    }
+}
+
+/// [`shape_dispatch::pre`] adapter taking the typed format.
+fn shape_dispatch_pre(fmt: QuantFmt, o: usize, i: usize, s_n: usize, gate: &mut usize) -> Option<bool> {
+    shape_dispatch::pre(fmt as u8, o, i, s_n, gate)
+}
+
+/// [`shape_dispatch::post`] adapter taking the typed format.
+fn shape_dispatch_post(fmt: QuantFmt, o: usize, i: usize, used_par: bool, ns: u64) {
+    shape_dispatch::post(fmt as u8, o, i, used_par, ns);
 }

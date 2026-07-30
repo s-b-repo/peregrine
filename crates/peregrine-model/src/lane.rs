@@ -20,6 +20,10 @@ pub struct LaneTimings {
     pub cpu_us: u64,
     pub gpu_us: u64,
     pub reduce_us: u64,
+    /// Expert-slab bytes the CPU lane processed this forward (weight + scale
+    /// regions of every streamed expert). With `cpu_us` this yields the
+    /// effective CPU-lane bandwidth the memory-bandwidth governor watches.
+    pub cpu_bytes: u64,
 }
 
 /// Atomic accumulator so several scoped threads can bump without a lock. The
@@ -31,6 +35,7 @@ pub struct LaneTimingsAccum {
     cpu_us: AtomicU64,
     gpu_us: AtomicU64,
     reduce_us: AtomicU64,
+    cpu_bytes: AtomicU64,
 }
 
 impl Default for LaneTimingsAccum {
@@ -40,6 +45,7 @@ impl Default for LaneTimingsAccum {
             cpu_us: AtomicU64::new(0),
             gpu_us: AtomicU64::new(0),
             reduce_us: AtomicU64::new(0),
+            cpu_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -65,6 +71,11 @@ impl LaneTimingsAccum {
         self.reduce_us.fetch_add(us, Ordering::Relaxed);
     }
 
+    /// Count expert-slab bytes the CPU lane consumed (bandwidth substrate).
+    pub fn add_cpu_bytes(&self, bytes: u64) {
+        self.cpu_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Take the current sums and reset the accumulator. Called once per forward.
     pub fn snapshot_and_reset(&self) -> LaneTimings {
         LaneTimings {
@@ -72,6 +83,7 @@ impl LaneTimingsAccum {
             cpu_us: self.cpu_us.swap(0, Ordering::Relaxed),
             gpu_us: self.gpu_us.swap(0, Ordering::Relaxed),
             reduce_us: self.reduce_us.swap(0, Ordering::Relaxed),
+            cpu_bytes: self.cpu_bytes.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -82,6 +94,7 @@ impl LaneTimingsAccum {
             cpu_us: self.cpu_us.load(Ordering::Relaxed),
             gpu_us: self.gpu_us.load(Ordering::Relaxed),
             reduce_us: self.reduce_us.load(Ordering::Relaxed),
+            cpu_bytes: self.cpu_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -184,6 +197,7 @@ impl BubbleTuner {
             cpu_us: self.ewma_cpu as u64,
             gpu_us: self.ewma_gpu as u64,
             reduce_us: 0,
+            cpu_bytes: 0,
         }
     }
 }
@@ -250,7 +264,7 @@ mod tests {
         a.add_gpu(300);
         a.add_reduce(50);
         let s = a.snapshot_and_reset();
-        assert_eq!(s, LaneTimings { io_us: 1000, cpu_us: 500, gpu_us: 300, reduce_us: 50 });
+        assert_eq!(s, LaneTimings { io_us: 1000, cpu_us: 500, gpu_us: 300, reduce_us: 50, cpu_bytes: 0 });
         let z = a.snapshot();
         assert_eq!(z, LaneTimings::default(), "reset zeros the accumulator");
     }
@@ -259,7 +273,7 @@ mod tests {
     fn tuner_reports_cpu_bias_after_k_consecutive() {
         let mut t = BubbleTuner::new(0.5, 1.5, 3);
         for _ in 0..4 {
-            let _ = t.observe(LaneTimings { io_us: 200, cpu_us: 1000, gpu_us: 100, reduce_us: 0 });
+            let _ = t.observe(LaneTimings { io_us: 200, cpu_us: 1000, gpu_us: 100, reduce_us: 0, cpu_bytes: 0 });
         }
         assert_eq!(t.bias(), Bias::TowardCpu);
     }
@@ -271,9 +285,9 @@ mod tests {
         for i in 0..10u32 {
             let big = 1000 + i as u64;
             let obs = if i.is_multiple_of(2) {
-                LaneTimings { io_us: big, cpu_us: 500, gpu_us: 500, reduce_us: 0 }
+                LaneTimings { io_us: big, cpu_us: 500, gpu_us: 500, reduce_us: 0, cpu_bytes: 0 }
             } else {
-                LaneTimings { io_us: 500, cpu_us: big, gpu_us: 500, reduce_us: 0 }
+                LaneTimings { io_us: 500, cpu_us: big, gpu_us: 500, reduce_us: 0, cpu_bytes: 0 }
             };
             let _ = t.observe(obs);
         }
