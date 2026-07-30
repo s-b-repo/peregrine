@@ -77,6 +77,7 @@ These aren't roadmap line-items but represent the substantial completed groundwo
 - [x] **Per-lane wall-time telemetry** — `LaneTimings` accumulator inside `moe_forward_concurrent`, drained + fed to `BubbleTuner` between forwards `lane.rs`, `model.rs::publish_lane_timings`
 - [x] **Zstd codec** — shared `peregrine_core::compress` module, threaded into both on-disk and warm-RAM paths `compress.rs`
 - [x] **gigatoken BPE tokenizer fast path** — vendored stable-toolchain subset of marcelroed/gigatoken v0.10.0 (MIT) in `peregrine-token`; the sole serve tokenizer (HF `tokenizers` is a dev-only parity oracle); id-for-id parity-gated; 34× measured locally (`--bench-tokenizer`)
+- [x] **Documentation wiki** (2026-07-30) — full docs under `docs/` ([index](docs/README.md)): getting started, `peregrine` CLI + stdio protocol, HTTP serving/API, layout tools, complete env-knob reference, model format + artifact inventory, architecture / scheduler / adaptive-runtime / prefetch / I/O / GPU / tokenizer deep dives, testing & quality gates, roadmap summary; README gained a Documentation section
 
 ---
 
@@ -291,6 +292,7 @@ distance between the top two frames exceeds a basis-points threshold.
 | `COLI_TIER_VRAM_MB` / `_RAM_MB` | unset | Galactic pass: tier byte budgets → emit `tiers.json` |
 | `COLI_TIER_SEED` | on | Prefetch-warm the planned RAM tier at model load |
 | `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize matmul dispatch |
+| `COLI_DEBUG` | off | Surface advisory-operation failures (hints, pinning, persistence) on stderr |
 | `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |
 
 ---
@@ -298,6 +300,7 @@ distance between the top two frames exceeds a basis-points threshold.
 ## Notes
 
 - **Audit basis:** statuses verified against source; file:line evidence inline. `Done` = actually implemented and covered by a bit-identical / round-trip test; `Partial` = scaffolding present but not yet on the hot path.
+- **Documentation:** the full docs wiki is [`docs/`](docs/README.md) (2026-07-30) — user guides (CLI, HTTP API, configuration, model format) and subsystem deep dives; this file remains the per-item engineering audit.
 - **Compilation & test invariant:** 282 tests pass workspace-wide, clippy clean, `--strict` bad-patterns audit green.
 - **What's left is CUDA-shaped:** persistent CUDA kernels, wiring CUDA Graphs into the decode path, and a `cudaMallocAsync` pool for `reheat` churn — three items that require `nvcc` + a real GPU to build and verify, so this workspace can't land them without that toolchain.
 - **Validation caveat:** synthetic-model tests catch correctness; throughput impact needs a real model to measure. The pattern is "many small adaptive knobs, each bit-identical when off" — evaluate combined.

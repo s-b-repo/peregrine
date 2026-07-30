@@ -1,0 +1,127 @@
+[« Docs index](README.md)
+
+# Adaptive runtime
+
+The 3-lane scheduler is stateless per forward; the adaptive runtime layers a
+**telemetry → tuner → placement feedback loop** on top of it. Every knob is
+env-gated, defaults to the historical behavior, and is **correctness-neutral**:
+only latency and residency change, never the reduced values — bit-identical
+when off.
+
+The cycle, each forward:
+
+1. `moe_forward_concurrent` brackets its three lanes and the reduce phase with
+   wall-time counters, consults the `LaneBalancer` for per-expert placement
+   using a live heat snapshot, and applies the co-activation affinity order.
+2. After the forward, `Model::publish_lane_timings` swap-resets the
+   accumulator, updates the tuners, steps the sensor governors, folds the
+   routing-entropy EWMA, rewards and re-chooses the learned scheduler, feeds
+   the co-activation tracker, and applies any changed io_uring worker cap.
+3. On the next forward, `build_balancer` reads the fresh bias and
+   `forward_hidden` applies the staged prefetch-distance nudges.
+
+All adaptive state lives on `Model` behind atomics and mutexes, safe to
+scrape from `&self`.
+
+## Lane telemetry
+
+`LaneTimings` (`lane.rs`) accumulates per-lane wall time (io / cpu / gpu /
+reduce) inside `moe_forward_concurrent` via atomic counters on a shared
+accumulator threaded through `ForwardCtx`. `PlanOptimizer::tick`
+(`telemetry.rs`) folds `LaneTimings`, `BubbleTuner`, and `IoTuner` snapshots
+into one `RuntimeTelemetry` value per forward.
+
+## Bubble tuner & lane balancer
+
+`BubbleTuner` maintains an EWMA per lane (α = 0.3) and declares a
+`Bias::Toward{Cpu,Gpu,Io}` only when the top lane exceeds **1.5×** the max of
+the others for **3 consecutive forwards** — hysteresis defeats one-off spikes.
+
+`LaneBalancer::choose(gpu_resident, heat)` consumes the bias inside the
+scheduler (gate: `COLI_LANE_BALANCE=1`):
+
+- `Bias::TowardGpu` → a **cold** GPU-resident expert downgrades to the CPU lane.
+- `Bias::TowardCpu` → a hot streamed expert is a candidate to spill onto the
+  GPU (the spill-upgrade path is reserved — it needs on-demand upload).
+
+**Runtime expert replication** (`COLI_REPLICATE_K=<K>`) composes with this:
+`Model::enqueue_expert_replicas`, called from `reheat`, prefetches the top-K
+hottest VRAM-resident experts into the CPU warm cache too — so a `TowardGpu`
+downgrade serves the expert straight from RAM, paying no disk read.
+
+## IoTuner
+
+EWMA over per-forward `io_us` plus SQ-full deltas (counted at every ring push,
+drained per forward) drive grow/halve of the io_uring `iowq_max_workers` cap,
+applied via `Reactor::set_iowq_max_workers` on every ring and deduped against
+the last-applied value. Gate: `COLI_IO_TUNE` (default on). The last applied
+cap is exposed as `Model::last_iowq()`.
+
+## Sensor governors
+
+Three governors (`peregrine-io/src/sensors.rs`, stepped from
+`publish_lane_timings`) write one shared governor-adjustable worker count with
+**shrink-wins arbitration**:
+
+| Governor | Gate | Behavior |
+|---|---|---|
+| Thermal | `COLI_THERMAL_LIMIT_C=<°C>` | `/sys/class/thermal` sampled every 16 forwards; shrink workers above the limit, regrow 8 °C below |
+| Power | `COLI_POWER_CAP_W=<W>` | wrap-aware RAPL meter (`/sys/class/powercap`); shrink above the cap, regrow below 80 % of it |
+| Memory bandwidth | `COLI_BW_GOVERNOR=1` | CPU-lane GB/s EWMA (slab bytes ÷ cpu time); shrink on a plateau, periodic probe regrows |
+
+## Routing entropy & phase detection
+
+- **Entropy-adaptive prefetch** (`COLI_ENTROPY_ADAPT=1`, needs
+  `COLI_PREFETCH_TUNE`): normalized Shannon entropy of the routed distribution
+  over the K-deep history, EWMA'd per forward — narrow prefetch breadth when
+  routing is repetitive, widen when dispersed.
+- **Phase detection** (`workload.rs`): `PhaseTracker` EWMAs frame-to-frame
+  Jaccard distance and flags a shift above `COLI_PHASE_THRESHOLD`
+  (default 0.6). `PredictSource::PhaseAware` folds a heavy vote onto the
+  newest frame's experts during a shift.
+- **Workload classes**: the HTTP handler classifies each request's prompt tail
+  (`workload::classify_str` → `Prose | Code | Json | Math | Mixed`) and the
+  engine resolves per-class prefetch breadth via
+  `COLI_PREFETCH_WARM_PATHS_<CLASS>` / `COLI_PREFETCH_HINT_PATHS_<CLASS>`.
+
+## Learned schedulers
+
+Both persist their policy in `route_stats.json` and are deterministic
+(seeded LCG); if both are enabled the bandit wins.
+
+- **ε-greedy bandit** (`COLI_LEARN_SCHED=1`, `learn.rs::BanditScheduler`):
+  arms are knob configurations (prefetch distance × workers); reward is an
+  EWMA of 1/decode-µs.
+- **Tabular Q-learning** (`COLI_RL_SCHED=1`, `learn.rs::QScheduler`): states
+  are (bias × stability), actions are knob deltas, reward is latency
+  improvement; the Q-table persists.
+
+## Cross-session persistence
+
+With `COLI_ROUTE_STATS_PERSIST` (default on), `Model` saves
+`<model-dir>/route_stats.json` on `Drop` — routing history, expert heat, the
+co-activation tracker, and any learned policy — and auto-loads a matching one
+at `Model::load`, so prefetch and residency start warm on the previous
+session's routing. Artifacts are config-tag guarded against stale checkpoints.
+See [Model format & artifacts](model-format.md) for the file inventory.
+
+## Adaptive batching (serve layer)
+
+The batching engine (`peregrine-serve/src/batch.rs`) contributes its own
+loop — a two-tier priority queue (`X-Peregrine-Priority: high` drains first),
+a latency-SLA working-cap governor (`COLI_BATCH_SLA_MS`), and a decode-heavy
+admission window (`COLI_ADAPTIVE_WINDOW=N` runs prefill every Nth tick).
+Details in [Serving](serving.md).
+
+## Hardware counters
+
+`peregrine_io::PerfCounter` is a real `perf_event_open(2)` LLC-miss counter
+(thread-following, user-space-only, hand-declared `PERF_ATTR_SIZE_VER0` attr
+layout). `telemetry::open_l3_miss_counter` gates it on `COLI_PERF_COUNTERS=1`;
+every constructor degrades to `None` when the kernel refuses (containers,
+`perf_event_paranoid ≥ 3`, no PMU) — the counter is an optimization input,
+never a dependency.
+
+## Knob reference
+
+The complete env-var table lives in [Configuration](configuration.md).

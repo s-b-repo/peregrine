@@ -83,17 +83,31 @@ Any `unsafe` elsewhere is reported for review (the pure-logic crates —
 `peregrine-core`, `peregrine-model`, `peregrine-sched`, `peregrine-engine` — should
 have none; `peregrine-core` is `#![forbid(unsafe_code)]`).
 
+## [L] `let Ok(x) = … else { … }` — informational
+
+The let-else twin of the gated `if let Ok(`: the `else` arm drops the `Err` on
+the floor. The codebase uses it as the sanctioned style for best-effort reads
+(sysfs probes in `sensors.rs`/`topo.rs`, optional JSON caches in `model.rs`),
+so it is reported for review rather than gated. Promoting it to strict means
+`ErrorKind`-aware matches (`NotFound` = expected, anything else =
+`note_advisory_err`) at every site — tracked as future work.
+
 ## What is intentionally NOT flagged
 
 Unlike the security-tool original, the noisy sections don't apply to a numeric
 kernel engine: numeric `as` casts (`as usize`/`as f32`/…) and array indexing are
 pervasive and intentional; there is no async/HTTP/SQL/crypto surface. Those sections
-are omitted rather than waived en masse.
+are omitted rather than waived en masse. Also not flagged: `Ok(_) => {}` arms
+(ignoring a success *value* inside a full `match` is normal — the `Err` arm is
+what the gate cares about, and it is covered) and `unwrap_or(`/`unwrap_or_else(`
+with a used binding (the grep can't tell `Option` defaults from `Result`
+swallows; the ignored-closure form `…or_else(|_e|` *is* gated).
 
 ## Current status
 
-`--strict` is green: **P=0, B=0, U=0, I=0** (51 files; `peregrine-token`
-excluded as vendored). Note: the root-level `audit-bad-patterns.sh` was previously a stale
+`--strict` is green: **P=0, B=0, U=0, I=0** (L=19 informational let-else
+sites; 51 files; `peregrine-token` excluded as vendored). Note: the root-level
+`audit-bad-patterns.sh` was previously a stale
 copy that resolved its repo root incorrectly and scanned zero files — it is now
 a shim delegating to `scripts/audit-bad-patterns.sh`, the canonical gate.
 Beyond the gate, error plumbing is structured workspace-wide: every fallible
@@ -101,5 +115,7 @@ public API returns `peregrine_core::Error` (thiserror + the `Context`/`.ctx()`
 extension) — no `Result<_, String>` surfaces remain outside the vendored crate.
 The one production `assert!` (KV-cache append order, `attention.rs`) carries an
 `// audit-allow:` waiver: it guards an engine-internal invariant whose silent
-violation would corrupt attention output.
+violation would corrupt attention output. Six more waivers cover the
+`while let Ok = recv()` worker loops (only `Err` is `Disconnected` = clean
+shutdown) and the off-Linux unused-param `let _cpu`/`let _bdf` silencing.
 Re-run after any change to the streaming, scheduler, or serve paths.
