@@ -241,10 +241,10 @@ per-shape dispatch specialization (`shape_dispatch` probe-then-memoize), kblock 
 auto-conversion (header-tagged, loader-normalized), and the `compile-plan` profile-guided
 execution plan (`plan.json`, consumed atomically at load).
 
-**The tokenizer fast path** (gigatoken integration): `peregrine-serve` selects its tokenizer at
-boot via `tok::TokenBackend` — the vendored gigatoken BPE engine when the model's
-`tokenizer.json` is a supported BPE flavor (logged, overridable with `COLI_TOKENIZER=giga|hf`),
-else the HF `tokenizers` crate. The gigatoken instance is process-persistent behind a mutex, so
+**The tokenizer fast path** (gigatoken integration): `peregrine-serve` boots the vendored
+gigatoken BPE engine via `tok::TokenBackend` as its **only** tokenizer — a `tokenizer.json`
+gigatoken can't load (SentencePiece/non-BPE) is a descriptive boot error, not a silent
+degradation. The gigatoken instance is process-persistent behind a mutex, so
 its pretoken memo cache warms across requests — repeated chat-template prefixes encode from
 cache. Correctness bar: the parity suite asserts id-for-id equality with the HF oracle over an
 edge-case corpus (unicode, CJK/RTL, chat markup, contractions, empty inputs) plus decode round
@@ -277,8 +277,8 @@ links no libpython and builds on stable (verified: `ldd` clean, `cargo +stable`)
   as the default fast path — SIMD (`std::arch`) pretokenizers with runtime dispatch, a memoizing
   BPE engine, and the HF `tokenizer.json` loader, all stable-toolchain (upstream is nightly-only
   via `portable_simd`, which lives solely in its SentencePiece engine — dropped here). The HF
-  `tokenizers` crate stays as the automatic fallback for SentencePiece/non-BPE models and as the
-  id-for-id parity oracle (`crates/peregrine-serve/tests/tokenizer_parity.rs`).
+  `tokenizers` crate survives only as a dev-dependency — the id-for-id parity oracle
+  (`crates/peregrine-serve/tests/tokenizer_parity.rs`); it is not linked into the serve binary.
 - **Support:** `crossbeam`, `core_affinity`, `bytemuck`, `parking_lot`, `serde_json`, `clap`.
 
 ---

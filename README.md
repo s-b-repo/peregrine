@@ -47,9 +47,9 @@ checkpoint self-rewrite (`--apply`), online bandit + Q-learning schedulers,
 per-shape dispatch specialization, kblock tensor-layout auto-conversion, and
 the `compile-plan` profile-guided execution plan. The serve layer now runs a
 **vendored [gigatoken](https://github.com/marcelroed/gigatoken) BPE tokenizer**
-(stable-toolchain subset, MIT) as its default fast path — measured **34× faster
-than HF `tokenizers` on this box** (204 vs 6 MB/s), id-for-id parity-gated, with
-the HF crate as automatic fallback for SentencePiece/non-BPE models. See
+(stable-toolchain subset, MIT) as its **sole runtime tokenizer** — measured **34×
+faster than HF `tokenizers` on this box** (204 vs 6 MB/s), id-for-id parity-gated
+(the HF crate remains only as the test-suite oracle). See
 [`todo.md`](todo.md) for the audited roadmap (**~87% strict / ~88% weighted of
 95 tracked items — every open item is hardware-gated**).
 
@@ -69,7 +69,7 @@ the HF crate as automatic fallback for SentencePiece/non-BPE models. See
 | Adaptive runtime | `peregrine-model` (`lane.rs`, `iotune.rs`, `telemetry.rs`, `workload.rs`) | ✅ | per-lane wall-time accum + `BubbleTuner` EWMA → `LaneBalancer` (CPU/GPU bias-driven downgrade); `IoTuner` adjusts `iowq_max_workers` between forwards; `PhaseTracker` + `PredictSource::PhaseAware`; per-class prefetch breadth from the serving layer's prompt classifier; heat-threshold cache admission; NUMA worker pinning; real `perf_event_open` LLC-miss counter; cross-session `route_stats.json` at Drop / auto-load on load |
 | Offline layout tool | `peregrine-tools` | ✅ | `peregrine-layout-reorg` consumes `dump-routes` JSON, emits `<dir>/schedule.json` via `--method greedy`, `louvain`, or `spectral` (Fiedler ordering); loader picks it up and pre-sorts disk reads |
 | Compression | `peregrine-core` (`compress.rs`), `peregrine-io` (`warmcache.rs`) | ✅ | zstd end-to-end on disk (`Blob::with_compression`, header carries the tag + original size); optional transparent zstd on WarmCache admissions (`COLI_CACHE_COMPRESS`) |
-| Tokenizer fast path | `peregrine-token`, `peregrine-serve` (`tok.rs`) | ✅ | vendored gigatoken BPE subset (stable toolchain, no libpython); id-for-id parity vs HF `tokenizers` on the committed GPT-2 fixture; cross-request memo cache; `COLI_TOKENIZER=giga\|hf`; `--bench-tokenizer` (34× locally) |
+| Tokenizer fast path | `peregrine-token`, `peregrine-serve` (`tok.rs`) | ✅ | vendored gigatoken BPE subset (stable toolchain, no libpython); id-for-id parity vs HF `tokenizers` on the committed GPT-2 fixture; cross-request memo cache; sole runtime tokenizer (HF crate is test-oracle only); `--bench-tokenizer` (34× locally) |
 
 ### Not yet done (all hardware-gated)
 Every remaining roadmap item needs hardware this workspace lacks: CUDA Graphs
@@ -190,7 +190,6 @@ token stream is unchanged.
 | `COLI_NUMA_PIN` | off | Pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
 | `COLI_PERF_COUNTERS` | off | Open a `perf_event_open` LLC-miss counter (needs `perf_event_paranoid ≤ 2`) |
 | `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
-| `COLI_TOKENIZER` | auto | `giga` = require the vendored BPE fast path, `hf` = force HF `tokenizers`; unset = try giga, fall back |
 | `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |
 
 #### Governors & learning
