@@ -390,8 +390,15 @@ fn sse_error(message: &str) -> Event {
     Event::default().data(serde_json::json!({ "error": { "message": message } }).to_string())
 }
 
-/// Encode `file` through the gigatoken tokenizer (per-line, mirroring the
-/// serve pattern of many short encodes) and report MB/s + total ids.
+/// Tokenizer throughput bench, three rows for the three regimes:
+///  - `line`  — one facade `encode` per non-empty line (the serve pattern of
+///    many short encodes; the historical row, comparable to the documented
+///    HF-ratio measurement),
+///  - `whole` — one `encode_into` call over the entire file (the engine's
+///    single-core capability; matches upstream's single-thread bench shape),
+///  - `parN`  — `encode_batch` over the lines with N forked workers (what
+///    upstream's batch layer does; engages only on bulk input).
+///
 /// Correctness is the parity test suite's job (`tests/tokenizer_parity.rs`,
 /// HF oracle as a dev-dependency); this only measures throughput. Numbers are
 /// local to this box; no docs-level claims.
@@ -414,15 +421,64 @@ fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Resul
         giga.encode(l);
     }
 
-    let t0 = std::time::Instant::now();
-    let mut giga_ids = 0usize;
-    for l in &lines {
-        giga_ids += giga.encode(l).len();
-    }
-    let giga_s = t0.elapsed().as_secs_f64();
+    let mbs = |b: usize, s: f64| b as f64 / 1e6 / s.max(1e-9);
 
-    let mbs = |s: f64| bytes as f64 / 1e6 / s.max(1e-9);
-    println!("gigatoken     : {:8.2} MB/s  ({giga_ids} ids, {giga_s:.3}s)", mbs(giga_s));
+    let t0 = std::time::Instant::now();
+    let mut line_ids = 0usize;
+    for l in &lines {
+        line_ids += giga.encode(l).len();
+    }
+    let line_s = t0.elapsed().as_secs_f64();
+    println!("gigatoken/line  : {:8.2} MB/s  ({line_ids} ids, {line_s:.3}s)", mbs(bytes, line_s));
+
+    let mut out: Vec<u32> = Vec::with_capacity(text.len() / 3);
+    let t0 = std::time::Instant::now();
+    giga.encode_into(&text, &mut out);
+    let whole_s = t0.elapsed().as_secs_f64();
+    println!(
+        "gigatoken/whole : {:8.2} MB/s  ({} ids, {whole_s:.3}s)",
+        mbs(text.len(), whole_s),
+        out.len()
+    );
+    drop(out); // keep the parallel row's peak RSS to its own output
+
+    // Batch input at upstream's granularity: documents, not lines — the file
+    // sliced at line boundaries into ~256 KiB pieces (also keeps the output
+    // to a few hundred Vecs instead of one per line).
+    let mut docs: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut acc = 0usize;
+    for line in text.split_inclusive('\n') {
+        acc += line.len();
+        if acc >= 256 << 10 {
+            let end = start + acc;
+            docs.push(&text[start..end]);
+            start = end;
+            acc = 0;
+        }
+    }
+    if start < text.len() {
+        docs.push(&text[start..]);
+    }
+    let workers = match std::thread::available_parallelism() {
+        Ok(n) => n.get(),
+        Err(e) => {
+            eprintln!("bench: available_parallelism unknown ({e}); using 1 worker");
+            1
+        }
+    };
+    // p1 pays one-time worker construction (the pool persists on the
+    // instance); p2 is the steady state a long batch run sees.
+    for pass in 1..=2 {
+        let t0 = std::time::Instant::now();
+        let par_ids: usize = giga.encode_batch(&docs, workers).iter().map(|v| v.len()).sum();
+        let par_s = t0.elapsed().as_secs_f64();
+        println!(
+            "gigatoken/par{workers:<2} p{pass}: {:8.2} MB/s  ({} docs, {par_ids} ids, {par_s:.3}s)",
+            mbs(text.len(), par_s),
+            docs.len()
+        );
+    }
     Ok(())
 }
 

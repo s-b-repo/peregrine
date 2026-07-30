@@ -11,6 +11,9 @@ the serve binary (verified: `ldd` clean, no libpython).
 
 Measured on the reference box: **204 MB/s vs 6 MB/s HF (34×)** on a 12 MB
 mixed corpus, identical ids (`peregrine-serve --bench-tokenizer <file>`).
+That number is the *serve-pattern* row (one short encode per line) — the
+engine itself runs several times faster on bulk input; see
+[Throughput anatomy](#throughput-anatomy) below.
 
 ## What is vendored
 
@@ -47,6 +50,44 @@ comments.
   at token boundaries via lossy conversion (a token that doesn't lengthen the
   decoded text emits no SSE chunk).
 - Boot prints `[tokenizer] gigatoken BPE active, vocab=<n>`.
+
+## Throughput anatomy
+
+Upstream's headline numbers (tens of GB/s) are its **batch API fanned out
+across many cores** on AVX-512/M-series hardware — ~170–390 MB/s per thread.
+The vendored engine is hot-path **byte-identical** to upstream (verified by
+per-file diff at v0.10.0; the only local changes are test-skip guards, module
+paths, and the SentencePiece strip), so per-core speed is at parity. What
+differs is everything around the engine:
+
+1. **Call granularity.** One `encode` call per short string pays a fixed
+   setup cost (SIMD pretokenizer state, span-batch machinery, added-token
+   scan, output alloc) that dominates ~50-byte inputs. One call over a whole
+   document runs ~3× faster on the same core, same code.
+2. **Parallelism.** Upstream ships a batch layer (dropped in vendoring —
+   serve encodes one prompt at a time). The facade now restores its shape as
+   [`encode_batch`](../crates/peregrine-token/src/lib.rs): contiguous
+   byte-balanced chunks over a **persistent pool of `fork`ed workers**
+   (pre-sized caches, built once, warm across calls), id-for-id identical to
+   serial, with a serial fallback if a worker dies. Small inputs
+   (< 2 MB/worker) stay serial — worker construction only pays on bulk.
+3. **Hardware.** Reference numbers elsewhere in these docs came from
+   laptop/desktop-class AVX2 machines; upstream's came from a Zen 5 X3D,
+   an M4 Max, and a 288-thread EPYC.
+
+`--bench-tokenizer` reports all three regimes. Example (i5-1235U laptop,
+2P+8E cores, 48 MB corpus, GPT-2):
+
+| Row | What it measures | MB/s |
+|---|---|---:|
+| `gigatoken/line` | one `encode` per line — the serve pattern, and the HF-comparison row | 129 |
+| `gigatoken/whole` | one `encode_into` call over the file — single-core engine capability | 384 |
+| `gigatoken/par12 p1` | `encode_batch`, cold (includes one-time worker construction) | 275 |
+| `gigatoken/par12 p2` | `encode_batch`, steady state (warm persistent pool) | **872** |
+
+For serving, none of this is a bottleneck: a request is one encode over one
+prompt (µs) against a model forward (ms–s). The bulk paths exist for corpus
+work and to keep the vendored subset honest against upstream's numbers.
 
 ## Correctness gates
 

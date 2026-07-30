@@ -39,6 +39,12 @@ pub use token::TokenId;
 /// prefixes encode from cache ("cross-request memo cache").
 pub struct GigaTokenizer {
     inner: bpe::Tokenizer,
+    /// Lazily-built forked workers for [`Self::encode_batch`], kept across
+    /// calls so their construction (a zeroed, vocab-seeded cache table each)
+    /// amortizes the way upstream's per-run batch workers do — and their
+    /// memo caches stay warm call-to-call. Empty until the first batch call;
+    /// costs nothing on the serve path.
+    pool: Vec<bpe::Tokenizer>,
 }
 
 impl GigaTokenizer {
@@ -47,7 +53,7 @@ impl GigaTokenizer {
     /// non-BPE models — the caller falls back to the HF `tokenizers` crate.
     pub fn from_hf_json_bytes(data: &[u8]) -> Result<GigaTokenizer, String> {
         match hf::load_hf_slice(data) {
-            Ok(hf::HfTokenizer::Bpe(t)) => Ok(GigaTokenizer { inner: t }),
+            Ok(hf::HfTokenizer::Bpe(t)) => Ok(GigaTokenizer { inner: t, pool: Vec::new() }),
             Err(e) => Err(format!("{e:#}")),
         }
     }
@@ -56,7 +62,115 @@ impl GigaTokenizer {
     /// pretokens served from the memo cache when repeated).
     pub fn encode(&mut self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
-        self.inner.encode_with_added_tokens_flat(text.as_bytes(), &mut out);
+        self.encode_into(text, &mut out);
+        out
+    }
+
+    /// [`Self::encode`] appending into a caller-owned buffer — the
+    /// allocation-free entry point for bulk work. One call over a whole
+    /// document runs ~3–4× faster than line-at-a-time calls: the SIMD
+    /// pretokenizer state, span-batch machinery, and added-token scan are
+    /// set up once per call, so short inputs are dominated by that fixed
+    /// cost (ids are identical either way).
+    pub fn encode_into(&mut self, text: &str, out: &mut Vec<u32>) {
+        self.inner.encode_with_added_tokens_flat(text.as_bytes(), out);
+    }
+
+    /// Encode many texts in parallel with `workers` forked engines
+    /// (upstream gigatoken's batch-layer shape, which the vendored subset
+    /// otherwise drops). Outputs are in input order and id-for-id identical
+    /// to serial [`Self::encode`] — the memo cache is pure memoization, so
+    /// per-worker caches cannot change ids.
+    ///
+    /// Worker construction (a vocab-seeded cache table per fork) only pays
+    /// for itself on bulk input, so small batches run serially on `self`:
+    /// parallelism engages at ≥ 2 MB of input per worker. `workers` is a
+    /// ceiling; pass `std::thread::available_parallelism()`. Workers persist
+    /// on this instance after the first call (construction amortizes across
+    /// calls, caches stay warm) — a `GigaTokenizer` that has done batch work
+    /// holds that pool's memory until dropped.
+    pub fn encode_batch(&mut self, texts: &[&str], workers: usize) -> Vec<Vec<u32>> {
+        self.encode_batch_with(texts, workers, 2 << 20)
+    }
+
+    fn encode_batch_with(
+        &mut self,
+        texts: &[&str],
+        workers: usize,
+        min_bytes_per_worker: usize,
+    ) -> Vec<Vec<u32>> {
+        let total: usize = texts.iter().map(|t| t.len()).sum();
+        let amortize_cap = if min_bytes_per_worker == 0 {
+            texts.len().max(1)
+        } else {
+            (total / min_bytes_per_worker).max(1)
+        };
+        let n = workers.clamp(1, texts.len().max(1)).min(amortize_cap);
+        if n <= 1 {
+            return texts.iter().map(|t| self.encode(t)).collect();
+        }
+
+        // Contiguous chunks balanced by bytes (order-preserving).
+        let target = total / n + 1;
+        let mut bounds = vec![0usize];
+        let mut acc = 0usize;
+        for (i, t) in texts.iter().enumerate() {
+            if acc >= target && bounds.len() < n {
+                bounds.push(i);
+                acc = 0;
+            }
+            acc += t.len();
+        }
+        bounds.push(texts.len());
+
+        // Grow the persistent pool to n workers, each pre-sized for an even
+        // share of this input (a capacity hint — tables still grow past it).
+        // Construction happens once; later calls reuse the warm workers.
+        while self.pool.len() < n {
+            self.pool.push(self.inner.fork_sized(total / n));
+        }
+
+        let mut results: Vec<Option<Vec<Vec<u32>>>> = Vec::new();
+        let chunks: Vec<&[&str]> = bounds.windows(2).map(|w| &texts[w[0]..w[1]]).collect();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = self
+                .pool
+                .iter_mut()
+                .zip(&chunks)
+                .map(|(worker, chunk)| {
+                    s.spawn(move || {
+                        let mut ids: Vec<Vec<u32>> = Vec::with_capacity(chunk.len());
+                        let mut flat: Vec<u32> = Vec::new();
+                        for t in *chunk {
+                            flat.clear();
+                            worker.encode_with_added_tokens_flat(t.as_bytes(), &mut flat);
+                            ids.push(flat.clone());
+                        }
+                        ids
+                    })
+                })
+                .collect();
+            results = handles.into_iter().map(|h| h.join().ok()).collect();
+        });
+
+        let mut out: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+        let mut poisoned = false;
+        for (chunk, r) in chunks.iter().zip(results) {
+            match r {
+                Some(ids) => out.extend(ids),
+                // A worker thread died (it cannot return an error, only
+                // panic); redo its chunk serially so the call still returns
+                // the full, correct id stream, and rebuild the pool next
+                // call rather than reuse a worker of unknown state.
+                None => {
+                    poisoned = true;
+                    out.extend(chunk.iter().map(|t| self.encode(t)));
+                }
+            }
+        }
+        if poisoned {
+            self.pool.clear();
+        }
         out
     }
 
@@ -70,7 +184,7 @@ impl GigaTokenizer {
     /// A new tokenizer sharing the immutable model data with a fresh memo
     /// cache — for per-worker encoding without cache contention.
     pub fn fork(&self) -> GigaTokenizer {
-        GigaTokenizer { inner: self.inner.fork() }
+        GigaTokenizer { inner: self.inner.fork(), pool: Vec::new() }
     }
 
     /// Vocabulary size (including added tokens).
@@ -130,6 +244,44 @@ mod facade_tests {
         let first = t.encode("The same sentence, encoded twice.");
         let second = t.encode("The same sentence, encoded twice.");
         assert_eq!(first, second, "cached encode == cold encode");
+    }
+
+    #[test]
+    fn encode_into_matches_encode() {
+        let mut t = gpt2();
+        let text = "Hello world <|endoftext|> and ünïcode ✓ tails";
+        let via_encode = t.encode(text);
+        let mut via_into = vec![9999]; // pre-existing content must be preserved
+        t.encode_into(text, &mut via_into);
+        assert_eq!(via_into[0], 9999);
+        assert_eq!(&via_into[1..], &via_encode[..]);
+    }
+
+    #[test]
+    fn encode_batch_matches_serial_ids() {
+        let mut t = gpt2();
+        let texts: Vec<String> = (0..97)
+            .map(|i| {
+                format!(
+                    "line {i}: the quick brown fox <|endoftext|> jumps {} times — naïve ✓",
+                    i * 7 % 13
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let serial: Vec<Vec<u32>> = refs.iter().map(|s| t.encode(s)).collect();
+        // min_bytes_per_worker = 0 forces the parallel path on a tiny input.
+        let parallel = t.encode_batch_with(&refs, 4, 0);
+        assert_eq!(parallel, serial, "parallel batch must be id-for-id serial");
+        // Second call reuses the now-warm persistent pool — still identical.
+        let parallel_warm = t.encode_batch_with(&refs, 4, 0);
+        assert_eq!(parallel_warm, serial, "warm-pool batch must be id-for-id serial");
+        // The public gate keeps tiny inputs serial — ids identical either way.
+        let gated = t.encode_batch(&refs, 4);
+        assert_eq!(gated, serial);
+        // Degenerate shapes.
+        assert!(t.encode_batch(&[], 4).is_empty());
+        assert_eq!(t.encode_batch_with(&["", "a"], 8, 0), vec![t.encode(""), t.encode("a")]);
     }
 
     #[test]
