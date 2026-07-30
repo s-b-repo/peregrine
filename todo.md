@@ -59,7 +59,7 @@ co-activation-driven expert fusion + hypergraph scheduling, macro-state routing 
 `galactic` one-shot preprocessing pass, Hilbert / 2-opt / tier-placement layout methods, physical
 checkpoint self-rewrite (`--apply`), online bandit + Q-learning schedulers, per-shape dispatch
 specialization, kblock tensor-layout auto-conversion, and the `compile-plan` profile-guided
-execution plan. Only hardware-gated work remains (see the dashboard note). Beyond the roadmap, the serve layer gained the **vendored gigatoken BPE tokenizer** (`peregrine-token`, MIT, stable-toolchain subset) as its default fast path — parity-gated id-for-id against HF `tokenizers`, 34× measured locally, HF fallback for non-BPE models.
+execution plan. Only hardware-gated work remains (see the dashboard note). Beyond the roadmap, the serve layer gained the **vendored gigatoken BPE tokenizer** (`peregrine-token`, MIT, stable-toolchain subset) as its sole runtime tokenizer — parity-gated id-for-id against the HF `tokenizers` test oracle, 34× measured locally.
 
 ---
 
@@ -76,7 +76,7 @@ These aren't roadmap line-items but represent the substantial completed groundwo
 - [x] **Quantization** — per-row INT4/INT8, grouped INT4 w/ fine-grained scales `qt.rs`, `quant.rs`
 - [x] **Per-lane wall-time telemetry** — `LaneTimings` accumulator inside `moe_forward_concurrent`, drained + fed to `BubbleTuner` between forwards `lane.rs`, `model.rs::publish_lane_timings`
 - [x] **Zstd codec** — shared `peregrine_core::compress` module, threaded into both on-disk and warm-RAM paths `compress.rs`
-- [x] **gigatoken BPE tokenizer fast path** — vendored stable-toolchain subset of marcelroed/gigatoken v0.10.0 (MIT) in `peregrine-token`; serve default with HF `tokenizers` fallback; id-for-id parity-gated; 34× measured locally (`--bench-tokenizer`)
+- [x] **gigatoken BPE tokenizer fast path** — vendored stable-toolchain subset of marcelroed/gigatoken v0.10.0 (MIT) in `peregrine-token`; the sole serve tokenizer (HF `tokenizers` is a dev-only parity oracle); id-for-id parity-gated; 34× measured locally (`--bench-tokenizer`)
 
 ---
 
@@ -291,7 +291,6 @@ distance between the top two frames exceeds a basis-points threshold.
 | `COLI_TIER_VRAM_MB` / `_RAM_MB` | unset | Galactic pass: tier byte budgets → emit `tiers.json` |
 | `COLI_TIER_SEED` | on | Prefetch-warm the planned RAM tier at model load |
 | `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize matmul dispatch |
-| `COLI_TOKENIZER` | auto | `giga` = require the vendored gigatoken BPE path, `hf` = force HF `tokenizers`; unset = try giga, fall back |
 | `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |
 
 ---

@@ -2,8 +2,9 @@
 
 A **vendored, stable-toolchain subset** of
 [marcelroed/gigatoken](https://github.com/marcelroed/gigatoken) **v0.10.0** (MIT
-— see `LICENSE-MIT-gigatoken`): GB/s BPE tokenization for `peregrine-serve`,
-with the HuggingFace `tokenizers` crate as the runtime fallback.
+— see `LICENSE-MIT-gigatoken`): GB/s BPE tokenization, the **sole runtime
+tokenizer** of `peregrine-serve` (the HuggingFace `tokenizers` crate is a
+dev-dependency parity oracle only).
 
 ## What is vendored (upstream-verbatim where possible)
 
@@ -22,7 +23,8 @@ with the HuggingFace `tokenizers` crate as the runtime fallback.
 - **SentencePiece engine** — upstream's only `portable_simd` user, which is what
   makes the whole upstream crate nightly-only. Dropping it keeps this workspace
   on **stable Rust** (edition 2024 crate-locally for let-chains).
-  `byte_fallback` models get a descriptive error; serve falls back to HF.
+  `byte_fallback` models get a descriptive error; serve treats that as a
+  hard boot error (no runtime fallback).
 - **PyO3 / numpy bindings** — would link libpython into `peregrine-serve`
   (verified absent: `ldd` shows no libpython).
 - **batch / parquet / jsonl / hub layers** — peregrine feeds in-memory prompts.
