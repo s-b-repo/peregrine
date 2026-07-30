@@ -145,9 +145,14 @@ silent fallback. The instance is process-persistent, so its pretoken memo
 cache warms across requests (repeated chat-template prefixes encode from
 cache).
 
-`--bench-tokenizer <file>` encodes the file line-by-line and prints
-`gigatoken     : <MB/s> …` to stdout without loading weights (measured 34×
-faster than HF `tokenizers` on the reference box: 204 vs 6 MB/s).
+`--bench-tokenizer <file>` runs without loading weights and prints three
+throughput rows: `gigatoken/line` (one encode per line — the serve pattern,
+and the row behind the documented 34×-vs-HF measurement),
+`gigatoken/whole` (one call over the whole file — single-core engine
+capability, ~3× the line row), and `gigatoken/parN p1/p2` (parallel
+`encode_batch` over ~256 KiB slices, cold then warm — the warm row is the
+batch-layer steady state). See
+[Tokenizer → Throughput anatomy](tokenizer.md#throughput-anatomy).
 
 ## Examples
 
