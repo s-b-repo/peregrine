@@ -12,6 +12,7 @@
 //! request; decode takes the same lock briefly (streaming decodes are one
 //! call per emitted token over a short id slice).
 
+use peregrine_core::{Context, Error};
 use peregrine_token::GigaTokenizer;
 use tokenizers::Tokenizer as HfTokenizer;
 
@@ -29,9 +30,9 @@ impl TokenBackend {
     /// Choose and construct the backend from the model dir's `tokenizer.json`.
     /// Logs the decision to stderr (a server boots once; the operator should
     /// see which path is active).
-    pub fn load(dir: &std::path::Path) -> Result<TokenBackend, String> {
+    pub fn load(dir: &std::path::Path) -> Result<TokenBackend, Error> {
         let path = dir.join("tokenizer.json");
-        let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let bytes = std::fs::read(&path).ctx(|| path.display().to_string())?;
         let forced = std::env::var("COLI_TOKENIZER").ok();
         match forced.as_deref() {
             Some("hf") => {
@@ -43,7 +44,7 @@ impl TokenBackend {
                     eprintln!("[tokenizer] gigatoken BPE active (forced), vocab={}", t.vocab_size());
                     Ok(TokenBackend::Giga(Box::new(parking_lot::Mutex::new(t))))
                 }
-                Err(e) => Err(format!("COLI_TOKENIZER=giga but gigatoken can't load this model: {e}")),
+                Err(e) => Err(Error::Format(format!("COLI_TOKENIZER=giga but gigatoken can't load this model: {e}"))),
             },
             _ => match GigaTokenizer::from_hf_json_bytes(&bytes) {
                 Ok(t) => {
@@ -58,17 +59,17 @@ impl TokenBackend {
         }
     }
 
-    fn load_hf(bytes: &[u8]) -> Result<TokenBackend, String> {
-        let t = HfTokenizer::from_bytes(bytes).map_err(|e| format!("HF tokenizer: {e}"))?;
+    fn load_hf(bytes: &[u8]) -> Result<TokenBackend, Error> {
+        let t = HfTokenizer::from_bytes(bytes).map_err(|e| Error::Format(format!("HF tokenizer: {e}")))?;
         Ok(TokenBackend::Hf(Box::new(t)))
     }
 
     /// Encode `text` to token ids.
-    pub fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, Error> {
         match self {
             TokenBackend::Giga(t) => Ok(t.lock().encode(text)),
             TokenBackend::Hf(t) => {
-                let enc = t.encode(text, false).map_err(|e| format!("encode: {e}"))?;
+                let enc = t.encode(text, false).map_err(|e| Error::Format(format!("encode: {e}")))?;
                 Ok(enc.get_ids().to_vec())
             }
         }
@@ -78,13 +79,13 @@ impl TokenBackend {
     /// special tokens materialized as their content is; the SSE path diffs
     /// consecutive decodes, so partial-UTF-8 at a token boundary is handled
     /// by the lossy conversion the same way for both.
-    pub fn decode(&self, ids: &[u32]) -> Result<String, String> {
+    pub fn decode(&self, ids: &[u32]) -> Result<String, Error> {
         match self {
             TokenBackend::Giga(t) => {
                 let bytes = t.lock().decode(ids);
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
-            TokenBackend::Hf(t) => t.decode(ids, true).map_err(|e| format!("decode: {e}")),
+            TokenBackend::Hf(t) => t.decode(ids, true).map_err(|e| Error::Format(format!("decode: {e}"))),
         }
     }
 

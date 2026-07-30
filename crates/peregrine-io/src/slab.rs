@@ -143,7 +143,7 @@ impl Bytes {
 
     /// Whether the exposed region is empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.as_slice().is_empty()
     }
 
     /// The exposed bytes as a shared slice (identical to `&self[..]`).

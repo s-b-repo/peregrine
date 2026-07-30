@@ -204,7 +204,7 @@ impl SeqKv {
 
     /// Whether no positions are cached yet.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.layers.first().is_none_or(|k| k.len == 0)
     }
 
     /// Rewind every layer to `new_len` (speculative-decode reject cleanup).
@@ -2223,9 +2223,8 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, stream_experts, direct, io_reactors, workers, ecache, route_hist, predictor, prefetch, gpu, heat, lane_timings, layout_schedule, ..
+                cfg, layers, kv, st, stream_experts, direct, io_reactors, ecache, route_hist, predictor, prefetch, gpu, heat, lane_timings, layout_schedule, ..
             } = self;
-            let _ = workers; // base count; the governors' adjusted count is used below
             let ctx = ForwardCtx {
                 st,
                 reactors: io_reactors,
