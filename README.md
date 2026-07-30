@@ -24,6 +24,29 @@ peregrine closes that gap: a completion-driven scheduler where the **GPU lane**,
 the **CPU lane**, and the **io_uring SSD lane** all drain the same MoE layer at
 once. Target: Linux + NVIDIA CUDA.
 
+## Documentation
+
+The full docs wiki lives in [**docs/**](docs/README.md):
+
+- **Using it** — [getting started](docs/getting-started.md) ·
+  [`peregrine` CLI + stdio protocol](docs/cli-peregrine.md) ·
+  [HTTP serving](docs/serving.md) · [layout tools](docs/layout-tools.md) ·
+  [configuration (all env knobs)](docs/configuration.md) ·
+  [model format & artifacts](docs/model-format.md) ·
+  [benchmarks](docs/benchmarks.md)
+- **How it works** — [architecture](docs/architecture.md) ·
+  [the 3-lane scheduler](docs/concurrent-scheduler.md) ·
+  [adaptive runtime](docs/adaptive-runtime.md) ·
+  [prefetch & caching](docs/prefetch-and-caching.md) ·
+  [I/O & storage](docs/io-and-storage.md) · [GPU/CUDA](docs/gpu-cuda.md) ·
+  [tokenizer](docs/tokenizer.md)
+- **Project** — [testing & quality gates](docs/testing-and-quality.md) ·
+  [roadmap & status](docs/roadmap.md) ·
+  [peregrine vs colibrì (full study)](docs/peregrine-vs-colibri.md)
+
+[`DESIGN.md`](DESIGN.md) is the original design document; [`todo.md`](todo.md)
+is the audited per-item roadmap.
+
 ## Status
 
 **282 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
@@ -167,7 +190,8 @@ weight-naming scheme (`model.layers.N.self_attn.*`, `mlp.experts.M.*`, …). The
 ### Tuning knobs (env)
 
 All default to sensible values; every one of them affects performance only — the
-token stream is unchanged.
+token stream is unchanged. (Annotated reference with deep-dive links:
+[docs/configuration.md](docs/configuration.md).)
 
 #### I/O & streaming
 | Var | Default | Effect |
@@ -189,6 +213,7 @@ token stream is unchanged.
 | `COLI_REPLICATE_K` | 0 | Top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
 | `COLI_NUMA_PIN` | off | Pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
 | `COLI_PERF_COUNTERS` | off | Open a `perf_event_open` LLC-miss counter (needs `perf_event_paranoid ≤ 2`) |
+| `COLI_DEBUG` | off | Surface advisory-operation failures (madvise/fadvise hints, NUMA pinning, route-stats persistence) on stderr |
 | `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
 | `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |
 
