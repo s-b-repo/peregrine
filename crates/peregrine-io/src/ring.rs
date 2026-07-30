@@ -51,6 +51,10 @@ mod uring {
         ring: IoUring,
         cap: usize,
         force_async: bool,
+        /// Times a submission-queue push was rejected (queue full) since the
+        /// last [`Reactor::take_sq_full`]. Queue-pressure signal for the
+        /// adaptive io-wq tuner.
+        sq_full: u64,
         /// fds registered with the kernel (index = fixed-file slot). A read whose
         /// fd is here uses `IOSQE_FIXED_FILE`, skipping per-op fd lookup/refcount.
         registered: Vec<RawFd>,
@@ -83,10 +87,34 @@ mod uring {
                 ring,
                 cap: entries as usize,
                 force_async: true,
+                sq_full: 0,
                 registered: Vec::new(),
                 registered_bufs: Vec::new(),
                 slab: SlabPool::new(ALIGN, 1),
             })
+        }
+
+        /// Submission-queue-full rejections since the last call (swap-reset).
+        /// Consumed by the adaptive io-wq tuner as its queue-pressure signal.
+        pub fn take_sq_full(&mut self) -> u64 {
+            std::mem::take(&mut self.sq_full)
+        }
+
+        /// Push one submission entry, counting a queue-full rejection into
+        /// [`Self::take_sq_full`]'s counter before surfacing the error.
+        ///
+        /// # Safety
+        ///
+        /// Same contract as `submission().push`: any buffer the entry points at
+        /// must stay live until its completion is reaped (every caller here
+        /// waits on the completion before reusing buffers).
+        unsafe fn push_counted(&mut self, e: &squeue::Entry) -> io::Result<()> {
+            // SAFETY: forwarded caller contract (see above).
+            if unsafe { self.ring.submission().push(e) }.is_err() {
+                self.sq_full += 1;
+                return Err(io::Error::other("submission queue full"));
+            }
+            Ok(())
         }
 
         /// Register `fds` as fixed files. Subsequent reads whose fd is in this set
@@ -213,9 +241,8 @@ mod uring {
                     .offset(off + done as u64)
                     .build()
                     .user_data(0);
-                unsafe {
-                    self.ring.submission().push(&e).map_err(|_| io::Error::other("submission queue full"))?;
-                }
+                // SAFETY: buffer outlives the op — completion reaped below.
+                unsafe { self.push_counted(&e) }?;
                 self.ring.submit_and_wait(1)?;
                 let mut n = i64::MIN;
                 for cqe in self.ring.completion() {
@@ -257,9 +284,8 @@ mod uring {
                 .build()
                 .user_data(0);
             // SAFETY: Fadvise carries no buffer — the op only hints the page cache.
-            unsafe {
-                self.ring.submission().push(&e).map_err(|_| io::Error::other("submission queue full"))?;
-            }
+            // SAFETY: Fadvise carries no buffer.
+            unsafe { self.push_counted(&e) }?;
             self.ring.submit_and_wait(1)?;
             let mut n = 0i64;
             for cqe in self.ring.completion() {
@@ -320,12 +346,9 @@ mod uring {
                         .build()
                         .user_data(j as u64);
                     // SAFETY: Fadvise carries no buffer.
-                    unsafe {
-                        self.ring
-                            .submission()
-                            .push(&e)
-                            .map_err(|_| io::Error::other("submission queue full"))?;
-                    }
+                    // SAFETY: buf outlives the op (completions reaped before return);
+                    // Fadvise entries carry no buffer.
+                    unsafe { self.push_counted(&e) }?;
                 }
                 self.ring.submit_and_wait(end - i)?;
                 // drain the completions we asked to wait for; ignore per-op codes
@@ -359,12 +382,9 @@ mod uring {
                     }
                     // SAFETY: buf outlives the op — read_many blocks until every
                     // completion for this chunk is reaped below.
-                    unsafe {
-                        self.ring
-                            .submission()
-                            .push(&e)
-                            .map_err(|_| io::Error::other("submission queue full"))?;
-                    }
+                    // SAFETY: buf outlives the op (completions reaped before return);
+                    // Fadvise entries carry no buffer.
+                    unsafe { self.push_counted(&e) }?;
                 }
                 self.ring.submit_and_wait(end - i)?;
                 let mut got = 0;
@@ -584,6 +604,9 @@ impl Reactor {
     }
     pub fn read_exact_retry(&mut self, _fd: RawFd, _off: u64, _buf: &mut [u8], _max_retries: u32) -> std::io::Result<()> {
         Self::unsupported()
+    }
+    pub fn take_sq_full(&mut self) -> u64 {
+        0
     }
     pub fn configure_slab(&mut self, _buf_cap: usize, _max_bufs: usize) {}
     pub fn read_direct_many(&mut self, _reqs: &mut [ReadReq]) -> std::io::Result<Vec<i64>> {

@@ -16,6 +16,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod batch;
+mod tok;
 
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ use clap::Parser;
 use peregrine_core::Error;
 use peregrine_model::{Model, Sampler};
 use serde::{Deserialize, Serialize};
-use tokenizers::Tokenizer;
+use tok::TokenBackend;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -62,6 +63,11 @@ struct Args {
     /// Max sequences decoded together per batched step (continuous-batching width).
     #[arg(long, default_value_t = 32)]
     max_batch: usize,
+    /// Benchmark the tokenizer backends on a text file and exit: encodes the
+    /// file through gigatoken and HF `tokenizers`, reports MB/s each. Needs
+    /// `<model>/tokenizer.json`; no model weights are loaded.
+    #[arg(long, value_name = "TEXT_FILE")]
+    bench_tokenizer: Option<std::path::PathBuf>,
 }
 
 /// Shared, cloneable server state.
@@ -72,7 +78,7 @@ struct AppState {
 
 struct Inner {
     engine: EngineHandle,
-    tokenizer: Arc<Tokenizer>,
+    tokenizer: Arc<TokenBackend>,
     args: Args,
 }
 
@@ -142,9 +148,9 @@ impl From<Error> for ApiError {
     }
 }
 
-/// Convert a tokenizer error (boxed) into our error type — the one boundary that
+/// Convert a tokenizer error into our error type — the one boundary that
 /// needs it, kept in a single helper.
-fn tk<T>(r: tokenizers::Result<T>) -> Result<T, ApiError> {
+fn tk<T>(r: Result<T, String>) -> Result<T, ApiError> {
     r.map_err(|e| ApiError::internal(format!("tokenizer: {e}")))
 }
 
@@ -225,8 +231,7 @@ fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>, usiz
         return Err(ApiError::bad_request("messages must not be empty"));
     }
     let prompt = build_prompt(&req.messages);
-    let enc = tk(state.inner.tokenizer.encode(prompt, false))?;
-    let ids = enc.get_ids().to_vec();
+    let ids = tk(state.inner.tokenizer.encode(&prompt))?;
     if ids.len() > state.inner.args.max_prompt_tokens {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -255,8 +260,8 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     }
 }
 
-async fn health() -> &'static str {
-    "ok"
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok", "tokenizer": state.inner.tokenizer.name() }))
 }
 
 async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<ModelList>, ApiError> {
@@ -293,7 +298,7 @@ async fn chat_completions(
                     EngineOut::Token(t) => {
                         out_ids.push(t);
                         // incremental decode: emit the newly-completed suffix
-                        if let Ok(text) = tokenizer.decode(&out_ids, true) {
+                        if let Ok(text) = tokenizer.decode(&out_ids) {
                             if text.len() > prev.len() {
                                 let ev = chunk_event(&mid, Some(&text[prev.len()..]), None);
                                 if sse_tx.send(Ok(ev)).await.is_err() {
@@ -323,7 +328,7 @@ async fn chat_completions(
                 EngineOut::Error(m) => return Err(ApiError::internal(m)),
             }
         }
-        let text = tk(tokenizer.decode(&out_ids, true))?;
+        let text = tk(tokenizer.decode(&out_ids))?;
         let body = serde_json::json!({
             "id": format!("chatcmpl-{}", seed()),
             "object": "chat.completion",
@@ -356,6 +361,54 @@ fn sse_error(message: &str) -> Event {
     Event::default().data(serde_json::json!({ "error": { "message": message } }).to_string())
 }
 
+/// Encode `file` through both tokenizer backends (per-line, mirroring the
+/// serve pattern of many short encodes) and report MB/s + total ids. When the
+/// backends disagree on any line the bench aborts — throughput of wrong ids is
+/// meaningless. Numbers are local to this box; no docs-level claims.
+fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let json = std::fs::read(model_dir.join("tokenizer.json"))?;
+    let text = std::fs::read_to_string(file)?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    let bytes: usize = lines.iter().map(|l| l.len()).sum();
+    if lines.is_empty() {
+        return Err("bench file has no non-empty lines".into());
+    }
+    eprintln!("bench: {} lines, {:.1} MB", lines.len(), bytes as f64 / 1e6);
+
+    let mut giga = peregrine_token::GigaTokenizer::from_hf_json_bytes(&json)
+        .map_err(|e| format!("gigatoken: {e}"))?;
+    let hf = tokenizers::Tokenizer::from_bytes(&json).map_err(|e| format!("hf: {e}"))?;
+
+    // warmup + parity spot-check on a sample
+    for l in lines.iter().take(64) {
+        let g = giga.encode(l);
+        let h = hf.encode(*l, false).map_err(|e| format!("hf encode: {e}"))?;
+        if g != h.get_ids() {
+            return Err(format!("parity mismatch on line {l:?} — aborting bench").into());
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    let mut giga_ids = 0usize;
+    for l in &lines {
+        giga_ids += giga.encode(l).len();
+    }
+    let giga_s = t0.elapsed().as_secs_f64();
+
+    let t0 = std::time::Instant::now();
+    let mut hf_ids = 0usize;
+    for l in &lines {
+        hf_ids += hf.encode(*l, false).map_err(|e| format!("hf encode: {e}"))?.get_ids().len();
+    }
+    let hf_s = t0.elapsed().as_secs_f64();
+
+    let mbs = |s: f64| bytes as f64 / 1e6 / s.max(1e-9);
+    println!("gigatoken     : {:8.2} MB/s  ({giga_ids} ids, {giga_s:.3}s)", mbs(giga_s));
+    println!("hf-tokenizers : {:8.2} MB/s  ({hf_ids} ids, {hf_s:.3}s)", mbs(hf_s));
+    println!("speedup       : {:8.2}x", hf_s / giga_s.max(1e-9));
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cap glibc arenas before the model spawns its worker pools, so the server no
@@ -363,8 +416,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     peregrine_model::cap_malloc_arenas();
     let args = Args::parse();
     let dir = std::path::PathBuf::from(&args.model);
+    // Tokenizer throughput bench: encode a text file through both backends and
+    // exit — no model weights loaded, so it runs anywhere tokenizer.json does.
+    if let Some(file) = &args.bench_tokenizer {
+        bench_tokenizer(&dir, file)?;
+        return Ok(());
+    }
     let model = Model::load(&dir)?;
-    let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer: {e}"))?;
+    let tokenizer = TokenBackend::load(&dir).map_err(|e| format!("tokenizer: {e}"))?;
 
     // One engine thread owns the model and continuously batches all requests.
     let (engine, _engine_join) = batch::spawn(model, args.max_batch)?;

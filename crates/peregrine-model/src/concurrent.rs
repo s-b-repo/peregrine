@@ -83,6 +83,77 @@ pub struct ForwardCtx<'a> {
     /// io_uring submit issues contiguous-offset reads first. Bit-identical to
     /// the natural-id order (only the read submission order changes).
     pub layout_schedule: Option<&'a [Vec<u32>]>,
+    /// Optional co-activation affinity hints (runtime expert fusion +
+    /// hypergraph scheduling): fused pairs kept adjacent in dispatch order,
+    /// hyperedge components grouped into the same io-batch claim window.
+    /// Bit-identical — only submission/claim order changes.
+    pub affinity: Option<&'a AffinityHints>,
+}
+
+/// Per-layer co-activation ordering hints, rebuilt periodically by the model
+/// from the [`crate::predict::CoActivation`] tracker.
+#[derive(Default)]
+pub struct AffinityHints {
+    /// Per-layer fused expert pairs (co-rate ≥ the fusion threshold): the
+    /// scheduler keeps each pair adjacent in the dispatch order.
+    pub pairs: Vec<Vec<(u32, u32)>>,
+    /// Per-layer hyperedge membership (expert → component id) at the lower
+    /// hypergraph threshold: members are grouped contiguously so one claim
+    /// window covers a whole co-firing group. Consulted only under
+    /// `COLI_HYPER_SCHED=1`.
+    pub groups: Vec<std::collections::HashMap<u32, u32>>,
+}
+
+/// Whether hypergraph (component-grouped) scheduling is on. `COLI_HYPER_SCHED=1`.
+fn hyper_sched_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("COLI_HYPER_SCHED").as_deref(), Ok("1") | Ok("true")))
+}
+
+/// Apply the affinity ordering to a layer's streamed plans: hyperedge grouping
+/// first (contiguous components, first-appearance order, non-members after in
+/// original order), then fused-pair adjacency (partner moved right after its
+/// mate). Stable throughout, so untouched experts keep their relative order.
+fn apply_affinity_order(plans: &mut Vec<EPlan>, layer: usize, aff: &AffinityHints) {
+    if hyper_sched_enabled() {
+        if let Some(gmap) = aff.groups.get(layer) {
+            if !gmap.is_empty() {
+                // decorate–stable-sort–undecorate; group rank = first appearance.
+                let mut rank: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+                let mut next = 0usize;
+                let keys: Vec<usize> = plans
+                    .iter()
+                    .map(|p| match gmap.get(&(p.expert as u32)) {
+                        Some(&g) => *rank.entry(g).or_insert_with(|| {
+                            let k = next;
+                            next += 1;
+                            k
+                        }),
+                        None => usize::MAX,
+                    })
+                    .collect();
+                let mut zipped: Vec<(usize, usize, EPlan)> =
+                    plans.drain(..).enumerate().map(|(i, p)| (keys[i], i, p)).collect();
+                zipped.sort_by_key(|&(k, i, _)| (k, i));
+                plans.extend(zipped.into_iter().map(|(_, _, p)| p));
+            }
+        }
+    }
+    if let Some(pairs) = aff.pairs.get(layer) {
+        for &(a, b) in pairs {
+            let pos_a = plans.iter().position(|p| p.expert as u32 == a);
+            let pos_b = plans.iter().position(|p| p.expert as u32 == b);
+            if let (Some(ia), Some(ib)) = (pos_a, pos_b) {
+                if ib != ia + 1 && ia != ib {
+                    let moved = plans.remove(ib);
+                    // removing before `ia` shifts it left by one
+                    let dst = if ib < ia { ia } else { ia + 1 };
+                    plans.insert(dst.min(plans.len()), moved);
+                }
+            }
+        }
+    }
 }
 
 /// Default CPU-lane width: the machine's parallelism, capped so a huge core
@@ -484,6 +555,12 @@ pub fn moe_forward_concurrent(
             plans.sort_by_key(|p| rank.get(&(p.expert as u32)).copied().unwrap_or(usize::MAX));
         }
     }
+    // Co-activation affinity: hyperedge grouping + fused-pair adjacency on top
+    // of (or instead of) the layout order. Reduce keys on `pos`, so any order
+    // here is bit-identical.
+    if let Some(aff) = ctx.affinity {
+        apply_affinity_order(&mut plans, layer, aff);
+    }
 
     // job: (disk-plan index, streamed gate/up/down bytes) from I/O lane → CPU pool.
     // `Bytes` regions so an O_DIRECT read can hand its aligned DMA buffer over the
@@ -626,6 +703,12 @@ pub fn moe_forward_concurrent(
             scope.spawn(move || {
                 while let Ok((idx, bytes)) = job_rx.recv() {
                     let plan = &plans_ref[idx];
+                    // Slab bytes consumed by this expert — the bandwidth-governor
+                    // numerator (counted before the regions move into the Mlp).
+                    if let Some(t) = timings_ref {
+                        let nb: usize = bytes.iter().map(|(w, s)| w.len() + s.len()).sum();
+                        t.add_cpu_bytes(nb as u64);
+                    }
                     let [(gw, gs), (uw, us), (dw, ds)] = bytes;
                     let t_cpu = std::time::Instant::now();
                     let mlp = Mlp {

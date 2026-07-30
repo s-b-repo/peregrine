@@ -40,7 +40,12 @@ in this codebase; the legitimate low-level work is confined to the crates below.
   OS-interface helpers: `madvise` hugepage/dontneed hints (`mem.rs`), `sched_setaffinity` /
   `mbind` NUMA pinning (`mem.rs`), and the `perf_event_open` counter (`perf.rs`);
 - **peregrine-cuda** — the CUDA FFI;
-- **peregrine-kernels** — hand-written AVX2 / AVX-VNNI SIMD intrinsics.
+- **peregrine-kernels** — hand-written AVX2 / AVX-VNNI SIMD intrinsics;
+- **peregrine-token** — vendored third-party code (marcelroed/gigatoken, MIT):
+  upstream style is kept verbatim (unsafe SIMD, unwrap/expect in engine
+  internals and tests), so the whole crate is **excluded from this audit's
+  file set** — its correctness gate is the id-for-id parity suite against the
+  HF `tokenizers` oracle plus the vendored upstream tests.
 
 Any `unsafe` elsewhere is reported for review (the pure-logic crates —
 `peregrine-core`, `peregrine-model`, `peregrine-sched`, `peregrine-engine` — should
@@ -55,5 +60,8 @@ are omitted rather than waived en masse.
 
 ## Current status
 
-`--strict` is green: **P=0, U=0, I=0**. Re-run after any change to the streaming,
-scheduler, or serve paths.
+`--strict` is green: **P=0, U=0, I=0** (51 files; `peregrine-token` excluded as
+vendored). Note: the root-level `audit-bad-patterns.sh` was previously a stale
+copy that resolved its repo root incorrectly and scanned zero files — it is now
+a shim delegating to `scripts/audit-bad-patterns.sh`, the canonical gate.
+Re-run after any change to the streaming, scheduler, or serve paths.

@@ -96,7 +96,7 @@ mod tests {
         let mut b = BubbleTuner::new(0.3, 1.5, 3);
         let io = IoTuner::new(IowqCap { bounded: 4, unbounded: 4 }, 1, 16);
         let mut o = PlanOptimizer::new();
-        let t = o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 50, gpu_us: 50, reduce_us: 5 }, 1000);
+        let t = o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 50, gpu_us: 50, reduce_us: 5, cpu_bytes: 0 }, 1000);
         assert_eq!(t.lane.io_us, 100);
     }
 }

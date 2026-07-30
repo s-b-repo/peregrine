@@ -26,7 +26,7 @@ once. Target: Linux + NVIDIA CUDA.
 
 ## Status
 
-**184 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
+**282 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
 numeric kernel is ported from colibrì's `c/glm.c` and validated; the scalar
 integer-dot kernels are the token-exactness reference and the SIMD variants are
 checked bit-for-bit against them. The 2026-07-30 "adaptive-runtime wave" added
@@ -37,8 +37,21 @@ worker cap, transparent zstd compression, an offline layout tool
 two-priority admission queue, NUMA thread pinning, a heat-threshold
 cache-admission gate, a real `perf_event_open` LLC-miss counter, idle-tick
 background recompression, and per-workload-class prefetch breadth — all
-env-gated and bit-identical when off. See [`todo.md`](todo.md) for the audited
-per-item roadmap (~60% strict / ~64% weighted of 95 tracked items).
+env-gated and bit-identical when off. A third pass (the **completion sweep**)
+closed every remaining non-hardware roadmap item: sensor governors (thermal /
+RAPL power / memory bandwidth), entropy-adaptive prefetch, NUMA-bound
+allocations + hierarchical pool dispatch, co-activation expert fusion +
+hypergraph scheduling, macro-state routing compression, the one-shot
+`galactic` preprocessing pass, Hilbert/2-opt/tier layout methods, physical
+checkpoint self-rewrite (`--apply`), online bandit + Q-learning schedulers,
+per-shape dispatch specialization, kblock tensor-layout auto-conversion, and
+the `compile-plan` profile-guided execution plan. The serve layer now runs a
+**vendored [gigatoken](https://github.com/marcelroed/gigatoken) BPE tokenizer**
+(stable-toolchain subset, MIT) as its default fast path — measured **34× faster
+than HF `tokenizers` on this box** (204 vs 6 MB/s), id-for-id parity-gated, with
+the HF crate as automatic fallback for SentencePiece/non-BPE models. See
+[`todo.md`](todo.md) for the audited roadmap (**~87% strict / ~88% weighted of
+95 tracked items — every open item is hardware-gated**).
 
 | Area | Crate(s) | Status | Validated by |
 |---|---|---|---|
@@ -56,15 +69,15 @@ per-item roadmap (~60% strict / ~64% weighted of 95 tracked items).
 | Adaptive runtime | `peregrine-model` (`lane.rs`, `iotune.rs`, `telemetry.rs`, `workload.rs`) | ✅ | per-lane wall-time accum + `BubbleTuner` EWMA → `LaneBalancer` (CPU/GPU bias-driven downgrade); `IoTuner` adjusts `iowq_max_workers` between forwards; `PhaseTracker` + `PredictSource::PhaseAware`; per-class prefetch breadth from the serving layer's prompt classifier; heat-threshold cache admission; NUMA worker pinning; real `perf_event_open` LLC-miss counter; cross-session `route_stats.json` at Drop / auto-load on load |
 | Offline layout tool | `peregrine-tools` | ✅ | `peregrine-layout-reorg` consumes `dump-routes` JSON, emits `<dir>/schedule.json` via `--method greedy`, `louvain`, or `spectral` (Fiedler ordering); loader picks it up and pre-sorts disk reads |
 | Compression | `peregrine-core` (`compress.rs`), `peregrine-io` (`warmcache.rs`) | ✅ | zstd end-to-end on disk (`Blob::with_compression`, header carries the tag + original size); optional transparent zstd on WarmCache admissions (`COLI_CACHE_COMPRESS`) |
+| Tokenizer fast path | `peregrine-token`, `peregrine-serve` (`tok.rs`) | ✅ | vendored gigatoken BPE subset (stable toolchain, no libpython); id-for-id parity vs HF `tokenizers` on the committed GPT-2 fixture; cross-request memo cache; `COLI_TOKENIZER=giga\|hf`; `--bench-tokenizer` (34× locally) |
 
-### Not yet done (gated on an NVIDIA box)
-The three items that are left are all CUDA-only and require `nvcc` + a real
-GPU: (1) CUDA Graphs wired into the decode loop — needs `forward_layer`
-moved onto the CUDA stream via the existing `coli_cuda_pipe_*` primitives;
-(2) persistent CUDA kernels with a device-side work queue; (3) a
-`cudaMallocAsync` pool for the `reheat` churn. Also gated on hardware: DSA
-sparse selection, GPUDirect Storage, multi-GPU expert ownership. See
-[`todo.md`](todo.md) for the audited roadmap (95 tracked items).
+### Not yet done (all hardware-gated)
+Every remaining roadmap item needs hardware this workspace lacks: CUDA Graphs
+wired into the decode loop, persistent CUDA kernels, GPU-side fused reduce and
+a `cudaMallocAsync` pool (`nvcc` + GPU); CPU/GPU split GEMM and idle-cycle GPU
+compute (GPU); PCIe bandwidth scheduling and GPUDirect Storage (vendor stack);
+multi-GPU expert ownership / NVLink placement / VRAM replication (≥ 2 GPUs);
+distributed inference (multiple hosts). See [`todo.md`](todo.md).
 
 ## Architecture
 
@@ -86,8 +99,11 @@ crates/
   peregrine-engine   binary `peregrine`: stdio serve protocol, demo, bench, automaton
   peregrine-serve    binary `peregrine-serve`: OpenAI HTTP server + continuous batching
                      (two-tier priority queue, adaptive batch cap, adaptive prefill window)
-  peregrine-tools    binary `peregrine-layout-reorg`: offline expert re-layout
-                     (greedy / Louvain), emits schedule.json for the loader to consume
+  peregrine-tools    lib + binary `peregrine-layout-reorg`: offline expert re-layout
+                     (greedy / Louvain / spectral / Hilbert, --optimize 2-opt), tier
+                     placement (tiers.json), physical checkpoint rewrite (--apply)
+  peregrine-token    vendored gigatoken v0.10.0 BPE subset (MIT): SIMD pretokenizers,
+                     memoizing BPE engine, HF tokenizer.json loader; GigaTokenizer facade
 cuda/                vendored CUDA kernels from colibrì (backend_cuda.cu / .h)
 ```
 
@@ -98,7 +114,7 @@ server) are mapped in [`DESIGN.md`](DESIGN.md#concurrency--parallelism-map-where
 ## Build & test
 
 ```bash
-cargo test --workspace          # 184 tests, CPU-only, no GPU needed
+cargo test --workspace          # 282 tests, CPU-only, no GPU needed
 cargo build --release           # optimized (fat LTO)
 cargo clippy --workspace --all-targets    # clean
 scripts/audit-bad-patterns.sh --strict   # quality gate: no panic-vectors/UB (see docs/BAD_PATTERNS.md)
@@ -138,6 +154,10 @@ cargo run --release --bin peregrine -- dump-routes /path/to/model routes.json 51
 cargo run --release --bin peregrine-layout-reorg -- \
     --routes routes.json --out /path/to/model --method louvain
 #   → writes /path/to/model/schedule.json (loader picks it up automatically)
+
+# tokenizer throughput bench (no weights loaded; needs <model>/tokenizer.json):
+cargo run --release -p peregrine-serve -- --model /path/to/model \
+    --bench-tokenizer big_text_file.txt
 ```
 
 `Model::load` accepts any real int4/int8 container model directory in the GLM-5.2
@@ -167,8 +187,29 @@ token stream is unchanged.
 | `COLI_PAR_THREADS` | ncpus (≤ 16) | `peregrine-par` pool size; `1` = fully serial (the A/B baseline) |
 | `COLI_LANE_BALANCE` | off | `LaneBalancer` overrides static residency: downgrade cold GPU residents to CPU when GPU is bottlenecked |
 | `COLI_REPLICATE_K` | 0 | Top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
-| `COLI_NUMA_PIN` | off | Pin par-pool + prefetch-pool workers round-robin across NUMA-node CPUs |
+| `COLI_NUMA_PIN` | off | Pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
 | `COLI_PERF_COUNTERS` | off | Open a `perf_event_open` LLC-miss counter (needs `perf_event_paranoid ≤ 2`) |
+| `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
+| `COLI_TOKENIZER` | auto | `giga` = require the vendored BPE fast path, `hf` = force HF `tokenizers`; unset = try giga, fall back |
+| `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |
+
+#### Governors & learning
+| Var | Default | Effect |
+|---|---|---|
+| `COLI_THERMAL_LIMIT_C` | unset | Shrink CPU workers above this package temperature; regrow 8 °C below |
+| `COLI_POWER_CAP_W` | unset | Shrink workers when RAPL watts exceed the cap; regrow below 80 % |
+| `COLI_BW_GOVERNOR` | off | Shrink workers on a CPU-lane GB/s plateau; periodic regrow probe |
+| `COLI_ENTROPY_ADAPT` | off | Routing-entropy-adaptive prefetch breadth (needs `COLI_PREFETCH_TUNE`) |
+| `COLI_LEARN_SCHED` | off | ε-greedy bandit over knob configurations; policy persisted |
+| `COLI_RL_SCHED` | off | Tabular Q-learning scheduler (bandit wins if both are set) |
+
+#### Scheduling affinity & offline artifacts
+| Var | Default | Effect |
+|---|---|---|
+| `COLI_FUSE_THRESHOLD` | 0.9 | Co-firing rate above which expert pairs stay adjacent in dispatch |
+| `COLI_HYPER_SCHED` | off | Group co-activation components into one io-claim window |
+| `COLI_TIER_VRAM_MB` / `_RAM_MB` | unset | `galactic`: tier byte budgets → emit `tiers.json` |
+| `COLI_TIER_SEED` | on | Prefetch-warm the planned RAM tier at model load |
 
 #### Batching & priority
 | Var | Default | Effect |

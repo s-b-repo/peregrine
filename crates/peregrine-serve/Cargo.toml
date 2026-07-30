@@ -17,6 +17,7 @@ cuda = ["peregrine-model/cuda"]
 [dependencies]
 peregrine-model = { path = "../peregrine-model" }
 peregrine-core = { path = "../peregrine-core" }
+peregrine-token = { path = "../peregrine-token" }
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
 axum = "0.7"

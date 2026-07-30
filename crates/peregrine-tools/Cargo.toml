@@ -6,9 +6,17 @@ license.workspace = true
 repository.workspace = true
 description = "peregrine offline preprocessing tools: routing-aware expert re-layout and schedule emission"
 
+[lib]
+name = "peregrine_tools"
+path = "src/lib.rs"
+
 [[bin]]
 name = "peregrine-layout-reorg"
 path = "src/reorg.rs"
 
 [dependencies]
 serde_json.workspace = true
+peregrine-core = { path = "../peregrine-core" }
+
+[dev-dependencies]
+peregrine-model = { path = "../peregrine-model" }
