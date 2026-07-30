@@ -790,8 +790,8 @@ mod tests {
         // With the feature the API exists; availability depends on the box.
         #[cfg(feature = "cuda")]
         {
-            let _ = device_count();
-            let _ = status();
+            assert!(device_count() >= 0);
+            assert!(!status().is_empty());
         }
     }
 }

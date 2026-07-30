@@ -82,7 +82,10 @@ mod uring {
             let ring = IoUring::builder()
                 .setup_coop_taskrun()
                 .build(entries)
-                .or_else(|_| IoUring::new(entries))?;
+                .or_else(|e| {
+                    crate::note_advisory_err("io_uring COOP_TASKRUN setup (using plain ring)", &e);
+                    IoUring::new(entries)
+                })?;
             Ok(Reactor {
                 ring,
                 cap: entries as usize,
@@ -204,9 +207,7 @@ mod uring {
                 if b.len() >= 2 * 1024 * 1024 {
                     // SAFETY: the vec is owned by `self.registered_bufs`; the advice is
                     // read-only from the caller's viewpoint.
-                    unsafe {
-                        let _ = crate::mem::advise_hugepages(b.as_mut_ptr(), b.len());
-                    }
+                    unsafe { crate::mem::advise_hugepages(b.as_mut_ptr(), b.len()) };
                 }
             }
             Ok(())
@@ -694,8 +695,10 @@ mod tests {
                 return Ok(());
             }
         };
-        // worker-cap tuning is a best-effort optimization; ignore if unsupported
-        let _ = reactor.set_iowq_max_workers(4, 4);
+        // worker-cap tuning is a best-effort optimization
+        if let Err(e) = reactor.set_iowq_max_workers(4, 4) {
+            crate::note_advisory_err("iowq worker-cap tuning", &e);
+        }
         let mut reqs: Vec<ReadReq> = bufs
             .iter_mut()
             .enumerate()
@@ -723,7 +726,8 @@ mod tests {
         let fd = f.as_raw_fd();
         let mut reactor = match Reactor::new(8) {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
                 std::fs::remove_file(&path)?;
                 return Ok(());
             }
@@ -759,7 +763,8 @@ mod tests {
         let fd = f.as_raw_fd();
         let mut reactor = match Reactor::new(8) {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
                 std::fs::remove_file(&path)?;
                 return Ok(());
             }
@@ -790,12 +795,15 @@ mod tests {
         let fd = f.as_raw_fd();
         let mut reactor = match Reactor::new(8) {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
                 std::fs::remove_file(&path)?;
                 return Ok(());
             }
         };
-        let _ = reactor.fadvise_willneed(fd, 0, 8192); // hint; ignore if unsupported
+        if let Err(e) = reactor.fadvise_willneed(fd, 0, 8192) {
+            crate::note_advisory_err("fadvise willneed hint", &e); // hint only; the read below still decides the test
+        }
         let mut out = vec![0u8; 64];
         reactor.read_exact(fd, 100, &mut out)?;
         assert_eq!(&out[..], &data[100..164]);
@@ -813,12 +821,13 @@ mod tests {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
         let (f, path, data) = temp_file_with(b"O_DIRECT-alignment-payload!", 40000)?;
-        let _ = f; // buffered fd unused; we read through the O_DIRECT fd below
+        drop(f); // buffered fd not needed — reads go through the O_DIRECT fd below
         let df = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&path) {
             Ok(df) => df,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("skipping: filesystem rejects O_DIRECT open: {e}");
                 std::fs::remove_file(&path)?;
-                return Ok(()); // filesystem rejects the O_DIRECT open → skip
+                return Ok(());
             }
         };
         let dfd = df.as_raw_fd();
@@ -828,7 +837,8 @@ mod tests {
         }
         let mut reactor = match Reactor::new(8) {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
                 std::fs::remove_file(&path)?;
                 return Ok(());
             }
@@ -866,12 +876,13 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         // unique size ⇒ unique temp path (avoids colliding with other tests).
         let (f, path, data) = temp_file_with(b"zero-copy-aligned-DMA-payload!", 41000)?;
-        let _ = f; // buffered fd unused; we read through the O_DIRECT fd below
+        drop(f); // buffered fd not needed — reads go through the O_DIRECT fd below
         let df = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&path) {
             Ok(df) => df,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("skipping: filesystem rejects O_DIRECT open: {e}");
                 std::fs::remove_file(&path)?;
-                return Ok(()); // filesystem rejects the O_DIRECT open → skip
+                return Ok(());
             }
         };
         let dfd = df.as_raw_fd();
@@ -881,7 +892,8 @@ mod tests {
         }
         let mut reactor = match Reactor::new(8) {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
                 std::fs::remove_file(&path)?;
                 return Ok(());
             }

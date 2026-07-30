@@ -18,6 +18,10 @@ pub mod safetensors;
 
 pub use compress::{decode, encode, Compression};
 pub use config::Cfg;
+/// Re-export of the shared advisory-failure reporter (`COLI_DEBUG=1` surfaces
+/// best-effort failures on stderr) so downstream crates that only depend on
+/// `peregrine-core` reach it through one canonical path.
+pub use peregrine_io::note_advisory_err;
 pub use dtype::{bf16_to_f32, f16_to_f32, Dtype};
 pub use qt::{detect_group_size, QtFmt, QtInfo};
 pub use safetensors::{SafeTensors, TensorInfo};

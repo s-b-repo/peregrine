@@ -28,10 +28,42 @@ peregrine already `#![deny(clippy::unwrap_used, expect_used, panic)]` in its cra
 this gate enforces it **uniformly** and also catches `unwrap_or_default`,
 `unreachable!`, and `todo!`, which the clippy lints miss.
 
+## [B] Silent error swallowing — **strict, must be zero**
+
+A discarded `Result` hides real failures. Every fallible call handles its `Err`
+explicitly. Each discard position matches **both** the `_` wildcard and any
+`_name` binding (`Err(_e)`, `map_err(|_err|`, `let _tmp =`), so renaming the
+ignored binding cannot dodge the gate:
+
+| Pattern | Fix |
+|---|---|
+| `let _ = fallible()` / `let _named = fallible()` | `if let Err(e) = … { note_advisory_err("…", &e) }` for best-effort ops; or handle the case |
+| `if let Ok(x) = …` / `while let Ok(x) = …` | full `match` — the `Err` arm notes the failure or matches the concrete control-flow variant (`VarError::NotPresent`, `TryRecvError::Empty`) |
+| `Err(_) =>` / `Err(_e) =>` / `Err(..) =>` | bind the error and include it in the message/log |
+| `Err(e) => {}` (bound but empty arm) | do something with `e` — an empty arm is the same silent drop |
+| `map_err(\|_\| …)` / `or_else(\|_\| …)` (incl. `unwrap_or_else`/`map_or_else`) | bind and propagate the source error |
+| `.to_str().ok()` | explicit match documenting the lax handling |
+| `.ok();` / `.err();` as a statement | the whole `Result` is thrown away — handle or `note_advisory_err` |
+
+One exemption: the RAII keep-alive idiom `let _g = gpu_guard();` (any
+`…guard()` callee) is *not* flagged — there the named binding is the point,
+since `let _ =` would drop the guard immediately, which would be the actual
+bug. The three `while let Ok(…) = rx.recv()` worker loops carry
+`// audit-allow:` waivers: a channel `recv`'s only error is `Disconnected`,
+which *is* the concrete shutdown variant.
+
+**Advisory operations** (madvise/fadvise hints, NUMA pinning, route-stats
+persistence, shutdown signalling) are correctness-neutral by design and must not
+become hard errors — they report through `peregrine_io::note_advisory_err`
+(re-exported from `peregrine-core`), which prints to stderr **only when
+`COLI_DEBUG=1`**. Bool-returning hint APIs (kernel may decline) are called as
+bare statements — the bool is informational by documented contract.
+
 ## [U] UB / concurrency footguns — **strict, must be zero**
 
-`static mut`, `transmute`, `mem::forget`, `MaybeUninit::…assume_init()`. None belong
-in this codebase; the legitimate low-level work is confined to the crates below.
+`static mut`, `transmute`, `mem::forget`, `MaybeUninit::…assume_init()`,
+`unwrap_unchecked`. None belong in this codebase; the legitimate low-level work
+is confined to the crates below.
 
 ## [I] `unsafe` outside the expected crates — informational
 
@@ -60,8 +92,8 @@ are omitted rather than waived en masse.
 
 ## Current status
 
-`--strict` is green: **P=0, U=0, I=0** (51 files; `peregrine-token` excluded as
-vendored). Note: the root-level `audit-bad-patterns.sh` was previously a stale
+`--strict` is green: **P=0, B=0, U=0, I=0** (51 files; `peregrine-token`
+excluded as vendored). Note: the root-level `audit-bad-patterns.sh` was previously a stale
 copy that resolved its repo root incorrectly and scanned zero files — it is now
 a shim delegating to `scripts/audit-bad-patterns.sh`, the canonical gate.
 Beyond the gate, error plumbing is structured workspace-wide: every fallible

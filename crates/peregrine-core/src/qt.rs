@@ -121,7 +121,11 @@ mod tests {
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("coli_qt_{}_{}", std::process::id(), tag));
-        let _ = std::fs::remove_dir_all(&d);
+        if let Err(e) = std::fs::remove_dir_all(&d) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                peregrine_io::note_advisory_err("pre-clean test tmpdir", &e);
+            }
+        }
         d
     }
 

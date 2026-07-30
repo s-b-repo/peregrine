@@ -548,11 +548,19 @@ pub fn apply_layout(model_dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error>
     }
     // Write to a temp dir entry then swap in.
     let tmp = model_dir.join(".relayout.tmp");
-    let _ = std::fs::remove_dir_all(&tmp);
+    if let Err(e) = std::fs::remove_dir_all(&tmp) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            peregrine_core::note_advisory_err("pre-clean relayout tmp dir", &e);
+        }
+    }
     pack::write_safetensors(&tmp, &blobs).ctx(|| "write relayout".to_string())?;
     std::fs::rename(tmp.join("model.safetensors"), model_dir.join("model.safetensors"))
         .ctx(|| "swap relayout in".to_string())?;
-    let _ = std::fs::remove_dir_all(&tmp);
+    if let Err(e) = std::fs::remove_dir_all(&tmp) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            peregrine_core::note_advisory_err("remove relayout tmp dir", &e);
+        }
+    }
     Ok(())
 }
 

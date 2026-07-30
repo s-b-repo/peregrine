@@ -270,7 +270,9 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
 fn pack_slab(six: Vec<Bytes>) -> Result<peregrine_io::ExpertSlab, Error> {
     let [gw, gs, uw, us, dw, ds]: [Bytes; 6] = six
         .try_into()
-        .map_err(|_| Error::Format("expert read returned wrong region count".into()))?;
+        .map_err(|wrong: Vec<Bytes>| {
+            Error::Format(format!("expert read returned wrong region count: {} (want 6)", wrong.len()))
+        })?;
     Ok([(gw, gs), (uw, us), (dw, ds)])
 }
 
@@ -368,7 +370,9 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
     // Purely advisory — bytes returned are identical either way.
     if !direct && fadvise_main_enabled() {
         // Soft-failure only: readahead failures never affect correctness.
-        let _ = r.fadvise_willneed_many(&regions);
+        if let Err(e) = r.fadvise_willneed_many(&regions) {
+            peregrine_io::note_advisory_err("fadvise willneed (batched readahead)", &e);
+        }
     }
     // one deep submit for all 6·n regions (buffered) or per-region aligned DMA
     // (direct, zero-copy); bytes come back in region order, six per expert.
@@ -396,7 +400,9 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
     // pages we just dropped. Purely advisory, so a soft failure is harmless.
     if !direct && fadvise_drop_enabled() {
         for &(fd, off, len) in &regions {
-            let _ = r.fadvise_dontneed(fd, off, len);
+            if let Err(e) = r.fadvise_dontneed(fd, off, len) {
+                peregrine_io::note_advisory_err("fadvise dontneed (page-cache release)", &e);
+            }
         }
     }
     Ok(slabs)
@@ -639,7 +645,9 @@ pub fn moe_forward_concurrent(
                     let slabs: Vec<Bytes3> = match slabs {
                         Ok(s) => s,
                         Err(e) => {
-                            let _ = res_tx.send(Err(e));
+                            if res_tx.send(Err(e)).is_err() {
+                                peregrine_io::note_advisory_err("io lane error forward", &"collector already gone");
+                            }
                             return;
                         }
                     };
@@ -689,7 +697,9 @@ pub fn moe_forward_concurrent(
                             }
                         }
                         Err(e) => {
-                            let _ = res_tx.send(Err(e));
+                            if res_tx.send(Err(e)).is_err() {
+                                peregrine_io::note_advisory_err("cpu lane error forward", &"collector already gone");
+                            }
                         }
                     }
                 });
@@ -701,7 +711,7 @@ pub fn moe_forward_concurrent(
             let job_rx = job_rx.clone();
             let res_tx = res_tx.clone();
             scope.spawn(move || {
-                while let Ok((idx, bytes)) = job_rx.recv() {
+                while let Ok((idx, bytes)) = job_rx.recv() { // audit-allow: recv's only Err is Disconnected = clean shutdown
                     let plan = &plans_ref[idx];
                     // Slab bytes consumed by this expert — the bandwidth-governor
                     // numerator (counted before the regions move into the Mlp).
@@ -753,12 +763,12 @@ pub fn moe_forward_concurrent(
                 }
                 Ok(Err(e)) => return Err(e),
                 // channel closed: fine only if every expert already arrived
-                Err(_) => {
+                Err(recv_err) => {
                     if got == n {
                         break;
                     }
                     return Err(Error::Format(format!(
-                        "concurrent MoE: io/cpu lane ended early ({got}/{n} experts)"
+                        "concurrent MoE: io/cpu lane ended early ({got}/{n} experts): {recv_err}"
                     )));
                 }
             }
@@ -930,9 +940,10 @@ mod tests {
 
         let mut reactor = match Reactor::new(16) {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
                 std::fs::remove_file(&path)?;
-                return Ok(()); // no io_uring on this host → skip
+                return Ok(());
             }
         };
         let slab = read_expert(&mut reactor, &gate, &up, &down, false)?;

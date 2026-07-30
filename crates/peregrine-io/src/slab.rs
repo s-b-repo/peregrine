@@ -76,12 +76,12 @@ impl AlignedBuf {
             // SAFETY: allocation just returned, unique, and lives for exactly `len`
             // bytes; the advice is read-only from the caller's viewpoint.
             unsafe {
-                let _ = crate::mem::advise_hugepages(ptr.as_ptr(), len);
+                crate::mem::advise_hugepages(ptr.as_ptr(), len);
                 // NUMA-bind to the allocating thread's node while the pages are
                 // still untouched (binding before first touch is the correct
                 // moment — MPOL_BIND controls where faults place pages). Opt-in
                 // via COLI_NUMA_PIN=1 and multi-node boxes only.
-                let _ = crate::mem::bind_local_if_enabled(ptr.as_ptr(), len);
+                crate::mem::bind_local_if_enabled(ptr.as_ptr(), len);
             }
         }
         Some(AlignedBuf { ptr, len, layout })

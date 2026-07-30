@@ -172,7 +172,14 @@ pub fn moe_streamed(
         // a panic in the io lane becomes an error here, never a re-panic
         let streamed = match io.join() {
             Ok(res) => res,
-            Err(_) => Err(Error::Format("io lane thread panicked".into())),
+            Err(payload) => {
+                let why = payload
+                    .downcast_ref::<&str>()
+                    .map(|m| (*m).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                Err(Error::Format(format!("io lane thread panicked: {why}")))
+            }
         };
         (out, streamed)
     });
