@@ -276,7 +276,7 @@ impl SafeTensors {
         let raw = match t.compression {
             Compression::None => disk,
             other => decode(&disk, other, t.uncompressed_nbytes as usize)
-                .map_err(|e| Error::Format(format!("read_f32 '{name}' decompress: {e}")))?,
+                .ctx(|| format!("read_f32 '{name}' decompress"))?,
         };
         convert_f32(dtype, &raw, &mut out[..need])?;
         Ok(need as i64)
@@ -314,7 +314,7 @@ impl SafeTensors {
                 let mut disk = vec![0u8; t.nbytes as usize];
                 maybe_hugepage(&mut disk);
                 self.read_at(fidx, off, &mut disk)?;
-                let raw = decode(&disk, other, need).map_err(|e| Error::Format(format!("read_raw '{name}' decompress: {e}")))?;
+                let raw = decode(&disk, other, need).ctx(|| format!("read_raw '{name}' decompress"))?;
                 out[..need].copy_from_slice(&raw);
             }
         }

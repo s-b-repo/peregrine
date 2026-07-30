@@ -64,4 +64,10 @@ are omitted rather than waived en masse.
 vendored). Note: the root-level `audit-bad-patterns.sh` was previously a stale
 copy that resolved its repo root incorrectly and scanned zero files — it is now
 a shim delegating to `scripts/audit-bad-patterns.sh`, the canonical gate.
+Beyond the gate, error plumbing is structured workspace-wide: every fallible
+public API returns `peregrine_core::Error` (thiserror + the `Context`/`.ctx()`
+extension) — no `Result<_, String>` surfaces remain outside the vendored crate.
+The one production `assert!` (KV-cache append order, `attention.rs`) carries an
+`// audit-allow:` waiver: it guards an engine-internal invariant whose silent
+violation would corrupt attention output.
 Re-run after any change to the streaming, scheduler, or serve paths.

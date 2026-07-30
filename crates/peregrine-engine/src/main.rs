@@ -78,13 +78,12 @@ fn run() -> Result<(), Error> {
             let routes_json = serde_json::to_vec(&trace).map_err(|e| Error::Format(format!("serialize trace: {e}")))?;
             std::fs::write(dirp.join("routes.json"), routes_json)?;
             // layout schedule from the same trace (Louvain + 2-opt refinement)
-            let mut ordered = peregrine_tools::order_experts(&trace, "louvain")
-                .map_err(Error::Format)?;
+            let mut ordered = peregrine_tools::order_experts(&trace, "louvain")?;
             for (l, row) in ordered.iter_mut().enumerate() {
                 let w = peregrine_tools::build_cooccurrence(&trace, l);
                 peregrine_tools::two_opt(row, &w);
             }
-            peregrine_tools::write_schedule(dirp, &ordered).map_err(Error::Format)?;
+            peregrine_tools::write_schedule(dirp, &ordered)?;
             // storage-tier placement (hypergraph: whole communities per tier),
             // emitted when the operator declares tier byte budgets.
             let vram_mb: u64 = std::env::var("COLI_TIER_VRAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -106,7 +105,7 @@ fn run() -> Result<(), Error> {
                     vram_all.extend(v.into_iter().map(|e| (l, e)));
                     ram_all.extend(r.into_iter().map(|e| (l, e)));
                 }
-                peregrine_tools::write_tiers(dirp, &vram_all, &ram_all).map_err(Error::Format)?;
+                peregrine_tools::write_tiers(dirp, &vram_all, &ram_all)?;
             }
             // heat + history + co-activation seed for the next session
             model.save_route_stats(dirp)?;

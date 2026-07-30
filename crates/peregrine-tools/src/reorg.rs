@@ -2,6 +2,7 @@
 //! contiguous batched reads coalesce more of the disk queue. Thin CLI over
 //! [`peregrine_tools`] — see the library docs for the methods.
 
+use peregrine_core::Error;
 use peregrine_tools::{order_experts, read_routes, write_schedule};
 use std::path::PathBuf;
 
@@ -12,7 +13,7 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().collect();
     let mut routes_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
@@ -42,12 +43,12 @@ fn run() -> Result<(), String> {
                 usage();
                 return Ok(());
             }
-            other => return Err(format!("unknown argument: {other}")),
+            other => return Err(Error::Format(format!("unknown argument: {other}"))),
         }
         i += 1;
     }
-    let routes = routes_path.ok_or_else(|| "missing --routes <routes.json>".to_string())?;
-    let out = out_path.ok_or_else(|| "missing --out <out_dir>".to_string())?;
+    let routes = routes_path.ok_or_else(|| Error::Format("missing --routes <routes.json>".to_string()))?;
+    let out = out_path.ok_or_else(|| Error::Format("missing --out <out_dir>".to_string()))?;
     let trace = read_routes(&routes)?;
     let mut ordered = order_experts(&trace, &method)?;
     if optimize {

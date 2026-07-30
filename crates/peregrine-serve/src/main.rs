@@ -150,7 +150,7 @@ impl From<Error> for ApiError {
 
 /// Convert a tokenizer error into our error type — the one boundary that
 /// needs it, kept in a single helper.
-fn tk<T>(r: Result<T, String>) -> Result<T, ApiError> {
+fn tk<T>(r: Result<T, peregrine_core::Error>) -> Result<T, ApiError> {
     r.map_err(|e| ApiError::internal(format!("tokenizer: {e}")))
 }
 
