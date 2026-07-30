@@ -71,7 +71,9 @@ per-shape dispatch specialization, kblock tensor-layout auto-conversion, and
 the `compile-plan` profile-guided execution plan. The serve layer now runs a
 **vendored [gigatoken](https://github.com/marcelroed/gigatoken) BPE tokenizer**
 (stable-toolchain subset, MIT) as its **sole runtime tokenizer** — measured **34×
-faster than HF `tokenizers` on this box** (204 vs 6 MB/s), id-for-id parity-gated
+faster than HF `tokenizers` on this box** (204 vs 6 MB/s, the per-line serve
+pattern; the whole-buffer and parallel-batch paths run 3–7× higher still — see
+[docs/tokenizer.md](docs/tokenizer.md#throughput-anatomy)), id-for-id parity-gated
 (the HF crate remains only as the test-suite oracle). See
 [`todo.md`](todo.md) for the audited roadmap (**~87% strict / ~88% weighted of
 95 tracked items — every open item is hardware-gated**).
