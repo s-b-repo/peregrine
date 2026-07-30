@@ -72,6 +72,61 @@ impl RouteHistory {
             ring.clear();
         }
     }
+
+    /// Serialize to a flat, ordered JSON document (deterministic output). Frames
+    /// preserve newest-first order per layer. Companion to [`Self::from_json`].
+    pub fn to_json(&self, tag: &str) -> serde_json::Value {
+        let layers: Vec<serde_json::Value> = self
+            .layers
+            .iter()
+            .map(|ring| {
+                let frames: Vec<serde_json::Value> =
+                    ring.iter().map(|frame| serde_json::json!(frame)).collect();
+                serde_json::Value::Array(frames)
+            })
+            .collect();
+        serde_json::json!({
+            "tag": tag,
+            "n_layers": self.layers.len(),
+            "depth": self.depth,
+            "layers": layers,
+        })
+    }
+
+    /// Reconstruct from [`Self::to_json`] output. `None` when the document is
+    /// malformed or its `tag` differs from `expected_tag` (config fingerprint
+    /// staleness check — same policy as [`TransitionTable::from_json`]).
+    pub fn from_json(v: &serde_json::Value, expected_tag: &str) -> Option<RouteHistory> {
+        let tag = v.get("tag")?.as_str()?;
+        if tag != expected_tag {
+            return None;
+        }
+        let n_layers = v.get("n_layers")?.as_u64()? as usize;
+        let depth = v.get("depth")?.as_u64()? as usize;
+        let layers = v.get("layers")?.as_array()?;
+        if layers.len() != n_layers {
+            return None;
+        }
+        let mut out = RouteHistory::new(n_layers, depth);
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            let frames = layer.as_array()?;
+            let ring = out.layers.get_mut(layer_idx)?;
+            // frames are newest-first in the serialized form; push in reverse so
+            // push_front keeps them newest-first after the loop.
+            for frame in frames.iter().rev() {
+                let arr = frame.as_array()?;
+                let mut ids: Vec<i32> = Vec::with_capacity(arr.len());
+                for x in arr {
+                    ids.push(x.as_i64()? as i32);
+                }
+                if ring.len() == depth.max(1) {
+                    ring.pop_back();
+                }
+                ring.push_front(ids);
+            }
+        }
+        Some(out)
+    }
 }
 
 /// Recency-weighted momentum predictor. Each recent routed set votes for its experts;
@@ -199,6 +254,13 @@ pub enum PredictSource {
     Momentum(Momentum),
     /// Offline transition automaton, with a momentum fallback for unseen states.
     Automaton { table: Arc<TransitionTable>, fallback: Momentum },
+    /// Phase-aware wrapper: delegate to `inner` normally, but when a phase-shift
+    /// is detected (Jaccard distance between the newest two frames exceeds
+    /// `threshold_bp / 10000`), fold in an extra momentum vote weighted heavily
+    /// on the newest frame so prefetch tracks the new routing distribution
+    /// faster than steady-state momentum would. Correctness-neutral — the
+    /// scores are still sorted by (score-desc, expert-asc).
+    PhaseAware { inner: Box<PredictSource>, threshold_bp: u32, boost: u32 },
 }
 
 impl Default for PredictSource {
@@ -223,7 +285,46 @@ impl PredictSource {
                 scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                 scores
             }
+            PredictSource::PhaseAware { inner, threshold_bp, boost } => {
+                let mut scores = inner.predict_layer(layer, hist);
+                // Cheap two-frame phase check: distance between the newest two
+                // frames. A bump above `threshold` means routing just shifted —
+                // temporarily amplify the newest frame's contribution so
+                // prefetch chases the new distribution instead of averaging.
+                let (top, prev) = {
+                    let mut it = hist.frames(layer);
+                    (it.next(), it.next())
+                };
+                if let (Some(cur), Some(prev)) = (top, prev) {
+                    if jaccard_distance_bp(cur, prev) > *threshold_bp {
+                        // Add one high-weight vote per expert in the newest set.
+                        let extra: Vec<(u32, u32)> = cur
+                            .iter()
+                            .filter(|&&e| e >= 0)
+                            .map(|&e| (e as u32, *boost))
+                            .collect();
+                        merge_scores(&mut scores, extra);
+                        scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                    }
+                }
+                scores
+            }
         }
+    }
+}
+
+/// Jaccard distance between two integer sets, expressed in basis points
+/// (0 → identical, 10000 → fully disjoint). Ignores negative ids ("no route").
+/// Zero when both sets are empty (no distance = no shift signal).
+fn jaccard_distance_bp(a: &[i32], b: &[i32]) -> u32 {
+    let sa: std::collections::HashSet<i32> = a.iter().copied().filter(|&x| x >= 0).collect();
+    let sb: std::collections::HashSet<i32> = b.iter().copied().filter(|&x| x >= 0).collect();
+    let inter = sa.intersection(&sb).count();
+    let uni = sa.union(&sb).count();
+    if uni == 0 {
+        0
+    } else {
+        (10_000 - (inter as u32 * 10_000 / uni as u32)).min(10_000)
     }
 }
 
@@ -356,6 +457,72 @@ mod tests {
         assert_eq!(h.frames(0).count(), 0);
         assert_eq!(h.latest(0), None);
         assert_eq!(h.frames(99).count(), 0); // out of range
+    }
+
+    #[test]
+    fn route_history_json_round_trip_preserves_newest_first_order() {
+        let mut h = RouteHistory::new(3, 2);
+        h.push_layer(1, vec![10, 20]);
+        h.push_layer(1, vec![30, 40]);
+        h.push_layer(2, vec![5]);
+        let j = h.to_json("TAG");
+        let h2 = RouteHistory::from_json(&j, "TAG");
+        assert!(h2.is_some(), "round trip must succeed");
+        if let Some(h2) = h2 {
+            assert_eq!(h2.n_layers(), 3);
+            assert_eq!(h2.depth(), 2);
+            assert_eq!(h2.latest(1), Some(&vec![30, 40]));
+            let frames: Vec<&Vec<i32>> = h2.frames(1).collect();
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0], &vec![30, 40]);
+            assert_eq!(frames[1], &vec![10, 20]);
+            assert_eq!(h2.latest(2), Some(&vec![5]));
+            assert_eq!(h2.latest(0), None);
+        }
+    }
+
+    #[test]
+    fn route_history_json_rejects_wrong_tag() {
+        let mut h = RouteHistory::new(1, 1);
+        h.push_layer(0, vec![7]);
+        let j = h.to_json("REAL");
+        assert!(RouteHistory::from_json(&j, "OTHER").is_none());
+    }
+
+    #[test]
+    fn phase_aware_boosts_newest_on_shift() {
+        // Two frames with fully-disjoint routing → phase shift detected → the
+        // newest frame's experts must dominate the returned ranking, even if
+        // the inner Momentum source averages older frames.
+        let mut h = RouteHistory::new(1, 4);
+        h.push_layer(0, vec![1, 2, 3]); // older
+        h.push_layer(0, vec![9, 8, 7]); // newest, disjoint from older
+        let inner = Box::new(PredictSource::Momentum(Momentum { window: 0 }));
+        // 6000 bp = 0.6 threshold; boost weight = 100 (bigger than any per-frame
+        // momentum weight for depth-4 history, so it dominates the ranking).
+        let src = PredictSource::PhaseAware { inner, threshold_bp: 6000, boost: 100 };
+        let ranked = src.predict_layer(0, &h);
+        // 9, 8, 7 (the newest frame) should be ranked above 1, 2, 3.
+        let top3: Vec<u32> = ranked.iter().take(3).map(|&(e, _)| e).collect();
+        assert!(top3.contains(&9) && top3.contains(&8) && top3.contains(&7));
+    }
+
+    #[test]
+    fn phase_aware_defers_to_inner_when_steady() {
+        // Two identical frames → Jaccard distance = 0 → below threshold → the
+        // wrapper must be a pure passthrough (bit-identical to the inner source).
+        let mut h = RouteHistory::new(1, 4);
+        h.push_layer(0, vec![1, 2, 3]);
+        h.push_layer(0, vec![1, 2, 3]);
+        let inner_ref = PredictSource::Momentum(Momentum { window: 0 });
+        let expected = inner_ref.predict_layer(0, &h);
+        let src = PredictSource::PhaseAware {
+            inner: Box::new(PredictSource::Momentum(Momentum { window: 0 })),
+            threshold_bp: 6000,
+            boost: 100,
+        };
+        let got = src.predict_layer(0, &h);
+        assert_eq!(got, expected, "steady-state PhaseAware == inner passthrough");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! twin fds and `fadvise(DONTNEED)` streaming belong to the M2 I/O lane
 //! (`peregrine-io`); this crate is the index plus straightforward converting reads.
 
+use crate::compress::{decode, Compression};
 use crate::dtype::{bf16_to_f32, f16_to_f32, Dtype};
 use crate::{Context, Error};
 use parking_lot::Mutex;
@@ -26,10 +27,19 @@ pub struct TensorInfo {
     pub file_idx: usize,
     /// absolute byte offset of the data within the file
     pub off: u64,
+    /// On-disk byte length. Equals the logical tensor size for uncompressed
+    /// entries; equals the compressed payload size when [`Self::compression`]
+    /// is [`Compression::Zstd`].
     pub nbytes: i64,
     pub dtype: Dtype,
     pub numel: i64,
     pub shape: Vec<i64>,
+    /// Compression scheme applied to the on-disk payload. `None` = raw bytes
+    /// (the historical format); `Zstd` = decompress via [`crate::compress::decode`].
+    pub compression: Compression,
+    /// Original (post-decompression) size, in bytes. Equals `nbytes` for
+    /// uncompressed entries.
+    pub uncompressed_nbytes: i64,
 }
 
 /// Index over all `*.safetensors` shards in a model directory.
@@ -142,15 +152,27 @@ impl SafeTensors {
                 }
                 let shape: Vec<i64> = shp.iter().map(|v| v.as_i64().unwrap_or(0)).collect();
                 let numel: i64 = shape.iter().product::<i64>().max(if shape.is_empty() { 1 } else { 0 });
+                let on_disk_nbytes = b0 - a0;
+                // Optional compression + original size. Missing tag ⇒ raw bytes.
+                let compression = Compression::from_tag(m.get("compression").and_then(|v| v.as_str()));
+                let uncompressed_nbytes = match compression {
+                    Compression::None => on_disk_nbytes,
+                    _ => m
+                        .get("uncompressed_nbytes")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(on_disk_nbytes),
+                };
                 let idx = tensors.len();
                 tensors.push(TensorInfo {
                     name: name.clone(),
                     file_idx,
                     off: data_start + a0 as u64,
-                    nbytes: b0 - a0,
+                    nbytes: on_disk_nbytes,
                     dtype,
                     numel,
                     shape,
+                    compression,
+                    uncompressed_nbytes,
                 });
                 index.insert(name.clone(), idx);
             }
@@ -209,6 +231,21 @@ impl SafeTensors {
         self.direct_files.iter().any(Option::is_some)
     }
 
+    /// The compression scheme applied to `name` (`Compression::None` for
+    /// uncompressed tensors or unknown names). Callers streaming raw bytes
+    /// through the concurrent MoE lane should check this — compressed
+    /// tensors need [`Self::read_raw`], which decompresses.
+    pub fn compression(&self, name: &str) -> Compression {
+        self.find(name).map(|t| t.compression).unwrap_or(Compression::None)
+    }
+
+    /// Whether any tensor in this index uses on-disk compression. When `true`
+    /// the caller should force resident-expert mode (streamed expert reads
+    /// hand raw bytes to the CPU/GPU kernels without a decompress step).
+    pub fn has_compressed_tensors(&self) -> bool {
+        self.tensors.iter().any(|t| !matches!(t.compression, Compression::None))
+    }
+
     /// Read a tensor as f32, converting BF16/F16/F32. `out` must hold `numel`
     /// floats. Errors on a U8 (quantized) tensor — use [`Self::read_raw`].
     pub fn read_f32(&self, name: &str, out: &mut [f32]) -> Result<i64, Error> {
@@ -223,26 +260,44 @@ impl SafeTensors {
                 out.len()
             )));
         }
-        let (dtype, off, nbytes, fidx) = (t.dtype, t.off, t.nbytes as usize, t.file_idx);
-        let mut raw = vec![0u8; nbytes];
-        self.read_at(fidx, off, &mut raw)?;
+        let (dtype, off, on_disk_nbytes, fidx) = (t.dtype, t.off, t.nbytes as usize, t.file_idx);
+        let mut disk = vec![0u8; on_disk_nbytes];
+        maybe_hugepage(&mut disk);
+        self.read_at(fidx, off, &mut disk)?;
+        let raw = match t.compression {
+            Compression::None => disk,
+            other => decode(&disk, other, t.uncompressed_nbytes as usize)
+                .map_err(|e| Error::Format(format!("read_f32 '{name}' decompress: {e}")))?,
+        };
         convert_f32(dtype, &raw, &mut out[..need])?;
         Ok(need as i64)
     }
 
     /// Read the raw bytes of a tensor (no dtype conversion) — for the already
-    /// int4/int8/int2-quantized U8 container payloads. `out` must be `nbytes`.
+    /// int4/int8/int2-quantized U8 container payloads. `out` must be
+    /// `uncompressed_nbytes`.
     pub fn read_raw(&self, name: &str, out: &mut [u8]) -> Result<(), Error> {
         let t = self.tensor(name)?;
-        let need = t.nbytes as usize;
+        let need = t.uncompressed_nbytes as usize;
         if out.len() < need {
             return Err(Error::Format(format!(
                 "read_raw '{name}': out buffer {} < nbytes {need}",
                 out.len()
             )));
         }
+        maybe_hugepage(&mut out[..need]);
         let (off, fidx) = (t.off, t.file_idx);
-        self.read_at(fidx, off, &mut out[..need])
+        match t.compression {
+            Compression::None => self.read_at(fidx, off, &mut out[..need]),
+            other => {
+                let mut disk = vec![0u8; t.nbytes as usize];
+                maybe_hugepage(&mut disk);
+                self.read_at(fidx, off, &mut disk)?;
+                let raw = decode(&disk, other, need).map_err(|e| Error::Format(format!("read_raw '{name}' decompress: {e}")))?;
+                out[..need].copy_from_slice(&raw);
+                Ok(())
+            }
+        }
     }
 
     /// Read `n_elems` starting at element `elem_off` (converted to f32). Used for
@@ -267,6 +322,7 @@ impl SafeTensors {
         }
         let (dtype, fidx) = (t.dtype, t.file_idx);
         let mut raw = vec![0u8; nb];
+        maybe_hugepage(&mut raw);
         self.read_at(fidx, boff, &mut raw)?;
         convert_f32(dtype, &raw, &mut out[..n_elems as usize])?;
         Ok(())
@@ -274,6 +330,16 @@ impl SafeTensors {
 
     fn tensor(&self, name: &str) -> Result<&TensorInfo, Error> {
         self.find(name).ok_or_else(|| Error::Format(format!("missing tensor: {name}")))
+    }
+}
+
+/// Ask the kernel to back a large landing buffer with transparent huge pages
+/// (2 MB). Threshold matches the huge-page size — below that the advice does
+/// nothing useful and just spends a syscall. All-safe wrapper around the
+/// `unsafe` `libc::madvise` in `peregrine-io::mem`.
+fn maybe_hugepage(buf: &mut [u8]) {
+    if buf.len() >= 2 * 1024 * 1024 {
+        let _ = peregrine_io::advise_hugepages_slice(buf);
     }
 }
 

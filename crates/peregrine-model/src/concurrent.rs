@@ -19,6 +19,7 @@ use peregrine_core::{Cfg, Context, Error, QtInfo, SafeTensors};
 use peregrine_io::{Bytes, Reactor, ReadReq, WarmCache};
 
 use crate::gpu::{GpuTier, HeatTable};
+use crate::lane::LaneTimingsAccum;
 use crate::mlp::Mlp;
 use crate::predict::RouteHistory;
 use crate::router::{batch_union, route, routed_at};
@@ -61,6 +62,27 @@ pub struct ForwardCtx<'a> {
     /// per routed expert per layer so [`crate::gpu::GpuTier::reheat`] can migrate
     /// hot experts into VRAM. `None` disables accumulation (no GPU tier / drafts).
     pub heat: Option<&'a HeatTable>,
+    /// Per-lane wall-time accumulator: I/O, CPU, GPU, and reduce phases bump
+    /// this from within `moe_forward_concurrent`. The Model reads and resets
+    /// it between forwards so the `BubbleTuner` sees per-forward deltas.
+    /// `None` disables the (very cheap) bracketing.
+    pub timings: Option<&'a LaneTimingsAccum>,
+    /// Optional adaptive CPU/GPU lane balancer. When `Some` (i.e. bias is
+    /// non-`Balanced` and `COLI_LANE_BALANCE=1`), the scheduler downgrades cold
+    /// GPU-resident experts to the CPU lane when the GPU is the bottleneck.
+    /// Correctness-neutral: an expert served on the CPU lane produces the same
+    /// bytes (either through the warm cache or a fresh stream) as it would on
+    /// the GPU lane, and the reduce order stays fixed.
+    pub balancer: Option<&'a crate::lane::LaneBalancer>,
+    /// Optional heat snapshot the balancer consults for per-expert decisions.
+    /// One flat `[layer * n_experts + expert]` slice; `None` disables balancing.
+    pub heat_counts: Option<&'a [u32]>,
+    /// Optional per-layer expert-order hint (from `<dir>/schedule.json`, emitted
+    /// by `peregrine-layout-reorg`). When present, the streamed `EPlan`s for a
+    /// layer are sorted by the schedule's rank of each expert id so the batched
+    /// io_uring submit issues contiguous-offset reads first. Bit-identical to
+    /// the natural-id order (only the read submission order changes).
+    pub layout_schedule: Option<&'a [Vec<u32>]>,
 }
 
 /// Default CPU-lane width: the machine's parallelism, capped so a huge core
@@ -223,6 +245,26 @@ pub fn experts_per_batch() -> usize {
     })
 }
 
+/// Whether to fire `POSIX_FADV_WILLNEED` for the main streamed-expert regions
+/// just before the batched read (buffered mode only — the O_DIRECT path bypasses
+/// the page cache, so the hint would be ignored). Default on when buffered;
+/// turn off with `COLI_FADVISE_MAIN=0`. Advisory, so bit-identical either way.
+fn fadvise_main_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_FADVISE_MAIN").as_deref(), Ok("0")))
+}
+
+/// Whether to fire `POSIX_FADV_DONTNEED` for the just-consumed regions after
+/// the read — releases page-cache pages under long-running loads to keep RSS
+/// flat. Off by default (drops the pages a warm cache would otherwise reuse);
+/// enable with `COLI_FADVISE_DROP=1` on memory-tight boxes.
+fn fadvise_drop_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("COLI_FADVISE_DROP").as_deref(), Ok("1")))
+}
+
 /// Stream a *batch* of experts' gate/up/down (six weight+scale regions each) through
 /// the ring in **one deep `read_many` submit**, so the disk queue stays full across
 /// the whole batch instead of draining one expert at a time. Short reads are
@@ -249,15 +291,81 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
             regions.push((sfd, t.s_off, t.s_len));
         }
     }
+    // Buffered path: hint the kernel to start readahead on every region before the
+    // batched read. The advice fires from the same ring in one submit, so it costs
+    // one extra syscall and can overlap NVMe queue depth with our submit ceremony.
+    // Purely advisory — bytes returned are identical either way.
+    if !direct && fadvise_main_enabled() {
+        // Soft-failure only: readahead failures never affect correctness.
+        let _ = r.fadvise_willneed_many(&regions);
+    }
     // one deep submit for all 6·n regions (buffered) or per-region aligned DMA
     // (direct, zero-copy); bytes come back in region order, six per expert.
-    let mut bytes = read_regions(r, &regions, direct)?.into_iter();
+    let bytes = match read_regions(r, &regions, direct) {
+        Ok(b) => b,
+        Err(e) if io_recovery_enabled() && !direct => {
+            // Retry ladder: on a batched-read failure, re-issue each region as
+            // an individual `read_exact_retry` (which handles EIO/EAGAIN/EINTR
+            // with backoff). Trades throughput for resilience — used only after
+            // the fast path has already failed. O_DIRECT is skipped because the
+            // recovery path uses buffered reads.
+            eprintln!("[io-recovery] batched read failed ({e}); retrying regions individually");
+            read_regions_with_retry(r, &regions)?
+        }
+        Err(e) => return Err(e),
+    };
+    let mut bytes = bytes.into_iter();
     let mut slabs: Vec<peregrine_io::ExpertSlab> = Vec::with_capacity(n);
     for _ in 0..n {
         let six: Vec<Bytes> = bytes.by_ref().take(6).collect();
         slabs.push(pack_slab(six)?);
     }
+    // Optional page-cache release for long-running RSS-bounded workloads. Only
+    // useful when the warm cache is off / cold — a hit would otherwise re-read the
+    // pages we just dropped. Purely advisory, so a soft failure is harmless.
+    if !direct && fadvise_drop_enabled() {
+        for &(fd, off, len) in &regions {
+            let _ = r.fadvise_dontneed(fd, off, len);
+        }
+    }
     Ok(slabs)
+}
+
+/// Whether the I/O recovery path (batched read → per-region retry with backoff)
+/// is enabled. Default on; disable with `COLI_IO_RECOVERY=0`.
+fn io_recovery_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_IO_RECOVERY").as_deref(), Ok("0") | Ok("false")))
+}
+
+/// Cache-admission heat threshold: a just-streamed expert is admitted into the
+/// warm cache only once its routing heat reaches this count. `0` (default)
+/// admits everything — the historical behavior. `1` means "cache from the
+/// second routing onward" (heat is bumped after the reduce, so a first-time
+/// expert still reads 0 here), filtering one-off experts out of the cache.
+/// Correctness-neutral: a skipped admission just re-streams identical bytes.
+fn cache_admit_min_heat() -> u32 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_CACHE_ADMIT_MIN_HEAT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Per-region fallback for the buffered path: reads each region with
+/// `Reactor::read_exact_retry` (transient EIO/EAGAIN/EINTR retried with linear
+/// backoff). Slower than the batched submit, but preserves the byte-identical
+/// contract when the batched path suffers a transient failure.
+fn read_regions_with_retry(r: &mut Reactor, regions: &[(RawFd, u64, usize)]) -> Result<Vec<Bytes>, Error> {
+    let mut out: Vec<Bytes> = Vec::with_capacity(regions.len());
+    for &(fd, off, len) in regions {
+        let mut buf = vec![0u8; len];
+        r.read_exact_retry(fd, off, &mut buf, 3)
+            .ctx(|| format!("io_uring per-region retry @ off={off} len={len}"))?;
+        out.push(Bytes::from(buf));
+    }
+    Ok(out)
 }
 
 fn rebuild(t: &TPlan, wb: Bytes, sb: Bytes) -> QtWeight {
@@ -308,6 +416,9 @@ pub fn moe_forward_concurrent(
     let mut gplans: Vec<GPlan> = Vec::new();
     let mut pos = 0usize;
     let uniq = batch_union(&r, s_n);
+    // Number of experts per layer — needed to look up per-expert heat in the
+    // flat counts slice (fallback to 0 when the balancer is disabled).
+    let n_experts_layer = cfg.n_experts as usize;
     for &e in uniq.iter() {
         let e = e as usize;
         let mut rows: Vec<usize> = Vec::new();
@@ -326,7 +437,20 @@ pub fn moe_forward_concurrent(
         }
         let this_pos = pos;
         pos += 1;
-        if gpu.is_some_and(|g| g.has(layer, e)) {
+        let gpu_resident = gpu.is_some_and(|g| g.has(layer, e));
+        // LaneBalancer consultation: if the balancer says the GPU lane is the
+        // bottleneck and this expert is cold enough, route it through the CPU
+        // lane instead — even though it's GPU-resident. When the resident
+        // expert has been replicated (see `Model::enqueue_expert_replicas`) the
+        // CPU lane serves it from the warm cache with no disk read.
+        let route_to_gpu = match (ctx.balancer, ctx.heat_counts) {
+            (Some(bal), Some(counts)) => {
+                let heat = counts.get(layer * n_experts_layer + e).copied().unwrap_or(0);
+                matches!(bal.choose(gpu_resident, heat), crate::lane::Placement::Gpu)
+            }
+            _ => gpu_resident,
+        };
+        if route_to_gpu {
             let nr = rows.len();
             let mut xg = vec![0f32; nr * hidden];
             for (ri, &s) in rows.iter().enumerate() {
@@ -348,6 +472,19 @@ pub fn moe_forward_concurrent(
     }
     let n = pos;
 
+    // Apply the layout schedule: reorder the streamed `EPlan`s by the schedule's
+    // rank of each expert. This changes only the io_uring submit order — the
+    // deterministic reduce uses `pos` (batch-union index) as its scatter key, so
+    // outputs stay bit-identical. Experts not in the schedule keep their
+    // original ordering, appended at the end. No-op when there is no schedule.
+    if let Some(sched) = ctx.layout_schedule {
+        if let Some(row) = sched.get(layer) {
+            let rank: std::collections::HashMap<u32, usize> =
+                row.iter().enumerate().map(|(i, &e)| (e, i)).collect();
+            plans.sort_by_key(|p| rank.get(&(p.expert as u32)).copied().unwrap_or(usize::MAX));
+        }
+    }
+
     // job: (disk-plan index, streamed gate/up/down bytes) from I/O lane → CPU pool.
     // `Bytes` regions so an O_DIRECT read can hand its aligned DMA buffer over the
     // channel with no copy (== peregrine_io::ExpertSlab).
@@ -366,6 +503,15 @@ pub fn moe_forward_concurrent(
     let x_ref = x;
     let completed_ref = &completed;
     let io_work_ref = &io_work;
+    // Per-lane wall-time accumulator (or `None` for the no-tracking path). Copied
+    // into each scoped thread so the atomic bumps in the accumulator's four counters
+    // are the only synchronization the timing incurs.
+    let timings_ref = ctx.timings;
+    // Cache-admission gate: shared HeatTable ref + threshold, consulted per
+    // streamed expert before inserting into the warm cache. Threshold 0 (the
+    // default) admits everything.
+    let heat_ref = ctx.heat;
+    let admit_min_heat = cache_admit_min_heat();
 
     let results: Result<Vec<Option<EOut>>, Error> = std::thread::scope(|scope| {
         // ---- I/O lanes: N io_uring rings in PARALLEL, lock-free (atomic) work-stealing ----
@@ -391,7 +537,7 @@ pub fn moe_forward_concurrent(
                     let mut miss: Vec<usize> = Vec::new();
                     for idx in start..end {
                         let key = (layer as u32, plans_ref[idx].expert as u32);
-                        let hit = ecache.and_then(|c| c.lock().get(key).cloned());
+                        let hit = ecache.and_then(|c| c.lock().get(key));
                         match hit {
                             Some(bytes) => {
                                 if job_tx.send((idx, bytes)).is_err() {
@@ -405,10 +551,14 @@ pub fn moe_forward_concurrent(
                         continue;
                     }
                     let chunk_plans: Vec<&EPlan> = miss.iter().map(|&i| &plans_ref[i]).collect();
+                    let t_io = std::time::Instant::now();
                     let slabs = {
                         let mut r = ring.lock(); // this ring, uncontended (owned by this thread)
                         read_experts_batched(&mut r, &chunk_plans, use_direct)
                     };
+                    if let Some(t) = timings_ref {
+                        t.add_io(t_io.elapsed().as_micros() as u64);
+                    }
                     let slabs: Vec<Bytes3> = match slabs {
                         Ok(s) => s,
                         Err(e) => {
@@ -418,9 +568,18 @@ pub fn moe_forward_concurrent(
                     };
                     for (&idx, bytes) in miss.iter().zip(slabs) {
                         if let Some(c) = ecache {
+                            let expert = plans_ref[idx].expert;
+                            // Admission gate: only cache experts with demonstrated
+                            // reuse (routing heat ≥ threshold). Heat is bumped after
+                            // the reduce, so a first-ever routing reads 0 here —
+                            // threshold 1 = "cache from the second routing on".
+                            let admit = admit_min_heat == 0
+                                || heat_ref.is_some_and(|h| h.get(layer, expert) >= admit_min_heat);
                             let mut c = c.lock();
                             c.note_disk_read(layer as u32);
-                            c.insert((layer as u32, plans_ref[idx].expert as u32), bytes.clone());
+                            if admit {
+                                c.insert((layer as u32, expert as u32), bytes.clone());
+                            }
                         }
                         if job_tx.send((idx, bytes)).is_err() {
                             return;
@@ -437,7 +596,12 @@ pub fn moe_forward_concurrent(
                 let res_tx = res_tx.clone();
                 scope.spawn(move || {
                     let jobs: Vec<(usize, Vec<f32>)> = gplans_ref.iter().map(|p| (p.e, p.xg.clone())).collect();
-                    match g.compute(layer, &jobs, hidden) {
+                    let t_gpu = std::time::Instant::now();
+                    let result = g.compute(layer, &jobs, hidden);
+                    if let Some(t) = timings_ref {
+                        t.add_gpu(t_gpu.elapsed().as_micros() as u64);
+                    }
+                    match result {
                         Ok(hs) => {
                             for (gp, h) in gplans_ref.iter().zip(hs) {
                                 completed_ref.fetch_add(1, Ordering::Relaxed);
@@ -463,6 +627,7 @@ pub fn moe_forward_concurrent(
                 while let Ok((idx, bytes)) = job_rx.recv() {
                     let plan = &plans_ref[idx];
                     let [(gw, gs), (uw, us), (dw, ds)] = bytes;
+                    let t_cpu = std::time::Instant::now();
                     let mlp = Mlp {
                         gate: rebuild(&plan.gate, gw, gs),
                         up: rebuild(&plan.up, uw, us),
@@ -474,6 +639,9 @@ pub fn moe_forward_concurrent(
                         xg[ri * hidden..ri * hidden + hidden].copy_from_slice(&x_ref[s * hidden..s * hidden + hidden]);
                     }
                     let h = mlp.swiglu(&xg, nr);
+                    if let Some(t) = timings_ref {
+                        t.add_cpu(t_cpu.elapsed().as_micros() as u64);
+                    }
                     completed_ref.fetch_add(1, Ordering::Relaxed);
                     let out = EOut { rows: plan.rows.clone(), rw: plan.rw.clone(), h };
                     if res_tx.send(Ok((plan.pos, out))).is_err() {
@@ -517,6 +685,7 @@ pub fn moe_forward_concurrent(
     let slots = results?;
 
     // ---- deterministic reduce: scatter in fixed batch-union order ----
+    let t_reduce = std::time::Instant::now();
     let mut out = vec![0f32; s_n * hidden];
     for eo in slots.into_iter().flatten() {
         for (ri, (&s, &wgt)) in eo.rows.iter().zip(&eo.rw).enumerate() {
@@ -532,6 +701,9 @@ pub fn moe_forward_concurrent(
         for z in 0..s_n * hidden {
             out[z] += hs[z];
         }
+    }
+    if let Some(t) = ctx.timings {
+        t.add_reduce(t_reduce.elapsed().as_micros() as u64);
     }
 
     // Accumulate routing frequency so the GPU tier can migrate hot experts into

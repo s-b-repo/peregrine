@@ -86,7 +86,24 @@ pub struct Pool {
     handles: Vec<JoinHandle<()>>,
 }
 
-fn worker_loop(rx: Receiver<Job>) {
+/// Optional worker-startup hook, run once by each worker thread with its index
+/// before it starts serving jobs. Set it with [`set_worker_start_hook`] *before*
+/// the first pool is built (the global pool is constructed lazily on first
+/// `par_*` call). The intended consumer is NUMA thread pinning — this crate
+/// stays std-only, so the affinity syscall lives in the caller's hook.
+static WORKER_START_HOOK: std::sync::OnceLock<fn(usize)> = std::sync::OnceLock::new();
+
+/// Install a hook run by every pool worker at startup with its worker index.
+/// First caller wins; later calls are ignored (returns whether this call set it).
+/// A hook installed after a pool has spawned only affects later-built pools.
+pub fn set_worker_start_hook(f: fn(usize)) -> bool {
+    WORKER_START_HOOK.set(f).is_ok()
+}
+
+fn worker_loop(index: usize, rx: Receiver<Job>) {
+    if let Some(hook) = WORKER_START_HOOK.get() {
+        hook(index);
+    }
     IN_POOL.with(|c| c.set(true)); // mark this thread so nested par_* run serial
     while let Ok(job) = rx.recv() {
         // SAFETY: `job.task.0` points to a `dyn Fn + Sync` owned by the dispatcher's
@@ -116,10 +133,10 @@ impl Pool {
         }
         let mut job_txs = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
-        for _ in 0..workers {
+        for i in 0..workers {
             let (tx, rx) = channel::<Job>();
             job_txs.push(tx);
-            handles.push(std::thread::spawn(move || worker_loop(rx)));
+            handles.push(std::thread::spawn(move || worker_loop(i, rx)));
         }
         Pool { job_txs, handles }
     }

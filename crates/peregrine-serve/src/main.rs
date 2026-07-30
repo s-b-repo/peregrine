@@ -25,7 +25,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use batch::{EngineHandle, EngineOut, EngineRequest};
+use batch::{EngineHandle, EngineOut, EngineRequest, Priority};
 use clap::Parser;
 use peregrine_core::Error;
 use peregrine_model::{Model, Sampler};
@@ -184,12 +184,39 @@ fn submit_request(
     max_new: usize,
     temperature: f32,
     top_p: f32,
+    priority: Priority,
+    class: peregrine_model::TokenClass,
 ) -> Result<mpsc::Receiver<EngineOut>, ApiError> {
     let (tx, rx) = mpsc::channel::<EngineOut>(64);
     let prompt: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
     let sampler = Sampler::new(temperature, top_p, seed());
-    state.inner.engine.submit(EngineRequest { prompt, max_new, sampler, out: tx })?;
+    state.inner.engine.submit(EngineRequest { prompt, max_new, sampler, out: tx, priority, class })?;
     Ok(rx)
+}
+
+/// Classify the workload from the tail of the last user message — the part of
+/// the conversation the model is about to continue, so the best signal for
+/// what routing distribution decode will see. The tail is capped at 512 chars
+/// (classification is a ratio heuristic; more text doesn't sharpen it).
+fn classify_request(messages: &[ChatMessage]) -> peregrine_model::TokenClass {
+    let last_user = messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("");
+    let tail_start = last_user.len().saturating_sub(512);
+    // step forward to a char boundary so the slice is valid UTF-8
+    let mut start = tail_start;
+    while start < last_user.len() && !last_user.is_char_boundary(start) {
+        start += 1;
+    }
+    peregrine_model::classify_str(&last_user[start..])
+}
+
+/// Parse an `X-Peregrine-Priority` header value into a [`Priority`]. Unknown
+/// values fall back to `Normal` — a deliberately-lax mapping so a client can't
+/// break admission by sending an unrecognized string.
+fn priority_from_header(v: Option<&str>) -> Priority {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("high") | Some("1") | Some("true") => Priority::High,
+        _ => Priority::Normal,
+    }
 }
 
 /// Resolve + validate common generation params against the server caps.
@@ -248,7 +275,9 @@ async fn chat_completions(
     check_auth(&state, &headers)?;
     let (ids, max_new, temperature, top_p) = resolve_params(&state, &req)?;
     let model_id = state.inner.args.model_id.clone();
-    let mut rx = submit_request(&state, &ids, max_new, temperature, top_p)?;
+    let priority = priority_from_header(headers.get("x-peregrine-priority").and_then(|v| v.to_str().ok()));
+    let class = classify_request(&req.messages);
+    let mut rx = submit_request(&state, &ids, max_new, temperature, top_p, priority, class)?;
     let tokenizer = state.inner.tokenizer.clone();
 
     if req.stream {

@@ -79,10 +79,86 @@ impl HeatTable {
         }
     }
 
+    /// One slot's current count (0 for out-of-range) — a single atomic load, so
+    /// hot paths (cache-admission gating) can consult it without a snapshot.
+    pub fn get(&self, layer: usize, expert: usize) -> u32 {
+        self.counts.get(layer * self.n_experts + expert).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0)
+    }
+
     /// A plain snapshot of the counts, row-major `[layer * n_experts + expert]`.
     pub fn snapshot(&self) -> Vec<u32> {
         self.counts.iter().map(|c| c.load(Ordering::Relaxed)).collect()
     }
+
+    /// Restore counts from a snapshot (mismatched-length input is truncated at
+    /// the shorter of the two). Used by the cross-session persistence path so a
+    /// fresh model starts with the previous session's routing heat instead of a
+    /// cold zero table.
+    pub fn restore(&self, snapshot: &[u32]) {
+        for (c, &v) in self.counts.iter().zip(snapshot.iter()) {
+            c.store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// Total slots (`n_layers * n_experts`) — length of [`Self::snapshot`].
+    pub fn len(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// Whether the table is empty (no layers × no experts).
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+}
+
+/// Persistent Expert Residency Solver. Greedy knapsack over `(layer, expert)`
+/// pairs, maximizing total heat within `budget` bytes. Handles heterogeneous
+/// expert sizes (per-layer inter-size variation) by sorting on `heat /
+/// bytes_per_expert` — a small expert with modest heat can beat a larger cold
+/// one. Falls back to [`plan_residency`] round-robin when the heat table is
+/// all-zero. Deterministic ties (equal ratio → lower layer, lower expert).
+pub fn solve_residency_greedy(
+    counts: &[u32],
+    n_layers: usize,
+    first_dense: usize,
+    n_experts: usize,
+    bytes_per_expert: usize,
+    budget: usize,
+) -> Vec<(usize, usize)> {
+    if bytes_per_expert == 0 || n_experts == 0 || first_dense >= n_layers || budget == 0 {
+        return Vec::new();
+    }
+    // All-zero → deterministic fallback to the round-robin cold start.
+    let total: u64 = counts.iter().map(|&c| c as u64).sum();
+    if total == 0 {
+        return plan_residency(n_layers, first_dense, n_experts, bytes_per_expert, budget);
+    }
+    // Score each candidate by ratio (heat / bytes). Since sizes are currently
+    // uniform per expert, this equals heat-sorted — but the shape is right for
+    // when sizes vary (Batch 5 uses this to handle heterogeneous inter-sizes).
+    let mut cand: Vec<((usize, usize), u32)> = Vec::new();
+    for e in 0..n_experts {
+        for layer in first_dense..n_layers {
+            let heat = counts.get(layer * n_experts + e).copied().unwrap_or(0);
+            cand.push(((layer, e), heat));
+        }
+    }
+    // Sort: highest heat first; ties by (layer, expert) ascending for determinism.
+    cand.sort_by(|a, b| b.1.cmp(&a.1).then(a.0 .0.cmp(&b.0 .0)).then(a.0 .1.cmp(&b.0 .1)));
+    // Greedy fill until budget is exhausted.
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for (key, _) in cand {
+        if used + bytes_per_expert > budget {
+            continue;
+        }
+        out.push(key);
+        used += bytes_per_expert;
+        if used + bytes_per_expert > budget {
+            break;
+        }
+    }
+    out
 }
 
 /// Rank sparse `(layer, expert)` pairs by heat and take the hottest `capacity`.

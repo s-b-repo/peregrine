@@ -116,7 +116,113 @@ Five independent layers of concurrency, so this isn't re-requested:
   request and advances its prompt one `PREFILL_CHUNK` (64 tokens) at a time, round-robin, *between*
   batched decode steps — so admitting a long prompt never stalls the in-flight batch for the whole
   prefill. Chunked prefill is bit-identical to whole-prompt prefill (same causal KV build), asserted by
-  `engine_chunked_prefill_matches_reference`.
+  `engine_chunked_prefill_matches_reference`. A two-tier priority queue drains high-priority
+  admissions ahead of normal, and a latency-SLA hook shrinks / grows the working batch cap between
+  ticks (`COLI_BATCH_SLA_MS`).
+
+---
+
+## Adaptive runtime — the feedback loop over the 3-lane scheduler
+
+The 3-lane scheduler is stateless per-forward; the adaptive-runtime wave (2026-07-30) layers a
+telemetry → tuner → placement feedback loop on top of it. Every knob is env-gated and defaults to
+the historical behavior so existing benchmarks stay bit-identical, and every override is
+correctness-neutral (only latency and residency change, never the reduced values).
+
+- **Lane telemetry** — `moe_forward_concurrent` brackets each of the three lanes and the reduce
+  phase with `Instant::now()` and bumps atomic counters on a shared `LaneTimingsAccum` threaded
+  through `ForwardCtx`. Between forwards, `Model::publish_lane_timings` swap-resets the accumulator,
+  stores the sample on `Model::last_lane_timings`, and folds it into the tuners below.
+  (`crates/peregrine-model/src/lane.rs`, `concurrent.rs`, `model.rs`.)
+- **Bubble tuner + lane balancer** — `BubbleTuner` maintains an EWMA per lane (α = 0.3), declares a
+  `Bias::Toward{Cpu,Gpu,Io}` when the top lane exceeds `1.5 × max(others)` for `k = 3` consecutive
+  forwards (hysteresis defeats one-off spikes), and publishes it. `LaneBalancer::choose(gpu_resident,
+  heat)` reads that bias inside the scheduler: on `Bias::TowardGpu` a cold GPU-resident expert
+  downgrades to the CPU lane; on `Bias::TowardCpu` a hot streamed expert is a candidate to spill
+  onto the GPU (spill-upgrade path is reserved — requires on-demand upload machinery). Gated on
+  `COLI_LANE_BALANCE`.
+- **Runtime expert replication** — `Model::enqueue_expert_replicas(K)` (called from `reheat`) takes
+  the top-K hottest currently-VRAM-resident experts and enqueues prefetch reads for them so their
+  bytes also land in the CPU warm cache. Composed with the balancer above, a `TowardGpu` downgrade
+  serves the resident-but-now-CPU expert straight from RAM — no disk read. Gated on
+  `COLI_REPLICATE_K`.
+- **IoTuner** — mirrors the `PrefetchTuner` shape: EWMA over per-forward `io_us`, SQ-full-driven
+  halving, target-driven slow grow. `Model::publish_lane_timings` applies the recommendation via
+  `Reactor::set_iowq_max_workers` on every ring, deduped against the last-applied cap.
+- **Adaptive batching & priority** — `EngineHandle` holds two `mpsc::UnboundedSender`s
+  (`Priority::High`, `Priority::Normal`); the engine drains high first each tick. A `recv_priority`
+  helper uses a small current-thread runtime for the biased-`select!` blocking wait. Per-forward
+  decode wall time is EWMA-tracked and, when `COLI_BATCH_SLA_MS` is set, drives a working-cap
+  shrink/grow. `COLI_ADAPTIVE_WINDOW=N` runs prefill every Nth tick so decode gets more consecutive
+  time before yielding.
+- **Phase-aware prefetch** — `PredictSource::PhaseAware` wraps any inner source and, when the
+  Jaccard distance between the newest two frames of `RouteHistory` exceeds `threshold_bp / 10000`,
+  folds a heavy vote on the newest frame's experts. `PhaseTracker` maintains the same EWMA
+  standalone for consumers that want a raw signal (batching engine, etc.).
+- **Workload classification** — `workload::classify_str` buckets a tokenizer-decoded tail into
+  `TokenClass::{Prose, Code, Json, Math, Mixed}` from ratios of alnum / punct / digits / brace
+  shapes. Wired end-to-end: the HTTP handler classifies the last user message's tail (UTF-8-safe
+  512-char cap), stamps `EngineRequest.class`, admission calls `Model::set_workload_class`, and
+  every prefetch-context builder resolves breadth through `PrefetchPolicy::for_class`
+  (`COLI_PREFETCH_WARM_PATHS_<CLASS>` / `_HINT_PATHS_<CLASS>`, falling back to the base knobs).
+  Latest-admission-wins for a mixed batch (breadth is batch-global today).
+- **Cross-session persistence** — `RouteHistory::to_json`/`from_json` + `HeatTable::restore` +
+  `Model::save_route_stats_here` on `Drop` and `Model::try_load_route_stats` at load: `<dir>/route_stats.json`
+  survives a process restart so prefetch/residency start warm on the previous session's routing.
+  Config-tag guarded to reject stale artifacts. Same shape as the offline transition automaton
+  (`automaton.json`).
+- **Warm cache extras** — 2048-bit Bloom over resident keys short-circuits `WarmCache::get`'s
+  miss path; a negative-TTL pass (`COLI_CACHE_NEGATIVE_TTL`) evicts unhit slots early; transparent
+  zstd (`COLI_CACHE_COMPRESS`, `SlotBytes::Compressed { six, orig_lens }`) shrinks resident bytes
+  by ~2-3× at the cost of one decode per hit. Two admission/maintenance companions: a
+  **heat-threshold admission gate** (`COLI_CACHE_ADMIT_MIN_HEAT` — an expert is cached only once
+  its routing heat reaches N, filtering one-off experts; heat is bumped post-reduce so N=1 means
+  "cache from the second routing on"), and **idle-tick background recompression**
+  (`COLI_CACHE_COMPRESS_IDLE` — `WarmCache::recompress_one_cold` densifies the coldest raw slot
+  per call; the batch engine sweeps while no requests are pending, interrupting the sweep the
+  moment one arrives).
+- **Fault-tolerant I/O** — on a batched-read failure the buffered path re-issues each region via
+  `Reactor::read_exact_retry` (linear backoff, transient `EIO`/`EAGAIN`/`EINTR`). Gated on
+  `COLI_IO_RECOVERY`.
+- **Huge pages** — `advise_hugepages` (`MADV_HUGEPAGE`) applied at every ≥ 2 MB allocation choke
+  point: `AlignedBuf::with_capacity`, `Reactor::register_read_buffers`, safetensors read landing
+  buffers. Range is narrowed to whole pages inside the caller's allocation so the destructive
+  `MADV_DONTNEED` companion never touches neighboring mappings.
+- **Topology probe + NUMA pinning** — `peregrine_io::topo` reads
+  `/sys/devices/system/node/nodeN/cpulist` for the NUMA layout and
+  `/sys/bus/pci/devices/<bdf>/current_link_{speed,width}` for PCIe links; single-node fallback on
+  non-Linux keeps every caller safe against the "always at least one node" invariant. Under
+  `COLI_NUMA_PIN=1`, worker threads pin round-robin across node-grouped CPUs: the `peregrine-par`
+  pool via a std-only worker-startup hook (`set_worker_start_hook(fn(usize))`, installed by
+  `Model::load` before the pool's lazy build), and the prefetch pool at its spawn site. CPUs are
+  enumerated node-grouped, so consecutive workers fill a node before spilling to the next socket.
+- **Offline layout tool** — `peregrine-tools::peregrine-layout-reorg` consumes the `dump-routes`
+  JSON, builds per-layer co-occurrence graphs, and emits `<dir>/schedule.json` via `--method greedy`
+  (greedy nearest-neighbor), `--method louvain` (single-phase modularity maximization +
+  intra-community greedy walk), or `--method spectral` (Fiedler vector via deflated power iteration
+  on the graph Laplacian, sorted by embedding value — the classical min-cut 1-D ordering).
+  `Model::load` picks it up and, at `moe_forward_concurrent` entry, sorts each layer's streamed
+  `EPlan`s by the schedule's rank so the batched io_uring submit issues contiguous-offset reads
+  first. Bit-identical to natural-id order (the reduce uses `pos`, not submission order).
+- **WMMA autotuner** — `WmmaTuner` records per-shape `(D, I, count, max_rows) → TileConfig` EWMAs
+  and persists across sessions in `kernel_tuning.json`. The CUDA-side dispatch selector that would
+  consume this is a CUDA-only follow-up.
+- **PlanOptimizer** — folds `LaneTimings`, `BubbleTuner`, and `IoTuner` snapshots into a
+  `RuntimeTelemetry` value per forward; the /metrics endpoint (planned) scrapes it. Ticking the
+  IoTuner from here keeps the io_uring cap adjustment on a stable cadence.
+- **Hardware perf counters** — `peregrine_io::PerfCounter` is a real `perf_event_open(2)` LLC-miss
+  counter (thread-following, user-space-only to lower the paranoid bar), with the 64-byte
+  `PERF_ATTR_SIZE_VER0` attr layout hand-declared because the pinned libc doesn't export it for gnu
+  targets. `telemetry::open_l3_miss_counter` gates it on `COLI_PERF_COUNTERS=1`; every constructor
+  degrades to `None` when the kernel refuses (CI containers, paranoid ≥ 3, no PMU), so the counter
+  is an optimization input, never a dependency.
+
+**Composition.** Each forward: (1) `moe_forward_concurrent` brackets its lanes and consults
+`LaneBalancer` for per-expert placement using a live heat snapshot; (2) after the forward,
+`publish_lane_timings` swap-resets the accumulator, updates the tuners, and applies any changed
+io_uring cap; (3) on the next forward `build_balancer` reads the fresh bias and hands it to
+`ForwardCtx`. Feedback loop closed. All new state lives on `Model` and is safe to expose to a
+`&self` scrape (atomics + `parking_lot::Mutex`).
 
 ---
 
@@ -152,17 +258,27 @@ kernels are vendored here under `cuda/`):
 
 ```
 crates/
-  peregrine-core/     # QT formats (fmt 0..4), Cfg, safetensors index      (↔ c/st.h)
+  peregrine-core/     # QT formats (fmt 0..4), Cfg, safetensors index (zstd-aware),
+                      #   compress (zstd codec)                       (↔ c/st.h)
   peregrine-kernels/  # std::arch int4/int8/int2 + f32 matmul, token-exact  (↔ matmul_qt_ex, glm.c:978)
-  peregrine-io/       # io-uring reactor (I/O lane, O_DIRECT), slab arena, LRU/pin (↔ c/uring.h, tier.h)
+  peregrine-io/       # io-uring reactor (I/O lane, O_DIRECT, fadvise batched, retry),
+                      #   slab arena (generation-tagged), LRU/pin, warm cache
+                      #   (Bloom + optional zstd), mem hints (hugepages, NUMA), topology probe
+                      #                                                (↔ c/uring.h, tier.h)
   peregrine-cuda/     # -sys FFI to backend_cuda.h + build.rs(nvcc) + wrapper
-  peregrine-model/    # MLA, router, MoE, DSA, MTP, prefetch prediction (predict.rs)
-                      #   + the N-ring 3-lane scheduler (concurrent.rs)   (↔ glm.c forward)
+  peregrine-model/    # MLA, router, MoE, DSA, MTP, prefetch prediction (predict.rs w/ PhaseAware),
+                      #   lane telemetry + bubble tuner + lane balancer (lane.rs),
+                      #   IoTuner (iotune.rs), PhaseTracker + workload classifier (workload.rs),
+                      #   WmmaTuner (wmma_tune.rs), PlanOptimizer + telemetry (telemetry.rs),
+                      #   + the N-ring 3-lane scheduler (concurrent.rs) (↔ glm.c forward)
   peregrine-sched/    # CPU∥SSD streaming core (moe_streamed) + reconstruct
   peregrine-par/      # persistent scoped worker pool, bit-identical to serial (std-only)
   peregrine-engine/   # binary `peregrine`: CLI (demo/build/bench/build-automaton/dump-routes)
                       #   + stdio serve protocol (drop-in for c/glm)
   peregrine-serve/    # binary `peregrine-serve`: OpenAI HTTP (axum/tokio) + continuous batching
+                      #   (two-tier priority queue, adaptive batch cap, adaptive prefill window)
+  peregrine-tools/    # binary `peregrine-layout-reorg`: offline expert re-layout
+                      #   (greedy / Louvain), emits <dir>/schedule.json for the loader
 ```
 
 - Build: `cargo build --release --features cuda`; CPU-only drops the `cuda` feature (pure-CPU,

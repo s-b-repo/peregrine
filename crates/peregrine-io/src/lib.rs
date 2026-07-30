@@ -19,14 +19,22 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod cache;
+pub mod mem;
+pub mod perf;
 pub mod ring;
 pub mod slab;
 pub mod tier;
+pub mod topo;
 pub mod warmcache;
 
 pub use cache::ExpertCache;
+pub use mem::{
+    advise_dontneed, advise_dontneed_slice, advise_hugepages, advise_hugepages_slice,
+    hugepage_disabled, mbind_to_node, pin_current_thread,
+};
+pub use perf::PerfCounter;
 pub use ring::{pread_many, probe_direct, read_file, Reactor, ReadReq};
-pub use slab::{align_down, align_up, AlignedBuf, Bytes, SlabPool, ALIGN};
+pub use slab::{align_down, align_up, AlignedBuf, Bytes, SlabHandle, SlabPool, ALIGN};
 pub use tier::{decay, lfru_score, pick_lfru, pick_swap, Swap};
 pub use warmcache::{ExpertSlab, WarmCache};
 
