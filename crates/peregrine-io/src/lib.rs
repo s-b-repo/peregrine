@@ -18,6 +18,16 @@
 // panicking error handling in library code.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+/// Report a failed best-effort operation (advisory kernel hints, cleanup,
+/// shutdown signalling). Such failures are correctness-neutral by design —
+/// they must never abort inference — but they should not vanish either:
+/// set `COLI_DEBUG=1` to surface them on stderr.
+pub fn note_advisory_err(op: &str, err: &dyn std::fmt::Display) {
+    if std::env::var_os("COLI_DEBUG").is_some() {
+        eprintln!("[peregrine advisory] {op}: {err}");
+    }
+}
+
 pub mod cache;
 pub mod mem;
 pub mod perf;
@@ -72,6 +82,6 @@ mod arena_tests {
     fn cap_malloc_arenas_runs() {
         // Must link and run without panicking; the boolean result depends on the
         // platform and environment (so it is not asserted).
-        let _ = super::cap_malloc_arenas();
+        super::cap_malloc_arenas();
     }
 }

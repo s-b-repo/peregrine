@@ -39,6 +39,14 @@ pub const PAR_ATTN_MIN: usize = 2;
 pub const PAR_MOE_MIN: usize = 2;
 pub const PAR_MATMUL_MIN: usize = 8;
 
+/// Advisory-failure note for this std-only crate (it deliberately has no
+/// dependency on `peregrine-io`'s shared reporter): visible with COLI_DEBUG=1.
+fn note_advisory(msg: &str) {
+    if std::env::var_os("COLI_DEBUG").is_some() {
+        eprintln!("[peregrine advisory] {msg}");
+    }
+}
+
 thread_local! {
     /// True on the pool's own worker threads, so a *nested* `par_*` (e.g. an
     /// expert's matmul inside a parallel MoE) runs serial instead of dispatching —
@@ -190,7 +198,7 @@ fn worker_loop(index: usize, rx: Receiver<Job>) {
         hook(index);
     }
     IN_POOL.with(|c| c.set(true)); // mark this thread so nested par_* run serial
-    while let Ok(job) = rx.recv() {
+    while let Ok(job) = rx.recv() { // audit-allow: recv's only Err is Disconnected = clean shutdown
         // SAFETY: `job.task.0` points to a `dyn Fn + Sync` owned by the dispatcher's
         // stack frame, which blocks on `job.done` (and its siblings) before that
         // frame unwinds — so this deref cannot dangle; `Sync` makes the read defined.
@@ -204,7 +212,9 @@ fn worker_loop(index: usize, rx: Receiver<Job>) {
             job.panicked.store(true, Ordering::Relaxed);
         }
         // Always signal, even on a caught panic, so the barrier can't deadlock.
-        let _ = job.done.send(());
+        if job.done.send(()).is_err() {
+            note_advisory("pool done-signal: dispatcher already gone (unwinding)");
+        }
     }
 }
 
@@ -280,9 +290,13 @@ impl Pool {
                 }
             }
         }
-        // Barrier — the soundness invariant above.
+        // Barrier — the soundness invariant above. A recv error means the done
+        // channel closed (no further signal can ever arrive), so stop waiting.
         for _ in 0..sent {
-            let _ = done_rx.recv();
+            if done_rx.recv().is_err() {
+                note_advisory("pool barrier: done channel closed early");
+                break;
+            }
         }
         if panicked.load(Ordering::Relaxed) {
             // debug/unwind builds only (release aborts on panic); never a deadlock.
@@ -386,7 +400,9 @@ impl Drop for Pool {
     fn drop(&mut self) {
         self.job_txs.clear(); // drop senders → workers' recv() errors → they exit
         for h in self.handles.drain(..) {
-            let _ = h.join();
+            if h.join().is_err() {
+                note_advisory("pool worker panicked during shutdown");
+            }
         }
     }
 }

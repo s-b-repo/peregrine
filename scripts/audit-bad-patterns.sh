@@ -30,7 +30,8 @@ mapfile -t FILES < <(find crates -path '*/src/*' -name '*.rs' -type f ! -path 'c
 # scan <regex>: matching non-comment lines as "file:line:code"
 scan() {
   grep -rEn -- "$1" "${FILES[@]}" 2>/dev/null \
-    | grep -vE ':[0-9]+:[[:space:]]*(//|///|\*)'
+    | grep -vE ':[0-9]+:[[:space:]]*(//|///|\*)' \
+    | grep -v 'audit-allow:'
 }
 
 # run_section <out-var> <pattern...>: print per-pattern counts (+ lines unless --strict),
@@ -56,12 +57,48 @@ P_PATTERNS=(
   '\.unwrap_err\(\)' '\.expect_err\('
   'panic!\(' 'unreachable!\(' 'todo!\(' 'unimplemented!\('
 )
+# B: silent error swallowing — a discarded Result hides real failures. Advisory
+# operations must handle the Err explicitly (peregrine_io::note_advisory_err,
+# COLI_DEBUG=1 surfaces them); control-flow errors must match concrete variants
+# (`Err(VarError::NotPresent)`, `TryRecvError::Empty`) — never a bare wildcard.
+# Every discard position matches BOTH the `_` wildcard and the `_name` binding
+# (`Err(_e)`, `map_err(|_err|`), so renaming the ignored binding can't dodge the
+# gate. `or_else(|_` also catches `unwrap_or_else(|_` / `map_or_else(|_` by
+# substring. `Err(e) => {}` binds the error and still drops it — same bug.
+B_PATTERNS=(
+  'let[[:space:]]+_[[:space:]]*='
+  'if[[:space:]]+let[[:space:]]+Ok\('
+  'while[[:space:]]+let[[:space:]]+Ok\('
+  'Err\(_[a-zA-Z0-9_]*\)'
+  'Err\(\.\.\)'
+  'Err\([a-zA-Z0-9_]+\)[[:space:]]*=>[[:space:]]*(\{[[:space:]]*\}|\(\))'
+  'map_err\(\|_[a-zA-Z0-9_]*\|'
+  'or_else\(\|_[a-zA-Z0-9_]*\|'
+  '\.to_str\(\)\.ok\(\)'
+  '\.ok\(\)[[:space:]]*;'
+  '\.err\(\)[[:space:]]*;'
+)
 # U: undefined-behavior / concurrency footguns. `transmute` is handled separately
 # below so peregrine-par's single documented lifetime-erasure can be exempted.
-U_PATTERNS=('\bstatic[[:space:]]+mut\b' '\bmem::forget\b' 'assume_init\(\)')
+U_PATTERNS=(
+  '\bstatic[[:space:]]+mut\b' '\bmem::forget\b' 'assume_init\(\)'
+  'unwrap_unchecked'
+)
 
 echo "== peregrine bad-patterns audit (${#FILES[@]} files) =="
 echo "[P] panicking error handling  (STRICT)"; run_section P_TOTAL "${P_PATTERNS[@]}"
+echo "[B] silent error swallowing   (STRICT)"; run_section B_TOTAL "${B_PATTERNS[@]}"
+# `let _named = fallible()` swallows exactly like `let _ =` while dodging the
+# wildcard regex, so it's strict too — EXCEPT the RAII keep-alive idiom
+# (`let _g = gpu_guard();`), where the named binding is the point: `let _ =`
+# would drop the guard immediately, which would be the actual bug.
+LETNAMED="$(scan 'let[[:space:]]+_[a-zA-Z0-9_]+[[:space:]]*=' | grep -vF 'guard()' || true)"
+LN_C="$(printf '%s' "$LETNAMED" | grep -c . || true)"
+if [ "$LN_C" -gt 0 ]; then
+  printf '  %-40s %d\n' 'let _named = (non-guard)' "$LN_C"
+  [ "$STRICT" -eq 0 ] && printf '%s\n' "$LETNAMED" | sed 's/^/      /'
+  B_TOTAL=$((B_TOTAL + LN_C))
+fi
 echo "[U] UB / concurrency footguns (STRICT)"; run_section U_TOTAL "${U_PATTERNS[@]}"
 # transmute is a strict footgun everywhere EXCEPT peregrine-par, which encapsulates
 # one documented lifetime-erasure (borrowed closure → persistent worker pool, made
@@ -83,9 +120,19 @@ I_TOTAL="$(printf '%s' "$UNSAFE" | grep -c . || true)"
 echo "[I] unsafe outside peregrine-io/cuda/kernels (INFO): $I_TOTAL"
 [ "$I_TOTAL" -gt 0 ] && [ "$STRICT" -eq 0 ] && printf '%s\n' "$UNSAFE" | sed 's/^/      /'
 
+# L: `let Ok(x) = … else { … }` drops the Err on the floor — the let-else twin
+# of the gated `if let Ok(`. The codebase uses it as the sanctioned style for
+# best-effort reads (sysfs probes, optional JSON caches), so it is reported for
+# review rather than gated; promoting it to strict means ErrorKind-aware
+# matches at every site. See docs/BAD_PATTERNS.md.
+LETELSE="$(scan '\blet[[:space:]]+Ok\(' | grep -vE '(if|while)[[:space:]]+let[[:space:]]+Ok\(' || true)"
+L_TOTAL="$(printf '%s' "$LETELSE" | grep -c . || true)"
+echo "[L] let-else Ok(..) err-discards (INFO): $L_TOTAL"
+[ "$L_TOTAL" -gt 0 ] && [ "$STRICT" -eq 0 ] && printf '%s\n' "$LETELSE" | sed 's/^/      /'
+
 echo "---"
-echo "P=$P_TOTAL (strict)  U=$U_TOTAL (strict)  I=$I_TOTAL (info)"
-if [ "$STRICT" -eq 1 ] && { [ "$P_TOTAL" -gt 0 ] || [ "$U_TOTAL" -gt 0 ]; }; then
+echo "P=$P_TOTAL (strict)  B=$B_TOTAL (strict)  U=$U_TOTAL (strict)  I=$I_TOTAL (info)  L=$L_TOTAL (info)"
+if [ "$STRICT" -eq 1 ] && { [ "$P_TOTAL" -gt 0 ] || [ "$B_TOTAL" -gt 0 ] || [ "$U_TOTAL" -gt 0 ]; }; then
   echo "FAIL: strict-section hits present"; exit 1
 fi
 echo "OK"

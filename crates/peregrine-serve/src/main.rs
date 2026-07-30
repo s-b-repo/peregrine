@@ -245,13 +245,26 @@ fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>, usiz
     Ok((ids, max_new, temperature, top_p))
 }
 
+/// A header value as UTF-8, treating a non-UTF-8 value as absent — the lax
+/// parse both header consumers (auth, priority) want. The rejection is
+/// reported (`COLI_DEBUG=1`) rather than silently `.ok()`-dropped.
+fn header_utf8(v: &axum::http::HeaderValue) -> Option<&str> {
+    match v.to_str() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            peregrine_core::note_advisory_err("non-UTF-8 request header ignored", &e);
+            None
+        }
+    }
+}
+
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(want) = state.inner.args.api_key.as_deref() else {
         return Ok(());
     };
     let got = headers
         .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
+        .and_then(header_utf8)
         .and_then(|s| s.strip_prefix("Bearer "));
     if got == Some(want) {
         Ok(())
@@ -280,7 +293,7 @@ async fn chat_completions(
     check_auth(&state, &headers)?;
     let (ids, max_new, temperature, top_p) = resolve_params(&state, &req)?;
     let model_id = state.inner.args.model_id.clone();
-    let priority = priority_from_header(headers.get("x-peregrine-priority").and_then(|v| v.to_str().ok()));
+    let priority = priority_from_header(headers.get("x-peregrine-priority").and_then(header_utf8));
     let class = classify_request(&req.messages);
     let mut rx = submit_request(&state, &ids, max_new, temperature, top_p, priority, class)?;
     let tokenizer = state.inner.tokenizer.clone();
@@ -298,24 +311,40 @@ async fn chat_completions(
                     EngineOut::Token(t) => {
                         out_ids.push(t);
                         // incremental decode: emit the newly-completed suffix
-                        if let Ok(text) = tokenizer.decode(&out_ids) {
-                            if text.len() > prev.len() {
-                                let ev = chunk_event(&mid, Some(&text[prev.len()..]), None);
-                                if sse_tx.send(Ok(ev)).await.is_err() {
-                                    return; // client disconnected
+                        match tokenizer.decode(&out_ids) {
+                            Ok(text) => {
+                                if text.len() > prev.len() {
+                                    let ev = chunk_event(&mid, Some(&text[prev.len()..]), None);
+                                    if sse_tx.send(Ok(ev)).await.is_err() {
+                                        return; // client disconnected
+                                    }
+                                    prev = text;
                                 }
-                                prev = text;
+                            }
+                            Err(e) => {
+                                // end the stream with an error event instead of
+                                // silently dropping the delta
+                                if sse_tx.send(Ok(sse_error(&format!("decode: {e}")))).await.is_err() {
+                                    peregrine_core::note_advisory_err("SSE decode-error event", &"client already disconnected");
+                                }
+                                return;
                             }
                         }
                     }
                     EngineOut::Error(m) => {
-                        let _ = sse_tx.send(Ok(sse_error(&m))).await;
+                        if sse_tx.send(Ok(sse_error(&m))).await.is_err() {
+                            peregrine_core::note_advisory_err("SSE error event", &"client already disconnected");
+                        }
                         return;
                     }
                 }
             }
-            let _ = sse_tx.send(Ok(chunk_event(&mid, None, Some("stop")))).await;
-            let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
+            // tail frames: a send error just means the client hung up first
+            if sse_tx.send(Ok(chunk_event(&mid, None, Some("stop")))).await.is_err()
+                || sse_tx.send(Ok(Event::default().data("[DONE]"))).await.is_err()
+            {
+                peregrine_core::note_advisory_err("SSE stream tail", &"client disconnected before [DONE]");
+            }
         });
         let stream = ReceiverStream::new(sse_rx);
         Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
@@ -379,9 +408,10 @@ fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Resul
     let mut giga = peregrine_token::GigaTokenizer::from_hf_json_bytes(&json)
         .map_err(|e| format!("gigatoken: {e}"))?;
 
-    // warmup (fills the pretoken memo cache the way a running server would)
+    // warmup (fills the pretoken memo cache the way a running server would;
+    // the ids themselves are not needed here)
     for l in lines.iter().take(64) {
-        let _ = giga.encode(l);
+        giga.encode(l);
     }
 
     let t0 = std::time::Instant::now();
@@ -428,7 +458,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("peregrine-serve listening on http://{addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                eprintln!("peregrine-serve: ctrl-c handler failed ({e}); shutting down");
+            }
             eprintln!("peregrine-serve shutting down");
         })
         .await?;

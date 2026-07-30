@@ -372,7 +372,7 @@ impl SafeTensors {
 /// `unsafe` `libc::madvise` in `peregrine-io::mem`.
 fn maybe_hugepage(buf: &mut [u8]) {
     if buf.len() >= 2 * 1024 * 1024 {
-        let _ = peregrine_io::advise_hugepages_slice(buf);
+        peregrine_io::advise_hugepages_slice(buf);
     }
 }
 
@@ -471,7 +471,11 @@ mod tests {
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("coli_st_{}_{}", std::process::id(), tag));
-        let _ = std::fs::remove_dir_all(&d);
+        if let Err(e) = std::fs::remove_dir_all(&d) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                peregrine_io::note_advisory_err("pre-clean test tmpdir", &e);
+            }
+        }
         d
     }
 

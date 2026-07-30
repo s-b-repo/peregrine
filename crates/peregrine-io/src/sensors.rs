@@ -108,6 +108,6 @@ mod tests {
         let mut m = EnergyMeter::new();
         let first = m.delta_uj();
         assert!(first.is_none() || energy_uj().is_none() || first.is_some());
-        let _second = m.delta_uj(); // either None (no RAPL) or a small delta
+        let _second = m.delta_uj(); // audit-allow: exercised for no-panic only — either None (no RAPL) or a small delta
     }
 }
