@@ -9,12 +9,14 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod compress;
 pub mod config;
 pub mod dtype;
 pub mod pack;
 pub mod qt;
 pub mod safetensors;
 
+pub use compress::{decode, encode, Compression};
 pub use config::Cfg;
 pub use dtype::{bf16_to_f32, f16_to_f32, Dtype};
 pub use qt::{detect_group_size, QtFmt, QtInfo};

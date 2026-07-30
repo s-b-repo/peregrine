@@ -25,10 +25,69 @@ fn slab_bytes(s: &ExpertSlab) -> usize {
     s.iter().map(|(w, sc)| w.len() + sc.len()).sum()
 }
 
+/// Compress each of a slab's six regions into a `SlotBytes::Compressed`
+/// variant. Returns `None` on a codec failure (the caller then stores the raw
+/// slab). The Compressed variant also carries `orig_lens` so decompression
+/// can pre-size and validate.
+fn encode_slab(s: &ExpertSlab) -> Option<(SlotBytes, usize)> {
+    // 6 regions in gate/up/down × (weight, scale) order — the layout the reader
+    // and the `pack_slab` builder both use, so the six-Vec array preserves it.
+    let mut six: [Vec<u8>; 6] = Default::default();
+    let mut orig: [usize; 6] = [0; 6];
+    let mut idx = 0usize;
+    for (w, sc) in s.iter() {
+        let ew = zstd::stream::encode_all(&w[..], 3).ok()?;
+        orig[idx] = w.len();
+        six[idx] = ew;
+        idx += 1;
+        let es = zstd::stream::encode_all(&sc[..], 3).ok()?;
+        orig[idx] = sc.len();
+        six[idx] = es;
+        idx += 1;
+    }
+    let compressed_bytes: usize = six.iter().map(|v| v.len()).sum();
+    Some((SlotBytes::Compressed { six, orig_lens: orig }, compressed_bytes))
+}
+
+/// Materialize an `ExpertSlab` from a stored `SlotBytes`. For `Raw` this is a
+/// deep clone (matching the previous `.cloned()` at the call site). For
+/// `Compressed` it decodes each region into a fresh `Vec` and assembles the
+/// three (weight, scale) pairs. Codec failures panic-free: they degrade to
+/// empty `Bytes` for the failing region — an upstream miss is preferable to a
+/// panic, and the caller will re-stream on the next attempt.
+fn materialize(sb: &SlotBytes) -> ExpertSlab {
+    match sb {
+        SlotBytes::Raw(s) => s.clone(),
+        SlotBytes::Compressed { six, orig_lens } => {
+            let decode = |i: usize| -> Bytes {
+                match zstd::stream::decode_all(&six[i][..]) {
+                    Ok(v) if v.len() == orig_lens[i] => Bytes::from(v),
+                    _ => Bytes::from(Vec::new()),
+                }
+            };
+            [
+                (decode(0), decode(1)),
+                (decode(2), decode(3)),
+                (decode(4), decode(5)),
+            ]
+        }
+    }
+}
+
+/// A cached expert slab, held either verbatim or transparently zstd-compressed.
+/// `Compressed` shrinks resident footprint at the cost of one zstd decode per
+/// hit; the choice per slot is fixed at admission time by `COLI_CACHE_COMPRESS`.
+/// Callers never observe the difference — [`WarmCache::get`] materializes a
+/// byte-identical [`ExpertSlab`] either way.
+enum SlotBytes {
+    Raw(ExpertSlab),
+    Compressed { six: [Vec<u8>; 6], orig_lens: [usize; 6] },
+}
+
 struct Slot {
     used: u64,
     bytes: usize,
-    data: ExpertSlab,
+    data: SlotBytes,
     /// This slot was populated by the prefetch lane (`insert_prefetched`), not a
     /// critical-path miss. Drives the `prefetch_used`/`prefetch_wasted` accounting.
     from_prefetch: bool,
@@ -43,12 +102,75 @@ struct Slot {
     prio: u32,
 }
 
+/// Small Bloom filter over currently-resident `(layer, expert)` keys. Two hash
+/// positions per key, 2048 bits (256 bytes). Optimizes the miss path — if the
+/// bloom returns "definitely not present" we skip the HashMap probe. False
+/// positives fall through to the HashMap so correctness is unchanged.
+///
+/// Rebuilt after each eviction batch (via [`Bloom::rebuild`]) so we don't have
+/// to track per-slot removal (a counting Bloom would double the space).
+struct Bloom {
+    bits: [u64; 32],
+}
+
+impl Bloom {
+    const N_BITS: u32 = 32 * 64; // 2048
+
+    fn new() -> Bloom {
+        Bloom { bits: [0; 32] }
+    }
+
+    fn hashes(key: (u32, u32)) -> (u32, u32) {
+        // Two independent, cheap non-cryptographic hashes derived by FNV-like
+        // mixing. Sufficient for a hint at this scale.
+        let mut a = 0x811c9dc5u32;
+        a ^= key.0;
+        a = a.wrapping_mul(0x01000193);
+        a ^= key.1;
+        a = a.wrapping_mul(0x01000193);
+
+        let mut b = 0xdeadbeefu32;
+        b ^= key.1.rotate_left(13);
+        b = b.wrapping_mul(0x9e3779b1);
+        b ^= key.0.rotate_left(7);
+        b = b.wrapping_mul(0x9e3779b1);
+
+        (a % Self::N_BITS, b % Self::N_BITS)
+    }
+
+    fn add(&mut self, key: (u32, u32)) {
+        let (h1, h2) = Self::hashes(key);
+        self.bits[(h1 / 64) as usize] |= 1u64 << (h1 % 64);
+        self.bits[(h2 / 64) as usize] |= 1u64 << (h2 % 64);
+    }
+
+    /// `false` ⇒ definitely absent; `true` ⇒ probably present (fall through to
+    /// the exact map).
+    fn probably_contains(&self, key: (u32, u32)) -> bool {
+        let (h1, h2) = Self::hashes(key);
+        let b1 = self.bits[(h1 / 64) as usize] & (1u64 << (h1 % 64)) != 0;
+        let b2 = self.bits[(h2 / 64) as usize] & (1u64 << (h2 % 64)) != 0;
+        b1 && b2
+    }
+
+    fn clear(&mut self) {
+        self.bits = [0; 32];
+    }
+}
+
 /// Bounded-by-bytes LRU cache of expert slabs, keyed by `(layer, expert)`.
 pub struct WarmCache {
     budget: usize,
     used: usize,
     map: HashMap<(u32, u32), Slot>,
     clock: u64,
+    /// Bloom hint over resident keys. Rebuilt on evictions; consulted in the
+    /// miss-fast-path of `contains`/`get`.
+    bloom: Bloom,
+    /// Negative-cache TTL. Slots that haven't been hit in this many `clock`
+    /// ticks become eligible for eager eviction ahead of pure LRU order. `0`
+    /// disables (default). Set via `COLI_CACHE_NEGATIVE_TTL`.
+    negative_ttl: u64,
     pub hits: u64,
     pub misses: u64,
     /// expert reads on the **critical path** (a main-lane miss streamed them).
@@ -75,16 +197,34 @@ pub struct WarmCache {
     /// speculative reads whose opt-in re-read verification found differing bytes —
     /// always 0 in a correct system; nonzero signals a real I/O bug.
     pub verify_mismatch: u64,
+    /// Fast-miss decisions the Bloom filter made (for diagnostics).
+    pub bloom_skips: u64,
+    /// Whether new admissions compress their slabs (`COLI_CACHE_COMPRESS=1`).
+    /// Fixed at construction; changing the env mid-process doesn't retroactively
+    /// compress or decompress existing slots.
+    compress_on_admit: bool,
+    /// Cumulative resident bytes we would have held without compression —
+    /// diagnostic to observe the compression win.
+    pub uncompressed_bytes_seen: u64,
+    /// Cumulative bytes actually admitted (post-compression when enabled).
+    pub compressed_bytes_seen: u64,
 }
 
 impl WarmCache {
     /// A cache bounded to `budget_bytes` of resident expert slabs.
     pub fn new(budget_bytes: usize) -> WarmCache {
+        let ttl: u64 = std::env::var("COLI_CACHE_NEGATIVE_TTL")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let compress = matches!(std::env::var("COLI_CACHE_COMPRESS").as_deref(), Ok("1") | Ok("true"));
         WarmCache {
             budget: budget_bytes,
             used: 0,
             map: HashMap::new(),
             clock: 0,
+            bloom: Bloom::new(),
+            negative_ttl: ttl,
             hits: 0,
             misses: 0,
             disk_reads: 0,
@@ -95,7 +235,50 @@ impl WarmCache {
             prefetch_wasted: 0,
             fadvise_hints: 0,
             verify_mismatch: 0,
+            bloom_skips: 0,
+            compress_on_admit: compress,
+            uncompressed_bytes_seen: 0,
+            compressed_bytes_seen: 0,
         }
+    }
+
+    /// Chainable override of the compress-on-admit flag. Useful in tests where
+    /// mutating `COLI_CACHE_COMPRESS` at runtime would race with parallel test
+    /// threads sharing the process env.
+    pub fn with_compression(mut self, on: bool) -> WarmCache {
+        self.compress_on_admit = on;
+        self
+    }
+
+    /// Compress the coldest still-raw slot in place, freeing the byte
+    /// difference from the budget accounting. Designed for idle ticks — the
+    /// engine calls this between forwards when no requests are pending, so a
+    /// cache admitted uncompressed (fast admits on the hot path) gradually
+    /// densifies in the background. Returns the bytes saved (`0` when nothing
+    /// was recompressed: every slot already compressed, empty cache, or the
+    /// coldest raw slot didn't shrink). One slot per call keeps the pause
+    /// bounded; call repeatedly while idle.
+    pub fn recompress_one_cold(&mut self) -> usize {
+        // Coldest = smallest `used` clock among Raw slots. Priority is ignored:
+        // recompression keeps the bytes resident, so protection is unaffected.
+        let victim = self
+            .map
+            .iter()
+            .filter(|(_, s)| matches!(s.data, SlotBytes::Raw(_)))
+            .min_by_key(|(_, s)| s.used)
+            .map(|(k, _)| *k);
+        let Some(key) = victim else { return 0 };
+        let Some(slot) = self.map.get_mut(&key) else { return 0 };
+        let SlotBytes::Raw(slab) = &slot.data else { return 0 };
+        let Some((compressed, new_bytes)) = encode_slab(slab) else { return 0 };
+        if new_bytes >= slot.bytes {
+            return 0; // incompressible — leave raw (decode cost for no gain)
+        }
+        let saved = slot.bytes - new_bytes;
+        self.used -= saved;
+        slot.bytes = new_bytes;
+        slot.data = compressed;
+        saved
     }
 
     pub fn budget(&self) -> usize {
@@ -111,13 +294,27 @@ impl WarmCache {
         self.map.is_empty()
     }
     pub fn contains(&self, key: (u32, u32)) -> bool {
+        // Bloom fast-path: a "definitely absent" answer skips the HashMap probe.
+        // A "probably present" answer falls through to the exact map — false
+        // positives are safe (the HashMap gives the true answer).
+        if !self.bloom.probably_contains(key) {
+            return false;
+        }
         self.map.contains_key(&key)
     }
 
-    /// Look up an expert slab. On a hit, bumps its recency and returns the bytes;
-    /// on a miss returns `None` (the caller streams from disk, then [`Self::insert`]s).
-    pub fn get(&mut self, key: (u32, u32)) -> Option<&ExpertSlab> {
+    /// Look up an expert slab. On a hit, bumps its recency and returns a
+    /// (possibly decompressed) [`ExpertSlab`] clone; on a miss returns `None`
+    /// (the caller streams from disk, then [`Self::insert`]s). Returns owned
+    /// because compressed slots materialize their bytes fresh per hit.
+    pub fn get(&mut self, key: (u32, u32)) -> Option<ExpertSlab> {
         self.clock += 1;
+        // Bloom fast-miss: skip the HashMap probe entirely on "definitely absent".
+        if !self.bloom.probably_contains(key) {
+            self.misses += 1;
+            self.bloom_skips += 1;
+            return None;
+        }
         let now = self.clock;
         let mut first_prefetch_hit = false;
         let hit = match self.map.get_mut(&key) {
@@ -136,11 +333,25 @@ impl WarmCache {
             if first_prefetch_hit {
                 self.prefetch_used += 1;
             }
-            self.map.get(&key).map(|s| &s.data)
+            self.map.get(&key).map(|s| materialize(&s.data))
         } else {
             self.misses += 1;
             None
         }
+    }
+
+    /// Rebuild the Bloom hint from the current resident set. Called after any
+    /// eviction so the hint stays tight (deletes-invalidate the flat bit array).
+    fn rebuild_bloom(&mut self) {
+        self.bloom.clear();
+        for &key in self.map.keys() {
+            self.bloom.add(key);
+        }
+    }
+
+    /// The negative-cache TTL (clock ticks since last hit). `0` disables.
+    pub fn negative_ttl(&self) -> u64 {
+        self.negative_ttl
     }
 
     /// Record that a miss streamed one expert from disk at `layer`. Kept separate
@@ -190,6 +401,7 @@ impl WarmCache {
     pub fn clear(&mut self) {
         self.map.clear();
         self.used = 0;
+        self.bloom.clear();
         self.hits = 0;
         self.misses = 0;
         self.disk_reads = 0;
@@ -200,6 +412,7 @@ impl WarmCache {
         self.prefetch_wasted = 0;
         self.fadvise_hints = 0;
         self.verify_mismatch = 0;
+        self.bloom_skips = 0;
     }
 
     /// Insert (or refresh) an expert slab streamed on the **critical path**,
@@ -221,25 +434,49 @@ impl WarmCache {
     fn insert_inner(&mut self, key: (u32, u32), data: ExpertSlab, from_prefetch: bool) {
         self.clock += 1;
         let now = self.clock;
-        let incoming = slab_bytes(&data);
+        let raw_bytes = slab_bytes(&data);
+        // Encode the payload into whichever SlotBytes representation is active.
+        // `incoming` counts the resident footprint the eviction policy sees.
+        // Codec failure silently degrades to `Raw` (correctness-neutral).
+        let (slot_data, incoming) = if self.compress_on_admit {
+            match encode_slab(&data) {
+                Some((sb, compressed_bytes)) => (sb, compressed_bytes),
+                None => (SlotBytes::Raw(data), raw_bytes),
+            }
+        } else {
+            (SlotBytes::Raw(data), raw_bytes)
+        };
+        self.uncompressed_bytes_seen = self.uncompressed_bytes_seen.saturating_add(raw_bytes as u64);
+        self.compressed_bytes_seen = self.compressed_bytes_seen.saturating_add(incoming as u64);
+        let was_new;
         match self.map.get_mut(&key) {
             Some(slot) => {
                 self.used = self.used - slot.bytes + incoming;
                 slot.bytes = incoming;
-                slot.data = data;
+                slot.data = slot_data;
                 slot.used = now;
                 // refreshing overwrites provenance: this is now a fresh fetch, so
                 // re-arm the used/wasted tracking from the new source.
                 slot.from_prefetch = from_prefetch;
                 slot.ever_hit = false;
+                was_new = false;
             }
             None => {
                 self.used += incoming;
                 self.map
-                    .insert(key, Slot { used: now, bytes: incoming, data, from_prefetch, ever_hit: false, prio: 0 });
+                    .insert(key, Slot { used: now, bytes: incoming, data: slot_data, from_prefetch, ever_hit: false, prio: 0 });
+                was_new = true;
             }
         }
-        self.evict_to_budget();
+        if was_new {
+            self.bloom.add(key);
+        }
+        let evicted = self.evict_to_budget();
+        if evicted {
+            // Slot removals invalidate flat Bloom bits — rebuild from the current
+            // resident set. Cheap: ≤ 32 words × slot count.
+            self.rebuild_bloom();
+        }
     }
 
     /// Set one resident slot's eviction-protection score (no-op if not resident).
@@ -275,8 +512,35 @@ impl WarmCache {
 
     /// Evict the least-recently-used slots until `used <= budget`, always keeping
     /// at least one resident (the just-touched newcomer, which has the max clock,
-    /// is never the LRU victim).
-    fn evict_to_budget(&mut self) {
+    /// is never the LRU victim). Returns whether at least one slot was removed
+    /// (so the caller can decide to rebuild the Bloom hint).
+    fn evict_to_budget(&mut self) -> bool {
+        let mut removed = false;
+        // Negative-cache pass first: eagerly drop slots that haven't been hit
+        // within `negative_ttl` clock ticks, regardless of priority. Prevents a
+        // resident-but-cold slab from squatting on cache room a genuinely-hot
+        // stream would use. Disabled at TTL = 0.
+        if self.negative_ttl > 0 && self.map.len() > 1 {
+            let cutoff = self.clock.saturating_sub(self.negative_ttl);
+            let stale: Vec<(u32, u32)> = self
+                .map
+                .iter()
+                .filter(|(_, s)| s.used < cutoff && s.prio == 0)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in stale {
+                if self.map.len() <= 1 {
+                    break;
+                }
+                if let Some(s) = self.map.remove(&k) {
+                    self.used -= s.bytes;
+                    if s.from_prefetch && !s.ever_hit {
+                        self.prefetch_wasted += 1;
+                    }
+                    removed = true;
+                }
+            }
+        }
         while self.used > self.budget && self.map.len() > 1 {
             // lowest (priority, recency) is the victim: unprotected slabs go first,
             // and within a priority the least-recently-used, exactly as before.
@@ -287,8 +551,10 @@ impl WarmCache {
                 if s.from_prefetch && !s.ever_hit {
                     self.prefetch_wasted += 1;
                 }
+                removed = true;
             }
         }
+        removed
     }
 
     pub fn hit_rate(&self) -> f64 {
@@ -308,6 +574,74 @@ mod tests {
     fn slab(w: usize, s: usize) -> ExpertSlab {
         let region = || (Bytes::from(vec![0u8; w]), Bytes::from(vec![0u8; s]));
         [region(), region(), region()]
+    }
+
+    /// A slab whose bytes are deterministic and non-uniform, so zstd actually
+    /// finds redundancy (all-zero payloads compress to ~4 bytes each and don't
+    /// stress the round-trip machinery interestingly).
+    fn patterned_slab(w: usize, s: usize) -> ExpertSlab {
+        let mkw: Vec<u8> = (0..w).map(|k| (k % 251) as u8).collect();
+        let mks: Vec<u8> = (0..s).map(|k| (k.wrapping_add(17) % 253) as u8).collect();
+        let region = || (Bytes::from(mkw.clone()), Bytes::from(mks.clone()));
+        [region(), region(), region()]
+    }
+
+    #[test]
+    fn recompress_one_cold_shrinks_and_round_trips() {
+        // Admit raw (compression off), recompress in the background path, and
+        // confirm: bytes accounting shrank, and a subsequent hit still returns
+        // byte-identical data.
+        let mut c = WarmCache::new(1 << 20); // compress_on_admit off by default env
+        let expected = patterned_slab(4096, 128);
+        let expected_bytes: Vec<(Vec<u8>, Vec<u8>)> =
+            expected.iter().map(|(w, s)| (w.to_vec(), s.to_vec())).collect();
+        c.insert((0, 7), expected);
+        let before = c.used();
+        let saved = c.recompress_one_cold();
+        assert!(saved > 0, "patterned slab must compress");
+        assert_eq!(c.used(), before - saved, "budget accounting tracks the shrink");
+        // Second call: nothing raw left → no-op.
+        assert_eq!(c.recompress_one_cold(), 0);
+        // Hit still round-trips byte-identically.
+        let got = c.get((0, 7));
+        assert!(got.is_some());
+        if let Some(got) = got {
+            for (i, (w, s)) in got.iter().enumerate() {
+                assert_eq!(&w[..], &expected_bytes[i].0[..], "region {i} weight bytes");
+                assert_eq!(&s[..], &expected_bytes[i].1[..], "region {i} scale bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_admit_round_trips_bytes() {
+        // With compression enabled, admissions are zstd-encoded on the way in
+        // and decoded on the way out. Hits must be byte-identical to the
+        // originally-inserted slab (transparent compression == correctness-
+        // neutral). We opt in via the constructor override to keep this test
+        // from racing other threads' `COLI_CACHE_COMPRESS` reads.
+        let mut c = WarmCache::new(1 << 20).with_compression(true);
+        let expected = patterned_slab(4096, 128);
+        let expected_bytes: Vec<(Vec<u8>, Vec<u8>)> =
+            expected.iter().map(|(w, s)| (w.to_vec(), s.to_vec())).collect();
+        c.insert((0, 42), expected);
+        let got = c.get((0, 42));
+        assert!(got.is_some(), "must hit");
+        let got = match got {
+            Some(g) => g,
+            None => return,
+        };
+        for (i, (w, s)) in got.iter().enumerate() {
+            assert_eq!(&w[..], &expected_bytes[i].0[..], "region {i} weight bytes");
+            assert_eq!(&s[..], &expected_bytes[i].1[..], "region {i} scale bytes");
+        }
+        // Resident footprint should be smaller than the raw slab (4096+128)*3.
+        assert!(
+            c.compressed_bytes_seen < c.uncompressed_bytes_seen,
+            "compression must shrink the footprint: uncompressed={} compressed={}",
+            c.uncompressed_bytes_seen,
+            c.compressed_bytes_seen
+        );
     }
 
     #[test]

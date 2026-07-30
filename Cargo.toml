@@ -11,7 +11,7 @@
 #   peregrine-engine   binary `peregrine`: CLI + stdio serve protocol
 [workspace]
 resolver = "2"
-members = ["crates/peregrine-core", "crates/peregrine-kernels", "crates/peregrine-model", "crates/peregrine-io", "crates/peregrine-sched", "crates/peregrine-engine", "crates/peregrine-cuda", "crates/peregrine-serve", "crates/peregrine-par"]
+members = ["crates/peregrine-core", "crates/peregrine-kernels", "crates/peregrine-model", "crates/peregrine-io", "crates/peregrine-sched", "crates/peregrine-engine", "crates/peregrine-cuda", "crates/peregrine-serve", "crates/peregrine-par", "crates/peregrine-tools"]
 
 [workspace.package]
 edition = "2021"

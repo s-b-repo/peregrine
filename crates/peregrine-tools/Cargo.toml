@@ -1,0 +1,14 @@
+[package]
+name = "peregrine-tools"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "peregrine offline preprocessing tools: routing-aware expert re-layout and schedule emission"
+
+[[bin]]
+name = "peregrine-layout-reorg"
+path = "src/reorg.rs"
+
+[dependencies]
+serde_json.workspace = true

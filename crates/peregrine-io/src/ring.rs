@@ -168,6 +168,19 @@ mod uring {
             // as it is registered; unregistered in `Drop`/on the next registration.
             unsafe { self.ring.submitter().register_buffers(&iovecs)? };
             self.registered_bufs = bufs;
+            // Ask the kernel to back each registered buffer with transparent huge
+            // pages when it clears the 2 MB threshold. The pages are pinned for the
+            // lifetime of the registration, so the syscall is amortized. No-op on
+            // non-Linux and when `COLI_HUGEPAGE=0`.
+            for b in self.registered_bufs.iter_mut() {
+                if b.len() >= 2 * 1024 * 1024 {
+                    // SAFETY: the vec is owned by `self.registered_bufs`; the advice is
+                    // read-only from the caller's viewpoint.
+                    unsafe {
+                        let _ = crate::mem::advise_hugepages(b.as_mut_ptr(), b.len());
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -226,7 +239,20 @@ mod uring {
         /// output, so a soft failure is harmless (a hard submit error is surfaced).
         pub fn fadvise_willneed(&mut self, fd: RawFd, off: u64, len: usize) -> io::Result<()> {
             const POSIX_FADV_WILLNEED: i32 = 3;
-            let e = opcode::Fadvise::new(types::Fd(fd), len as libc::off_t, POSIX_FADV_WILLNEED)
+            self.fadvise(fd, off, len, POSIX_FADV_WILLNEED)
+        }
+
+        /// Advise the kernel to drop page-cache references for `[off, off+len)` of
+        /// `fd` (`POSIX_FADV_DONTNEED`). Called after the last consumer of a
+        /// streamed expert to keep long-running RSS flat under buffered reads.
+        /// Purely advisory: soft failure is harmless.
+        pub fn fadvise_dontneed(&mut self, fd: RawFd, off: u64, len: usize) -> io::Result<()> {
+            const POSIX_FADV_DONTNEED: i32 = 4;
+            self.fadvise(fd, off, len, POSIX_FADV_DONTNEED)
+        }
+
+        fn fadvise(&mut self, fd: RawFd, off: u64, len: usize, advice: i32) -> io::Result<()> {
+            let e = opcode::Fadvise::new(types::Fd(fd), len as libc::off_t, advice)
                 .offset(off)
                 .build()
                 .user_data(0);
@@ -241,6 +267,71 @@ mod uring {
             }
             if n < 0 {
                 return Err(io::Error::from_raw_os_error((-n) as i32));
+            }
+            Ok(())
+        }
+
+        /// Retry `read_exact` up to `max_retries` times on transient failures
+        /// (`EIO`, `EAGAIN`, `EINTR`). Sleeps between retries with linear backoff
+        /// (10 ms × attempt) — enough to survive a queued NVMe error retry
+        /// without hanging the forward. Non-transient errors and EOF-short reads
+        /// propagate immediately. Returns the last error on exhaustion.
+        pub fn read_exact_retry(
+            &mut self,
+            fd: RawFd,
+            off: u64,
+            buf: &mut [u8],
+            max_retries: u32,
+        ) -> io::Result<()> {
+            let mut last: io::Error = io::Error::other("no attempt made");
+            for attempt in 0..=max_retries {
+                match self.read_exact(fd, off, buf) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        let transient = matches!(
+                            e.raw_os_error(),
+                            Some(libc::EIO) | Some(libc::EAGAIN) | Some(libc::EINTR)
+                        );
+                        if !transient || attempt == max_retries {
+                            return Err(e);
+                        }
+                        last = e;
+                        std::thread::sleep(std::time::Duration::from_millis(10u64 * (attempt as u64 + 1)));
+                    }
+                }
+            }
+            Err(last)
+        }
+
+        /// Batched `POSIX_FADV_WILLNEED` — one submit for all N regions. Purely
+        /// advisory: individual completion codes are ignored (a soft failure is
+        /// harmless), only a hard submit error surfaces. Reads submitted through
+        /// [`Self::read_many`] afterwards run against pages the kernel already
+        /// started warming.
+        pub fn fadvise_willneed_many(&mut self, regions: &[(RawFd, u64, usize)]) -> io::Result<()> {
+            const POSIX_FADV_WILLNEED: i32 = 3;
+            let mut i = 0;
+            while i < regions.len() {
+                let end = (i + self.cap).min(regions.len());
+                for j in i..end {
+                    let (fd, off, len) = regions[j];
+                    let e = opcode::Fadvise::new(types::Fd(fd), len as libc::off_t, POSIX_FADV_WILLNEED)
+                        .offset(off)
+                        .build()
+                        .user_data(j as u64);
+                    // SAFETY: Fadvise carries no buffer.
+                    unsafe {
+                        self.ring
+                            .submission()
+                            .push(&e)
+                            .map_err(|_| io::Error::other("submission queue full"))?;
+                    }
+                }
+                self.ring.submit_and_wait(end - i)?;
+                // drain the completions we asked to wait for; ignore per-op codes
+                // (advisory).
+                for _ in self.ring.completion() {}
+                i = end;
             }
             Ok(())
         }
@@ -483,6 +574,15 @@ impl Reactor {
         Self::unsupported()
     }
     pub fn fadvise_willneed(&mut self, _fd: RawFd, _off: u64, _len: usize) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn fadvise_dontneed(&mut self, _fd: RawFd, _off: u64, _len: usize) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn fadvise_willneed_many(&mut self, _regions: &[(RawFd, u64, usize)]) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn read_exact_retry(&mut self, _fd: RawFd, _off: u64, _buf: &mut [u8], _max_retries: u32) -> std::io::Result<()> {
         Self::unsupported()
     }
     pub fn configure_slab(&mut self, _buf_cap: usize, _max_bufs: usize) {}

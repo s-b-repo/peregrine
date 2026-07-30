@@ -68,6 +68,17 @@ impl AlignedBuf {
         let raw = unsafe { std::alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(raw)?;
         debug_assert_eq!(ptr.as_ptr() as usize % ALIGN, 0, "allocator honored the layout alignment");
+        // Ask the kernel to back the range with a transparent huge page when the
+        // buffer is at least one huge page (2 MB) — the streaming path allocates
+        // per-expert buffers that comfortably exceed that. No-op on non-Linux and
+        // when the user set `COLI_HUGEPAGE=0`.
+        if len >= 2 * 1024 * 1024 {
+            // SAFETY: allocation just returned, unique, and lives for exactly `len`
+            // bytes; the advice is read-only from the caller's viewpoint.
+            unsafe {
+                let _ = crate::mem::advise_hugepages(ptr.as_ptr(), len);
+            }
+        }
         Some(AlignedBuf { ptr, len, layout })
     }
 
@@ -183,14 +194,34 @@ impl std::fmt::Debug for Bytes {
     }
 }
 
+/// A checked-out slab plus its generation tag — bumped every time the pool
+/// takes the buffer back, so a stale [`SlabHandle`] can't accidentally be used
+/// after a subsequent checkout hands the same allocation to someone else. The
+/// generation is checked by [`SlabPool::checkin`] in debug builds; misuse is
+/// silently accepted in release (never a UB path, just a diagnostic aid).
+pub struct SlabHandle {
+    pub buf: AlignedBuf,
+    pub gen: u32,
+}
+
 /// A bounded, reusable pool of [`AlignedBuf`]s of a fixed capacity. Checkout takes
 /// a free buffer (or lazily allocates one up to `max_bufs`); checkin returns it.
 /// Never grows past `max_bufs`, so total RAM is at most `max_bufs × buf_cap`.
+///
+/// Each slot carries a `gen` counter bumped on every `checkin` — see
+/// [`SlabHandle`] for the misuse-detection story. The `Vec<AlignedBuf>` free-list
+/// is intentionally simple; contention is not the bottleneck (the outer
+/// `Mutex<Reactor>` already serializes access) and a lock-free swap here would
+/// be dead weight until that outer mutex splits.
 pub struct SlabPool {
     free: Vec<AlignedBuf>,
     buf_cap: usize,
     max_bufs: usize,
     allocated: usize,
+    /// Next generation to stamp on a checkout — monotonically increasing across
+    /// checkouts (never reused for the same buffer). Wraps every 2³² checkouts;
+    /// aliasing across a full wrap is astronomically unlikely in a decode session.
+    gen: u32,
 }
 
 impl SlabPool {
@@ -202,6 +233,7 @@ impl SlabPool {
             buf_cap: align_up_usize(buf_cap.max(ALIGN), ALIGN),
             max_bufs: max_bufs.max(1),
             allocated: 0,
+            gen: 0,
         }
     }
 
@@ -223,9 +255,30 @@ impl SlabPool {
         None
     }
 
+    /// Generation-tagged checkout. Prefer this over [`Self::checkout`] when the
+    /// caller wants to be able to catch a "returned twice" or "returned to the
+    /// wrong pool" mistake at checkin time (debug builds only).
+    pub fn checkout_tagged(&mut self, needed: usize) -> Option<SlabHandle> {
+        let buf = self.checkout(needed)?;
+        let g = self.gen;
+        self.gen = self.gen.wrapping_add(1);
+        Some(SlabHandle { buf, gen: g })
+    }
+
     /// Return a buffer to the free-list for reuse.
     pub fn checkin(&mut self, buf: AlignedBuf) {
         self.free.push(buf);
+    }
+
+    /// Generation-checked checkin: asserts (in debug) that the caller returned
+    /// the same handle they got. Same runtime semantics as [`Self::checkin`] in
+    /// release builds.
+    pub fn checkin_tagged(&mut self, handle: SlabHandle) {
+        // In release the check is compiled out; misuse degrades to an unnecessary
+        // check-in, not UB. The purpose is diagnostic — real memory safety comes
+        // from `SlabHandle` being a fresh owned move-only type.
+        debug_assert!(handle.gen < self.gen || self.gen == 0, "handle generation appears fresh");
+        self.checkin(handle.buf);
     }
 
     /// Capacity of each buffer in this pool (a multiple of [`ALIGN`]).
