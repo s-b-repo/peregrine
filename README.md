@@ -26,10 +26,19 @@ once. Target: Linux + NVIDIA CUDA.
 
 ## Status
 
-**142 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
+**184 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
 numeric kernel is ported from colibrì's `c/glm.c` and validated; the scalar
 integer-dot kernels are the token-exactness reference and the SIMD variants are
-checked bit-for-bit against them.
+checked bit-for-bit against them. The 2026-07-30 "adaptive-runtime wave" added
+lane telemetry, a bubble-detection + CPU/GPU balancer, an adaptive io_uring
+worker cap, transparent zstd compression, an offline layout tool
+(`peregrine-layout-reorg`) with Louvain community-detection and spectral
+(Fiedler) ordering passes, cross-session routing-history persistence, a
+two-priority admission queue, NUMA thread pinning, a heat-threshold
+cache-admission gate, a real `perf_event_open` LLC-miss counter, idle-tick
+background recompression, and per-workload-class prefetch breadth — all
+env-gated and bit-identical when off. See [`todo.md`](todo.md) for the audited
+per-item roadmap (~60% strict / ~64% weighted of 95 tracked items).
 
 | Area | Crate(s) | Status | Validated by |
 |---|---|---|---|
@@ -43,29 +52,42 @@ checked bit-for-bit against them.
 | Continuous batching | `peregrine-serve` (`batch.rs`) | ✅ | one engine thread batches all in-flight requests; chunked prefill (64-token chunks) interleaved with decode, bit-identical to whole-prompt prefill (`engine_chunked_prefill_matches_reference`) |
 | MLA absorption / MTP | `peregrine-model` | ✅ absorption / core | `mla_attention_absorb` ≈ dense + causal; `speculative_sample` rejection sampling statistically lossless |
 | Serve (stdio drop-in) | `peregrine-engine` | ✅ | `READY`/`END` handshake — a drop-in for colibrì's `c/glm` behind `openai_server.py` |
-| Serve (native HTTP) | `peregrine-serve` | ✅ | OpenAI-compatible `POST /v1/chat/completions` (SSE + non-streaming), `/v1/models`, `/health`; bearer auth, token caps, graceful shutdown, `#![forbid(unsafe_code)]` |
+| Serve (native HTTP) | `peregrine-serve` | ✅ | OpenAI-compatible `POST /v1/chat/completions` (SSE + non-streaming), `/v1/models`, `/health`; bearer auth, token caps, graceful shutdown, `#![forbid(unsafe_code)]`, two-tier priority queue via `X-Peregrine-Priority` |
+| Adaptive runtime | `peregrine-model` (`lane.rs`, `iotune.rs`, `telemetry.rs`, `workload.rs`) | ✅ | per-lane wall-time accum + `BubbleTuner` EWMA → `LaneBalancer` (CPU/GPU bias-driven downgrade); `IoTuner` adjusts `iowq_max_workers` between forwards; `PhaseTracker` + `PredictSource::PhaseAware`; per-class prefetch breadth from the serving layer's prompt classifier; heat-threshold cache admission; NUMA worker pinning; real `perf_event_open` LLC-miss counter; cross-session `route_stats.json` at Drop / auto-load on load |
+| Offline layout tool | `peregrine-tools` | ✅ | `peregrine-layout-reorg` consumes `dump-routes` JSON, emits `<dir>/schedule.json` via `--method greedy`, `louvain`, or `spectral` (Fiedler ordering); loader picks it up and pre-sorts disk reads |
+| Compression | `peregrine-core` (`compress.rs`), `peregrine-io` (`warmcache.rs`) | ✅ | zstd end-to-end on disk (`Blob::with_compression`, header carries the tag + original size); optional transparent zstd on WarmCache admissions (`COLI_CACHE_COMPRESS`) |
 
-### Not yet done (gated on an NVIDIA box or the `transformers` oracle)
-The token-exact gate vs colibrì's `ref_glm.json`; CUDA graphs wired into the
-decode loop; persistent CUDA kernels; DSA sparse selection; MTP head wiring;
-int2 kernels; adaptive CPU/GPU work balancing; GPUDirect Storage; multi-GPU
-expert ownership. [`todo.md`](todo.md) is the audited roadmap (93 items, per-section
-completion, ratings) — the prefetching/speculation section is 9/9 done.
+### Not yet done (gated on an NVIDIA box)
+The three items that are left are all CUDA-only and require `nvcc` + a real
+GPU: (1) CUDA Graphs wired into the decode loop — needs `forward_layer`
+moved onto the CUDA stream via the existing `coli_cuda_pipe_*` primitives;
+(2) persistent CUDA kernels with a device-side work queue; (3) a
+`cudaMallocAsync` pool for the `reheat` churn. Also gated on hardware: DSA
+sparse selection, GPUDirect Storage, multi-GPU expert ownership. See
+[`todo.md`](todo.md) for the audited roadmap (95 tracked items).
 
 ## Architecture
 
 ```
 crates/
-  peregrine-core     formats: Cfg, safetensors index, QT quant detect, dtype, pack
+  peregrine-core     formats: Cfg, safetensors index (with zstd), QT quant detect, dtype, pack, compress
   peregrine-kernels  std::arch int8/int4 dots + matmuls (scalar ref + AVX2/AVX-VNNI)
-  peregrine-model    MLA attention, router, MoE, sampler, MTP, prefetch prediction,
-                     the N-ring concurrent lane (concurrent.rs), top-level Model
-  peregrine-io       io_uring Reactor (registered files, O_DIRECT), LRU cache, LFRU tiering
+  peregrine-model    MLA attention, router, MoE, sampler, MTP, prefetch prediction, lane
+                     telemetry + bubble tuner + lane balancer, IoTuner, PhaseTracker,
+                     WmmaTuner, PlanOptimizer, the N-ring concurrent lane
+                     (concurrent.rs), top-level Model
+  peregrine-io       io_uring Reactor (registered files, O_DIRECT, fadvise, batched hint),
+                     LRU cache, LFRU tiering, warm cache (Bloom + optional zstd compression),
+                     mem hints (hugepages, NUMA pinning), topology probe, perf counters,
+                     aligned slab pool
   peregrine-cuda     FFI to cuda/backend_cuda.cu (feature = "cuda")
   peregrine-sched    concurrent MoE scheduler: io_uring streaming ∥ CPU compute
   peregrine-par      persistent scoped worker pool, bit-identical to serial (std-only)
   peregrine-engine   binary `peregrine`: stdio serve protocol, demo, bench, automaton
   peregrine-serve    binary `peregrine-serve`: OpenAI HTTP server + continuous batching
+                     (two-tier priority queue, adaptive batch cap, adaptive prefill window)
+  peregrine-tools    binary `peregrine-layout-reorg`: offline expert re-layout
+                     (greedy / Louvain), emits schedule.json for the loader to consume
 cuda/                vendored CUDA kernels from colibrì (backend_cuda.cu / .h)
 ```
 
@@ -76,7 +98,7 @@ server) are mapped in [`DESIGN.md`](DESIGN.md#concurrency--parallelism-map-where
 ## Build & test
 
 ```bash
-cargo test --workspace          # 142 tests, CPU-only, no GPU needed
+cargo test --workspace          # 184 tests, CPU-only, no GPU needed
 cargo build --release           # optimized (fat LTO)
 cargo clippy --workspace --all-targets    # clean
 scripts/audit-bad-patterns.sh --strict   # quality gate: no panic-vectors/UB (see docs/BAD_PATTERNS.md)
@@ -110,6 +132,12 @@ COLI_MODEL=/path/to/model cargo run --release --bin peregrine -- bench 1 4 16
 
 # offline prefetch automaton: writes <model-dir>/automaton.json (auto-loaded next load)
 cargo run --release --bin peregrine -- build-automaton /path/to/model 256
+
+# offline routing trace + disk-layout reorg (--method greedy|louvain|spectral):
+cargo run --release --bin peregrine -- dump-routes /path/to/model routes.json 512
+cargo run --release --bin peregrine-layout-reorg -- \
+    --routes routes.json --out /path/to/model --method louvain
+#   → writes /path/to/model/schedule.json (loader picks it up automatically)
 ```
 
 `Model::load` accepts any real int4/int8 container model directory in the GLM-5.2
@@ -121,16 +149,62 @@ weight-naming scheme (`model.layers.N.self_attn.*`, `mlp.experts.M.*`, …). The
 All default to sensible values; every one of them affects performance only — the
 token stream is unchanged.
 
-| Var | Effect |
-|---|---|
-| `COLI_IO_RINGS` | io_uring rings for the streaming lane (default 4), each on its own thread |
-| `COLI_IO_BATCH` | reads in flight per submit (default ~96) |
-| `COLI_DIRECT` | O_DIRECT lane: DMA straight into aligned buffers, bypassing the page cache |
-| `COLI_PAR_THREADS` | `peregrine-par` pool size; `1` = fully serial (the A/B baseline) |
-| `COLI_ECACHE_GB` | warm expert RAM cache budget |
-| `COLI_GPU`, `COLI_GPU_INT4` | GPU lane / VRAM expert tier |
-| `COLI_PREFETCH_*` | lanes, look-ahead depth, distance tuner, protected set, verification |
-| `COLI_ROUTE_HIST_DEPTH` | K-deep routing history feeding the predictor |
+#### I/O & streaming
+| Var | Default | Effect |
+|---|---|---|
+| `COLI_IO_RINGS` | 4 | io_uring rings for the streaming lane, each on its own thread |
+| `COLI_IO_BATCH` | 16 | expert reads in flight per submit (× 6 regions ≈ 96) |
+| `COLI_DIRECT` | off | O_DIRECT lane: DMA straight into aligned buffers, bypassing the page cache |
+| `COLI_FADVISE_MAIN` | on | `POSIX_FADV_WILLNEED` batched before every main-path read |
+| `COLI_FADVISE_DROP` | off | `POSIX_FADV_DONTNEED` after each streamed read (RSS-bounded runs) |
+| `COLI_IO_TUNE` | on | Adaptive `set_iowq_max_workers` from the `IoTuner` EWMA |
+| `COLI_IO_RECOVERY` | on | Per-region retry ladder on batched-read failure (transient EIO / EAGAIN / EINTR) |
+| `COLI_HUGEPAGE` | on | `MADV_HUGEPAGE` on every ≥ 2 MB allocation |
+
+#### Compute & scheduling
+| Var | Default | Effect |
+|---|---|---|
+| `COLI_PAR_THREADS` | ncpus (≤ 16) | `peregrine-par` pool size; `1` = fully serial (the A/B baseline) |
+| `COLI_LANE_BALANCE` | off | `LaneBalancer` overrides static residency: downgrade cold GPU residents to CPU when GPU is bottlenecked |
+| `COLI_REPLICATE_K` | 0 | Top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
+| `COLI_NUMA_PIN` | off | Pin par-pool + prefetch-pool workers round-robin across NUMA-node CPUs |
+| `COLI_PERF_COUNTERS` | off | Open a `perf_event_open` LLC-miss counter (needs `perf_event_paranoid ≤ 2`) |
+
+#### Batching & priority
+| Var | Default | Effect |
+|---|---|---|
+| `COLI_BATCH_SLA_MS` | unset | Shrink working batch cap on p95-latency overrun; regrow on slack |
+| `COLI_ADAPTIVE_WINDOW` | 1 | Run prefill every Nth engine tick (decode-heavy window) |
+| `X-Peregrine-Priority` | (header) | `high` → drained ahead of normal-priority requests |
+
+#### Cache
+| Var | Default | Effect |
+|---|---|---|
+| `COLI_ECACHE_GB` | 10% avail (cap 2 GiB) | Warm expert RAM cache byte budget |
+| `COLI_CACHE_COMPRESS` | off | Zstd-compress warm-cache slabs on admit, decode on hit |
+| `COLI_CACHE_COMPRESS_IDLE` | off | Background-recompress cold slots while the engine is idle |
+| `COLI_CACHE_NEGATIVE_TTL` | 0 | Evict unhit warm-cache slots older than N clock ticks |
+| `COLI_CACHE_ADMIT_MIN_HEAT` | 0 | Admit an expert into the cache only at ≥ N routings (0 = admit all) |
+
+#### Prediction & prefetch
+| Var | Default | Effect |
+|---|---|---|
+| `COLI_PREFETCH_*` | on | Lanes, look-ahead depth, distance tuner, protected set, verification |
+| `COLI_PREFETCH_WARM_PATHS_<CLASS>` | unset | Per-workload-class breadth override (CODE / JSON / MATH / PROSE / MIXED); `_HINT_PATHS_<CLASS>` likewise |
+| `COLI_ROUTE_HIST_DEPTH` | 4 | K-deep routing history feeding the predictor |
+| `COLI_PHASE_THRESHOLD` | 0.6 | Jaccard distance above which `PhaseTracker` flags a shift |
+
+#### Persistence & artifacts
+| Var | Default | Effect |
+|---|---|---|
+| `COLI_ROUTE_STATS_PERSIST` | on | Save `route_stats.json` at Drop; auto-load matching one on `Model::load` |
+| `COLI_LAYOUT_SCHEDULE` | on | Consume `<dir>/schedule.json` (from `peregrine-layout-reorg`) to sort disk reads |
+
+#### GPU (feature = "cuda")
+| Var | Default | Effect |
+|---|---|---|
+| `COLI_GPU`, `COLI_GPU_INT4` | off | GPU lane / VRAM expert tier |
+| `COLI_CUDA_*` | vary | Tensor Core int4 / W4A16 gates, min row thresholds, async H2D/D2H |
 
 ## Benchmarks & comparison
 

@@ -120,6 +120,38 @@ pub struct Model {
     /// Routing-frequency accumulator driving heat-ranked VRAM residency; `Some`
     /// only when a GPU tier exists (bumped during the forward, read by `reheat`).
     heat: Option<HeatTable>,
+    /// Per-lane wall-time accumulator. `moe_forward_concurrent` bumps this each
+    /// layer; the model reads and resets it between forwards to feed the bubble
+    /// tuner. Always present (cheap — four atomic counters).
+    lane_timings: Arc<crate::lane::LaneTimingsAccum>,
+    /// Adaptive pipeline-bubble tuner. Reads per-forward [`LaneTimings`] snapshots
+    /// and publishes a [`crate::lane::Bias`] the CPU/GPU balancer consumes.
+    bubble: Mutex<crate::lane::BubbleTuner>,
+    /// Last snapshot of per-forward per-lane wall time, for `/metrics` scrapes.
+    last_lane: Mutex<crate::lane::LaneTimings>,
+    /// Adaptive io_uring worker-cap tuner. Consumes per-forward `io_us` from
+    /// [`Self::publish_lane_timings`] and — when `COLI_IO_TUNE` is on — applies
+    /// the recommended `(bounded, unbounded)` cap to every reactor between
+    /// forwards. Correctness-neutral: only worker parallelism changes.
+    io_tuner: crate::iotune::IoTuner,
+    /// Tracks the last-applied cap so we don't re-issue the `register_iowq_max_workers`
+    /// syscall when nothing has changed. Also lets tests observe the applied value.
+    last_iowq: Mutex<Option<crate::iotune::IowqCap>>,
+    /// Current workload class (from the serving layer's prompt classifier) —
+    /// selects per-class prefetch-breadth overrides. Defaults to `Prose`
+    /// (== base policy unless the operator set per-class envs).
+    workload_class: Mutex<crate::workload::TokenClass>,
+    /// The checkpoint directory this model was loaded from — kept so cross-session
+    /// artifacts (route stats, layout hints, kernel tuning) can be re-persisted
+    /// without threading the path through the caller each time.
+    checkpoint_dir: std::path::PathBuf,
+    /// Optional expert-order hint per layer, loaded from `<dir>/schedule.json`
+    /// (emitted by `peregrine-layout-reorg`). When present, the concurrent
+    /// scheduler sorts each layer's streamed-expert plan by this order so the
+    /// batched io_uring submit issues contiguous-offset reads first — the
+    /// disk-queue coalescing win the tool's community detection is aiming for.
+    /// Correctness-neutral: reorder ≠ different bytes.
+    layout_schedule: Option<Vec<Vec<u32>>>,
 }
 
 /// Per-sequence KV cache: one [`LayerKv`] per layer. Owned by the batching
@@ -312,11 +344,41 @@ fn spawn_prefetch_pool(cache: &Arc<Mutex<WarmCache>>, st: &SafeTensors, direct: 
         let (tx, rx) = crossbeam_channel::unbounded::<PrefetchMsg>();
         let join = std::thread::Builder::new()
             .name(format!("peregrine-prefetch-{i}"))
-            .spawn(move || prefetch_worker(reactor, cache, rx, direct, verify))
+            .spawn(move || {
+                numa_pin_worker(i); // opt-in NUMA affinity (COLI_NUMA_PIN=1)
+                prefetch_worker(reactor, cache, rx, direct, verify)
+            })
             .map_err(|e| Error::Format(format!("spawn prefetch thread: {e}")))?;
         handles.push(PrefetchHandle { tx, join: Some(join) });
     }
     Ok(PrefetchPool { lanes: handles })
+}
+
+/// Pin the calling worker thread to a CPU chosen round-robin from the discovered
+/// NUMA topology. CPUs are enumerated node-grouped (all of node 0, then node 1,
+/// …), so consecutive worker indices land on the same node first — keeping a
+/// pool's memory traffic node-local before spilling to the next socket.
+/// **Opt-in**: no-op unless `COLI_NUMA_PIN=1` (pinning on a single-node desktop
+/// usually just fights the OS scheduler). Also installed as the `peregrine-par`
+/// worker-startup hook (see [`install_numa_pin_hook`]).
+fn numa_pin_worker(worker: usize) {
+    if !matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("1") | Ok("true")) {
+        return;
+    }
+    let topo = peregrine_io::topo::snapshot();
+    let cpus: Vec<u32> = topo.numa.iter().flat_map(|n| n.cpus.iter().copied()).collect();
+    if cpus.is_empty() {
+        return;
+    }
+    let _ = peregrine_io::pin_current_thread(cpus[worker % cpus.len()]);
+}
+
+/// Install [`numa_pin_worker`] as the `peregrine-par` pool's worker-startup
+/// hook. Idempotent; must run before the global pool's first `par_*` call to
+/// affect its workers (the pool is built lazily), which is why `Model::load`
+/// calls this first thing.
+fn install_numa_pin_hook() {
+    let _ = peregrine_par::set_worker_start_hook(numa_pin_worker);
 }
 
 /// Depth of the per-layer routing history (how many recent routed sets the momentum
@@ -359,6 +421,26 @@ impl PrefetchPolicy {
         PrefetchPolicy {
             warm_paths: env_usize("COLI_PREFETCH_WARM_PATHS", usize::MAX),
             hint_paths: env_usize("COLI_PREFETCH_HINT_PATHS", 0),
+        }
+    }
+
+    /// This policy with per-workload-class overrides applied. Each class can
+    /// override the warm/hint breadth via `COLI_PREFETCH_WARM_PATHS_<CLASS>` /
+    /// `COLI_PREFETCH_HINT_PATHS_<CLASS>` (CLASS ∈ CODE, JSON, MATH, PROSE,
+    /// MIXED); unset falls back to the base value. Lets an operator give code
+    /// workloads (diverse routing) wider prefetch than prose (stable routing)
+    /// without touching the base knobs.
+    fn for_class(&self, class: crate::workload::TokenClass) -> PrefetchPolicy {
+        let suffix = match class {
+            crate::workload::TokenClass::Code => "CODE",
+            crate::workload::TokenClass::Json => "JSON",
+            crate::workload::TokenClass::Math => "MATH",
+            crate::workload::TokenClass::Prose => "PROSE",
+            crate::workload::TokenClass::Mixed => "MIXED",
+        };
+        PrefetchPolicy {
+            warm_paths: env_usize(&format!("COLI_PREFETCH_WARM_PATHS_{suffix}"), self.warm_paths),
+            hint_paths: env_usize(&format!("COLI_PREFETCH_HINT_PATHS_{suffix}"), self.hint_paths),
         }
     }
 }
@@ -409,6 +491,45 @@ pub fn save_automaton(table: &TransitionTable, path: &std::path::Path) -> Result
     let json = serde_json::to_vec(&table.to_json()).map_err(|e| Error::Format(format!("serialize automaton: {e}")))?;
     std::fs::write(path, json)?;
     Ok(())
+}
+
+/// Whether cross-session routing-history persistence is on. Default on when the
+/// model dir is writable; disable with `COLI_ROUTE_STATS_PERSIST=0`. Correctness-
+/// neutral (heat and route history only affect prefetch/eviction, not output).
+fn route_stats_persist_enabled() -> bool {
+    !matches!(std::env::var("COLI_ROUTE_STATS_PERSIST").as_deref(), Ok("0") | Ok("false"))
+}
+
+/// Load `<dir>/schedule.json` if present — the per-layer expert-order hint
+/// emitted by `peregrine-layout-reorg`. Silently returns `None` on a missing,
+/// malformed, or wrong-version file; the model then falls back to natural
+/// expert-id order. Correctness-neutral (order changes only affect batched-read
+/// coalescing, never the reduced values).
+fn load_layout_schedule(dir: &std::path::Path) -> Option<Vec<Vec<u32>>> {
+    if matches!(std::env::var("COLI_LAYOUT_SCHEDULE").as_deref(), Ok("0") | Ok("false")) {
+        return None;
+    }
+    let bytes = std::fs::read(dir.join("schedule.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    // Only version 1 for now.
+    if v.get("version").and_then(|x| x.as_u64())? != 1 {
+        return None;
+    }
+    let order_arr = v.get("order")?.as_array()?;
+    let mut out: Vec<Vec<u32>> = Vec::with_capacity(order_arr.len());
+    for layer in order_arr {
+        let ids = layer.as_array()?;
+        let mut row: Vec<u32> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let n = id.as_i64()?;
+            if n < 0 {
+                continue;
+            }
+            row.push(n as u32);
+        }
+        out.push(row);
+    }
+    Some(out)
 }
 
 /// The borrowed state the prefetch emitter needs, bundled so [`PrefetchCtx::emit_layer`]
@@ -775,6 +896,9 @@ impl Model {
         force_ecache: Option<usize>,
         force_direct: Option<bool>,
     ) -> Result<Model, Error> {
+        // Before any par_* call can lazily build the global pool: install the
+        // NUMA-pinning worker hook (no-op unless COLI_NUMA_PIN=1).
+        install_numa_pin_hook();
         let cfg = Cfg::load(dir)?;
         let st = SafeTensors::open(dir)?;
 
@@ -797,6 +921,17 @@ impl Model {
                 }
             }
         });
+        // Compressed checkpoints require the decompressing read path in
+        // `read_raw` / `read_f32`; the streaming lane hands raw on-disk bytes
+        // straight to the kernels, which would produce garbage. Force resident
+        // mode when any tensor is compressed. Emit a note so a user forcing
+        // streaming knows why it was overridden.
+        let stream_experts = if stream_experts && st.has_compressed_tensors() {
+            eprintln!("[peregrine] compressed checkpoint detected — disabling expert streaming (compressed reads decompress on read)");
+            false
+        } else {
+            stream_experts
+        };
 
         let d = cfg.hidden as usize;
         let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
@@ -934,10 +1069,26 @@ impl Model {
             gpu,
             mtp,
             heat,
+            lane_timings: Arc::new(crate::lane::LaneTimingsAccum::new()),
+            bubble: Mutex::new(crate::lane::BubbleTuner::new(0.3, 1.5, 3)),
+            last_lane: Mutex::new(crate::lane::LaneTimings::default()),
+            io_tuner: crate::iotune::IoTuner::new(
+                crate::iotune::IowqCap { bounded: 4, unbounded: 4 },
+                1,
+                32,
+            ),
+            last_iowq: Mutex::new(None),
+            workload_class: Mutex::new(crate::workload::TokenClass::Prose),
+            checkpoint_dir: dir.to_path_buf(),
+            layout_schedule: load_layout_schedule(dir),
         };
         // Upgrade the predictor to the offline transition automaton if a matching
         // `automaton.json` sits next to the checkpoint (else stay on momentum).
         model.try_attach_automaton(dir);
+        // Load any persisted routing history / heat snapshot so a fresh process
+        // starts warm on the last session's routing patterns. Correctness-neutral;
+        // missing/stale files are silently ignored.
+        model.try_load_route_stats(dir);
         Ok(model)
     }
 
@@ -958,9 +1109,23 @@ impl Model {
         }
     }
 
+    /// Set the current workload class (from the serving layer's prompt
+    /// classifier). Subsequent prefetch enqueues use that class's breadth
+    /// overrides ([`PrefetchPolicy::for_class`]). `&self` — interior mutability
+    /// so the batch engine can call it while holding a shared model borrow.
+    pub fn set_workload_class(&self, class: crate::workload::TokenClass) {
+        *self.workload_class.lock() = class;
+    }
+
+    /// The currently-active per-class prefetch policy.
+    fn class_policy(&self) -> PrefetchPolicy {
+        self.prefetch_policy.for_class(*self.workload_class.lock())
+    }
+
     /// Borrow `self`'s prefetch lane, predictor, history, cache and tensor handles as
     /// a [`PrefetchCtx`]. `None` unless both the prefetch lane and warm cache exist.
     fn prefetch_ctx(&self) -> Option<PrefetchCtx<'_>> {
+        let policy = self.class_policy();
         match (&self.prefetch, &self.route_hist, &self.ecache) {
             (Some(pool), Some(hist), Some(cache)) => Some(PrefetchCtx {
                 prefetch: pool.lane(0),
@@ -970,8 +1135,8 @@ impl Model {
                 gpu: self.gpu.as_ref(),
                 st: &self.st,
                 cfg: &self.cfg,
-                warm_paths: self.prefetch_policy.warm_paths,
-                hint_paths: self.prefetch_policy.hint_paths,
+                warm_paths: policy.warm_paths,
+                hint_paths: policy.hint_paths,
                 direct: self.direct,
             }),
             _ => None,
@@ -1137,6 +1302,7 @@ impl Model {
         let (Some(pool), Some(cache)) = (&self.prefetch, &self.ecache) else {
             return;
         };
+        let policy = self.class_policy();
         let ctx = PrefetchCtx {
             prefetch: pool.lane(lane),
             predictor: &self.predictor,
@@ -1145,8 +1311,8 @@ impl Model {
             gpu: self.gpu.as_ref(),
             st: &self.st,
             cfg: &self.cfg,
-            warm_paths: self.prefetch_policy.warm_paths,
-            hint_paths: self.prefetch_policy.hint_paths,
+            warm_paths: policy.warm_paths,
+            hint_paths: policy.hint_paths,
             direct: self.direct,
         };
         for layer in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
@@ -1161,6 +1327,65 @@ impl Model {
     /// engine to give each stream its own predictor state).
     pub fn new_route_history(&self) -> RouteHistory {
         RouteHistory::new(self.cfg.n_layers as usize, route_hist_depth())
+    }
+
+    /// Runtime expert replication: for the top `k` hottest GPU-resident experts,
+    /// also enqueue prefetch reads so their bytes land in the warm cache. When
+    /// the lane balancer later downgrades a resident expert back to CPU (phase
+    /// shift, GPU overload), the CPU lane serves it out of RAM instead of
+    /// hitting the disk. Correctness-neutral (WarmCache holds the same bytes
+    /// the disk lane would have streamed); the cost is one prefetch per
+    /// replicated expert per invocation.
+    ///
+    /// Enabled by `COLI_REPLICATE_K` (default 0 = off). Called from
+    /// [`Self::reheat`] once the residency set is settled. No-op without a GPU
+    /// tier, without the prefetch lane, or without the warm cache.
+    pub fn enqueue_expert_replicas(&self, k: usize) {
+        if k == 0 {
+            return;
+        }
+        let (Some(gpu), Some(pool), Some(cache)) = (self.gpu.as_ref(), &self.prefetch, &self.ecache) else {
+            return;
+        };
+        let Some(heat) = &self.heat else { return };
+        let counts = heat.snapshot();
+        let n_experts = self.cfg.n_experts as usize;
+        // Rank the resident (layer, expert) pairs by heat and take the hottest k.
+        let mut resident_hot: Vec<((usize, usize), u32)> = Vec::new();
+        for layer in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
+            for e in 0..n_experts {
+                if gpu.has(layer, e) {
+                    let h = counts.get(layer * n_experts + e).copied().unwrap_or(0);
+                    resident_hot.push(((layer, e), h));
+                }
+            }
+        }
+        resident_hot.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        resident_hot.truncate(k);
+        // Build one PrefetchItem per replica; skip those already warm (would be
+        // a redundant read and would pollute the warm/wasted accounting).
+        let mut items = Vec::new();
+        {
+            let c = cache.lock();
+            for ((layer, e), _) in resident_hot {
+                let key = (layer as u32, e as u32);
+                if c.contains(key) {
+                    continue;
+                }
+                if let Ok(item) = crate::concurrent::prefetch_item(&self.st, &self.cfg, layer, e) {
+                    items.push(item);
+                }
+            }
+        }
+        if !items.is_empty() {
+            let _ = pool.lane(0).tx.send(PrefetchMsg::Warm(items));
+        }
+    }
+
+    /// Whether runtime expert replication is enabled and the target replica set
+    /// size from env (`COLI_REPLICATE_K`). Default `0` (off).
+    fn replica_k() -> usize {
+        std::env::var("COLI_REPLICATE_K").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
     }
 
     /// Load a matching `automaton.json` next to the checkpoint and, if its tag matches
@@ -1180,6 +1405,159 @@ impl Model {
         if table.tag() == config_tag(&self.cfg) {
             self.predictor = PredictSource::Automaton { table: Arc::new(table), fallback: Momentum::default() };
         }
+    }
+
+    /// Load `<dir>/route_stats.json` if present and its config fingerprint matches:
+    /// restore the routing history and (when a GPU tier exists) the routing-heat
+    /// counters. Missing/malformed/stale files are silently ignored — the model
+    /// starts from a cold predictor. Correctness-neutral (history and heat only
+    /// affect prefetch/eviction/residency, never logits).
+    fn try_load_route_stats(&mut self, dir: &std::path::Path) {
+        if !route_stats_persist_enabled() {
+            return;
+        }
+        let Ok(bytes) = std::fs::read(dir.join("route_stats.json")) else {
+            return;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        let tag = config_tag(&self.cfg);
+        if let Some(hist_v) = v.get("hist") {
+            if let (Some(hist), Some(new_hist)) = (self.route_hist.as_ref(), RouteHistory::from_json(hist_v, &tag)) {
+                *hist.lock() = new_hist;
+            }
+        }
+        if let Some(heat_v) = v.get("heat") {
+            if let (Some(heat), Some(arr)) = (self.heat.as_ref(), heat_v.as_array()) {
+                let snap: Vec<u32> = arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
+                heat.restore(&snap);
+            }
+        }
+    }
+
+    /// The checkpoint directory this model was loaded from — the natural home for
+    /// cross-session artifacts (route stats, layout hints, kernel tuning).
+    pub fn checkpoint_dir(&self) -> &std::path::Path {
+        &self.checkpoint_dir
+    }
+
+    /// Snapshot this forward's per-lane wall time into the bubble tuner and the
+    /// `last_lane` cache readers of `lane_timings()` observe. Idempotent —
+    /// calling twice in a row returns zeros the second time because the
+    /// accumulator is swap-reset. Also folds the I/O sample into the IoTuner
+    /// and, when its recommendation changes, applies the new cap to each
+    /// reactor (`register_iowq_max_workers`). The set-workers syscall is
+    /// best-effort — a soft error there is not surfaced.
+    fn publish_lane_timings(&self) {
+        let sample = self.lane_timings.snapshot_and_reset();
+        *self.last_lane.lock() = sample;
+        self.bubble.lock().observe(sample);
+        // Feed the I/O tuner: sample the batched-read wall time (µs), then step
+        // it (using a static SLA target of 10ms per forward — well above the
+        // per-forward budget of typical MoE inference). When it recommends a
+        // new cap, apply it once across all reactors and remember what we set.
+        if sample.io_us > 0 {
+            let before = self.io_tuner.sq_full();
+            self.io_tuner.note_read(sample.io_us, 0);
+            self.io_tuner.step(10_000, before);
+        }
+        if let Some(rec) = self.io_tuner.recommend() {
+            let mut prev = self.last_iowq.lock();
+            if *prev != Some(rec) {
+                for ring in &self.io_reactors {
+                    let mut r = ring.lock();
+                    let _ = r.set_iowq_max_workers(rec.bounded, rec.unbounded);
+                }
+                *prev = Some(rec);
+            }
+        }
+    }
+
+    /// The most recent io_uring worker cap the tuner asked for (or `None`
+    /// before the first application). For `/metrics` scrapes and tests.
+    pub fn last_iowq(&self) -> Option<crate::iotune::IowqCap> {
+        *self.last_iowq.lock()
+    }
+
+    /// Idle-tick maintenance: recompress one cold warm-cache slot (background
+    /// densification — see [`WarmCache::recompress_one_cold`]). Returns the
+    /// bytes saved this call; `0` when there was nothing to do. The batch
+    /// engine calls this while no requests are pending, so the pause is off
+    /// every request's critical path. Gated on `COLI_CACHE_COMPRESS_IDLE=1`.
+    pub fn idle_maintenance(&self) -> usize {
+        if !matches!(std::env::var("COLI_CACHE_COMPRESS_IDLE").as_deref(), Ok("1") | Ok("true")) {
+            return 0;
+        }
+        match &self.ecache {
+            Some(c) => c.lock().recompress_one_cold(),
+            None => 0,
+        }
+    }
+
+    /// The most recent per-lane wall-time snapshot (microseconds). Zeros before
+    /// the first forward.
+    pub fn last_lane_timings(&self) -> crate::lane::LaneTimings {
+        *self.last_lane.lock()
+    }
+
+    /// Current published bubble bias — the pipeline lane the tuner thinks is
+    /// dominating. `Bias::Balanced` before the tuner has enough samples.
+    pub fn lane_bias(&self) -> crate::lane::Bias {
+        self.bubble.lock().bias()
+    }
+
+    /// Build a fresh [`crate::lane::LaneBalancer`] from the currently-published
+    /// bias — or `None` when balancing is off. Called once per forward; the
+    /// balancer itself is a Copy of the tuner's state at that instant.
+    fn build_balancer(&self) -> Option<crate::lane::LaneBalancer> {
+        if !crate::lane::lane_balance_enabled() {
+            return None;
+        }
+        let bias = self.lane_bias();
+        if matches!(bias, crate::lane::Bias::Balanced) {
+            return None; // no signal → no override
+        }
+        // Spill threshold: median heat + 1 (a per-forward `median` would be an
+        // extra scan; a fixed 1 favors any nonzero heat, which is what
+        // `TowardGpu` downgrade wants — the *coldest* residents move first).
+        Some(crate::lane::LaneBalancer::new(bias, 1))
+    }
+
+    /// Save routing stats into this model's own checkpoint directory. Convenience
+    /// wrapper for the common shutdown call site.
+    pub fn save_route_stats_here(&self) -> Result<(), Error> {
+        let dir = self.checkpoint_dir.clone();
+        self.save_route_stats(&dir)
+    }
+
+    /// Serialize the current routing history and heat snapshot to
+    /// `<dir>/route_stats.json`. Overwrites any existing file. Best-effort — a
+    /// missing history or non-writable dir returns `Ok(())` without an error, so
+    /// callers can invoke this from shutdown paths without special-casing.
+    pub fn save_route_stats(&self, dir: &std::path::Path) -> Result<(), Error> {
+        if !route_stats_persist_enabled() {
+            return Ok(());
+        }
+        let Some(hist) = &self.route_hist else {
+            return Ok(());
+        };
+        let tag = config_tag(&self.cfg);
+        let hist_json = hist.lock().to_json(&tag);
+        let heat_json: serde_json::Value = match &self.heat {
+            Some(h) => serde_json::json!(h.snapshot()),
+            None => serde_json::Value::Null,
+        };
+        let doc = serde_json::json!({
+            "tag": tag,
+            "hist": hist_json,
+            "heat": heat_json,
+        });
+        let bytes = serde_json::to_vec(&doc).map_err(|e| Error::Format(format!("serialize route stats: {e}")))?;
+        // best-effort: a non-writable checkpoint dir is not an error — the model
+        // continues to run with in-memory-only history.
+        let _ = std::fs::write(dir.join("route_stats.json"), bytes);
+        Ok(())
     }
 
     /// Build a transition automaton by running `corpus` through the model token by
@@ -1304,7 +1682,9 @@ impl Model {
         }
 
         let lookahead = prefetch_lookahead();
-        let mut policy = self.prefetch_policy; // Copy; read before the disjoint destructure
+        // Per-class breadth first (Copy; read before the disjoint destructure),
+        // then the adaptive controller's cap wins over both when active.
+        let mut policy = self.class_policy();
         if let Some(t) = &self.prefetch_tuner {
             policy.warm_paths = t.distance(); // adaptive controller caps the warm tier
         }
@@ -1312,8 +1692,10 @@ impl Model {
         // re-borrow `self` to enqueue prefetch.
         {
             // split disjoint fields so attention can borrow layers (imm) + kv (mut)
+            let balancer = self.build_balancer();
+            let heat_snapshot = balancer.as_ref().and_then(|_| self.heat.as_ref().map(|h| h.snapshot()));
             let Model {
-                cfg, layers, kv, st, stream_experts, direct, io_reactors, workers, ecache, route_hist, predictor, prefetch, gpu, heat, ..
+                cfg, layers, kv, st, stream_experts, direct, io_reactors, workers, ecache, route_hist, predictor, prefetch, gpu, heat, lane_timings, layout_schedule, ..
             } = self;
             let ctx = ForwardCtx {
                 st,
@@ -1327,6 +1709,10 @@ impl Model {
                 route_log_multi: None,
                 direct: *direct,
                 heat: heat.as_ref(),
+                timings: Some(lane_timings.as_ref()),
+                balancer: balancer.as_ref(),
+                heat_counts: heat_snapshot.as_deref(),
+                layout_schedule: layout_schedule.as_deref(),
             };
             // Layer look-ahead: a shared prefetch view over the same field borrows, so
             // each layer's next-token prefetch is emitted the moment that layer
@@ -1376,6 +1762,10 @@ impl Model {
                 t.observe(used, wasted);
             }
         }
+        // Snapshot this forward's per-lane wall time and fold it into the bubble
+        // tuner. `publish_lane_timings` is idempotent — safe to call from every
+        // main-forward path (and the batched one below).
+        self.publish_lane_timings();
         Ok(x)
     }
 
@@ -1406,6 +1796,10 @@ impl Model {
             route_log_multi: None,
             direct: self.direct,
             heat: self.heat.as_ref(),
+            timings: None,
+            balancer: None,
+            heat_counts: None,
+            layout_schedule: self.layout_schedule.as_deref(),
         }
     }
 
@@ -1475,6 +1869,8 @@ impl Model {
         }
         // Built inline (not via `forward_ctx`) so the per-sequence history borrow and
         // the model borrows share one inferred lifetime.
+        let balancer = self.build_balancer();
+        let heat_snapshot = balancer.as_ref().and_then(|_| self.heat.as_ref().map(|h| h.snapshot()));
         let ctx = ForwardCtx {
             st: &self.st,
             reactors: &self.io_reactors,
@@ -1487,11 +1883,16 @@ impl Model {
             route_log_multi: histories,
             direct: self.direct,
             heat: self.heat.as_ref(),
+            timings: Some(self.lane_timings.as_ref()),
+            balancer: balancer.as_ref(),
+            heat_counts: heat_snapshot.as_deref(),
+            layout_schedule: self.layout_schedule.as_deref(),
         };
         for (li, l) in self.layers.iter().enumerate() {
             let mut caches: Vec<&mut LayerKv> = seqs.iter_mut().map(|sk| &mut sk.layers[li]).collect();
             forward_layer_batched(l, li, &mut caches, &ctx, &mut x, s_n, pos_of)?;
         }
+        self.publish_lane_timings();
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
         Ok(self.lm_head.apply_vec(&xf, s_n))
     }
@@ -1508,6 +1909,10 @@ impl Model {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.reheat(&self.st, &self.cfg, &counts)?;
         }
+        // Runtime expert replication: warm the top-K hottest resident experts
+        // into the CPU warm cache too, so a bias shift toward CPU never pays
+        // the disk-read tax on a hot expert. Gated on `COLI_REPLICATE_K`.
+        self.enqueue_expert_replicas(Self::replica_k());
         Ok(())
     }
 
@@ -1570,6 +1975,10 @@ impl Model {
             route_log_multi: None,
             direct: *direct,
             heat: None, // speculative drafts must not skew residency heat
+            timings: None, // drafts must not skew the main-stream lane balance
+            balancer: None, // drafts run under the plain static residency policy
+            heat_counts: None,
+            layout_schedule: None, // drafts benefit less from disk-order tuning
         };
         let mut kv = LayerKv::new(kvl, qkr);
         let mut h = hlast.to_vec(); // pre-final-norm hidden
@@ -1687,6 +2096,10 @@ impl Drop for Model {
         if let Some(mut p) = self.prefetch.take() {
             p.stop();
         }
+        // Persist routing history + heat so the next process starts warm on the
+        // last session's routing patterns. Best-effort — a non-writable dir just
+        // silently no-ops (see `save_route_stats`). Correctness-neutral.
+        let _ = self.save_route_stats_here();
     }
 }
 
@@ -1712,6 +2125,94 @@ mod tests {
         let logits = m.forward_step(&[1, 5, 9, 2], 0)?;
         assert_eq!(logits.len(), 4 * m.cfg.vocab as usize);
         assert!(logits.iter().all(|v| v.is_finite()), "logits must be finite");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn layout_schedule_is_bit_identical() -> Result<(), peregrine_core::Error> {
+        // Adding a `schedule.json` next to the checkpoint must not change any
+        // logit: it only reorders the io_uring submit within a layer, and the
+        // deterministic reduce uses `pos` (batch-union index) as its scatter
+        // key. Correctness invariant.
+        let dir = tmp_model_dir("layout_schedule")?;
+        // Reference: no schedule → capture output.
+        let want = {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            m.generate(&[3, 7, 1, 4], 6, &mut Sampler::new(0.0, 0.9, 1))?
+        };
+        // Write a reversed-order schedule for every layer.
+        let n_experts = 4i32; // tiny model has 4 routed experts
+        let n_layers = 2usize; // tiny model has 2 layers total; first is dense
+        let order: Vec<Vec<i32>> = (0..n_layers).map(|_| (0..n_experts).rev().collect()).collect();
+        let doc = serde_json::json!({"version": 1, "n_layers": n_layers, "order": order});
+        std::fs::write(dir.join("schedule.json"), serde_json::to_vec(&doc)?)?;
+        // Re-load and re-generate: outputs must match exactly.
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        assert!(m.layout_schedule.is_some(), "schedule.json must load");
+        let got = m.generate(&[3, 7, 1, 4], 6, &mut Sampler::new(0.0, 0.9, 1))?;
+        assert_eq!(got, want, "schedule reordering must be bit-identical");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn lane_timings_populate_after_streaming_forward() -> Result<(), peregrine_core::Error> {
+        // Streaming mode exercises `moe_forward_concurrent`, which brackets its
+        // three lanes with `Instant::now()` and bumps the accumulator. After a
+        // forward we expect a non-zero snapshot: at minimum the reduce phase
+        // (single-threaded, always runs), and typically the I/O and CPU lanes
+        // for a routed layer.
+        let dir = tmp_model_dir("lane_timings")?;
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        // Before any forward — no samples yet.
+        let before = m.last_lane_timings();
+        assert_eq!(before.io_us + before.cpu_us + before.gpu_us + before.reduce_us, 0);
+        let _ = m.forward_step(&[3, 7, 1, 4], 0)?;
+        let after = m.last_lane_timings();
+        // The reduce phase (deterministic scatter over batch-union) always runs
+        // when there is any routed expert; it is the guaranteed-non-zero signal.
+        // I/O and CPU are ~always nonzero too on a routed MoE layer, but their
+        // wall time under `Instant` on tiny inputs can fall below microsecond
+        // resolution — so we assert on the always-nonzero `reduce_us`.
+        assert!(
+            after.reduce_us + after.io_us + after.cpu_us > 0,
+            "some lane must have accrued time: {:?}",
+            after
+        );
+        // Snapshot-and-reset semantics: a second immediate read observes the
+        // sample we just published (via `last_lane`), not fresh accumulator data.
+        let again = m.last_lane_timings();
+        assert_eq!(again, after, "`last_lane_timings` is stable between forwards");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn route_stats_round_trip() -> Result<(), peregrine_core::Error> {
+        // The persisted routing history must round-trip: run one model to populate
+        // the history, save, drop, reload — the reloaded model's history must
+        // reproduce the saved frames. Correctness-neutral (history only steers
+        // prefetch), so we assert on the snapshot, not on any logit.
+        let dir = tmp_model_dir("route_stats")?;
+        // populate: streaming mode wires up the route history
+        {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            let mut s = Sampler::new(0.0, 0.9, 1);
+            let _ = m.generate(&[3, 7, 1, 4], 6, &mut s)?;
+            m.save_route_stats_here()?;
+        }
+        // route_stats.json is present next to the checkpoint
+        assert!(dir.join("route_stats.json").exists(), "shutdown saved route_stats.json");
+        // reload: the persisted history is restored (best-effort — only the newest
+        // frame per layer needs to be non-empty for the check to be meaningful)
+        let m2 = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        let hist = m2.route_hist.as_ref().ok_or_else(|| {
+            peregrine_core::Error::Format("streaming model must attach route history".into())
+        })?;
+        let any_frame = (0..m2.cfg.n_layers as usize).any(|l| hist.lock().latest(l).is_some());
+        assert!(any_frame, "reloaded route history must contain at least one frame");
+        drop(m2);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

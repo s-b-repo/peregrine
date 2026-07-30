@@ -3,6 +3,7 @@
 //! int4/int8 container format the engine reads (a numpy-free synthetic model
 //! generator), without pulling in torch.
 
+use crate::compress::{encode, Compression};
 use crate::dtype::bf16_to_f32;
 use std::path::Path;
 
@@ -12,27 +13,52 @@ pub struct Blob {
     pub dtype: String,
     pub shape: Vec<i64>,
     pub bytes: Vec<u8>,
+    /// Optional per-blob compression scheme. When set, the payload is
+    /// compressed before being embedded and the tensor entry gains a
+    /// `"compression": "zstd"` field plus an `"uncompressed_nbytes"` field.
+    /// [`Compression::None`] emits the historical (raw) format so a fresh
+    /// writer stays byte-compatible with the reader that predates compression.
+    pub compression: Compression,
 }
 
 impl Blob {
     pub fn new(name: impl Into<String>, dtype: &str, shape: Vec<i64>, bytes: Vec<u8>) -> Blob {
-        Blob { name: name.into(), dtype: dtype.into(), shape, bytes }
+        Blob { name: name.into(), dtype: dtype.into(), shape, bytes, compression: Compression::None }
+    }
+
+    /// Set the compression scheme for this blob.
+    pub fn with_compression(mut self, c: Compression) -> Blob {
+        self.compression = c;
+        self
     }
 }
 
 /// Write a single-shard `model.safetensors` into `dir` (created if needed).
+/// Blobs with [`Compression::Zstd`] have their payload zstd-encoded (level 3);
+/// the reader detects and decompresses via the `"compression"` header field.
 pub fn write_safetensors(dir: &Path, blobs: &[Blob]) -> std::io::Result<()> {
     let mut header = serde_json::Map::new();
     let mut cursor: i64 = 0;
     let mut data: Vec<u8> = Vec::new();
     for b in blobs {
+        // Compress the payload once. The tensor entry's `data_offsets` describe
+        // the *on-disk* bytes (compressed or raw); the reader also learns the
+        // original size from `uncompressed_nbytes` so it can preallocate cleanly.
+        let payload = encode(&b.bytes, b.compression, 3).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("compress '{}': {e}", b.name))
+        })?;
         let start = cursor;
-        let end = start + b.bytes.len() as i64;
-        header.insert(
-            b.name.clone(),
-            serde_json::json!({"dtype": b.dtype, "shape": b.shape, "data_offsets": [start, end]}),
-        );
-        data.extend_from_slice(&b.bytes);
+        let end = start + payload.len() as i64;
+        let mut entry = serde_json::Map::new();
+        entry.insert("dtype".into(), serde_json::Value::String(b.dtype.clone()));
+        entry.insert("shape".into(), serde_json::json!(b.shape));
+        entry.insert("data_offsets".into(), serde_json::json!([start, end]));
+        if let Some(tag) = b.compression.tag() {
+            entry.insert("compression".into(), serde_json::Value::String(tag.to_string()));
+            entry.insert("uncompressed_nbytes".into(), serde_json::json!(b.bytes.len()));
+        }
+        header.insert(b.name.clone(), serde_json::Value::Object(entry));
+        data.extend_from_slice(&payload);
         cursor = end;
     }
     let hdr = serde_json::to_vec(&serde_json::Value::Object(header))
@@ -152,6 +178,42 @@ mod tests {
         )?;
         let st = SafeTensors::open(&dir)?;
         assert_eq!(QtInfo::detect(&st, "w", o as i64, i as i64).fmt, QtFmt::Int4);
+        let mut n = [0f32; 4];
+        st.read_f32("norm", &mut n)?;
+        assert_eq!(n, [1.0, 2.0, 3.0, 4.0]);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_written_model_reads_back() -> Result<(), crate::Error> {
+        // Round-trip a compressed tensor: the reader must decompress and yield
+        // byte-identical values to what the writer supplied. Correctness-neutral
+        // is the whole point of the compression feature.
+        let dir = std::env::temp_dir().join(format!("coli_pack_zstd_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        // A larger tensor so compression actually engages a real zstd frame.
+        let vals: Vec<f32> = (0..1024).map(|k| ((k as f32 * 0.13) % 5.0) - 2.5).collect();
+        write_safetensors(
+            &dir,
+            &[
+                Blob::new("weights", "F32", vec![vals.len() as i64], f32_bytes(&vals))
+                    .with_compression(Compression::Zstd),
+                // Uncompressed norm to confirm mixed shards work.
+                Blob::new("norm", "F32", vec![4], f32_bytes(&[1.0, 2.0, 3.0, 4.0])),
+            ],
+        )?;
+        let st = SafeTensors::open(&dir)?;
+        assert!(st.has_compressed_tensors());
+        assert_eq!(st.compression("weights"), Compression::Zstd);
+        assert_eq!(st.compression("norm"), Compression::None);
+        // read_f32 decompresses transparently.
+        let mut got = vec![0f32; vals.len()];
+        st.read_f32("weights", &mut got)?;
+        assert_eq!(got, vals);
+        // The uncompressed sibling still reads back correctly.
         let mut n = [0f32; 4];
         st.read_f32("norm", &mut n)?;
         assert_eq!(n, [1.0, 2.0, 3.0, 4.0]);

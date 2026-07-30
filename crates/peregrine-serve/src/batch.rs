@@ -43,6 +43,17 @@ struct Prefilling {
     max_new: usize,
 }
 
+/// Request priority. Higher priority requests are admitted and drained before
+/// normal ones — the batching engine drains its `high` channel first each tick,
+/// then normal. Correctness-neutral: priority only reorders admission, never the
+/// final token stream for any individual request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Priority {
+    #[default]
+    Normal,
+    High,
+}
+
 /// A generation request handed to the engine. The engine prefills `prompt`, then
 /// emits sampled token ids on `out` until a stop id, `max_new` tokens, or the
 /// client drops `out`. `sampler` carries this request's temperature/nucleus/seed,
@@ -52,6 +63,15 @@ pub struct EngineRequest {
     pub max_new: usize,
     pub sampler: Sampler,
     pub out: mpsc::Sender<EngineOut>,
+    /// Admission priority. Defaults to `Normal`; the HTTP handler maps an
+    /// optional `X-Peregrine-Priority: high` header to `High`.
+    #[doc(hidden)]
+    pub priority: Priority,
+    /// Workload class inferred from the prompt tail by the HTTP handler (the
+    /// engine is tokenizer-free, so classification happens where the text is).
+    /// Selects per-class prefetch-breadth overrides on the model
+    /// (`COLI_PREFETCH_WARM_PATHS_<CLASS>`). `TokenClass::Prose` == base policy.
+    pub class: peregrine_model::TokenClass,
 }
 
 /// One engine → handler message. The token stream ends when the channel closes
@@ -65,14 +85,20 @@ pub enum EngineOut {
 /// `Send + Sync` (a tokio unbounded sender), so it lives in shared server state.
 #[derive(Clone)]
 pub struct EngineHandle {
-    tx: mpsc::UnboundedSender<EngineRequest>,
+    tx_normal: mpsc::UnboundedSender<EngineRequest>,
+    tx_high: mpsc::UnboundedSender<EngineRequest>,
 }
 
 impl EngineHandle {
-    /// Submit a request; the engine streams tokens on `req.out`. Errors only if
-    /// the engine thread has already shut down.
+    /// Submit a request at its `priority` — the engine drains high-priority
+    /// requests before normal ones each tick. Errors only if the engine thread
+    /// has already shut down.
     pub fn submit(&self, req: EngineRequest) -> Result<(), Error> {
-        self.tx.send(req).map_err(|_| Error::Format("batch engine is not running".into()))
+        let ch = match req.priority {
+            Priority::High => &self.tx_high,
+            Priority::Normal => &self.tx_normal,
+        };
+        ch.send(req).map_err(|_| Error::Format("batch engine is not running".into()))
     }
 }
 
@@ -81,13 +107,41 @@ impl EngineHandle {
 /// handle (the thread exits once every [`EngineHandle`] is dropped and all active
 /// sequences finish).
 pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle<()>), Error> {
-    let (tx, rx) = mpsc::unbounded_channel::<EngineRequest>();
+    let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
+    let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
     let join = std::thread::Builder::new()
         .name("peregrine-batch".to_string())
-        .spawn(move || run(model, rx, cap))
+        .spawn(move || run(model, rx_normal, rx_high, cap))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx }, join))
+    Ok((EngineHandle { tx_normal, tx_high }, join))
+}
+
+/// Latency SLA target for adaptive batching, in milliseconds. When set
+/// (`COLI_BATCH_SLA_MS=<n>` or via [`spawn_with_sla`] callers), the engine
+/// shrinks the working batch cap on p95-latency overrun and grows it back when
+/// slack appears. Unset → static `max_batch` (the historical default).
+fn batch_sla_ms() -> Option<u64> {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("COLI_BATCH_SLA_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0))
+}
+
+/// Number of decode ticks per prefill tick when the adaptive window is on.
+/// `COLI_ADAPTIVE_WINDOW=<n>` (default `1` = the historical every-tick prefill
+/// interleave). Larger values let decode run further before yielding to prefill,
+/// trading admission latency for decode throughput when the workload is decode-
+/// heavy. Purely a scheduling knob — correctness-neutral.
+fn adaptive_window_ratio() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_ADAPTIVE_WINDOW")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
 }
 
 /// One in-flight sequence. Invariant at the top of a decode step: `seq.len() ==
@@ -109,37 +163,84 @@ struct SeqState {
 /// The engine loop: admit + prefill new requests, then decode all active
 /// sequences one batched step at a time until each hits a stop id, its token
 /// budget, or a dropped client.
-fn run(mut model: Model, mut rx: mpsc::UnboundedReceiver<EngineRequest>, max_batch: usize) {
+fn run(
+    mut model: Model,
+    mut rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
+    mut rx_high: mpsc::UnboundedReceiver<EngineRequest>,
+    max_batch: usize,
+) {
     let vocab = model.cfg.vocab as usize;
     let stop_ids = model.cfg.stop_ids.clone();
     let mut active: Vec<SeqState> = Vec::new();
     let mut pending: VecDeque<Prefilling> = VecDeque::new();
     let mut steps = 0usize;
+    // Adaptive-batching state. `working_cap` is the current admission ceiling
+    // (starts at `max_batch`, shrinks under SLA overrun, grows on slack). EWMA
+    // over per-forward wall time drives the adjustment.
+    let sla_ms = batch_sla_ms();
+    let mut working_cap = max_batch;
+    let mut ewma_decode_us: u64 = 0;
+    // Small current-thread runtime just for the priority-aware blocking recv.
+    // Owned by this thread — it never crosses `spawn` boundaries.
+    let idle_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok();
 
     loop {
-        // Drain queued requests into the prefill queue, capped so total in-flight
-        // (prefilling + decoding) stays within `max_batch`.
-        while active.len() + pending.len() < max_batch {
-            match rx.try_recv() {
+        // Drain queued requests into the prefill queue: HIGH first (so they
+        // beat normal admissions to the batch), NORMAL second — both capped by
+        // the *working* cap so an SLA-shrunk engine backpressures both queues.
+        while active.len() + pending.len() < working_cap {
+            match rx_high.try_recv() {
+                Ok(req) => admit_pending(&model, &mut pending, req),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        while active.len() + pending.len() < working_cap {
+            match rx_normal.try_recv() {
                 Ok(req) => admit_pending(&model, &mut pending, req),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break, // drain, then exit
             }
         }
-        // Nothing in flight → block for the next request (or exit when all dropped).
+        // Nothing in flight → idle. Run one bounded maintenance step (background
+        // warm-cache recompression, COLI_CACHE_COMPRESS_IDLE) and keep going while
+        // it makes progress AND no request has arrived — then block for the next
+        // request (high preferred). Exit when both senders are gone.
         if active.is_empty() && pending.is_empty() {
-            match rx.blocking_recv() {
+            while model.idle_maintenance() > 0 {
+                // A request arriving interrupts the sweep immediately.
+                if let Ok(req) = rx_high.try_recv() {
+                    admit_pending(&model, &mut pending, req);
+                    break;
+                }
+                if let Ok(req) = rx_normal.try_recv() {
+                    admit_pending(&model, &mut pending, req);
+                    break;
+                }
+            }
+            if !pending.is_empty() {
+                continue;
+            }
+            let req = recv_priority(idle_rt.as_ref(), &mut rx_high, &mut rx_normal);
+            match req {
                 Some(req) => {
                     admit_pending(&model, &mut pending, req);
                     continue;
                 }
-                None => break, // all senders dropped and nothing in flight → shutdown
+                None => break,
             }
         }
 
         // Advance one prefill chunk (a finished prefill joins `active`), interleaved
         // with decode so a long admission never stalls the batch for its whole prefill.
-        prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids);
+        // Adaptive window: when `COLI_ADAPTIVE_WINDOW=N > 1`, only run prefill every
+        // Nth engine tick so decode gets more consecutive time before yielding.
+        // If no decodes are active yet, always run prefill (else the engine stalls
+        // waiting for a prefill that never fires).
+        let win = adaptive_window_ratio();
+        if win == 1 || active.is_empty() || steps.is_multiple_of(win as usize) {
+            prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids);
+        }
         if active.is_empty() {
             continue; // only prefilling so far (or everything retired) — no decode yet
         }
@@ -147,6 +248,7 @@ fn run(mut model: Model, mut rx: mpsc::UnboundedReceiver<EngineRequest>, max_bat
         // One batched decode step: feed each active sequence's pending token.
         let tokens: Vec<i32> = active.iter().map(|s| s.next_tok).collect();
         let pos_of: Vec<usize> = active.iter().map(|s| s.pos).collect();
+        let t_decode = std::time::Instant::now();
         let logits = {
             // Split each SeqState into (KV, history) disjoint borrows so the batched
             // forward records each sequence's *own* routed set into its own history.
@@ -168,6 +270,21 @@ fn run(mut model: Model, mut rx: mpsc::UnboundedReceiver<EngineRequest>, max_bat
                 }
             }
         };
+        let decode_us = t_decode.elapsed().as_micros() as u64;
+        // EWMA of decode wall time (α = 0.3). Feeds the SLA-driven cap adjustment.
+        ewma_decode_us = if ewma_decode_us == 0 {
+            decode_us
+        } else {
+            (ewma_decode_us as u128 * 7 / 10 + decode_us as u128 * 3 / 10) as u64
+        };
+        if let Some(sla_ms) = sla_ms {
+            let sla_us = sla_ms * 1000;
+            if ewma_decode_us > sla_us && working_cap > 1 {
+                working_cap -= 1; // shrink one at a time — smooth backpressure
+            } else if ewma_decode_us * 2 < sla_us && working_cap < max_batch {
+                working_cap += 1; // grow slowly when there's slack
+            }
+        }
         // Per-sequence, parallel-async prefetch: warm each stream's predicted next
         // experts onto its assigned lane (round-robin) while sampling proceeds.
         for (i, s) in active.iter().enumerate() {
@@ -207,12 +324,63 @@ fn run(mut model: Model, mut rx: mpsc::UnboundedReceiver<EngineRequest>, max_bat
     }
 }
 
+/// Blocking-wait for a request across the two priority channels, biased toward
+/// high-priority. Returns `None` when both senders are dropped (shutdown).
+fn recv_priority(
+    rt: Option<&tokio::runtime::Runtime>,
+    rx_high: &mut mpsc::UnboundedReceiver<EngineRequest>,
+    rx_normal: &mut mpsc::UnboundedReceiver<EngineRequest>,
+) -> Option<EngineRequest> {
+    // Fast path: something already queued (fold both into one blocking wait if not).
+    if let Ok(r) = rx_high.try_recv() {
+        return Some(r);
+    }
+    if let Ok(r) = rx_normal.try_recv() {
+        return Some(r);
+    }
+    // Slow path: park until whichever arrives first, biased toward high.
+    match rt {
+        Some(rt) => rt.block_on(async {
+            tokio::select! {
+                biased;
+                r = rx_high.recv() => r,
+                r = rx_normal.recv() => r,
+            }
+        }),
+        // Fallback if the mini-runtime failed to build (e.g. resource-starved test
+        // process): busy-wait poll with a short sleep. Correctness preserved.
+        None => {
+            loop {
+                let high = rx_high.try_recv();
+                if let Ok(r) = high {
+                    return Some(r);
+                }
+                let norm = rx_normal.try_recv();
+                if let Ok(r) = norm {
+                    return Some(r);
+                }
+                // Both senders dropped and both queues empty → shutdown signal.
+                let high_dead = matches!(high, Err(mpsc::error::TryRecvError::Disconnected));
+                let norm_dead = matches!(norm, Err(mpsc::error::TryRecvError::Disconnected));
+                if high_dead && norm_dead {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 /// Queue a request for chunked prefill. Validates it (empty prompt / zero budget is
 /// a clean no-op); the forward happens in [`prefill_step`], interleaved with decode.
+/// The most recent admission's workload class becomes the model's active class —
+/// a pragmatic "latest wins" policy for a mixed batch (per-sequence classes would
+/// need per-sequence prefetch policies; the breadth knob is batch-global today).
 fn admit_pending(model: &Model, pending: &mut VecDeque<Prefilling>, req: EngineRequest) {
     if req.prompt.is_empty() || req.max_new == 0 {
         return; // nothing to generate; dropping req.out closes the stream cleanly
     }
+    model.set_workload_class(req.class);
     pending.push_back(Prefilling {
         seq: SeqKv::new(&model.cfg),
         prompt: req.prompt,
@@ -334,6 +502,8 @@ mod tests {
                 max_new: n,
                 sampler: Sampler::new(0.0, 0.9, 1),
                 out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
             })?;
             rxs.push(rx);
         }
@@ -374,7 +544,7 @@ mod tests {
 
         let (handle, join) = spawn(Model::load(&dir)?, 8)?;
         let (tx, mut rx) = mpsc::channel::<EngineOut>(64);
-        handle.submit(EngineRequest { prompt: prompt.clone(), max_new: n, sampler: Sampler::new(0.0, 0.9, 1), out: tx })?;
+        handle.submit(EngineRequest { prompt: prompt.clone(), max_new: n, sampler: Sampler::new(0.0, 0.9, 1), out: tx, priority: Priority::Normal, class: peregrine_model::TokenClass::Prose })?;
         let mut got = Vec::new();
         while let Some(msg) = rx.blocking_recv() {
             match msg {
@@ -397,7 +567,7 @@ mod tests {
         let (handle, join) = spawn(Model::load(&dir)?, 4)?;
 
         let (tx1, mut rx1) = mpsc::channel::<EngineOut>(16);
-        handle.submit(EngineRequest { prompt: vec![2, 5, 1], max_new: 3, sampler: Sampler::new(0.0, 0.9, 1), out: tx1 })?;
+        handle.submit(EngineRequest { prompt: vec![2, 5, 1], max_new: 3, sampler: Sampler::new(0.0, 0.9, 1), out: tx1, priority: Priority::Normal, class: peregrine_model::TokenClass::Prose })?;
         let mut n1 = 0;
         while let Some(msg) = rx1.blocking_recv() {
             if let EngineOut::Token(_) = msg {
@@ -407,7 +577,7 @@ mod tests {
         assert_eq!(n1, 3, "max_new must cap emitted tokens");
 
         let (tx2, mut rx2) = mpsc::channel::<EngineOut>(16);
-        handle.submit(EngineRequest { prompt: vec![], max_new: 5, sampler: Sampler::new(0.0, 0.9, 1), out: tx2 })?;
+        handle.submit(EngineRequest { prompt: vec![], max_new: 5, sampler: Sampler::new(0.0, 0.9, 1), out: tx2, priority: Priority::Normal, class: peregrine_model::TokenClass::Prose })?;
         let mut n2 = 0;
         while let Some(msg) = rx2.blocking_recv() {
             if let EngineOut::Token(_) = msg {

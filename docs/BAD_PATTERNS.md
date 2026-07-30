@@ -36,7 +36,9 @@ in this codebase; the legitimate low-level work is confined to the crates below.
 ## [I] `unsafe` outside the expected crates — informational
 
 `unsafe` is expected and reviewed in three domains only:
-- **peregrine-io** — io_uring submission + aligned-buffer (`AlignedBuf`) allocation;
+- **peregrine-io** — io_uring submission, aligned-buffer (`AlignedBuf`) allocation, and the
+  OS-interface helpers: `madvise` hugepage/dontneed hints (`mem.rs`), `sched_setaffinity` /
+  `mbind` NUMA pinning (`mem.rs`), and the `perf_event_open` counter (`perf.rs`);
 - **peregrine-cuda** — the CUDA FFI;
 - **peregrine-kernels** — hand-written AVX2 / AVX-VNNI SIMD intrinsics.
 
