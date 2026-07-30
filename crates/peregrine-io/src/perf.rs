@@ -116,8 +116,9 @@ impl PerfCounter {
             // PERF_EVENT_IOC_RESET = _IO('$', 3)
             const PERF_EVENT_IOC_RESET: libc::c_ulong = 0x2403;
             // SAFETY: valid owned fd; the ioctl takes no pointer argument.
-            unsafe {
-                let _ = libc::ioctl(self.fd, PERF_EVENT_IOC_RESET, 0);
+            let rc = unsafe { libc::ioctl(self.fd, PERF_EVENT_IOC_RESET, 0) };
+            if rc == -1 {
+                crate::note_advisory_err("perf counter reset ioctl", &std::io::Error::last_os_error());
             }
         }
     }
@@ -127,8 +128,9 @@ impl PerfCounter {
 impl Drop for PerfCounter {
     fn drop(&mut self) {
         // SAFETY: closing the fd we opened; double-close impossible (unique owner).
-        unsafe {
-            let _ = libc::close(self.fd);
+        let rc = unsafe { libc::close(self.fd) };
+        if rc == -1 {
+            crate::note_advisory_err("perf counter fd close", &std::io::Error::last_os_error());
         }
     }
 }

@@ -29,7 +29,16 @@ pub fn numa_nodes() -> Vec<NumaNode> {
     #[cfg(target_os = "linux")]
     {
         let root = Path::new("/sys/devices/system/node");
-        if let Ok(entries) = std::fs::read_dir(root) {
+        let entries = match std::fs::read_dir(root) {
+            // Absent sysfs node tree (containers, non-NUMA kernels) → the
+            // documented single-node fallback.
+            Err(e) => {
+                crate::note_advisory_err("NUMA sysfs enumeration (single-node fallback)", &e);
+                return vec![NumaNode { id: 0, cpus: (0..logical_cpus() as u32).collect() }];
+            }
+            Ok(entries) => entries,
+        };
+        {
             let mut nodes: Vec<NumaNode> = Vec::new();
             for e in entries.flatten() {
                 let name = e.file_name();
@@ -70,8 +79,13 @@ fn parse_cpu_list(s: &str) -> Vec<u32> {
                     out.push(c);
                 }
             }
-        } else if let Ok(c) = token.parse::<u32>() {
-            out.push(c);
+        } else {
+            match token.parse::<u32>() {
+                Ok(c) => out.push(c),
+                // cpulist grammar is ranges and numbers; anything else is a
+                // malformed sysfs entry — skip the token, keep the rest.
+                Err(e) => crate::note_advisory_err("cpulist token parse (token skipped)", &e),
+            }
         }
     }
     out.sort_unstable();
@@ -102,7 +116,7 @@ pub fn pcie_link_by_bdf(bdf: &str) -> Option<PcieLink> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = bdf;
+        let _bdf = bdf; // audit-allow: unused-param silencing — PCIe sysfs doesn't exist off-Linux; documented None
         None
     }
 }

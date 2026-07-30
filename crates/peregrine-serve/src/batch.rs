@@ -98,7 +98,7 @@ impl EngineHandle {
             Priority::High => &self.tx_high,
             Priority::Normal => &self.tx_normal,
         };
-        ch.send(req).map_err(|_| Error::Format("batch engine is not running".into()))
+        ch.send(req).map_err(|send_err| Error::Format(format!("batch engine is not running: {send_err}")))
     }
 }
 
@@ -181,8 +181,16 @@ fn run(
     let mut working_cap = max_batch;
     let mut ewma_decode_us: u64 = 0;
     // Small current-thread runtime just for the priority-aware blocking recv.
-    // Owned by this thread — it never crosses `spawn` boundaries.
-    let idle_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok();
+    // Owned by this thread — it never crosses `spawn` boundaries. Without it
+    // the loop degrades to the spin-recv path below, so build failure is
+    // advisory, not fatal.
+    let idle_rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => Some(rt),
+        Err(e) => {
+            peregrine_core::note_advisory_err("batch: idle-recv runtime build", &e);
+            None
+        }
+    };
 
     loop {
         // Drain queued requests into the prefill queue: HIGH first (so they
@@ -208,14 +216,22 @@ fn run(
         // request (high preferred). Exit when both senders are gone.
         if active.is_empty() && pending.is_empty() {
             while model.idle_maintenance() > 0 {
-                // A request arriving interrupts the sweep immediately.
-                if let Ok(req) = rx_high.try_recv() {
-                    admit_pending(&model, &mut pending, req);
-                    break;
+                // A request arriving interrupts the sweep immediately. An empty
+                // or disconnected queue just continues the sweep — disconnection
+                // is handled as shutdown by `recv_priority` below.
+                match rx_high.try_recv() {
+                    Ok(req) => {
+                        admit_pending(&model, &mut pending, req);
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
                 }
-                if let Ok(req) = rx_normal.try_recv() {
-                    admit_pending(&model, &mut pending, req);
-                    break;
+                match rx_normal.try_recv() {
+                    Ok(req) => {
+                        admit_pending(&model, &mut pending, req);
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
                 }
             }
             if !pending.is_empty() {
@@ -263,7 +279,9 @@ fn run(
                 Ok(l) => l,
                 Err(e) => {
                     for s in &active {
-                        let _ = s.out.blocking_send(EngineOut::Error(e.to_string()));
+                        if s.out.blocking_send(EngineOut::Error(e.to_string())).is_err() {
+                            peregrine_core::note_advisory_err("batch error forward", &"client already disconnected");
+                        }
                     }
                     active.clear();
                     continue;
@@ -331,12 +349,16 @@ fn recv_priority(
     rx_high: &mut mpsc::UnboundedReceiver<EngineRequest>,
     rx_normal: &mut mpsc::UnboundedReceiver<EngineRequest>,
 ) -> Option<EngineRequest> {
-    // Fast path: something already queued (fold both into one blocking wait if not).
-    if let Ok(r) = rx_high.try_recv() {
-        return Some(r);
+    // Fast path: something already queued (fold both into one blocking wait if
+    // not; empty/disconnected queues fall through — the slow path treats
+    // both-senders-gone as the shutdown signal).
+    match rx_high.try_recv() {
+        Ok(r) => return Some(r),
+        Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
     }
-    if let Ok(r) = rx_normal.try_recv() {
-        return Some(r);
+    match rx_normal.try_recv() {
+        Ok(r) => return Some(r),
+        Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
     }
     // Slow path: park until whichever arrives first, biased toward high.
     match rt {
@@ -351,17 +373,17 @@ fn recv_priority(
         // process): busy-wait poll with a short sleep. Correctness preserved.
         None => {
             loop {
-                let high = rx_high.try_recv();
-                if let Ok(r) = high {
-                    return Some(r);
-                }
-                let norm = rx_normal.try_recv();
-                if let Ok(r) = norm {
-                    return Some(r);
-                }
+                let high = match rx_high.try_recv() {
+                    Ok(r) => return Some(r),
+                    Err(state) => state,
+                };
+                let norm = match rx_normal.try_recv() {
+                    Ok(r) => return Some(r),
+                    Err(state) => state,
+                };
                 // Both senders dropped and both queues empty → shutdown signal.
-                let high_dead = matches!(high, Err(mpsc::error::TryRecvError::Disconnected));
-                let norm_dead = matches!(norm, Err(mpsc::error::TryRecvError::Disconnected));
+                let high_dead = matches!(high, mpsc::error::TryRecvError::Disconnected);
+                let norm_dead = matches!(norm, mpsc::error::TryRecvError::Disconnected);
                 if high_dead && norm_dead {
                     return None;
                 }
@@ -404,7 +426,9 @@ fn prefill_step(model: &Model, pending: &mut VecDeque<Prefilling>, active: &mut 
     let logits = match model.forward_prefill_seq(&chunk, &mut p.seq, p.pos) {
         Ok(l) => l,
         Err(e) => {
-            let _ = p.out.blocking_send(EngineOut::Error(e.to_string()));
+            if p.out.blocking_send(EngineOut::Error(e.to_string())).is_err() {
+                peregrine_core::note_advisory_err("prefill error forward", &"client already disconnected");
+            }
             return; // drop this sequence
         }
     };
@@ -520,7 +544,9 @@ mod tests {
             outs.push(toks);
         }
         drop(handle); // let the engine thread observe shutdown and exit
-        let _ = join.join();
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
 
         for (i, o) in outs.iter().enumerate() {
             assert_eq!(o, &want, "batched request {i} must match the reference decode");
@@ -553,7 +579,9 @@ mod tests {
             }
         }
         drop(handle);
-        let _ = join.join();
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
         assert_eq!(got, want, "chunked-prefill engine output must match whole-prefill reference");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
@@ -587,7 +615,9 @@ mod tests {
         assert_eq!(n2, 0, "empty prompt must produce no tokens and close the stream");
 
         drop(handle);
-        let _ = join.join();
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

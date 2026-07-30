@@ -446,7 +446,7 @@ mod tests {
         let mut full = new_cache(&c);
         let out_full = mla_attention(&w.view(), &x, 4, 0, &mut full, &c);
         let mut inc = new_cache(&c);
-        let _ = mla_attention(&w.view(), &x[..3 * hidden], 3, 0, &mut inc, &c);
+        mla_attention(&w.view(), &x[..3 * hidden], 3, 0, &mut inc, &c);
         let out_dec = mla_attention(&w.view(), &x[3 * hidden..4 * hidden], 1, 3, &mut inc, &c);
         for d in 0..hidden {
             assert!((out_full[3 * hidden + d] - out_dec[d]).abs() < 1e-4);
@@ -537,7 +537,7 @@ mod tests {
         let mut seq_caches: Vec<LayerKv> = (0..b).map(|_| new_cache(&c)).collect();
         for (s, cache) in seq_caches.iter_mut().enumerate() {
             let pre: Vec<f32> = (0..lens[s] * hidden).map(|_| r.f()).collect();
-            let _ = mla_attention_absorb(&w.view(), &pre, lens[s], 0, cache, &c);
+            mla_attention_absorb(&w.view(), &pre, lens[s], 0, cache, &c);
         }
 
         // one new decode token per sequence

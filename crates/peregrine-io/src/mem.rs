@@ -42,7 +42,7 @@ pub unsafe fn advise_hugepages(ptr: *mut u8, len: usize) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (ptr, len);
+        let (_ptr, _len) = (ptr, len); // hint doesn't exist off-Linux; documented no-op
         false
     }
 }
@@ -96,7 +96,7 @@ pub unsafe fn advise_dontneed(ptr: *mut u8, len: usize) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (ptr, len);
+        let (_ptr, _len) = (ptr, len); // hint doesn't exist off-Linux; documented no-op
         false
     }
 }
@@ -154,7 +154,7 @@ pub fn pin_current_thread(cpu: u32) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = cpu;
+        let _cpu = cpu; // audit-allow: unused-param silencing — affinity syscall doesn't exist off-Linux; documented no-op
         false
     }
 }
@@ -248,7 +248,7 @@ pub unsafe fn mbind_to_node(ptr: *mut u8, len: usize, node: u32) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (ptr, len, node);
+        let (_ptr, _len, _node) = (ptr, len, node); // mbind doesn't exist off-Linux; documented no-op
         false
     }
 }
@@ -260,9 +260,10 @@ mod tests {
     #[test]
     fn advise_on_a_regular_vec_does_not_crash() {
         let mut v = vec![0u8; 1 << 20]; // 1 MB — smaller than a hugepage but valid
-        // SAFETY: the vec is live for the duration of the call.
-        let _ = unsafe { advise_hugepages(v.as_mut_ptr(), v.len()) };
-        let _ = unsafe { advise_dontneed(v.as_mut_ptr(), v.len()) };
+        // SAFETY: the vec is live for the duration of the call. The bool results
+        // are informational (kernel may decline the hints) — not asserted.
+        unsafe { advise_hugepages(v.as_mut_ptr(), v.len()) };
+        unsafe { advise_dontneed(v.as_mut_ptr(), v.len()) };
     }
 
     #[test]

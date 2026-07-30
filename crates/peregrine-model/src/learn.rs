@@ -404,7 +404,7 @@ mod tests {
         let mut q = QScheduler::new(11);
         let s = QState { bias: 1, stability: 1 };
         for _ in 0..100 {
-            let _ = q.choose(s);
+            q.choose(s);
             q.reward(3_000, s);
         }
         let j = q.to_json();

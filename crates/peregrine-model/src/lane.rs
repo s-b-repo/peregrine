@@ -273,7 +273,7 @@ mod tests {
     fn tuner_reports_cpu_bias_after_k_consecutive() {
         let mut t = BubbleTuner::new(0.5, 1.5, 3);
         for _ in 0..4 {
-            let _ = t.observe(LaneTimings { io_us: 200, cpu_us: 1000, gpu_us: 100, reduce_us: 0, cpu_bytes: 0 });
+            t.observe(LaneTimings { io_us: 200, cpu_us: 1000, gpu_us: 100, reduce_us: 0, cpu_bytes: 0 });
         }
         assert_eq!(t.bias(), Bias::TowardCpu);
     }
@@ -289,7 +289,7 @@ mod tests {
             } else {
                 LaneTimings { io_us: 500, cpu_us: big, gpu_us: 500, reduce_us: 0, cpu_bytes: 0 }
             };
-            let _ = t.observe(obs);
+            t.observe(obs);
         }
         assert_eq!(t.bias(), Bias::Balanced);
     }
