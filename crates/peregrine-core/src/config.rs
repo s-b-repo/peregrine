@@ -73,13 +73,21 @@ impl Cfg {
     pub fn from_json(root: &Value) -> Result<Cfg, Error> {
         let n_layers = gi(root, "num_hidden_layers");
 
-        // stop tokens: eos_token_id is a scalar or an array
+        // stop tokens: eos_token_id is a scalar or an array. Every listed id is
+        // kept — truncating the list would let generation run past a stop token
+        // the checkpoint declares.
         let mut stop_ids = Vec::new();
         match root.get("eos_token_id") {
-            Some(Value::Number(n)) => stop_ids.push(n.as_i64().unwrap_or(0) as i32),
+            Some(Value::Number(n)) => match n.as_i64() {
+                Some(id) => stop_ids.push(id as i32),
+                None => return Err(Error::Format(format!("config: eos_token_id={n} is not an integer"))),
+            },
             Some(Value::Array(a)) => {
-                for v in a.iter().take(8) {
-                    stop_ids.push(v.as_i64().unwrap_or(0) as i32);
+                for v in a.iter() {
+                    match v.as_i64() {
+                        Some(id) => stop_ids.push(id as i32),
+                        None => return Err(Error::Format(format!("config: eos_token_id entry {v} is not an integer"))),
+                    }
                 }
             }
             _ => {}
@@ -112,12 +120,28 @@ impl Cfg {
 
         let qk_nope = gi(root, "qk_nope_head_dim");
         let qk_rope = gi(root, "qk_rope_head_dim");
-        let theta = root
+        // `rope_theta` lives under `rope_parameters` in newer transformers
+        // exports and at the top level in the long-standing HF layout. Read both
+        // (nested wins): a checkpoint using the top-level spelling would
+        // otherwise silently fall back to 10000.0 and scramble every position.
+        let theta_json = root
             .get("rope_parameters")
             .and_then(|rp| rp.get("rope_theta"))
-            .and_then(|v| v.as_f64())
-            .map(|f| f as f32)
-            .unwrap_or(10000.0);
+            .or_else(|| root.get("rope_theta"));
+        let theta = match theta_json {
+            Some(v) => match v.as_f64() {
+                Some(f) if f.is_finite() && f > 0.0 => f as f32,
+                _ => return Err(Error::Format(format!("config: rope_theta={v} is not a positive number"))),
+            },
+            // Absent theta with RoPE lanes in play means the parse missed the
+            // field rather than the model being RoPE-free — refuse to guess.
+            None if qk_rope > 0 => {
+                return Err(Error::Format(
+                    "config: rope_theta not found (looked in rope_parameters.rope_theta and top-level rope_theta)".into(),
+                ))
+            }
+            None => 10000.0,
+        };
 
         let mut c = Cfg {
             hidden: gi(root, "hidden_size"),
@@ -186,6 +210,36 @@ impl Cfg {
         ck("index_topk", self.index_topk, 0, 1 << 20)?;
         ck("index_n_heads", self.index_nh, 0, 1024)?;
         ck("index_head_dim", self.index_hd, 0, 1 << 16)?;
+        // The router selects `topk` distinct experts without replacement, so a
+        // topk above the expert count has no valid selection to make.
+        if self.topk > self.n_experts {
+            return Err(Error::Format(format!(
+                "config: num_experts_per_tok={} exceeds n_routed_experts={}",
+                self.topk, self.n_experts
+            )));
+        }
+        // RoPE rotates (2j, 2j+1) pairs, so an odd lane count would leave the
+        // final lane un-rotated *and* in the wrong output slot.
+        for (name, v) in [("qk_rope_head_dim", self.qk_rope), ("index_head_dim", self.index_hd)] {
+            if v % 2 != 0 {
+                return Err(Error::Format(format!("config: {name}={v} must be even (RoPE rotates lane pairs)")));
+            }
+        }
+        // The indexer keeps the top-`index_topk` keys; zero would select no keys
+        // at all and yield an identically-zero attention context.
+        if self.index_nh > 0 && self.index_hd > 0 && self.index_topk < 1 {
+            return Err(Error::Format(
+                "config: index_topk must be >= 1 when the DSA indexer is configured".into(),
+            ));
+        }
+        // `topk_group` is only meaningful with grouped routing, which this
+        // engine does not implement (n_group=1 is enforced above).
+        if self.topk_group != 1 {
+            return Err(Error::Format(format!(
+                "config: topk_group={} is unsupported (this engine requires topk_group=1)",
+                self.topk_group
+            )));
+        }
         Ok(())
     }
 }
@@ -265,6 +319,73 @@ mod tests {
         j["eos_token_id"] = serde_json::json!(7);
         let c = Cfg::from_json(&j)?;
         assert_eq!(c.stop_ids, vec![7]);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_topk_above_expert_count() {
+        // Both fields are individually in range, but the router cannot select 8
+        // distinct experts out of 4 — previously this loaded and then indexed
+        // out of bounds on the first sparse layer.
+        let mut j = tiny_json();
+        j["n_routed_experts"] = serde_json::json!(4);
+        j["num_experts_per_tok"] = serde_json::json!(8);
+        assert!(Cfg::from_json(&j).is_err(), "topk > n_experts must be rejected at load");
+    }
+
+    #[test]
+    fn rejects_odd_rope_dims() {
+        for field in ["qk_rope_head_dim", "index_head_dim"] {
+            let mut j = tiny_json();
+            j[field] = serde_json::json!(7);
+            assert!(Cfg::from_json(&j).is_err(), "{field} must be even");
+        }
+    }
+
+    #[test]
+    fn rejects_zero_index_topk_with_indexer() {
+        // index_topk=0 (also the missing-field default) selects no keys, which
+        // makes DSA attention output identically zero with no error.
+        let mut j = tiny_json();
+        j["index_topk"] = serde_json::json!(0);
+        assert!(Cfg::from_json(&j).is_err());
+        // ...but a model with no indexer at all is still fine.
+        let mut j2 = tiny_json();
+        j2["index_topk"] = serde_json::json!(0);
+        j2["index_n_heads"] = serde_json::json!(0);
+        j2["index_head_dim"] = serde_json::json!(0);
+        assert!(Cfg::from_json(&j2).is_ok(), "no-indexer model needs no index_topk");
+    }
+
+    #[test]
+    fn reads_top_level_rope_theta() -> Result<(), Error> {
+        // The long-standing HF layout puts rope_theta at the top level; reading
+        // only the nested spelling silently defaulted it to 10000.0.
+        let mut j = tiny_json();
+        j["rope_parameters"] = serde_json::json!({ "rope_type": "default" });
+        j["rope_theta"] = serde_json::json!(1_000_000.0);
+        let c = Cfg::from_json(&j)?;
+        assert_eq!(c.theta, 1_000_000.0);
+        // The nested spelling still wins when both are present.
+        let mut j2 = tiny_json();
+        j2["rope_theta"] = serde_json::json!(1_000_000.0);
+        assert_eq!(Cfg::from_json(&j2)?.theta, 10000.0);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_missing_rope_theta_when_roped() {
+        let mut j = tiny_json();
+        j["rope_parameters"] = serde_json::json!({ "rope_type": "default" });
+        assert!(Cfg::from_json(&j).is_err(), "a roped model must not silently default theta");
+    }
+
+    #[test]
+    fn keeps_every_eos_token() -> Result<(), Error> {
+        let mut j = tiny_json();
+        j["eos_token_id"] = serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let c = Cfg::from_json(&j)?;
+        assert_eq!(c.stop_ids.len(), 10, "no stop id may be dropped");
         Ok(())
     }
 }

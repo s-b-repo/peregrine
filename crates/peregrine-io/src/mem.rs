@@ -135,28 +135,38 @@ pub fn advise_dontneed_slice(slice: &mut [u8]) -> bool {
 /// Pin the *current* thread to a single logical CPU. Best-effort: returns
 /// `true` on kernel-accepted binding, `false` on rejection / non-Linux. No-op
 /// when `COLI_NUMA_PIN=0`.
+#[cfg(target_os = "linux")]
 pub fn pin_current_thread(cpu: u32) -> bool {
     if matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("0") | Ok("false")) {
         return false;
     }
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: `cpu_set_t` is initialized via `CPU_ZERO`; we then set exactly
-        // one bit and call the syscall which reads (not owns) the set. The syscall
-        // is documented thread-safe.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_ZERO(&mut set);
-            libc::CPU_SET(cpu as usize, &mut set);
-            let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
-            rc == 0
-        }
+    // `CPU_SET` indexes the fixed-size `cpu_set_t` bit array without any bounds
+    // check of its own, so a cpu id at or past its capacity would be an
+    // out-of-bounds write. Reachable on very large hosts and from sparse sysfs
+    // cpu ids, and this function's contract is "best effort, false when it
+    // cannot pin".
+    const CPU_SETSIZE_BITS: u32 = (8 * std::mem::size_of::<libc::cpu_set_t>()) as u32;
+    if cpu >= CPU_SETSIZE_BITS {
+        return false;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _cpu = cpu; // audit-allow: unused-param silencing — affinity syscall doesn't exist off-Linux; documented no-op
-        false
+    // SAFETY: `cpu_set_t` is initialized via `CPU_ZERO`; `cpu` is bounds-checked
+    // above, so we set exactly one in-range bit, and the syscall reads (not
+    // owns) the set. The syscall is documented thread-safe.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu as usize, &mut set);
+        let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        rc == 0
     }
+}
+
+/// No affinity syscall exists off Linux, so nothing is ever pinned. The
+/// signature is cfg-split (rather than binding the argument away in the body)
+/// so the unused parameter is declared as such.
+#[cfg(not(target_os = "linux"))]
+pub fn pin_current_thread(_cpu: u32) -> bool {
+    false
 }
 
 /// The NUMA node the calling thread is currently running on, from

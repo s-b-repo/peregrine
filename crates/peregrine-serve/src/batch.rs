@@ -39,7 +39,7 @@ struct Prefilling {
     prompt: Vec<i32>,
     pos: usize, // next prompt position to prefill
     sampler: Sampler,
-    out: mpsc::Sender<EngineOut>,
+    out: mpsc::UnboundedSender<EngineOut>,
     max_new: usize,
 }
 
@@ -62,7 +62,7 @@ pub struct EngineRequest {
     pub prompt: Vec<i32>,
     pub max_new: usize,
     pub sampler: Sampler,
-    pub out: mpsc::Sender<EngineOut>,
+    pub out: mpsc::UnboundedSender<EngineOut>,
     /// Admission priority. Defaults to `Normal`; the HTTP handler maps an
     /// optional `X-Peregrine-Priority: high` header to `High`.
     #[doc(hidden)]
@@ -155,7 +155,7 @@ struct SeqState {
     pos: usize,
     next_tok: i32,
     sampler: Sampler,
-    out: mpsc::Sender<EngineOut>,
+    out: mpsc::UnboundedSender<EngineOut>,
     produced: usize,
     max_new: usize,
 }
@@ -279,7 +279,7 @@ fn run(
                 Ok(l) => l,
                 Err(e) => {
                     for s in &active {
-                        if s.out.blocking_send(EngineOut::Error(e.to_string())).is_err() {
+                        if s.out.send(EngineOut::Error(e.to_string())).is_err() {
                             peregrine_core::note_advisory_err("batch error forward", &"client already disconnected");
                         }
                     }
@@ -318,7 +318,7 @@ fn run(
                 keep.push(false); // stop token is not emitted
                 continue;
             }
-            let delivered = s.out.blocking_send(EngineOut::Token(tok as u32)).is_ok();
+            let delivered = s.out.send(EngineOut::Token(tok as u32)).is_ok();
             s.produced += 1;
             s.next_tok = tok;
             keep.push(delivered && s.produced < s.max_new);
@@ -360,13 +360,28 @@ fn recv_priority(
         Ok(r) => return Some(r),
         Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
     }
-    // Slow path: park until whichever arrives first, biased toward high.
+    // Slow path: park until whichever arrives first, biased toward high. A
+    // `None` from one channel means only *that* sender is gone — the other may
+    // still deliver work, so keep waiting on it rather than reading one closed
+    // channel as engine shutdown.
     match rt {
         Some(rt) => rt.block_on(async {
-            tokio::select! {
-                biased;
-                r = rx_high.recv() => r,
-                r = rx_normal.recv() => r,
+            let (mut high_open, mut normal_open) = (true, true);
+            loop {
+                if !high_open && !normal_open {
+                    return None; // both senders dropped → shutdown
+                }
+                tokio::select! {
+                    biased;
+                    r = rx_high.recv(), if high_open => match r {
+                        Some(req) => return Some(req),
+                        None => high_open = false,
+                    },
+                    r = rx_normal.recv(), if normal_open => match r {
+                        Some(req) => return Some(req),
+                        None => normal_open = false,
+                    },
+                }
             }
         }),
         // Fallback if the mini-runtime failed to build (e.g. resource-starved test
@@ -417,47 +432,53 @@ fn admit_pending(model: &Model, pending: &mut VecDeque<Prefilling>, req: EngineR
 /// prompt is fully prefilled, sample the first token and move it to `active` (or
 /// retire it). Round-robins the queue so no one prefill monopolizes the engine.
 fn prefill_step(model: &Model, pending: &mut VecDeque<Prefilling>, active: &mut Vec<SeqState>, vocab: usize, stop_ids: &[i32]) {
-    let Some(mut p) = pending.pop_front() else {
+    let Some(p) = pending.pop_front() else {
         return;
     };
-    let end = (p.pos + PREFILL_CHUNK).min(p.prompt.len());
-    // clone the chunk so `p.prompt` isn't borrowed while `p.seq` is borrowed mut
-    let chunk = p.prompt[p.pos..end].to_vec();
-    let logits = match model.forward_prefill_seq(&chunk, &mut p.seq, p.pos) {
+    // Destructure so the prompt and the KV cache are disjoint borrows — the
+    // chunk is then a plain slice instead of a per-step copy.
+    let Prefilling { mut seq, prompt, pos, mut sampler, out, max_new } = p;
+    let end = (pos + PREFILL_CHUNK).min(prompt.len());
+    let chunk = &prompt[pos..end];
+    let logits = match model.forward_prefill_seq(chunk, &mut seq, pos) {
         Ok(l) => l,
         Err(e) => {
-            if p.out.blocking_send(EngineOut::Error(e.to_string())).is_err() {
+            if out.send(EngineOut::Error(e.to_string())).is_err() {
                 peregrine_core::note_advisory_err("prefill error forward", &"client already disconnected");
             }
             return; // drop this sequence
         }
     };
-    p.pos = end;
-    if p.pos < p.prompt.len() {
-        pending.push_back(p); // more chunks to go — round-robin with the others
+    let chunk_len = chunk.len();
+    if end < prompt.len() {
+        // more chunks to go — round-robin with the others
+        pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new });
         return;
     }
     // Prefill complete: sample the first token from the last prompt position.
-    let last = (chunk.len() - 1) * vocab;
-    let t0 = p.sampler.pick(&logits[last..last + vocab], -1) as i32;
+    // An empty chunk would mean an empty prompt, which `admit_pending` rejects.
+    let Some(last) = chunk_len.checked_sub(1).map(|c| c * vocab) else {
+        return;
+    };
+    let t0 = sampler.pick(&logits[last..last + vocab], -1) as i32;
     if stop_ids.contains(&t0) {
         return; // first token is a stop → emit nothing
     }
-    if p.out.blocking_send(EngineOut::Token(t0 as u32)).is_err() {
+    if out.send(EngineOut::Token(t0 as u32)).is_err() {
         return; // client already gone
     }
-    if p.max_new <= 1 {
+    if max_new <= 1 {
         return; // only one token requested
     }
     active.push(SeqState {
-        seq: p.seq,
+        seq,
         hist: Mutex::new(model.new_route_history()),
-        pos: p.prompt.len(),
+        pos: prompt.len(),
         next_tok: t0,
-        sampler: p.sampler,
-        out: p.out,
+        sampler,
+        out,
         produced: 1,
-        max_new: p.max_new,
+        max_new,
     });
 }
 
@@ -520,7 +541,7 @@ mod tests {
         let (handle, join) = spawn(Model::load(&dir)?, 8)?;
         let mut rxs = Vec::new();
         for _ in 0..3 {
-            let (tx, rx) = mpsc::channel::<EngineOut>(64);
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
             handle.submit(EngineRequest {
                 prompt: prompt.clone(),
                 max_new: n,
@@ -569,7 +590,7 @@ mod tests {
         };
 
         let (handle, join) = spawn(Model::load(&dir)?, 8)?;
-        let (tx, mut rx) = mpsc::channel::<EngineOut>(64);
+        let (tx, mut rx) = mpsc::unbounded_channel::<EngineOut>();
         handle.submit(EngineRequest { prompt: prompt.clone(), max_new: n, sampler: Sampler::new(0.0, 0.9, 1), out: tx, priority: Priority::Normal, class: peregrine_model::TokenClass::Prose })?;
         let mut got = Vec::new();
         while let Some(msg) = rx.blocking_recv() {
@@ -588,13 +609,71 @@ mod tests {
     }
 
     #[test]
+    fn slow_client_does_not_stall_other_streams() -> Result<(), Error> {
+        // Head-of-line regression: one client that never reads its channel must
+        // not block the engine thread and freeze every other sequence. With a
+        // bounded per-request channel the engine blocked in `send` once the slow
+        // reader's queue filled, wedging the whole batch.
+        let dir = tiny_dir("slowclient")?;
+        let n = 64usize; // far more than the old 64-slot bound could hold unread
+        let (handle, join) = spawn(Model::load(&dir)?, 8)?;
+
+        // Submitted first, never drained until the very end.
+        let (slow_tx, mut slow_rx) = mpsc::unbounded_channel::<EngineOut>();
+        handle.submit(EngineRequest {
+            prompt: vec![3, 7, 1, 4],
+            max_new: n,
+            sampler: Sampler::new(0.0, 0.9, 1),
+            out: slow_tx,
+            priority: Priority::Normal,
+            class: peregrine_model::TokenClass::Prose,
+        })?;
+
+        // A second stream submitted behind it must still run to completion.
+        let (fast_tx, mut fast_rx) = mpsc::unbounded_channel::<EngineOut>();
+        handle.submit(EngineRequest {
+            prompt: vec![3, 7, 1, 4],
+            max_new: n,
+            sampler: Sampler::new(0.0, 0.9, 1),
+            out: fast_tx,
+            priority: Priority::Normal,
+            class: peregrine_model::TokenClass::Prose,
+        })?;
+        let mut fast = Vec::new();
+        while let Some(msg) = fast_rx.blocking_recv() {
+            match msg {
+                EngineOut::Token(t) => fast.push(t),
+                EngineOut::Error(e) => return Err(Error::Format(e)),
+            }
+        }
+        assert_eq!(fast.len(), n, "the reading client completes while the other never drains");
+
+        // The slow client's tokens were queued all along, not dropped.
+        let mut slow = Vec::new();
+        while let Some(msg) = slow_rx.blocking_recv() {
+            match msg {
+                EngineOut::Token(t) => slow.push(t),
+                EngineOut::Error(e) => return Err(Error::Format(e)),
+            }
+        }
+        assert_eq!(slow, fast, "the un-drained stream is buffered intact");
+
+        drop(handle);
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn engine_respects_max_new_and_empty_prompt() -> Result<(), Error> {
         // max_new caps the stream length; an empty prompt yields zero tokens and a
         // cleanly closed channel (no hang).
         let dir = tiny_dir("caps")?;
         let (handle, join) = spawn(Model::load(&dir)?, 4)?;
 
-        let (tx1, mut rx1) = mpsc::channel::<EngineOut>(16);
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<EngineOut>();
         handle.submit(EngineRequest { prompt: vec![2, 5, 1], max_new: 3, sampler: Sampler::new(0.0, 0.9, 1), out: tx1, priority: Priority::Normal, class: peregrine_model::TokenClass::Prose })?;
         let mut n1 = 0;
         while let Some(msg) = rx1.blocking_recv() {
@@ -604,7 +683,7 @@ mod tests {
         }
         assert_eq!(n1, 3, "max_new must cap emitted tokens");
 
-        let (tx2, mut rx2) = mpsc::channel::<EngineOut>(16);
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<EngineOut>();
         handle.submit(EngineRequest { prompt: vec![], max_new: 5, sampler: Sampler::new(0.0, 0.9, 1), out: tx2, priority: Priority::Normal, class: peregrine_model::TokenClass::Prose })?;
         let mut n2 = 0;
         while let Some(msg) = rx2.blocking_recv() {

@@ -20,9 +20,18 @@ use crate::Bytes;
 /// (zero-copy) while the buffered lane and cache clones use a plain `Vec`.
 pub type ExpertSlab = [(Bytes, Bytes); 3];
 
-/// Total bytes a slab occupies (all six weight/scale regions).
+/// Resident bytes a slab occupies (all six weight/scale regions). Uses each
+/// region's real footprint, not its exposed length: an O_DIRECT region holds a
+/// block-aligned window that can be up to 8 KiB larger than the bytes it
+/// exposes, and budgeting on the smaller number over-admits.
 fn slab_bytes(s: &ExpertSlab) -> usize {
-    s.iter().map(|(w, sc)| w.len() + sc.len()).sum()
+    s.iter().map(|(w, sc)| w.footprint() + sc.footprint()).sum()
+}
+
+/// Convert every region to refcounted shared bytes. Done once at admission so
+/// each later hit is six refcount bumps instead of a full ~19 MB copy.
+fn share_slab(s: ExpertSlab) -> ExpertSlab {
+    s.map(|(w, sc)| (w.into_shared(), sc.into_shared()))
 }
 
 /// Compress each of a slab's six regions into a `SlotBytes::Compressed`
@@ -49,27 +58,31 @@ fn encode_slab(s: &ExpertSlab) -> Option<(SlotBytes, usize)> {
     Some((SlotBytes::Compressed { six, orig_lens: orig }, compressed_bytes))
 }
 
-/// Materialize an `ExpertSlab` from a stored `SlotBytes`. For `Raw` this is a
-/// deep clone (matching the previous `.cloned()` at the call site). For
-/// `Compressed` it decodes each region into a fresh `Vec` and assembles the
-/// three (weight, scale) pairs. Codec failures panic-free: they degrade to
-/// empty `Bytes` for the failing region — an upstream miss is preferable to a
-/// panic, and the caller will re-stream on the next attempt.
-fn materialize(sb: &SlotBytes) -> ExpertSlab {
+/// Materialize an `ExpertSlab` from a stored `SlotBytes`. For `Raw` this clones
+/// six refcounts (the regions are shared). For `Compressed` it decodes each
+/// region into a fresh `Vec` and assembles the three (weight, scale) pairs.
+///
+/// Returns `None` when any region fails to decode or comes back the wrong
+/// length. That must NOT be papered over with empty bytes: the caller counts
+/// the lookup as a hit and feeds the slab straight into `QtWeight`, which reads
+/// it as an `[o, i]` weight — a zero-length region then indexes out of bounds
+/// (an abort, under `panic = "abort"`) or silently contributes garbage. A miss
+/// is the correct degradation: the expert is simply re-streamed from disk.
+fn materialize(sb: &SlotBytes) -> Option<ExpertSlab> {
     match sb {
-        SlotBytes::Raw(s) => s.clone(),
+        SlotBytes::Raw(s) => Some(s.clone()),
         SlotBytes::Compressed { six, orig_lens } => {
-            let decode = |i: usize| -> Bytes {
+            let decode = |i: usize| -> Option<Bytes> {
                 match zstd::stream::decode_all(&six[i][..]) {
-                    Ok(v) if v.len() == orig_lens[i] => Bytes::from(v),
-                    _ => Bytes::from(Vec::new()),
+                    Ok(v) if v.len() == orig_lens[i] => Some(Bytes::from(v)),
+                    _ => None,
                 }
             };
-            [
-                (decode(0), decode(1)),
-                (decode(2), decode(3)),
-                (decode(4), decode(5)),
-            ]
+            Some([
+                (decode(0)?, decode(1)?),
+                (decode(2)?, decode(3)?),
+                (decode(4)?, decode(5)?),
+            ])
         }
     }
 }
@@ -173,6 +186,9 @@ pub struct WarmCache {
     negative_ttl: u64,
     pub hits: u64,
     pub misses: u64,
+    /// Slots dropped because their stored payload would not decode (corruption
+    /// or a codec failure). The lookup degrades to a miss and re-streams.
+    decode_failures: u64,
     /// expert reads on the **critical path** (a main-lane miss streamed them).
     pub disk_reads: u64,
     /// expert reads done **ahead of time** by the prefetch lane (off the critical
@@ -227,6 +243,7 @@ impl WarmCache {
             negative_ttl: ttl,
             hits: 0,
             misses: 0,
+            decode_failures: 0,
             disk_reads: 0,
             prefetch_reads: 0,
             disk_reads_by_layer: Vec::new(),
@@ -316,27 +333,61 @@ impl WarmCache {
             return None;
         }
         let now = self.clock;
-        let mut first_prefetch_hit = false;
-        let hit = match self.map.get_mut(&key) {
+        // One probe: bump recency and materialize from the same borrow.
+        let (slab, first_prefetch_hit) = match self.map.get_mut(&key) {
             Some(slot) => {
                 slot.used = now;
-                if slot.from_prefetch && !slot.ever_hit {
+                let first = slot.from_prefetch && !slot.ever_hit;
+                if first {
                     slot.ever_hit = true;
-                    first_prefetch_hit = true;
                 }
-                true
+                (materialize(&slot.data), first)
             }
-            None => false,
+            None => {
+                self.misses += 1;
+                return None;
+            }
         };
-        if hit {
-            self.hits += 1;
-            if first_prefetch_hit {
-                self.prefetch_used += 1;
+        match slab {
+            Some(slab) => {
+                self.hits += 1;
+                if first_prefetch_hit {
+                    self.prefetch_used += 1;
+                }
+                Some(slab)
             }
-            self.map.get(&key).map(|s| materialize(&s.data))
-        } else {
-            self.misses += 1;
-            None
+            None => {
+                // A resident slot whose payload will not decode is worse than no
+                // slot at all: drop it so the next lookup re-streams clean bytes,
+                // and count the lookup as the miss it effectively is.
+                crate::note_advisory_err("warm cache: undecodable slot dropped", &"zstd decode failed or wrong length");
+                self.decode_failures += 1;
+                if let Some(s) = self.map.remove(&key) {
+                    self.used = self.used.saturating_sub(s.bytes);
+                }
+                self.rebuild_bloom();
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    /// Slots dropped because their stored payload failed to decode. Non-zero
+    /// means real data corruption (or a codec bug) — the affected experts were
+    /// re-streamed, so output stays correct, but it is worth surfacing.
+    pub fn decode_failures(&self) -> u64 {
+        self.decode_failures
+    }
+
+    /// Corrupt a resident compressed slot's payload, to exercise the
+    /// decode-failure path (bit rot in a multi-GB resident cache is exactly the
+    /// scenario this guards). No-op for a raw slot.
+    #[cfg(test)]
+    fn corrupt_slot_for_test(&mut self, key: (u32, u32)) {
+        if let Some(slot) = self.map.get_mut(&key) {
+            if let SlotBytes::Compressed { six, .. } = &mut slot.data {
+                six[0] = vec![0xFF; 8]; // not a valid zstd frame
+            }
         }
     }
 
@@ -434,6 +485,9 @@ impl WarmCache {
     fn insert_inner(&mut self, key: (u32, u32), data: ExpertSlab, from_prefetch: bool) {
         self.clock += 1;
         let now = self.clock;
+        // Share once on admission: every later hit is a refcount bump instead of
+        // a full copy of the slab while the cache lock is held.
+        let data = share_slab(data);
         let raw_bytes = slab_bytes(&data);
         // Encode the payload into whichever SlotBytes representation is active.
         // `incoming` counts the resident footprint the eviction policy sees.
@@ -471,7 +525,7 @@ impl WarmCache {
         if was_new {
             self.bloom.add(key);
         }
-        let evicted = self.evict_to_budget();
+        let evicted = self.evict_to_budget(Some(key));
         if evicted {
             // Slot removals invalidate flat Bloom bits — rebuild from the current
             // resident set. Cheap: ≤ 32 words × slot count.
@@ -514,7 +568,7 @@ impl WarmCache {
     /// at least one resident (the just-touched newcomer, which has the max clock,
     /// is never the LRU victim). Returns whether at least one slot was removed
     /// (so the caller can decide to rebuild the Bloom hint).
-    fn evict_to_budget(&mut self) -> bool {
+    fn evict_to_budget(&mut self, keep: Option<(u32, u32)>) -> bool {
         let mut removed = false;
         // Negative-cache pass first: eagerly drop slots that haven't been hit
         // within `negative_ttl` clock ticks, regardless of priority. Prevents a
@@ -525,7 +579,7 @@ impl WarmCache {
             let stale: Vec<(u32, u32)> = self
                 .map
                 .iter()
-                .filter(|(_, s)| s.used < cutoff && s.prio == 0)
+                .filter(|(k, s)| s.used < cutoff && s.prio == 0 && Some(**k) != keep)
                 .map(|(k, _)| *k)
                 .collect();
             for k in stale {
@@ -544,7 +598,16 @@ impl WarmCache {
         while self.used > self.budget && self.map.len() > 1 {
             // lowest (priority, recency) is the victim: unprotected slabs go first,
             // and within a priority the least-recently-used, exactly as before.
-            let victim = self.map.iter().min_by_key(|(_, s)| (s.prio, s.used)).map(|(k, _)| *k);
+            // The slot just inserted is never its own victim. New slots start at
+            // `prio: 0` while any predictor-protected slot is >= 1, so ordering
+            // by `(prio, used)` would otherwise pick the newcomer first and make
+            // every admission a silent no-op once anything is protected.
+            let victim = self
+                .map
+                .iter()
+                .filter(|(k, _)| Some(**k) != keep)
+                .min_by_key(|(_, s)| (s.prio, s.used))
+                .map(|(k, _)| *k);
             let Some(vk) = victim else { break };
             if let Some(s) = self.map.remove(&vk) {
                 self.used -= s.bytes;
@@ -584,6 +647,65 @@ mod tests {
         let mks: Vec<u8> = (0..s).map(|k| (k.wrapping_add(17) % 253) as u8).collect();
         let region = || (Bytes::from(mkw.clone()), Bytes::from(mks.clone()));
         [region(), region(), region()]
+    }
+
+    #[test]
+    fn admission_lands_even_when_every_other_slot_is_protected() {
+        // Regression: victims were chosen by `(prio, used)`, and a new slot
+        // always starts at prio 0 while protected slots are >= 1 — so the
+        // just-inserted slab was picked as its own victim and every admission
+        // silently did nothing once the predictor protected anything.
+        let mut c = WarmCache::new(3 * (1024 + 16)); // room for ~1 slab
+        c.insert((0, 1), slab(1024, 16));
+        c.set_priority((0, 1), 5); // predictor protects the resident
+        assert!(c.contains((0, 1)));
+
+        c.insert((0, 2), slab(1024, 16)); // over budget → something must go
+        assert!(c.contains((0, 2)), "the newly admitted slab must be resident");
+        assert!(c.get((0, 2)).is_some(), "and must be retrievable");
+    }
+
+    #[test]
+    fn undecodable_slot_is_a_miss_not_an_empty_hit() {
+        // Regression: a zstd region that failed to decode was returned as empty
+        // `Bytes` on a path already counted as a HIT. `QtWeight` does no length
+        // validation, so an empty weight region reached the matmul and indexed
+        // out of bounds — an abort in release. The correct degradation is a
+        // miss: the caller simply re-streams the expert.
+        let mut c = WarmCache::new(1 << 20).with_compression(true);
+        c.insert((0, 9), patterned_slab(4096, 128));
+        assert!(c.get((0, 9)).is_some(), "sanity: a healthy slot hits");
+        let hits_before = c.hits;
+
+        c.corrupt_slot_for_test((0, 9));
+        let got = c.get((0, 9));
+        assert!(got.is_none(), "a corrupt slot must read as a miss, never as empty bytes");
+        assert_eq!(c.hits, hits_before, "a failed decode must not count as a hit");
+        assert_eq!(c.decode_failures(), 1, "the corruption is surfaced in a counter");
+        assert!(!c.contains((0, 9)), "the poisoned slot is dropped, so the retry re-streams");
+        // The cache stays usable afterwards.
+        c.insert((0, 9), patterned_slab(4096, 128));
+        assert!(c.get((0, 9)).is_some());
+    }
+
+    #[test]
+    fn hits_share_bytes_instead_of_copying() {
+        // Admission converts the slab to refcounted bytes, so a hit is six
+        // refcount bumps rather than a ~19 MB copy taken while the cache lock is
+        // held (which serialized every I/O lane behind one memcpy).
+        let mut c = WarmCache::new(1 << 20);
+        c.insert((1, 3), patterned_slab(8192, 64));
+        let (a, b) = (c.get((1, 3)), c.get((1, 3)));
+        assert!(a.is_some() && b.is_some(), "both lookups must hit");
+        if let (Some(a), Some(b)) = (a, b) {
+            for i in 0..3 {
+                assert_eq!(&a[i].0[..], &b[i].0[..], "region {i} bytes match");
+                assert!(
+                    std::ptr::eq(&a[i].0[0], &b[i].0[0]),
+                    "region {i} must be shared, not copied per hit"
+                );
+            }
+        }
     }
 
     #[test]

@@ -110,10 +110,19 @@ impl SafeTensors {
                 reactor.read_exact(f.as_raw_fd(), off, buf).ctx(|| format!("{}: io_uring read @ {off}", path.display()))
             };
 
+            // Check the size before reading: an 8-byte read against a shorter
+            // file surfaces an opaque io_uring short-read error instead of
+            // "this is not a safetensors file".
+            if fsz < 8 {
+                return Err(Error::Format(format!(
+                    "{}: too small to be a safetensors file ({fsz} bytes)",
+                    path.display()
+                )));
+            }
             let mut lenbuf = [0u8; 8];
             read(&mut reactor, 0, &mut lenbuf)?;
             let hlen = u64::from_le_bytes(lenbuf);
-            if fsz < 8 || hlen > fsz - 8 || hlen > ST_MAX_HEADER {
+            if hlen > fsz - 8 || hlen > ST_MAX_HEADER {
                 return Err(Error::Format(format!(
                     "{}: bad safetensors header length {hlen} (file {fsz} bytes)",
                     path.display()
@@ -144,18 +153,34 @@ impl SafeTensors {
                         )))
                     }
                 };
-                let dtype = Dtype::from_str(dt)
+                let dtype = Dtype::parse(dt)
                     .ok_or_else(|| Error::Format(format!("unsupported dtype: {dt}")))?;
                 let a0 = offs[0].as_i64().unwrap_or(-1);
                 let b0 = offs[1].as_i64().unwrap_or(-1);
-                if a0 < 0 || b0 < a0 || data_start as i64 + b0 > fsz as i64 {
+                // Bounds in u64 with checked arithmetic: `data_start as i64 + b0`
+                // wraps negative for a crafted offset near i64::MAX (release
+                // builds do not check overflow), which passed this test and then
+                // asked for an exabyte-sized allocation.
+                let bounds_ok = match (u64::try_from(a0), u64::try_from(b0)) {
+                    (Ok(a), Ok(b)) => {
+                        b >= a && data_start.checked_add(b).is_some_and(|end| end <= fsz)
+                    }
+                    _ => false,
+                };
+                if !bounds_ok {
                     return Err(Error::Format(format!(
                         "{}: tensor '{name}' data_offsets [{a0},{b0}] out of file bounds ({fsz})",
                         path.display()
                     )));
                 }
                 let shape: Vec<i64> = shp.iter().map(|v| v.as_i64().unwrap_or(0)).collect();
-                let numel: i64 = shape.iter().product::<i64>().max(if shape.is_empty() { 1 } else { 0 });
+                if shape.iter().any(|&d| d < 0) {
+                    return Err(Error::Format(format!("{}: tensor '{name}' has a negative dimension", path.display())));
+                }
+                let numel: i64 = shape
+                    .iter()
+                    .try_fold(1i64, |acc, &d| acc.checked_mul(d))
+                    .ok_or_else(|| Error::Format(format!("{}: tensor '{name}' shape overflows", path.display())))?;
                 let on_disk_nbytes = b0 - a0;
                 // Optional compression + original size. Missing tag ⇒ raw bytes.
                 let compression = Compression::from_tag(m.get("compression").and_then(|v| v.as_str()));
@@ -166,6 +191,23 @@ impl SafeTensors {
                         .and_then(|v| v.as_i64())
                         .unwrap_or(on_disk_nbytes),
                 };
+                // The shape and the payload length are independent fields; nothing
+                // tied them together, so a short payload for a declared shape read
+                // partially and left the tail of the destination at zero while
+                // returning Ok. U8 tensors are quantized containers whose element
+                // count is deliberately not `numel * 1`, so they are exempt.
+                if !matches!(dtype, Dtype::U8) {
+                    let want = numel.checked_mul(dtype.elem_size() as i64).ok_or_else(|| {
+                        Error::Format(format!("{}: tensor '{name}' size overflows", path.display()))
+                    })?;
+                    if want != uncompressed_nbytes {
+                        return Err(Error::Format(format!(
+                            "{}: tensor '{name}' declares {:?} shape {shape:?} ({want} bytes) but carries {uncompressed_nbytes}",
+                            path.display(),
+                            dtype
+                        )));
+                    }
+                }
                 let layout = match (m.get("layout").and_then(|v| v.as_str()), m.get("layout_gs_bytes").and_then(|v| v.as_u64())) {
                     (Some(tag), Some(gs)) => Some((tag.to_string(), gs as usize)),
                     _ => None,
@@ -183,7 +225,15 @@ impl SafeTensors {
                     uncompressed_nbytes,
                     layout,
                 });
-                index.insert(name.clone(), idx);
+                if index.insert(name.clone(), idx).is_some() {
+                    // Two shards claiming the same tensor (e.g. a directory
+                    // holding both a full and a sharded copy) would resolve half
+                    // the model to the wrong file.
+                    return Err(Error::Format(format!(
+                        "{}: tensor '{name}' appears in more than one shard",
+                        path.display()
+                    )));
+                }
             }
             files.push(f);
             direct_files.push(direct);
@@ -213,8 +263,19 @@ impl SafeTensors {
     pub fn numel(&self, name: &str) -> Option<i64> {
         self.find(name).map(|t| t.numel)
     }
+    /// **On-disk** byte length — the compressed payload size for a zstd tensor.
+    /// Callers deciding what a tensor *contains* (quantized container format,
+    /// element counts) want [`Self::uncompressed_nbytes`] instead; this is for
+    /// callers that are about to read those bytes off the disk.
     pub fn nbytes(&self, name: &str) -> Option<i64> {
         self.find(name).map(|t| t.nbytes)
+    }
+
+    /// Logical byte length after any decompression — the size of the buffer a
+    /// reader ends up with, and the only length that describes the tensor's
+    /// *contents*. Equals [`Self::nbytes`] for uncompressed entries.
+    pub fn uncompressed_nbytes(&self, name: &str) -> Option<i64> {
+        self.find(name).map(|t| t.uncompressed_nbytes)
     }
 
     /// Raw on-disk location of a tensor's data: `(fd, absolute_offset, nbytes)`.
@@ -300,9 +361,13 @@ impl SafeTensors {
     pub fn read_raw(&self, name: &str, out: &mut [u8]) -> Result<(), Error> {
         let t = self.tensor(name)?;
         let need = t.uncompressed_nbytes as usize;
-        if out.len() < need {
+        // Exact, not "at least": an oversized buffer used to be filled partially
+        // and the tail left at zero. For a quantized payload zero nibbles decode
+        // to -8 (maximum-magnitude negative weights), so the model would produce
+        // confident garbage rather than an error.
+        if out.len() != need {
             return Err(Error::Format(format!(
-                "read_raw '{name}': out buffer {} < nbytes {need}",
+                "read_raw '{name}': out buffer {} bytes, tensor is {need}",
                 out.len()
             )));
         }
@@ -347,9 +412,40 @@ impl SafeTensors {
         if t.dtype == Dtype::U8 {
             return Err(Error::Format(format!("read_slice_f32 on quantized (U8) tensor '{name}'")));
         }
+        if !matches!(t.compression, Compression::None) {
+            // Slicing reads bytes at an offset; a compressed payload has no
+            // addressable element boundaries, so the bytes would be decoded as
+            // if they were floats.
+            return Err(Error::Format(format!(
+                "read_slice_f32 '{name}': tensor is compressed — use read_f32 (whole-tensor decompress)"
+            )));
+        }
         let esz = t.dtype.elem_size() as i64;
-        let boff = t.off + (elem_off * esz) as u64;
-        let nb = (n_elems * esz) as usize;
+        // All of this is attacker/corruption-reachable through the header, so it
+        // is checked: a negative offset used to wrap to ~2^64 when cast, and the
+        // slice could read past the tensor into the next one's bytes.
+        if elem_off < 0 || n_elems < 0 {
+            return Err(Error::Format(format!("read_slice_f32 '{name}': negative offset/length")));
+        }
+        let last = elem_off
+            .checked_add(n_elems)
+            .ok_or_else(|| Error::Format(format!("read_slice_f32 '{name}': range overflows")))?;
+        if last > t.numel {
+            return Err(Error::Format(format!(
+                "read_slice_f32 '{name}': elements [{elem_off},{last}) exceed the tensor's {} elements",
+                t.numel
+            )));
+        }
+        let byte_off = elem_off
+            .checked_mul(esz)
+            .and_then(|b| u64::try_from(b).ok())
+            .and_then(|b| t.off.checked_add(b))
+            .ok_or_else(|| Error::Format(format!("read_slice_f32 '{name}': byte offset overflows")))?;
+        let nb = n_elems
+            .checked_mul(esz)
+            .and_then(|b| usize::try_from(b).ok())
+            .ok_or_else(|| Error::Format(format!("read_slice_f32 '{name}': byte length overflows")))?;
+        let boff = byte_off;
         if out.len() < n_elems as usize {
             return Err(Error::Format(format!("read_slice_f32 '{name}': out buffer too small")));
         }
@@ -377,6 +473,18 @@ fn maybe_hugepage(buf: &mut [u8]) {
 }
 
 fn convert_f32(dtype: Dtype, raw: &[u8], out: &mut [f32]) -> Result<(), Error> {
+    // `zip` stops at the shorter side, so a source that is too short used to
+    // leave the tail of `out` untouched (zeros, or stale contents) and still
+    // return Ok — half a weight row silently dequantizing to 0.0.
+    let esz = dtype.elem_size();
+    let want = out.len().saturating_mul(esz);
+    if raw.len() < want {
+        return Err(Error::Format(format!(
+            "convert_f32: source holds {} bytes but {} elements ({want} bytes) were requested",
+            raw.len(),
+            out.len()
+        )));
+    }
     match dtype {
         Dtype::F32 => {
             for (o, c) in out.iter_mut().zip(raw.chunks_exact(4)) {

@@ -5,7 +5,7 @@
 //! (M2), CACHE_ROUTE, and EXPERT_BUDGET opt-ins.
 
 use crate::math::silu_mul;
-use crate::router::{batch_union, route};
+use crate::router::{batch_union, route, RouterCfg};
 use crate::weight::QtWeight;
 
 /// One expert (or the shared expert / a dense layer's MLP): gate, up, down.
@@ -26,26 +26,34 @@ impl Mlp {
     }
 }
 
+/// The per-layer MoE configuration: batch shape plus the routing knobs. One
+/// value instead of five positional parameters, so a call site cannot silently
+/// transpose `hidden` and `k`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoeCfg {
+    pub s_n: usize,
+    pub hidden: usize,
+    pub k: usize,
+    pub norm_topk: bool,
+    pub routed_scale: f32,
+}
+
 /// Full MoE layer forward. `x[s_n, hidden]` → `out[s_n, hidden]`.
 ///
 /// Each unique routed expert is computed once over the positions that route to
 /// it (the batch-union invariant), its output scattered back weighted by the
 /// gate weight; the shared expert (if any) is added to every position.
-#[allow(clippy::too_many_arguments)]
 pub fn moe_forward(
     x: &[f32],
     router_w: &[f32],
     router_bias: &[f32],
     experts: &[Mlp],
     shared: Option<&Mlp>,
-    s_n: usize,
-    hidden: usize,
-    k: usize,
-    norm_topk: bool,
-    routed_scale: f32,
+    cfg: MoeCfg,
 ) -> Vec<f32> {
+    let MoeCfg { s_n, hidden, k, norm_topk, routed_scale } = cfg;
     let e_n = experts.len();
-    let r = route(x, router_w, router_bias, s_n, hidden, e_n, k, norm_topk, routed_scale);
+    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk, routed_scale });
     let mut out = vec![0f32; s_n * hidden];
 
     // Gather each routed expert's positions (+ gate weights) in batch-union order.
@@ -54,24 +62,38 @@ pub fn moe_forward(
         rows: Vec<usize>,
         rw: Vec<f32>,
     }
-    let mut plans: Vec<Plan> = Vec::new();
-    for &e in batch_union(&r, s_n).iter() {
-        let e = e as usize;
-        let mut rows: Vec<usize> = Vec::new();
-        let mut rw: Vec<f32> = Vec::new();
-        for s in 0..s_n {
-            for kk in 0..r.keff[s] as usize {
-                if r.idx[s * r.k + kk] as usize == e {
-                    rows.push(s);
-                    rw.push(r.w[s * r.k + kk]);
-                    break;
-                }
+    // One pass over the routing table buckets every expert's rows; the previous
+    // shape rescanned the whole table once per unique expert
+    // (O(|union| × S × K) — millions of comparisons per sparse layer on a long
+    // prefill) to recover information a single sweep already has.
+    //
+    // Emission stays in `batch_union` order and rows stay in ascending `s` with
+    // the first matching `kk` per position, so the scatter order — and therefore
+    // the f32 accumulation order — is bit-identical to the rescan version.
+    let union = batch_union(&r, s_n);
+    let mut slot_of: Vec<Option<usize>> = vec![None; e_n];
+    let mut plans: Vec<Plan> = Vec::with_capacity(union.len());
+    for &e in union.iter() {
+        if let Some(slot) = usize::try_from(e).ok().filter(|&e| e < e_n) {
+            if slot_of[slot].is_none() {
+                slot_of[slot] = Some(plans.len());
+                plans.push(Plan { e: slot, rows: Vec::new(), rw: Vec::new() });
             }
         }
-        if !rows.is_empty() {
-            plans.push(Plan { e, rows, rw });
+    }
+    for s in 0..s_n {
+        for kk in 0..(r.keff[s].max(0) as usize).min(r.k) {
+            let Ok(e) = usize::try_from(r.idx[s * r.k + kk]) else { continue };
+            let Some(&Some(pi)) = slot_of.get(e) else { continue };
+            // one row per position per expert — mirrors the original `break`
+            if plans[pi].rows.last() == Some(&s) {
+                continue;
+            }
+            plans[pi].rows.push(s);
+            plans[pi].rw.push(r.w[s * r.k + kk]);
         }
     }
+    plans.retain(|p| !p.rows.is_empty());
 
     // Compute each expert's SwiGLU on the pool (disjoint scratch), then scatter
     // SERIALLY in batch-union order — a row hit by two experts accumulates in the
@@ -156,10 +178,10 @@ mod tests {
         let experts: Vec<Mlp> = (0..e_n).map(|_| make_mlp(&mut rng, hidden, inter)).collect();
         let shared = make_mlp(&mut rng, hidden, inter);
 
-        let out = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), s_n, hidden, k, true, 2.5);
+        let out = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), MoeCfg { s_n, hidden, k, norm_topk: true, routed_scale: 2.5 });
 
         // Reference: identical routing (f32 router), f32 expert compute.
-        let r = route(&x, &router_w, &router_bias, s_n, hidden, e_n, k, true, 2.5);
+        let r = route(&x, &router_w, &router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: true, routed_scale: 2.5 });
         let mut refout = vec![0f32; s_n * hidden];
         for s in 0..s_n {
             for kk in 0..k {
@@ -194,10 +216,10 @@ mod tests {
         let experts: Vec<Mlp> = (0..e_n).map(|_| make_mlp(&mut rng, hidden, inter)).collect();
         let shared = make_mlp(&mut rng, hidden, inter);
 
-        let par = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), s_n, hidden, k, true, 2.5);
+        let par = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), MoeCfg { s_n, hidden, k, norm_topk: true, routed_scale: 2.5 });
 
         // serial oracle: gather → swiglu → scatter, in batch-union order
-        let r = route(&x, &router_w, &router_bias, s_n, hidden, e_n, k, true, 2.5);
+        let r = route(&x, &router_w, &router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: true, routed_scale: 2.5 });
         let mut ser = vec![0f32; s_n * hidden];
         for &e in batch_union(&r, s_n).iter() {
             let e = e as usize;

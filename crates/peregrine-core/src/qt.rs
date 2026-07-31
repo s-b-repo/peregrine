@@ -22,6 +22,10 @@ pub enum QtFmt {
     Int2 = 3,
     /// grouped packed int4 (`gs` weights share one scale)
     Int4Grouped = 4,
+    /// the payload size matches no known container for the requested `[O, I]`
+    /// — a truncated tensor, or a caller/file shape disagreement. Loading one
+    /// is an error rather than a guess.
+    Unknown = 5,
 }
 
 /// Resolved format for one weight `[O, I]`.
@@ -66,22 +70,32 @@ impl QtInfo {
     /// Inspect a weight `[O, I]` in `st` and resolve its container format.
     pub fn detect(st: &SafeTensors, name: &str, o: i64, i: i64) -> QtInfo {
         let scale_name = format!("{name}.qs");
-        let Some(nb) = st.nbytes(name) else {
+        // The *uncompressed* size is what describes the container: `nbytes` is
+        // the on-disk payload, which for a zstd tensor is the compressed length
+        // and matches no format's byte count — every compressed quantized weight
+        // was therefore misdetected (and then failed to load).
+        let Some(nb) = st.uncompressed_nbytes(name) else {
             // absent weight → treat as runtime-quantized full precision
             return QtInfo { fmt: QtFmt::F32, o, i, gs: 0, scale_count: 0 };
         };
         if !st.has(&scale_name) {
             return QtInfo { fmt: QtFmt::F32, o, i, gs: 0, scale_count: 0 };
         }
-        // scales are F32; count = bytes / 4
-        let ns = st.nbytes(&scale_name).unwrap_or(0) / 4;
+        // Scale count straight from the tensor's element count — independent of
+        // both compression and the scale dtype's byte width.
+        let ns = st.numel(&scale_name).unwrap_or(0);
 
         let mut fmt = if nb == o * i {
             QtFmt::Int8
         } else if nb == o * ((i + 1) / 2) {
             QtFmt::Int4
-        } else {
+        } else if nb == o * ((i + 3) / 4) {
             QtFmt::Int2
+        } else {
+            // Deliberately not "assume int2": an unrecognized size means the
+            // caller's (o, i) disagrees with the file, or the tensor is
+            // truncated. Guessing produced 2-bit garbage that loaded cleanly.
+            return QtInfo { fmt: QtFmt::Unknown, o, i, gs: 0, scale_count: 0 };
         };
         let mut gs = 0;
         if fmt == QtFmt::Int4 {
@@ -162,6 +176,55 @@ mod tests {
         assert_eq!(QtInfo::detect(&st, "w8", o, i).fmt, QtFmt::Int8);
         assert_eq!(QtInfo::detect(&st, "wf", o, i).fmt, QtFmt::F32);
 
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn detects_compressed_quantized_weights() -> Result<(), Error> {
+        // Regression: detection compared the *on-disk* byte count, which for a
+        // zstd tensor is the compressed length. It matched no format, fell
+        // through to "assume int2", and the weight then failed to load — making
+        // compression unusable for exactly the tensors it matters most for.
+        let (o, i) = (4i64, 64i64);
+        let packed4 = (o * ((i + 1) / 2)) as usize;
+        // Patterned bytes so zstd actually shrinks the payload.
+        let w: Vec<u8> = (0..packed4).map(|k| (k % 7) as u8).collect();
+        let scales: Vec<u8> = (0..o as usize * 4).map(|k| (k % 5) as u8).collect();
+        let dir = tmpdir("compressed");
+        // The real writer, since only it emits the compression header fields.
+        crate::pack::write_safetensors(
+            &dir,
+            &[
+                crate::pack::Blob::new("w4", "U8", vec![o, i / 2], w).with_compression(crate::Compression::Zstd),
+                crate::pack::Blob::new("w4.qs", "F32", vec![o], scales),
+            ],
+        )?;
+        let st = SafeTensors::open(&dir)?;
+        assert!(st.nbytes("w4") < st.uncompressed_nbytes("w4"), "the payload must really be compressed");
+        let info = QtInfo::detect(&st, "w4", o, i);
+        assert_eq!(info.fmt, QtFmt::Int4, "a compressed int4 weight is still an int4 weight");
+        assert_eq!(info.scale_count, o);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unrecognized_payload_size_is_not_guessed_as_int2() -> Result<(), Error> {
+        // A truncated tensor (or a caller shape that disagrees with the file)
+        // used to be silently classified int2 and loaded as 2-bit garbage.
+        let (o, i) = (4i64, 64i64);
+        let dir = tmpdir("mismatch");
+        write_safetensors(
+            &dir,
+            &[
+                // 100 bytes matches none of int8 (256), int4 (128), int2 (64).
+                Blob { name: "w", dtype: "U8", shape: vec![100], bytes: vec![0u8; 100] },
+                Blob { name: "w.qs", dtype: "F32", shape: vec![o], bytes: vec![0u8; (o * 4) as usize] },
+            ],
+        )?;
+        let st = SafeTensors::open(&dir)?;
+        assert_eq!(QtInfo::detect(&st, "w", o, i).fmt, QtFmt::Unknown);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

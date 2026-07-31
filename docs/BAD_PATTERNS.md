@@ -48,9 +48,9 @@ ignored binding cannot dodge the gate:
 One exemption: the RAII keep-alive idiom `let _g = gpu_guard();` (any
 `…guard()` callee) is *not* flagged — there the named binding is the point,
 since `let _ =` would drop the guard immediately, which would be the actual
-bug. The three `while let Ok(…) = rx.recv()` worker loops carry
-`// audit-allow:` waivers: a channel `recv`'s only error is `Disconnected`,
-which *is* the concrete shutdown variant.
+bug. The `while let Ok(…) = rx.recv()` worker loops were rewritten as explicit
+`match`es on `RecvError` — a channel `recv`'s only error is `Disconnected`,
+which *is* the concrete shutdown variant, so naming it is the fix.
 
 **Advisory operations** (madvise/fadvise hints, NUMA pinning, route-stats
 persistence, shutdown signalling) are correctness-neutral by design and must not
@@ -88,9 +88,14 @@ have none; `peregrine-core` is `#![forbid(unsafe_code)]`).
 The let-else twin of the gated `if let Ok(`: the `else` arm drops the `Err` on
 the floor. The codebase uses it as the sanctioned style for best-effort reads
 (sysfs probes in `sensors.rs`/`topo.rs`, optional JSON caches in `model.rs`),
-so it is reported for review rather than gated. Promoting it to strict means
-`ErrorKind`-aware matches (`NotFound` = expected, anything else =
-`note_advisory_err`) at every site — tracked as future work.
+so it is reported for review rather than gated.
+
+The `ErrorKind`-aware upgrade (`NotFound` = expected absence, anything else
+reported through `note_advisory_err`) has landed at the sites where a
+non-`NotFound` failure would otherwise be indistinguishable from "not present" —
+`topo::pcie_link_by_bdf` via `read_sysfs_opt`, and the artifact readers in
+`engine/main.rs` (`compile-plan` now separates a corrupt artifact from a missing
+one). The remaining sites are genuine either-way probes.
 
 ## What is intentionally NOT flagged
 
@@ -105,17 +110,32 @@ swallows; the ignored-closure form `…or_else(|_e|` *is* gated).
 
 ## Current status
 
-`--strict` is green: **P=0, B=0, U=0, I=0** (L=19 informational let-else
-sites; 51 files; `peregrine-token` excluded as vendored). Note: the root-level
-`audit-bad-patterns.sh` was previously a stale
+`--strict` is green: **P=0, B=0, U=0, I=0** (L=26 informational let-else
+sites; 51 files; `peregrine-token` excluded as vendored). **No `// audit-allow:`
+waivers and no `#[allow(...)]` attributes remain anywhere in first-party code** —
+the waiver mechanism still exists, but every former use was replaced with real
+handling (see below). Note: the root-level `audit-bad-patterns.sh` was previously a stale
 copy that resolved its repo root incorrectly and scanned zero files — it is now
 a shim delegating to `scripts/audit-bad-patterns.sh`, the canonical gate.
 Beyond the gate, error plumbing is structured workspace-wide: every fallible
 public API returns `peregrine_core::Error` (thiserror + the `Context`/`.ctx()`
 extension) — no `Result<_, String>` surfaces remain outside the vendored crate.
-The one production `assert!` (KV-cache append order, `attention.rs`) carries an
-`// audit-allow:` waiver: it guards an engine-internal invariant whose silent
-violation would corrupt attention output. Six more waivers cover the
-`while let Ok = recv()` worker loops (only `Err` is `Disconnected` = clean
-shutdown) and the off-Linux unused-param `let _cpu`/`let _bdf` silencing.
+The former waivers are all gone, each replaced by the handling it was standing in for:
+- the production `assert!` on KV-cache append order became `LayerKv::append -> Result`,
+  propagated through `mla_attention*` — the invariant is still checked on every
+  append, but a violation fails that one request instead of aborting the process
+  (the release profile sets `panic = "abort"`, so the assert would have taken
+  every concurrent sequence down with it);
+- the three `while let Ok(..) = rx.recv()` worker loops became explicit
+  `match`es on `RecvError`, naming disconnection as the shutdown signal;
+- the off-Linux `let _cpu` / `let _bdf` bindings became cfg-split function
+  signatures whose parameters are declared unused (`_cpu: u32`), and the sensors
+  test now asserts on the value it used to discard.
+
+Likewise the 14 `#[allow(...)]` attributes were removed by fixing what they
+suppressed: `clippy::too_many_arguments` by introducing `MatShape`/`ActScratch`
+(kernels), `RouterCfg` (router) and `MoeCfg` (MoE layer); `should_implement_trait`
+by implementing `FromStr` for `Dtype` (the inherent parser is now `Dtype::parse`);
+`type_complexity` by naming `OfflineArtifacts`; and the three crate-wide
+`needless_range_loop` opt-outs by rewriting each flagged loop in iterator form.
 Re-run after any change to the streaming, scheduler, or serve paths.

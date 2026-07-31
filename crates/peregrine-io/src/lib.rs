@@ -13,7 +13,6 @@
 //! the M4 scheduler.
 
 // tier.h is ported with explicit expert-index loops for line-by-line parity.
-#![allow(clippy::needless_range_loop)]
 // Quality gates: io_uring submission is the only (irreducible) `unsafe` here; no
 // panicking error handling in library code.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

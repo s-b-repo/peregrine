@@ -29,9 +29,37 @@ pub fn matmul_f32(y: &mut [f32], x: &[f32], w: &[f32], s_n: usize, d_n: usize, o
     }
 }
 
+/// The dimensions every matmul here shares: `S` rows of activations, `I` inputs
+/// per row, `O` outputs per row (weights are row-major `[O, I]`). Grouped-int4
+/// adds its group size. Passing these as one value keeps the entry points
+/// readable — the alternative was six-to-ten positional `usize` parameters,
+/// which is both hard to call correctly and what the lint was complaining about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatShape {
+    /// rows of activations (batch)
+    pub s_n: usize,
+    /// inputs per row
+    pub i_n: usize,
+    /// outputs per row
+    pub o_n: usize,
+}
+
+impl MatShape {
+    pub fn new(s_n: usize, i_n: usize, o_n: usize) -> MatShape {
+        MatShape { s_n, i_n, o_n }
+    }
+}
+
+/// Per-row int8 activation scratch shared by the `*_from_f32` entry points:
+/// `xq` holds `S*I` quantized activations, `sx` their `S` per-row scales.
+pub struct ActScratch<'a> {
+    pub xq: &'a mut [i8],
+    pub sx: &'a mut [f32],
+}
+
 /// int8 weights `q[O*I]`, int8 activations `xq[S*I]` → `y[S*O]`.
-#[allow(clippy::too_many_arguments)] // matmul shapes are inherently wide
-pub fn matmul_q_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q: &[i8], scale: &[f32], s_n: usize, i_n: usize, o_n: usize) {
+pub fn matmul_q_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q: &[i8], scale: &[f32], shape: MatShape) {
+    let MatShape { s_n, i_n, o_n } = shape;
     for o in 0..o_n {
         let w = &q[o * i_n..o * i_n + i_n];
         let sc = scale[o];
@@ -44,8 +72,8 @@ pub fn matmul_q_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q: &[i8], scale: &[f3
 }
 
 /// packed-int4 weights `q4[O*ceil(I/2)]`, int8 activations `xq[S*I]` → `y[S*O]`.
-#[allow(clippy::too_many_arguments)]
-pub fn matmul_i4_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q4: &[u8], scale: &[f32], s_n: usize, i_n: usize, o_n: usize) {
+pub fn matmul_i4_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q4: &[u8], scale: &[f32], shape: MatShape) {
+    let MatShape { s_n, i_n, o_n } = shape;
     let rb = i_n.div_ceil(2);
     for o in 0..o_n {
         let w = &q4[o * rb..o * rb + rb];
@@ -62,18 +90,8 @@ pub fn matmul_i4_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q4: &[u8], scale: &[
 /// `scale[O*ng]` (`ng = ceil(I/gs)`, row `o` group `g` at `scale[o*ng + g]`),
 /// int8 activations `xq[S*I]` → `y[S*O]`. The weight group scales are folded in
 /// by [`dot_i4i8_grouped`]; only the per-row activation scale `sx[s]` remains.
-#[allow(clippy::too_many_arguments)]
-pub fn matmul_i4g_idot(
-    y: &mut [f32],
-    xq: &[i8],
-    sx: &[f32],
-    q4: &[u8],
-    scale: &[f32],
-    s_n: usize,
-    i_n: usize,
-    o_n: usize,
-    gs: usize,
-) {
+pub fn matmul_i4g_idot(y: &mut [f32], xq: &[i8], sx: &[f32], q4: &[u8], scale: &[f32], shape: MatShape, gs: usize) {
+    let MatShape { s_n, i_n, o_n } = shape;
     let rb = i_n.div_ceil(2);
     let ng = i_n.div_ceil(gs);
     for o in 0..o_n {
@@ -88,62 +106,42 @@ pub fn matmul_i4g_idot(
 }
 
 /// Convenience: same as [`matmul_i4_from_f32`] for grouped packed-int4 weights.
-#[allow(clippy::too_many_arguments)]
 pub fn matmul_i4g_from_f32(
     y: &mut [f32],
     x: &[f32],
     q4: &[u8],
     scale: &[f32],
-    s_n: usize,
-    i_n: usize,
-    o_n: usize,
+    shape: MatShape,
     gs: usize,
-    xq: &mut [i8],
-    sx: &mut [f32],
+    act: ActScratch<'_>,
 ) {
+    let (i_n, s_n) = (shape.i_n, shape.s_n);
+    let ActScratch { xq, sx } = act;
     for s in 0..s_n {
         sx[s] = qrow_i8(&x[s * i_n..s * i_n + i_n], &mut xq[s * i_n..s * i_n + i_n]);
     }
-    matmul_i4g_idot(y, xq, sx, q4, scale, s_n, i_n, o_n, gs);
+    matmul_i4g_idot(y, xq, sx, q4, scale, shape, gs);
 }
 
 /// Convenience: quantize f32 activations row-wise (`qrow_i8`) into `xq`/`sx`
 /// scratch, then run [`matmul_q_idot`]. `xq` is `S*I`, `sx` is `S`.
-#[allow(clippy::too_many_arguments)] // matmul shape (dims + scratch) is inherently wide
-pub fn matmul_i8_from_f32(
-    y: &mut [f32],
-    x: &[f32],
-    q: &[i8],
-    scale: &[f32],
-    s_n: usize,
-    i_n: usize,
-    o_n: usize,
-    xq: &mut [i8],
-    sx: &mut [f32],
-) {
+pub fn matmul_i8_from_f32(y: &mut [f32], x: &[f32], q: &[i8], scale: &[f32], shape: MatShape, act: ActScratch<'_>) {
+    let (i_n, s_n) = (shape.i_n, shape.s_n);
+    let ActScratch { xq, sx } = act;
     for s in 0..s_n {
         sx[s] = qrow_i8(&x[s * i_n..s * i_n + i_n], &mut xq[s * i_n..s * i_n + i_n]);
     }
-    matmul_q_idot(y, xq, sx, q, scale, s_n, i_n, o_n);
+    matmul_q_idot(y, xq, sx, q, scale, shape);
 }
 
 /// Convenience: same as [`matmul_i8_from_f32`] for packed-int4 weights.
-#[allow(clippy::too_many_arguments)]
-pub fn matmul_i4_from_f32(
-    y: &mut [f32],
-    x: &[f32],
-    q4: &[u8],
-    scale: &[f32],
-    s_n: usize,
-    i_n: usize,
-    o_n: usize,
-    xq: &mut [i8],
-    sx: &mut [f32],
-) {
+pub fn matmul_i4_from_f32(y: &mut [f32], x: &[f32], q4: &[u8], scale: &[f32], shape: MatShape, act: ActScratch<'_>) {
+    let (i_n, s_n) = (shape.i_n, shape.s_n);
+    let ActScratch { xq, sx } = act;
     for s in 0..s_n {
         sx[s] = qrow_i8(&x[s * i_n..s * i_n + i_n], &mut xq[s * i_n..s * i_n + i_n]);
     }
-    matmul_i4_idot(y, xq, sx, q4, scale, s_n, i_n, o_n);
+    matmul_i4_idot(y, xq, sx, q4, scale, shape);
 }
 
 #[cfg(test)]
@@ -213,7 +211,7 @@ mod tests {
         let mut xq = vec![0i8; s_n * i_n];
         let mut sx = vec![0f32; s_n];
         let mut y = vec![0f32; s_n * o_n];
-        matmul_i8_from_f32(&mut y, &xf, &q8, &sc8, s_n, i_n, o_n, &mut xq, &mut sx);
+        matmul_i8_from_f32(&mut y, &xf, &q8, &sc8, MatShape::new(s_n, i_n, o_n), ActScratch { xq: &mut xq, sx: &mut sx });
 
         for s in 0..s_n {
             for o in 0..o_n {
@@ -236,7 +234,7 @@ mod tests {
         let mut xq = vec![0i8; s_n * i_n];
         let mut sx = vec![0f32; s_n];
         let mut y = vec![0f32; s_n * o_n];
-        matmul_i4_from_f32(&mut y, &xf, &q4, &sc4, s_n, i_n, o_n, &mut xq, &mut sx);
+        matmul_i4_from_f32(&mut y, &xf, &q4, &sc4, MatShape::new(s_n, i_n, o_n), ActScratch { xq: &mut xq, sx: &mut sx });
 
         for s in 0..s_n {
             for o in 0..o_n {
@@ -288,7 +286,7 @@ mod tests {
         let mut xq = vec![0i8; s_n * i_n];
         let mut sx = vec![0f32; s_n];
         let mut y = vec![0f32; s_n * o_n];
-        matmul_i4g_from_f32(&mut y, &xf, &q4, &sc4, s_n, i_n, o_n, gs, &mut xq, &mut sx);
+        matmul_i4g_from_f32(&mut y, &xf, &q4, &sc4, MatShape::new(s_n, i_n, o_n), gs, ActScratch { xq: &mut xq, sx: &mut sx });
 
         // exact vs by-definition grouped scalar dot
         for s in 0..s_n {
@@ -309,7 +307,7 @@ mod tests {
         let (q4r, sc4r) = quant_i4_rows(&wf, o_n, i_n);
         let mut yr = vec![0f32; s_n * o_n];
         let (mut xqr, mut sxr) = (vec![0i8; s_n * i_n], vec![0f32; s_n]);
-        matmul_i4_from_f32(&mut yr, &xf, &q4r, &sc4r, s_n, i_n, o_n, &mut xqr, &mut sxr);
+        matmul_i4_from_f32(&mut yr, &xf, &q4r, &sc4r, MatShape::new(s_n, i_n, o_n), ActScratch { xq: &mut xqr, sx: &mut sxr });
         let (mut eg, mut er) = (0f32, 0f32);
         for s in 0..s_n {
             for o in 0..o_n {
@@ -334,7 +332,7 @@ mod tests {
         let mut xq = vec![0i8; s_n * i_n];
         let mut sx = vec![0f32; s_n];
         let mut y = vec![0f32; s_n * o_n];
-        matmul_i8_from_f32(&mut y, &xf, &q8, &sc8, s_n, i_n, o_n, &mut xq, &mut sx);
+        matmul_i8_from_f32(&mut y, &xf, &q8, &sc8, MatShape::new(s_n, i_n, o_n), ActScratch { xq: &mut xq, sx: &mut sx });
 
         for s in 0..s_n {
             for o in 0..o_n {

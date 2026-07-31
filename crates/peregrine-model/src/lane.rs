@@ -124,6 +124,9 @@ pub struct BubbleTuner {
     streak_kind: Bias,
     streak: u32,
     current: Bias,
+    /// Forwards since the published bias was last (re)confirmed by a completed
+    /// streak. Lets a stale bias expire back to `Balanced`.
+    since_publish: u32,
 }
 
 impl BubbleTuner {
@@ -143,6 +146,7 @@ impl BubbleTuner {
             streak_kind: Bias::Balanced,
             streak: 0,
             current: Bias::Balanced,
+            since_publish: 0,
         }
     }
 
@@ -161,7 +165,12 @@ impl BubbleTuner {
         } else {
             (gpu, io.max(cpu))
         };
-        let dominant = if others > 0.0 && mx / others >= self.dominance {
+        // `others == 0` with real work on the winning lane is *maximal* dominance,
+        // not "balanced": on a CPU-only box (gpu always 0) served entirely from
+        // the warm cache (io 0), the guard against dividing by zero was
+        // suppressing the strongest signal the tuner can see.
+        let dominates = if others > 0.0 { mx / others >= self.dominance } else { mx > 0.0 };
+        let dominant = if dominates {
             if mx == io {
                 Bias::TowardIo
             } else if mx == cpu {
@@ -181,6 +190,17 @@ impl BubbleTuner {
         }
         if self.streak >= self.k_consecutive {
             self.current = self.streak_kind;
+            self.since_publish = 0;
+        } else {
+            // A published bias must be able to expire. Under a noisy workload the
+            // dominant lane alternates, so no streak ever completes and whatever
+            // was published — possibly from a single spike thousands of forwards
+            // ago — stayed in force forever.
+            self.since_publish = self.since_publish.saturating_add(1);
+            if self.current != Bias::Balanced && self.since_publish >= self.k_consecutive.saturating_mul(4) {
+                self.current = Bias::Balanced;
+                self.since_publish = 0;
+            }
         }
         self.current
     }
@@ -235,7 +255,12 @@ impl LaneBalancer {
     pub fn choose(&self, gpu_resident: bool, heat: u32) -> Placement {
         match self.bias {
             Bias::TowardCpu if !gpu_resident && heat >= self.spill_threshold => Placement::GpuSpill,
-            Bias::TowardGpu if gpu_resident => Placement::Cpu, // spill a resident back to CPU
+            // Only the *coldest* residents move: an unconditional downgrade sent
+            // every VRAM-resident expert to the streaming lane the moment the GPU
+            // was transiently slowest, which collapsed GPU utilization, flipped
+            // the bias back, and oscillated with a latency cliff every few
+            // forwards. The doc for this arm always said "cold".
+            Bias::TowardGpu if gpu_resident && heat < self.spill_threshold => Placement::Cpu,
             _ => {
                 if gpu_resident {
                     Placement::Gpu
@@ -304,7 +329,51 @@ mod tests {
 
     #[test]
     fn balancer_downgrades_cold_resident_when_gpu_bound() {
+        // "Cold" is the whole point: when the GPU lane is the bottleneck, only
+        // residents below the spill threshold move to the streaming lane. The
+        // arm used to ignore heat entirely, so *every* VRAM resident was
+        // downgraded on a transient GPU spike — GPU utilization collapsed, the
+        // bias flipped back, and the two states oscillated.
         let b = LaneBalancer::new(Bias::TowardGpu, 10);
-        assert_eq!(b.choose(true, 20), Placement::Cpu);
+        assert_eq!(b.choose(true, 3), Placement::Cpu, "cold resident streams instead");
+        assert_eq!(b.choose(true, 20), Placement::Gpu, "hot resident keeps its VRAM slot");
+        assert_eq!(b.choose(false, 20), Placement::Cpu, "non-resident is unaffected");
+    }
+
+    #[test]
+    fn published_bias_expires_back_to_balanced() {
+        // A bias published from a burst must not stay in force forever when the
+        // workload turns noisy and no streak ever completes again.
+        let mut t = BubbleTuner::new(0.5, 1.5, 2);
+        let cpu_heavy = LaneTimings { io_us: 1, cpu_us: 1000, gpu_us: 1, reduce_us: 0, cpu_bytes: 0 };
+        for _ in 0..4 {
+            t.observe(cpu_heavy);
+        }
+        assert_eq!(t.bias(), Bias::TowardCpu, "a sustained burst publishes a bias");
+        // Now alternate so no lane ever wins k in a row.
+        let io_heavy = LaneTimings { io_us: 1000, cpu_us: 1, gpu_us: 1, reduce_us: 0, cpu_bytes: 0 };
+        let mut saw_balanced = false;
+        for i in 0..32 {
+            t.observe(if i % 2 == 0 { io_heavy } else { cpu_heavy });
+            if t.bias() == Bias::Balanced {
+                saw_balanced = true;
+                break;
+            }
+        }
+        assert!(saw_balanced, "a stale bias must expire back to Balanced");
+    }
+
+    #[test]
+    fn idle_sibling_lanes_still_show_dominance() {
+        // CPU-only box (gpu always 0) served entirely from the warm cache (io 0):
+        // the divide-by-zero guard used to report Balanced even though the CPU
+        // lane was 100% of the time.
+        let mut t = BubbleTuner::new(1.0, 1.5, 1);
+        let only_cpu = LaneTimings { io_us: 0, cpu_us: 500, gpu_us: 0, reduce_us: 0, cpu_bytes: 0 };
+        assert_eq!(t.observe(only_cpu), Bias::TowardCpu);
+        // All lanes idle is genuinely balanced.
+        let mut t2 = BubbleTuner::new(1.0, 1.5, 1);
+        let idle = LaneTimings { io_us: 0, cpu_us: 0, gpu_us: 0, reduce_us: 0, cpu_bytes: 0 };
+        assert_eq!(t2.observe(idle), Bias::Balanced);
     }
 }

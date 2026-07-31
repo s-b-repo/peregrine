@@ -73,9 +73,15 @@ impl BanditScheduler {
     /// Pick the next arm: explore with probability `ε = 1/(1+total_pulls/16)`
     /// (decays as evidence accumulates), else exploit the best EWMA.
     pub fn choose(&mut self) -> KnobArm {
-        let total: u32 = self.pulls.iter().sum();
+        // u64: each arm's count saturates individually, but their u32 sum can
+        // wrap on a long-lived server (and counts carry across sessions), which
+        // would snap a converged policy back to near-maximal exploration.
+        let total: u64 = self.pulls.iter().map(|&p| p as u64).sum();
         let eps_denom = 1 + (total / 16);
-        let explore = self.rng.next().is_multiple_of(eps_denom as u64 + 1);
+        // ε = 1/(1 + pulls/16), as documented. Using `eps_denom + 1` here made
+        // the real rate 1/(2 + pulls/16) — half the intended exploration at
+        // every point in the schedule.
+        let explore = self.rng.next().is_multiple_of(eps_denom);
         self.current = if explore || total == 0 {
             (self.rng.next() as usize) % self.arms.len()
         } else {
@@ -138,7 +144,16 @@ impl BanditScheduler {
                 .iter()
                 .position(|arm| arm.prefetch_distance == d as usize && arm.workers == w as usize)
             {
-                self.value[i] = val as f32;
+                // Check the *converted* value: `1e39` is a perfectly finite f64
+                // (and valid JSON) that becomes +inf as f32. An infinite or NaN
+                // entry makes this arm win forever — the EWMA update keeps it
+                // infinite, and comparisons against NaN never displace it.
+                let v32 = val as f32;
+                if !v32.is_finite() {
+                    peregrine_io::note_advisory_err("bandit policy value rejected", &"non-finite after f32 conversion");
+                    continue;
+                }
+                self.value[i] = v32;
                 self.pulls[i] = p as u32;
             }
         }
@@ -195,7 +210,7 @@ impl QScheduler {
     }
 
     fn state_index(s: QState) -> usize {
-        ((s.bias as usize) & 3) * 2 + (s.stability as usize)
+        ((s.bias as usize) & 3) * 2 + ((s.stability as usize) & 1)
     }
 
     /// Choose an action for `state` (ε-greedy, ε = 1/(1+visits/8)).
@@ -203,7 +218,8 @@ impl QScheduler {
         let si = Self::state_index(state);
         self.visits[si] = self.visits[si].saturating_add(1);
         let eps_denom = 1 + (self.visits[si] / 8);
-        let explore = self.rng.next().is_multiple_of(eps_denom as u64 + 1);
+        // ε = 1/(1 + visits/8), as documented (the `+ 1` halved it).
+        let explore = self.rng.next().is_multiple_of(eps_denom as u64);
         let ai = if explore {
             (self.rng.next() as usize) % 5
         } else {
@@ -257,8 +273,12 @@ impl QScheduler {
             for (i, row) in rows.iter().take(self.q.len()).enumerate() {
                 if let Some(vals) = row.as_array() {
                     for (j, x) in vals.iter().take(5).enumerate() {
-                        if let Some(f) = x.as_f64() {
-                            self.q[i][j] = f as f32;
+                        // Non-finite entries make `max_next` infinite, poison the
+                        // update to NaN, and collapse the argmax to index 0 —
+                        // the policy then holds forever. Checked after the f32
+                        // conversion: a finite f64 like 1e39 overflows to +inf.
+                        if let Some(f) = x.as_f64().map(|f| f as f32).filter(|f| f.is_finite()) {
+                            self.q[i][j] = f;
                         }
                     }
                 }
@@ -311,7 +331,11 @@ impl Learner {
     /// The Q learner emits deltas; they are resolved against `cur` here so both
     /// learners return an absolute [`KnobArm`].
     pub fn choose(&mut self, bias: Bias, entropy: f32, cur: KnobArm, max_workers: usize) -> KnobArm {
-        match self {
+        // Whatever either learner proposes is clamped to the caller's ceiling
+        // below. That ceiling carries the thermal/power governor's decision, so
+        // a learned policy can only choose *within* the safe envelope — even
+        // when `cur` itself arrives above it.
+        let mut arm = match self {
             Learner::Bandit(b) => b.choose(),
             Learner::Q(q) => {
                 let a = q.choose(QState::from(bias, entropy));
@@ -320,12 +344,22 @@ impl Learner {
                     QAction::Hold => {}
                     QAction::PrefetchUp => next.prefetch_distance = (cur.prefetch_distance + 1).min(16),
                     QAction::PrefetchDown => next.prefetch_distance = cur.prefetch_distance.saturating_sub(1).max(1),
+                    // (floors intentionally match the engine's applied range —
+                    // see `publish_lane_timings`, which no longer re-floors)
                     QAction::WorkersUp => next.workers = (cur.workers + 1).min(max_workers),
-                    QAction::WorkersDown => next.workers = cur.workers.saturating_sub(1).max(2),
+                    // Floor of 2, but never above the ceiling: on a ceiling below
+                    // 2 the "down" action used to produce a value *above*
+                    // `max_workers`, so up/down oscillated around an
+                    // unreachable target.
+                    QAction::WorkersDown => {
+                        next.workers = cur.workers.saturating_sub(1).clamp(2.min(max_workers.max(1)), max_workers.max(1))
+                    }
                 }
                 next
             }
-        }
+        };
+        arm.workers = arm.workers.clamp(1, max_workers.max(1));
+        arm
     }
 
     /// Report the observed decode latency for the last choice.
@@ -411,6 +445,78 @@ mod tests {
         let mut q2 = QScheduler::new(5);
         q2.restore(&j);
         assert_eq!(q2.greedy(s), q.greedy(s));
+    }
+
+    #[test]
+    fn learners_never_exceed_the_caller_ceiling() {
+        // The ceiling is how the thermal/power governor's decision reaches the
+        // learner. The bandit used to ignore both `cur` and `max_workers` and
+        // return an absolute arm, so the engine overwrote every throttle with
+        // the learner's choice in the same call that applied it.
+        let ceiling = 3usize;
+        let cur = KnobArm { prefetch_distance: 4, workers: 8 };
+        let mut bandit = Learner::Bandit(BanditScheduler::new(16, 7));
+        for _ in 0..64 {
+            let arm = bandit.choose(Bias::Balanced, 0.5, cur, ceiling);
+            assert!(arm.workers <= ceiling, "bandit chose {} > ceiling {ceiling}", arm.workers);
+            bandit.reward(1000, Bias::Balanced, 0.5);
+        }
+        let mut q = Learner::Q(QScheduler::new(7));
+        for _ in 0..64 {
+            let arm = q.choose(Bias::Balanced, 0.5, cur, ceiling);
+            assert!(arm.workers <= ceiling, "Q chose {} > ceiling {ceiling}", arm.workers);
+            q.reward(1000, Bias::Balanced, 0.5);
+        }
+    }
+
+    #[test]
+    fn non_finite_persisted_policy_is_rejected() {
+        // `1e39` is valid JSON and parses to +inf as f32; an infinite value wins
+        // every comparison forever and the EWMA can never dislodge it.
+        let mut b = BanditScheduler::new(4, 3);
+        // Poison every arm the fresh scheduler knows about.
+        let healthy = b.to_json();
+        let arms = healthy.get("arms").and_then(|a| a.as_array()).cloned();
+        assert!(arms.is_some(), "policy must serialize its arms");
+        let poisoned_arms: Vec<serde_json::Value> = arms
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row.as_array().cloned())
+            .map(|a| serde_json::json!([a[0], a[1], 1e39, 5]))
+            .collect();
+        b.restore(&serde_json::json!({ "kind": "bandit", "arms": poisoned_arms }));
+        for _ in 0..32 {
+            b.reward(1000);
+        }
+        let json = b.to_json();
+        let rows = json.get("arms").and_then(|v| v.as_array());
+        assert!(rows.is_some(), "policy must serialize its arms");
+        if let Some(rows) = rows {
+            let all_finite = rows
+                .iter()
+                .filter_map(|r| r.as_array())
+                .filter_map(|a| a.get(2))
+                .all(|v| v.as_f64().is_some_and(|f| f.is_finite()));
+            assert!(all_finite, "no non-finite value may survive a restore: {rows:?}");
+        }
+
+        let mut q = QScheduler::new(3);
+        q.restore(&serde_json::json!({ "q": [[f64::MAX * 10.0, 0.0, 0.0, 0.0, 0.0]], "visits": [1] }));
+        let s = QState { bias: 0, stability: 0 };
+        for _ in 0..16 {
+            q.reward(1000, s);
+        }
+        let qj = q.to_json();
+        let rows = qj.get("q").and_then(|v| v.as_array());
+        assert!(rows.is_some(), "Q table must serialize its rows");
+        if let Some(rows) = rows {
+            let all_finite = rows
+                .iter()
+                .filter_map(|r| r.as_array())
+                .flatten()
+                .all(|v| v.as_f64().is_some_and(|f| f.is_finite()));
+            assert!(all_finite, "no non-finite Q entry may survive a restore");
+        }
     }
 
     #[test]

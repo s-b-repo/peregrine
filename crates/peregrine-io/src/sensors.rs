@@ -45,14 +45,22 @@ pub fn energy_uj() -> Option<u64> {
         for e in entries.flatten() {
             let name = e.file_name();
             let Some(name) = name.to_str() else { continue };
-            // top-level package domains only ("intel-rapl:0"), not subzones
+            // top-level domains only ("intel-rapl:0"), not subzones
             // ("intel-rapl:0:0") — subzones double-count the package total.
             if !name.starts_with("intel-rapl:") || name.matches(':').count() != 1 {
                 continue;
             }
+            // ...and only *package* domains. On many client/mobile parts
+            // `intel-rapl:1` is `psys`, a whole-platform domain that already
+            // includes package-0 — summing both roughly doubles the reported
+            // energy and silently skews every watt-derived decision.
+            let Ok(domain) = std::fs::read_to_string(e.path().join("name")) else { continue };
+            if !domain.trim().starts_with("package") {
+                continue;
+            }
             let Ok(text) = std::fs::read_to_string(e.path().join("energy_uj")) else { continue };
             let Ok(uj) = text.trim().parse::<u64>() else { continue };
-            sum = Some(sum.unwrap_or(0) + uj);
+            sum = Some(sum.unwrap_or(0).saturating_add(uj));
         }
         sum
     }
@@ -108,6 +116,10 @@ mod tests {
         let mut m = EnergyMeter::new();
         let first = m.delta_uj();
         assert!(first.is_none() || energy_uj().is_none() || first.is_some());
-        let _second = m.delta_uj(); // audit-allow: exercised for no-panic only — either None (no RAPL) or a small delta
+        // A second sample is either None (no RAPL on this box) or a delta; the
+        // meter is wrap-aware, so it must never report a negative-looking huge
+        // jump on a healthy machine.
+        let second = m.delta_uj();
+        assert!(second.is_none() || second.is_some_and(|d| d < u64::MAX / 2), "sane energy delta: {second:?}");
     }
 }

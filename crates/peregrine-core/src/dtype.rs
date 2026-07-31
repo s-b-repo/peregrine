@@ -23,10 +23,12 @@ pub enum Dtype {
 
 impl Dtype {
     /// Parse a safetensors `dtype` string. `I8` maps to `U8` (both are raw
-    /// quantized bytes here), matching `st_dtype_code`. Returns `Option` (not
-    /// `Result`), so this is deliberately not the `FromStr` trait method.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Dtype> {
+    /// quantized bytes here), matching `st_dtype_code`. `None` for anything this
+    /// engine does not support.
+    ///
+    /// The same parse is available as [`std::str::FromStr`] (which is what makes
+    /// this inherent name legitimate rather than a shadow of the trait).
+    pub fn parse(s: &str) -> Option<Dtype> {
         match s {
             "BF16" => Some(Dtype::Bf16),
             "F16" => Some(Dtype::F16),
@@ -43,6 +45,15 @@ impl Dtype {
             Dtype::Bf16 | Dtype::F16 => 2,
             Dtype::U8 => 1,
         }
+    }
+}
+
+impl std::str::FromStr for Dtype {
+    type Err = crate::Error;
+
+    /// The safetensors spelling of a dtype (see [`Dtype::parse`]).
+    fn from_str(s: &str) -> Result<Dtype, crate::Error> {
+        Dtype::parse(s).ok_or_else(|| crate::Error::Format(format!("unsupported dtype: {s}")))
     }
 }
 
@@ -104,9 +115,9 @@ mod tests {
 
     #[test]
     fn dtype_parse() {
-        assert_eq!(Dtype::from_str("BF16"), Some(Dtype::Bf16));
-        assert_eq!(Dtype::from_str("I8"), Some(Dtype::U8));
-        assert_eq!(Dtype::from_str("F64"), None);
+        assert_eq!(Dtype::parse("BF16"), Some(Dtype::Bf16));
+        assert_eq!(Dtype::parse("I8"), Some(Dtype::U8));
+        assert_eq!(Dtype::parse("F64"), None);
         assert_eq!(Dtype::Bf16 as i32, 0);
         assert_eq!(Dtype::U8 as i32, 3);
     }
