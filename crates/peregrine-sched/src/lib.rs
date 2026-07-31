@@ -18,7 +18,7 @@ pub mod reconstruct;
 use std::os::unix::io::RawFd;
 
 use peregrine_core::{Context, Error};
-use peregrine_model::{batch_union, route, Mlp, Routed};
+use peregrine_model::{batch_union, route, Mlp, MoeCfg, Routed, RouterCfg};
 use reconstruct::{mlp_from_segments, QtMeta};
 
 /// Where an expert's weights live.
@@ -76,21 +76,58 @@ impl Streamer {
     /// the io_uring ring (short completions are retried by `read_exact`); any
     /// I/O error propagates — no fallback.
     fn read_experts(&mut self, experts: &[(usize, &DiskExpert)]) -> Result<Vec<(usize, Mlp)>, Error> {
-        let read_qt = |reactor: &mut peregrine_io::Reactor, q: &DiskQt| -> Result<(Vec<u8>, Vec<u8>), Error> {
-            let mut w = vec![0u8; q.w_len];
-            let mut s = vec![0u8; q.s_len];
-            reactor.read_exact(q.w_fd, q.w_off, &mut w).ctx(|| format!("io_uring expert weight read @ {}", q.w_off))?;
-            reactor.read_exact(q.s_fd, q.s_off, &mut s).ctx(|| format!("io_uring expert scale read @ {}", q.s_off))?;
-            Ok((w, s))
-        };
+        // One deep submit for every region of every expert. Reading them one at
+        // a time (six blocking `read_exact`s per expert) put the ring at queue
+        // depth 1 — 6·E serialized NVMe round-trips on the lane whose whole
+        // purpose is to overlap them.
+        let mut bufs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(experts.len() * 3);
+        for (_, de) in experts {
+            for q in [&de.gate, &de.up, &de.down] {
+                bufs.push((vec![0u8; q.w_len], vec![0u8; q.s_len]));
+            }
+        }
+        {
+            // Borrow every landing buffer at once so a single `read_many` covers
+            // the whole batch.
+            let mut reqs: Vec<peregrine_io::ReadReq> = Vec::with_capacity(bufs.len() * 2);
+            let mut qts: Vec<&DiskQt> = Vec::with_capacity(bufs.len());
+            for (_, de) in experts {
+                qts.extend([&de.gate, &de.up, &de.down]);
+            }
+            for (q, (w, sc)) in qts.iter().zip(bufs.iter_mut()) {
+                reqs.push(peregrine_io::ReadReq { fd: q.w_fd, offset: q.w_off, buf: w.as_mut_slice(), tag: 0 });
+                reqs.push(peregrine_io::ReadReq { fd: q.s_fd, offset: q.s_off, buf: sc.as_mut_slice(), tag: 0 });
+            }
+            let results = self.reactor.read_many(&mut reqs).ctx(|| "io_uring batched expert read".to_string())?;
+            // Complete any short region individually (the kernel may return less
+            // than requested); a hard error propagates.
+            for (j, n) in results.iter().enumerate() {
+                let want = reqs[j].buf.len() as i64;
+                if *n == want {
+                    continue;
+                }
+                if *n < 0 {
+                    return Err(Error::Format(format!(
+                        "io_uring batched expert read failed at region {j} (errno {})",
+                        -*n
+                    )));
+                }
+                let done = (*n).max(0) as usize;
+                let (fd, off) = (reqs[j].fd, reqs[j].offset + done as u64);
+                self.reactor
+                    .read_exact(fd, off, &mut reqs[j].buf[done..])
+                    .ctx(|| format!("io_uring expert read completion @ {off}"))?;
+            }
+        }
 
         let mut out = Vec::with_capacity(experts.len());
-        for (eid, de) in experts {
+        for (i, (eid, de)) in experts.iter().enumerate() {
             let metas = [de.gate.meta, de.up.meta, de.down.meta];
-            let bufs6 = [
-                read_qt(&mut self.reactor, &de.gate)?,
-                read_qt(&mut self.reactor, &de.up)?,
-                read_qt(&mut self.reactor, &de.down)?,
+            let base = i * 3;
+            let bufs6: [(Vec<u8>, Vec<u8>); 3] = [
+                std::mem::take(&mut bufs[base]),
+                std::mem::take(&mut bufs[base + 1]),
+                std::mem::take(&mut bufs[base + 2]),
             ];
             out.push((*eid, mlp_from_segments(&metas, &bufs6)?));
         }
@@ -104,7 +141,9 @@ fn contribute(out: &mut [f32], x: &[f32], mlp: &Mlp, r: &Routed, eid: usize, hid
     let mut rows = Vec::new();
     let mut rw = Vec::new();
     for s in 0..s_n {
-        for kk in 0..r.keff[s] as usize {
+        // `keff` can never exceed `k`, but it arrives from the caller — clamp so
+        // a malformed `Routed` cannot index past the row.
+        for kk in 0..(r.keff[s].max(0) as usize).min(r.k) {
             if r.idx[s * r.k + kk] as usize == eid {
                 rows.push(s);
                 rw.push(r.w[s * r.k + kk]);
@@ -132,22 +171,18 @@ fn contribute(out: &mut [f32], x: &[f32], mlp: &Mlp, r: &Routed, eid: usize, hid
 
 /// Concurrent MoE forward: I/O lane streams disk experts while the CPU lane
 /// computes resident experts; results merge into one output `[s_n, hidden]`.
-#[allow(clippy::too_many_arguments)]
 pub fn moe_streamed(
     streamer: &mut Streamer,
     x: &[f32],
-    hidden: usize,
-    s_n: usize,
     router_w: &[f32],
     router_bias: &[f32],
-    topk: usize,
-    norm_topk: bool,
-    routed_scale: f32,
     experts: &[ExpertLoc],
     shared: Option<&Mlp>,
+    cfg: MoeCfg,
 ) -> Result<Vec<f32>, Error> {
+    let MoeCfg { s_n, hidden, k: topk, norm_topk, routed_scale } = cfg;
     let e_n = experts.len();
-    let r = route(x, router_w, router_bias, s_n, hidden, e_n, topk, norm_topk, routed_scale);
+    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k: topk, norm_topk, routed_scale });
     let uniq = batch_union(&r, s_n);
 
     // partition the batch-union by residency
@@ -204,7 +239,7 @@ mod tests {
     use super::*;
     use peregrine_core::pack::{f32_bytes, quant_i4};
     use peregrine_core::QtFmt;
-    use peregrine_model::{moe_forward, Mlp, QtWeight, QuantFmt};
+    use peregrine_model::{moe_forward, Mlp, MoeCfg, QtWeight, QuantFmt};
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
 
@@ -269,7 +304,7 @@ mod tests {
         let shared = make_mlp(&mut r, hidden, inter);
 
         // sequential reference: all experts resident
-        let seq = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), s_n, hidden, k, true, 2.5);
+        let seq = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), MoeCfg { s_n, hidden, k, norm_topk: true, routed_scale: 2.5 });
 
         // write the odd-indexed experts' gate/up/down (6 regions each) to a file;
         // even ones stay resident — exercises the mixed CPU∥IO path.
@@ -300,8 +335,8 @@ mod tests {
 
         // one persistent streamer, reused across calls (the ring is set up once)
         let mut streamer = Streamer::new(64)?;
-        let conc = moe_streamed(&mut streamer, &x, hidden, s_n, &router_w, &router_bias, k, true, 2.5, &locs, Some(&shared))?;
-        let conc2 = moe_streamed(&mut streamer, &x, hidden, s_n, &router_w, &router_bias, k, true, 2.5, &locs, Some(&shared))?;
+        let conc = moe_streamed(&mut streamer, &x, &router_w, &router_bias, &locs, Some(&shared), MoeCfg { s_n, hidden, k, norm_topk: true, routed_scale: 2.5 })?;
+        let conc2 = moe_streamed(&mut streamer, &x, &router_w, &router_bias, &locs, Some(&shared), MoeCfg { s_n, hidden, k, norm_topk: true, routed_scale: 2.5 })?;
         assert_eq!(conc, conc2, "reused streamer must give identical output");
 
         for z in 0..s_n * hidden {

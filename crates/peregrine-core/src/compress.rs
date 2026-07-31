@@ -47,10 +47,17 @@ impl Compression {
 /// (1..=22 typical; 3 is a sensible default for streaming inference). Returns
 /// the raw bytes unchanged for [`Compression::None`].
 pub fn encode(raw: &[u8], scheme: Compression, level: i32) -> Result<Vec<u8>, crate::Error> {
-    use crate::Context;
+    use crate::{Context, Error};
     match scheme {
         Compression::None => Ok(raw.to_vec()),
-        Compression::Zstd => zstd::stream::encode_all(raw, level).ctx(|| "zstd encode".to_string()),
+        Compression::Zstd => {
+            // Outside 1..=22 zstd returns an opaque codec error; name the real
+            // problem instead.
+            if !(1..=22).contains(&level) {
+                return Err(Error::Format(format!("zstd level {level} is outside the valid range 1..=22")));
+            }
+            zstd::stream::encode_all(raw, level).ctx(|| "zstd encode".to_string())
+        }
     }
 }
 
@@ -70,7 +77,15 @@ pub fn decode(payload: &[u8], scheme: Compression, orig_len: usize) -> Result<Ve
             Ok(payload.to_vec())
         }
         Compression::Zstd => {
-            let out = zstd::stream::decode_all(payload).ctx(|| "zstd decode".to_string())?;
+            // Bounded decode: the frame header is attacker/corruption-controlled,
+            // so a few KB can expand to hundreds of GB. Reading at most
+            // `orig_len + 1` caps memory while still detecting an overrun (the
+            // extra byte makes "too long" observable), and the length check
+            // below catches truncation.
+            use std::io::Read;
+            let mut out = Vec::with_capacity(orig_len.min(1 << 30));
+            let dec = zstd::stream::Decoder::new(payload).ctx(|| "zstd decoder".to_string())?;
+            dec.take(orig_len as u64 + 1).read_to_end(&mut out).ctx(|| "zstd decode".to_string())?;
             if out.len() != orig_len {
                 return Err(Error::Format(format!(
                     "zstd decompressed length mismatch: header says {orig_len}, got {}",
@@ -85,6 +100,29 @@ pub fn decode(payload: &[u8], scheme: Compression, orig_len: usize) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_is_bounded_by_the_declared_size() -> Result<(), crate::Error> {
+        // A "zstd bomb": a small frame that expands enormously. The declared
+        // size is known up front, so decoding must stop there instead of
+        // materializing the whole expansion and only then noticing the mismatch.
+        let huge = vec![0u8; 8 << 20]; // 8 MiB of zeros compresses to a few hundred bytes
+        let frame = encode(&huge, Compression::Zstd, 3)?;
+        assert!(frame.len() < 4096, "the bomb frame is small: {} bytes", frame.len());
+        // Claiming a small original size must fail without expanding 8 MiB.
+        let err = decode(&frame, Compression::Zstd, 1024);
+        assert!(err.is_err(), "an over-expanding frame must be rejected");
+        // The honest size still round-trips.
+        assert_eq!(decode(&frame, Compression::Zstd, huge.len())?.len(), huge.len());
+        Ok(())
+    }
+
+    #[test]
+    fn encode_rejects_out_of_range_levels() {
+        assert!(encode(b"data", Compression::Zstd, 0).is_err());
+        assert!(encode(b"data", Compression::Zstd, 99).is_err());
+        assert!(encode(b"data", Compression::Zstd, 3).is_ok());
+    }
 
     #[test]
     fn none_is_verbatim() -> Result<(), crate::Error> {

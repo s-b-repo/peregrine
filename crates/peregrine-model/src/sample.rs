@@ -6,10 +6,24 @@
 //! then inverse-CDF sampling with an optional banned token (used by speculative
 //! rejection sampling so the draft stays invisible to the output distribution).
 
+/// The C engine's default xorshift64 seed. Also the substitute for a caller
+/// seed of 0, which xorshift64 maps to itself forever (a dead RNG stream).
+const DEFAULT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Greedy argmax; lowest index wins ties (strict `>`), matching `argmax_v`.
+///
+/// NaN logits are skipped rather than allowed to win: `x > NaN` is false, so a
+/// NaN sitting at the running best would make every later candidate compare
+/// false and pin the result to that index — greedy decode would then emit the
+/// same token forever instead of surfacing the numerical fault. An all-NaN row
+/// still returns 0 (nothing is comparable), which the caller sees as a normal
+/// token id.
 pub fn argmax(lo: &[f32]) -> usize {
-    let mut b = 0usize;
-    for i in 1..lo.len() {
+    let mut b = match lo.iter().position(|v| !v.is_nan()) {
+        Some(i) => i,
+        None => return 0, // empty, or every logit is NaN
+    };
+    for i in b + 1..lo.len() {
         if lo[i] > lo[b] {
             b = i;
         }
@@ -42,7 +56,12 @@ impl Sampler {
     /// `temp <= 0` → greedy. `nucleus` in (0,1) enables top-p truncation.
     /// The default RNG seed matches the C engine (`0x9E3779B97F4A7C15`).
     pub fn new(temp: f32, nucleus: f32, seed: u64) -> Sampler {
-        Sampler { rng: seed, temp, nucleus, p: Vec::new(), idx: Vec::new() }
+        // xorshift64 has 0 as a fixed point: seeded with it, every `rndu()`
+        // returns 0.0 and sampling degenerates to "always the first token".
+        // `--seed 0` is the most natural determinism knob a caller would reach
+        // for, so map it to the documented default stream.
+        let rng = if seed == 0 { DEFAULT_SEED } else { seed };
+        Sampler { rng, temp, nucleus, p: Vec::new(), idx: Vec::new() }
     }
 
     /// xorshift64 → uniform double in [0,1). Port of `rndu`.
@@ -63,14 +82,19 @@ impl Sampler {
         let mx = lo.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let invt = 1.0 / self.temp.max(1e-4);
         let mut s = 0f64;
-        for i in 0..v {
-            self.p[i] = ((lo[i] - mx) * invt).exp();
-            s += self.p[i] as f64;
+        for (p, &l) in self.p.iter_mut().zip(lo.iter()).take(v) {
+            *p = ((l - mx) * invt).exp();
+            s += *p as f64;
         }
-        for i in 0..v {
-            self.p[i] /= s as f32;
+        for p in self.p.iter_mut().take(v) {
+            *p /= s as f32;
         }
-        if self.nucleus > 0.0 && self.nucleus < 1.0 {
+        // `nucleus >= 1` (or NaN) means "keep everything". A `nucleus` of 0 is a
+        // request for the tightest possible nucleus, i.e. the single most likely
+        // token — the loop below reaches `cum >= 0` at the first entry and keeps
+        // exactly one. Gating on `> 0.0` instead disabled truncation entirely,
+        // which is the opposite of what `top_p: 0` asks for.
+        if self.nucleus < 1.0 && !self.nucleus.is_nan() {
             self.idx.clear();
             self.idx.extend(0..v);
             let p = &self.p;
@@ -103,7 +127,18 @@ impl Sampler {
     /// Inverse-CDF sample from `self.p`; `ban >= 0` excludes that token,
     /// renormalizing on the fly. Port of `dist_sample`.
     fn dist_sample(&mut self, v: usize, ban: i32) -> usize {
-        let banned = if ban >= 0 { self.p[ban as usize] as f64 } else { 0.0 };
+        // Resolve the ban to an in-range index once: a ban past the vocabulary
+        // (a draft id from a mismatched tokenizer, a stale id after a vocab
+        // change) would otherwise index `self.p` out of range and abort.
+        let ban_idx: Option<usize> = usize::try_from(ban).ok().filter(|&b| b < v.min(self.p.len()));
+        let ban: i32 = match ban_idx {
+            Some(b) => b as i32,
+            None => -1,
+        };
+        let banned = match ban_idx {
+            Some(b) => self.p[b] as f64,
+            None => 0.0,
+        };
         let mut z = 1.0 - banned;
         if z <= 1e-12 {
             z = 1e-12;
@@ -115,7 +150,9 @@ impl Sampler {
                 continue;
             }
             cum += self.p[i] as f64;
-            if cum >= u {
+            // `cum > u` (not `>=`) so a draw of exactly 0.0 cannot select a
+            // token the nucleus truncation zeroed out.
+            if cum > u {
                 return i;
             }
         }
@@ -124,7 +161,10 @@ impl Sampler {
                 return i;
             }
         }
-        0
+        // Nothing carries positive probability. Return any non-banned index —
+        // returning 0 unconditionally could hand back the banned token itself,
+        // which would defeat speculative rejection sampling's correctness.
+        (0..v).find(|&i| i as i32 != ban).unwrap_or(0)
     }
 
     /// Next token from logits. Greedy if `temp <= 0`, else sampled. `ban < 0`
@@ -208,6 +248,61 @@ mod tests {
         let mut s = Sampler::new(1.0, 1.0, 99);
         for _ in 0..200 {
             assert_ne!(s.pick(&lo, 1), 1);
+        }
+    }
+
+    #[test]
+    fn argmax_skips_nan_and_finds_the_real_peak() {
+        // `x > NaN` is false, so a NaN at the running best used to pin the result
+        // to index 0 — greedy decode then emitted token 0 forever.
+        assert_eq!(argmax(&[f32::NAN, 1.0, 9.0, 2.0]), 2);
+        assert_eq!(argmax(&[f32::NAN, f32::NAN, 3.0]), 2);
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0, "all-NaN still returns a valid index");
+        assert_eq!(argmax(&[]), 0, "empty row returns a valid index");
+    }
+
+    #[test]
+    fn top_p_zero_selects_the_single_most_likely_token() {
+        // `top_p: 0` asks for the tightest nucleus (top-1). The old `> 0.0` guard
+        // skipped truncation entirely and sampled the FULL distribution — the
+        // exact opposite. The HTTP layer clamps top_p to [0,1], so 0 is reachable.
+        let lo = [0.0f32, 1.0, 2.0, 5.0];
+        let mut s = Sampler::new(1.0, 0.0, 11);
+        for _ in 0..200 {
+            assert_eq!(s.pick(&lo, -1), 3, "top_p=0 must behave as top-1");
+        }
+    }
+
+    #[test]
+    fn out_of_range_ban_is_ignored_not_fatal() {
+        // A ban id past the vocabulary indexed the probability buffer out of
+        // bounds; under `panic = "abort"` that killed the server.
+        let lo = [1.0f32, 2.0, 3.0];
+        let mut s = Sampler::new(1.0, 1.0, 21);
+        for ban in [3i32, 99, i32::MAX] {
+            let t = s.pick(&lo, ban);
+            assert!(t < lo.len(), "ban {ban} must be ignored, got {t}");
+        }
+    }
+
+    #[test]
+    fn zero_seed_still_produces_a_live_rng_stream() {
+        // xorshift64 maps 0 to 0 forever: `rndu()` would return 0.0 every draw
+        // and sampling would always return the first token.
+        let lo = [1.0f32, 1.0, 1.0, 1.0, 1.0];
+        let mut s = Sampler::new(1.0, 1.0, 0);
+        let picks: std::collections::HashSet<usize> = (0..200).map(|_| s.pick(&lo, -1)).collect();
+        assert!(picks.len() > 1, "seed 0 must not collapse to one token: {picks:?}");
+    }
+
+    #[test]
+    fn banned_token_is_not_returned_by_the_fallback() {
+        // Degenerate case: the only token with mass is the banned one. Returning
+        // 0 unconditionally would re-emit exactly the token being rejected.
+        let lo = [10.0f32, -50.0];
+        let mut s = Sampler::new(1.0, 1.0, 4);
+        for _ in 0..50 {
+            assert_ne!(s.pick(&lo, 0), 0, "the fallback must respect the ban");
         }
     }
 }

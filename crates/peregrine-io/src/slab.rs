@@ -130,6 +130,11 @@ impl Drop for AlignedBuf {
 pub enum Bytes {
     Vec(Vec<u8>),
     Aligned { buf: AlignedBuf, head: usize, len: usize },
+    /// Refcounted bytes shared between holders. The warm cache stores slabs in
+    /// this form so a hit hands out a refcount bump instead of copying the whole
+    /// (~19 MB) expert — the copy used to happen while the cache lock was held,
+    /// serializing every I/O lane behind it.
+    Shared(std::sync::Arc<[u8]>),
 }
 
 impl Bytes {
@@ -138,6 +143,37 @@ impl Bytes {
         match self {
             Bytes::Vec(v) => v.len(),
             Bytes::Aligned { len, .. } => *len,
+            Bytes::Shared(a) => a.len(),
+        }
+    }
+
+    /// Resident footprint, which for an O_DIRECT region is the whole aligned
+    /// window — up to a block larger than the exposed length. The cache budgets
+    /// on this so it accounts for the memory it actually holds.
+    pub fn footprint(&self) -> usize {
+        match self {
+            Bytes::Vec(v) => v.capacity(),
+            Bytes::Aligned { buf, .. } => buf.capacity(),
+            Bytes::Shared(a) => a.len(),
+        }
+    }
+
+    /// The exposed bytes as a mutable slice, or `None` for a [`Bytes::Shared`]
+    /// region (other holders may be reading it concurrently).
+    pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        match self {
+            Bytes::Vec(v) => Some(v),
+            Bytes::Aligned { buf, head, len } => Some(&mut buf.as_mut_slice()[*head..*head + *len]),
+            Bytes::Shared(_) => None,
+        }
+    }
+
+    /// Convert into refcounted shared bytes (copies once, from any variant).
+    /// Cloning the result is a refcount bump.
+    pub fn into_shared(self) -> Bytes {
+        match self {
+            Bytes::Shared(a) => Bytes::Shared(a),
+            other => Bytes::Shared(std::sync::Arc::from(other.as_slice())),
         }
     }
 
@@ -159,25 +195,20 @@ impl std::ops::Deref for Bytes {
             Bytes::Vec(v) => v,
             // head+len <= capacity by construction (the aligned window covers the region)
             Bytes::Aligned { buf, head, len } => &buf.as_slice()[*head..*head + *len],
-        }
-    }
-}
-
-impl std::ops::DerefMut for Bytes {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        match self {
-            Bytes::Vec(v) => v,
-            Bytes::Aligned { buf, head, len } => &mut buf.as_mut_slice()[*head..*head + *len],
+            Bytes::Shared(a) => a,
         }
     }
 }
 
 impl Clone for Bytes {
-    /// Cloning always yields an owned [`Bytes::Vec`] of the exposed region. The warm
-    /// cache stores clones and never needs O_DIRECT alignment, so this keeps
-    /// [`AlignedBuf`] non-cloneable while staying byte-identical to the original.
+    /// [`Bytes::Shared`] clones by refcount; the owned variants copy their
+    /// exposed region into a fresh [`Bytes::Vec`] (this keeps [`AlignedBuf`]
+    /// non-cloneable while staying byte-identical to the original).
     fn clone(&self) -> Self {
-        Bytes::Vec(self.to_vec())
+        match self {
+            Bytes::Shared(a) => Bytes::Shared(std::sync::Arc::clone(a)),
+            other => Bytes::Vec(other.to_vec()),
+        }
     }
 }
 
@@ -272,6 +303,17 @@ impl SlabPool {
 
     /// Return a buffer to the free-list for reuse.
     pub fn checkin(&mut self, buf: AlignedBuf) {
+        // Only buffers this pool handed out may come back: a foreign or
+        // wrong-sized buffer would make `free.len()` exceed `allocated` (so
+        // `in_use()` underflows) and could later be checked out for a request it
+        // cannot hold, slicing past its end.
+        if buf.capacity() != self.buf_cap || self.free.len() >= self.allocated {
+            crate::note_advisory_err(
+                "slab checkin rejected (foreign or duplicate buffer)",
+                &format!("capacity {} vs pool {}", buf.capacity(), self.buf_cap),
+            );
+            return; // dropping it frees the allocation; the pool stays consistent
+        }
         self.free.push(buf);
     }
 
@@ -293,7 +335,7 @@ impl SlabPool {
 
     /// Buffers currently checked out (allocated but not in the free-list).
     pub fn in_use(&self) -> usize {
-        self.allocated - self.free.len()
+        self.allocated.saturating_sub(self.free.len())
     }
 
     /// Total buffers this pool has ever allocated (≤ `max_bufs`).

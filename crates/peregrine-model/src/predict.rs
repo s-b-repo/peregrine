@@ -23,6 +23,20 @@ pub struct RouteHistory {
     depth: usize,
 }
 
+/// Upper bounds for values read out of persisted artifacts before they size an
+/// allocation. `Cfg::validate` caps a real model at 128 layers, so anything
+/// past that is corruption (or a hand-edited file) — and `n_layers` straight
+/// from JSON used to reach `Vec::with_capacity`, where a bogus value aborts the
+/// process during `Model::load` instead of falling back to a cold predictor.
+const MAX_PERSISTED_LAYERS: usize = 128;
+const MAX_PERSISTED_DEPTH: usize = 1024;
+
+/// Read a layer count from a persisted document, rejecting implausible values.
+fn persisted_layers(v: &serde_json::Value) -> Option<usize> {
+    let n = v.get("n_layers")?.as_u64()? as usize;
+    (n <= MAX_PERSISTED_LAYERS).then_some(n)
+}
+
 impl RouteHistory {
     /// History for `n_layers` layers, keeping the last `depth` routed sets per layer.
     /// `depth` is floored at 1, so a depth-1 history reproduces the legacy predictor
@@ -101,8 +115,8 @@ impl RouteHistory {
         if tag != expected_tag {
             return None;
         }
-        let n_layers = v.get("n_layers")?.as_u64()? as usize;
-        let depth = v.get("depth")?.as_u64()? as usize;
+        let n_layers = persisted_layers(v)?;
+        let depth = v.get("depth")?.as_u64().filter(|&d| d as usize <= MAX_PERSISTED_DEPTH)? as usize;
         let layers = v.get("layers")?.as_array()?;
         if layers.len() != n_layers {
             return None;
@@ -183,7 +197,8 @@ impl TransitionTable {
             let row = map.entry(f as u32).or_default();
             for &t in to_set {
                 if t >= 0 {
-                    *row.entry(t as u32).or_insert(0) += 1;
+                    let slot = row.entry(t as u32).or_insert(0);
+                    *slot = slot.saturating_add(1); // long-lived counters must not wrap
                 }
             }
         }
@@ -233,13 +248,16 @@ impl TransitionTable {
     /// Parse a table from [`Self::to_json`] output. `None` on a malformed document.
     pub fn from_json(v: &serde_json::Value) -> Option<TransitionTable> {
         let tag = v.get("tag")?.as_str()?.to_string();
-        let n_layers = v.get("n_layers")?.as_u64()? as usize;
+        let n_layers = persisted_layers(v)?;
         let mut table = TransitionTable::new(n_layers, tag);
         for e in v.get("edges")?.as_array()? {
             let a = e.as_array()?;
             let (l, f, t, c) = (a.first()?.as_u64()?, a.get(1)?.as_u64()?, a.get(2)?.as_u64()?, a.get(3)?.as_u64()?);
             if let Some(map) = table.layers.get_mut(l as usize) {
-                *map.entry(f as u32).or_default().entry(t as u32).or_insert(0) += c as u32;
+                let slot = map.entry(f as u32).or_default().entry(t as u32).or_insert(0);
+                // Saturate: a count above u32::MAX would wrap to a small number
+                // and silently invert this edge's ranking.
+                *slot = slot.saturating_add(u32::try_from(c).unwrap_or(u32::MAX));
             }
         }
         Some(table)
@@ -292,7 +310,8 @@ impl MacroTable {
         if same {
             entry.0 = entry.0.saturating_add(1);
         } else {
-            *entry.1.entry(c).or_insert(0) += 1;
+            let slot = entry.1.entry(c).or_insert(0);
+            *slot = slot.saturating_add(1);
         }
     }
 
@@ -337,7 +356,7 @@ impl MacroTable {
     /// Parse [`Self::to_json`] output; `None` on malformed input.
     pub fn from_json(v: &serde_json::Value) -> Option<MacroTable> {
         let tag = v.get("tag")?.as_str()?.to_string();
-        let n_layers = v.get("n_layers")?.as_u64()? as usize;
+        let n_layers = persisted_layers(v)?;
         let mut t = MacroTable::new(n_layers, tag);
         for (li, layer) in v.get("layers")?.as_array()?.iter().enumerate() {
             let map = t.layers.get_mut(li)?;
@@ -401,7 +420,8 @@ impl CoActivation {
                     continue;
                 }
                 let (lo, hi) = if a < b { (a as u32, b as u32) } else { (b as u32, a as u32) };
-                *self.pairs.entry((layer as u32, lo, hi)).or_insert(0) += 1;
+                let slot = self.pairs.entry((layer as u32, lo, hi)).or_insert(0);
+                *slot = slot.saturating_add(1);
             }
         }
     }
@@ -444,7 +464,7 @@ impl CoActivation {
 
     /// Parse [`Self::to_json`] output; `None` on malformed input.
     pub fn from_json(v: &serde_json::Value) -> Option<CoActivation> {
-        let n_layers = v.get("n_layers")?.as_u64()? as usize;
+        let n_layers = persisted_layers(v)?;
         let frames = v.get("frames")?.as_u64()? as u32;
         let mut t = CoActivation::new(n_layers);
         t.frames = frames;

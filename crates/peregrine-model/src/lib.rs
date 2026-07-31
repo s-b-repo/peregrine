@@ -8,7 +8,6 @@
 
 // Explicit index loops mirror the C forward pass (for verification) and mostly
 // index several tensors at once — `needless_range_loop` is noise in this crate.
-#![allow(clippy::needless_range_loop)]
 
 // Quality gates: no unsafe here, and no panicking error handling anywhere
 // (denied even in tests).
@@ -36,8 +35,11 @@ pub mod wmma_tune;
 pub mod workload;
 
 pub use attention::{mla_attention, mla_attention_absorb, mla_attention_batched, AttnWeights, LayerKv, RowAttn};
-pub use math::{layernorm, rmsnorm, rope_interleave, sigmoidf, siluf, silu_mul, softmax};
-pub use mlp::{moe_forward, Mlp};
+pub use math::{
+    layernorm, rmsnorm, rmsnorm_inplace, rope_interleave, rope_interleave_with, sigmoidf, siluf, silu_mul, softmax,
+    RopeTable,
+};
+pub use mlp::{moe_forward, Mlp, MoeCfg};
 pub use model::{save_automaton, save_macrostates, Model, SeqKv};
 pub use iotune::{IoTuner, IowqCap};
 pub use lane::{Bias, BubbleTuner, LaneBalancer, LaneTimings, LaneTimingsAccum, Placement};
@@ -47,7 +49,7 @@ pub use wmma_tune::{KernelShape, TileConfig, WmmaTuner};
 pub use workload::{classify_str, PhaseTracker, TokenClass};
 pub use predict::{Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 pub use mtp::speculative_sample;
-pub use router::{batch_union, route, Routed};
+pub use router::{batch_union, route, Routed, RouterCfg};
 pub use sample::{argmax, pick_batch_greedy, Sampler};
 pub use weight::{QtWeight, QuantFmt};
 

@@ -351,10 +351,10 @@ mod tests {
 
             // hand reference: Σ_g scale[g] · Σ_{i in g} val[i]·x[i]
             let mut hand = 0f32;
-            for g in 0..ng {
+            for (g, &scale) in scales.iter().enumerate().take(ng) {
                 let (s, e) = (g * gs, ((g + 1) * gs).min(n));
                 let d: i32 = (s..e).map(|i| vals[i] * x[i] as i32).sum();
-                hand += scales[g] * d as f32;
+                hand += scale * d as f32;
             }
             let scal = dot_i4i8_grouped_scalar(&w4, &x, &scales, n, gs);
             let disp = dot_i4i8_grouped(&w4, &x, &scales, n, gs);

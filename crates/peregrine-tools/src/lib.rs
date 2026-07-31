@@ -7,7 +7,6 @@
 use peregrine_core::{Context, Error};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 
 pub fn read_routes(path: &Path) -> Result<Vec<Vec<Vec<i32>>>, Error> {
@@ -133,6 +132,13 @@ pub fn greedy_nearest_neighbor(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> 
 /// Deterministic: node iteration order is by ascending expert id; ties in the
 /// modularity gain are broken by preferring the smaller-id community.
 pub fn louvain_communities(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> {
+    louvain_blocks(w).into_iter().flatten().collect()
+}
+
+/// [`louvain_communities`] before flattening: each detected community as its own
+/// block, in the same order. Callers that place or budget *whole* communities
+/// (storage tiers, layout blocks) need the grouping, not the concatenation.
+pub fn louvain_blocks(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<Vec<i32>> {
     // Node ids in ascending order — the canonical iteration order that keeps
     // the algorithm deterministic (Louvain is order-sensitive).
     let mut nodes: Vec<i32> = w.keys().copied().collect();
@@ -140,6 +146,7 @@ pub fn louvain_communities(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> {
     if nodes.is_empty() {
         return Vec::new();
     }
+    let single = |ns: Vec<i32>| -> Vec<Vec<i32>> { ns.into_iter().map(|n| vec![n]).collect() };
     // Node → community. Start with each node in its own community.
     let mut community: HashMap<i32, i32> = nodes.iter().map(|&n| (n, n)).collect();
     // Degree (sum of edge weights) per node, and total graph weight (2m).
@@ -149,8 +156,8 @@ pub fn louvain_communities(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> {
         .collect();
     let two_m: u64 = node_deg.values().sum();
     if two_m == 0 {
-        // No edges → every node stays in its own community; append ascending.
-        return nodes;
+        // No edges → every node is its own community, ascending.
+        return single(nodes);
     }
     // Community → total degree of its members (updated on each move).
     let mut comm_deg: HashMap<i32, u64> = HashMap::new();
@@ -183,7 +190,11 @@ pub fn louvain_communities(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> {
             let w_into_self = w_into.get(&cur_comm).copied().unwrap_or(0) as i128;
             let sigma_tot_minus_i = cur_deg - k_i;
             // Baseline modularity contribution for leaving `n` in its own community.
-            let baseline = (w_into_self * 2) - (k_i * sigma_tot_minus_i * 2) / two_m_i.max(1);
+            // Compare gains multiplied through by `2m` (a positive constant), so
+            // the ranking is exact: dividing first truncated, and near-ties then
+            // resolved by rounding rather than by modularity.
+            let m2 = two_m_i.max(1);
+            let baseline = (w_into_self * 2) * m2 - (k_i * sigma_tot_minus_i * 2);
             let mut best_comm = cur_comm;
             let mut best_gain = baseline;
             for (&nc, &w_nc) in &w_into {
@@ -191,7 +202,7 @@ pub fn louvain_communities(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> {
                     continue;
                 }
                 let sigma_tot = comm_deg.get(&nc).copied().unwrap_or(0) as i128;
-                let gain = (w_nc as i128 * 2) - (k_i * sigma_tot * 2) / two_m_i.max(1);
+                let gain = (w_nc as i128 * 2) * m2 - (k_i * sigma_tot * 2);
                 if gain > best_gain || (gain == best_gain && nc < best_comm) {
                     best_gain = gain;
                     best_comm = nc;
@@ -216,7 +227,7 @@ pub fn louvain_communities(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> {
     }
     let mut comm_order: Vec<(i32, Vec<i32>)> = by_comm.into_iter().collect();
     comm_order.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
-    let mut out = Vec::new();
+    let mut out: Vec<Vec<i32>> = Vec::new();
     for (_c, members) in comm_order {
         // Slice the graph to this community and reuse the greedy walker.
         let sub: HashMap<i32, HashMap<i32, u32>> = members
@@ -228,13 +239,14 @@ pub fn louvain_communities(w: &HashMap<i32, HashMap<i32, u32>>) -> Vec<i32> {
                 Some((n, restricted))
             })
             .collect();
-        out.extend(greedy_nearest_neighbor(&sub));
+        let mut block = greedy_nearest_neighbor(&sub);
         // Members with no edges within the community still deserve a slot.
         for m in &members {
-            if !out.contains(m) {
-                out.push(*m);
+            if !block.contains(m) {
+                block.push(*m);
             }
         }
+        out.push(block);
     }
     out
 }
@@ -411,23 +423,11 @@ pub fn assign_tiers(
     vram_budget: u64,
     ram_budget: u64,
 ) -> (Vec<i32>, Vec<i32>) {
-    // communities from the same detector the layout uses
-    let ordered = louvain_communities(w);
-    // rebuild community blocks: split on zero-weight adjacency (community
-    // boundaries in the concatenated walk have no intra-edge) — plus singletons.
-    let mut blocks: Vec<Vec<i32>> = Vec::new();
-    for &e in &ordered {
-        let extend = blocks.last().is_some_and(|b: &Vec<i32>| {
-            b.last().is_some_and(|&prev| w.get(&prev).and_then(|r| r.get(&e)).copied().unwrap_or(0) > 0)
-        });
-        if extend {
-            if let Some(b) = blocks.last_mut() {
-                b.push(e);
-                continue;
-            }
-        }
-        blocks.push(vec![e]);
-    }
+    // The detector's actual communities. Re-deriving them by splitting the
+    // concatenated order wherever two adjacent experts share no edge merged any
+    // two communities that happened to have a cross edge — the oversized block
+    // then missed a tier its real community would have fit in.
+    let mut blocks = louvain_blocks(w);
     // greedy by heat density, deterministic tie-break by first expert id
     let density = |b: &Vec<i32>| -> (u64, i32) {
         let h: u64 = b.iter().map(|e| heat.get(e).copied().unwrap_or(0)).sum();
@@ -463,10 +463,7 @@ pub fn write_tiers(dir: &Path, vram: &[(usize, i32)], ram: &[(usize, i32)]) -> R
     };
     let doc = serde_json::json!({ "version": 1, "vram": enc(vram), "ram": enc(ram) });
     let bytes = serde_json::to_vec_pretty(&doc).ctx(|| "serialize tiers".to_string())?;
-    let out = dir.join("tiers.json");
-    let mut f = std::fs::File::create(&out).ctx(|| format!("create {}", out.display()))?;
-    f.write_all(&bytes).ctx(|| "write tiers.json".to_string())?;
-    Ok(())
+    peregrine_core::write_atomic(&dir.join("tiers.json"), &bytes)
 }
 
 /// Per-layer expert heat from a raw routing trace (occurrence counts).
@@ -554,7 +551,15 @@ pub fn apply_layout(model_dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error>
         }
     }
     pack::write_safetensors(&tmp, &blobs).ctx(|| "write relayout".to_string())?;
-    std::fs::rename(tmp.join("model.safetensors"), model_dir.join("model.safetensors"))
+    // fsync the rewritten checkpoint before it replaces the original: this
+    // rename overwrites the *only* copy of the weights, so a crash between the
+    // rename and the data reaching disk would leave a truncated model.
+    let written = tmp.join("model.safetensors");
+    {
+        let f = std::fs::File::open(&written).ctx(|| format!("open {}", written.display()))?;
+        f.sync_all().ctx(|| format!("fsync {}", written.display()))?;
+    }
+    peregrine_core::commit_atomic(&written, &model_dir.join("model.safetensors"))
         .ctx(|| "swap relayout in".to_string())?;
     if let Err(e) = std::fs::remove_dir_all(&tmp) {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -572,10 +577,7 @@ pub fn write_schedule(dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error> {
         "order": ordered,
     });
     let bytes = serde_json::to_vec_pretty(&doc).ctx(|| "serialize schedule".to_string())?;
-    let out_path = dir.join("schedule.json");
-    let mut f = std::fs::File::create(&out_path).ctx(|| format!("create {}", out_path.display()))?;
-    f.write_all(&bytes).ctx(|| "write schedule.json".to_string())?;
-    Ok(())
+    peregrine_core::write_atomic(&dir.join("schedule.json"), &bytes)
 }
 
 #[cfg(test)]

@@ -105,19 +105,37 @@ pub struct PcieLink {
 
 /// Read the PCIe link info for `bdf` (`0000:01:00.0`). `None` on non-Linux,
 /// missing sysfs entries, or unparseable values.
+#[cfg(target_os = "linux")]
 pub fn pcie_link_by_bdf(bdf: &str) -> Option<PcieLink> {
-    #[cfg(target_os = "linux")]
-    {
-        let base = Path::new("/sys/bus/pci/devices").join(bdf);
-        let speed = std::fs::read_to_string(base.join("current_link_speed")).ok()?;
-        let width = std::fs::read_to_string(base.join("current_link_width")).ok()?;
-        let width: u32 = width.trim().parse().ok()?;
-        Some(PcieLink { speed: speed.trim().to_string(), width })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _bdf = bdf; // audit-allow: unused-param silencing — PCIe sysfs doesn't exist off-Linux; documented None
-        None
+    let base = Path::new("/sys/bus/pci/devices").join(bdf);
+    // A missing entry means "this device exposes no link info", which is the
+    // documented `None`; anything else is worth surfacing under COLI_DEBUG.
+    let speed = read_sysfs_opt(&base.join("current_link_speed"))?;
+    let width = read_sysfs_opt(&base.join("current_link_width"))?;
+    let width: u32 = width.trim().parse().ok()?;
+    Some(PcieLink { speed: speed.trim().to_string(), width })
+}
+
+/// PCIe topology comes from sysfs, which does not exist off Linux. The
+/// signature is cfg-split (rather than binding the argument away in the body)
+/// so the unused parameter is declared as such.
+#[cfg(not(target_os = "linux"))]
+pub fn pcie_link_by_bdf(_bdf: &str) -> Option<PcieLink> {
+    None
+}
+
+/// Read a sysfs file, treating "not present" as a normal absence and reporting
+/// any other failure (permissions, EIO) through the advisory channel instead of
+/// silently reading as absent.
+#[cfg(target_os = "linux")]
+fn read_sysfs_opt(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            crate::note_advisory_err("read sysfs attribute", &e);
+            None
+        }
     }
 }
 

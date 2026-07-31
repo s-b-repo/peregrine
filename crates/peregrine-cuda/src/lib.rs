@@ -441,11 +441,14 @@ pub fn capture(device: i32, body: impl FnOnce() -> Result<(), Error>) -> Result<
     let mut ptr: *mut ffi::ColiCudaGraph = std::ptr::null_mut();
     // SAFETY: `ptr` is a valid out-slot; end_capture writes the instantiated graph.
     let ended = unsafe { ffi::coli_cuda_graph_end(device as c_int, &mut ptr) };
+    // Take ownership of whatever the capture produced BEFORE propagating a body
+    // error: `graph_end` can succeed even when the body failed, and returning
+    // early with a bare pointer would leak the instantiated graph.
+    let graph = if ended == 1 && !ptr.is_null() { Some(Graph { ptr }) } else { None };
     body_res?; // surface a body error only after the capture is properly ended
-    if ended == 1 && !ptr.is_null() {
-        Ok(Graph { ptr })
-    } else {
-        Err(Error::Format("cuda graph end/instantiate failed".into()))
+    match graph {
+        Some(g) => Ok(g),
+        None => Err(Error::Format("cuda graph end/instantiate failed".into())),
     }
 }
 

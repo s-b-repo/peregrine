@@ -88,6 +88,42 @@ impl<T> SendPtr<T> {
     }
 }
 
+/// Drops the slots [`Pool::par_map`] managed to write when a task panics
+/// mid-batch. A panic leaves *gaps* rather than a filled prefix, so the guard
+/// consults per-slot flags. Disarmed on the success path, where the returned
+/// `Vec` takes ownership of every slot instead.
+struct PartialInit<'a, R> {
+    ptr: SendPtr<R>,
+    filled: &'a [AtomicBool],
+    armed: bool,
+}
+
+impl<R> Drop for PartialInit<'_, R> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for (i, done) in self.filled.iter().enumerate() {
+            if done.load(Ordering::Acquire) {
+                // SAFETY: slot `i` was written exactly once, and `set_len` was
+                // never reached, so nothing else will ever drop this value.
+                unsafe { std::ptr::drop_in_place(self.ptr.get().add(i)) };
+            }
+        }
+    }
+}
+
+/// The largest row count `buf_len` elements can hold at `stride` per row — the
+/// clamp the raw-slice row/chunk APIs apply to a caller-supplied `n`, so a
+/// miscomputed count cannot hand workers slices past the end of the buffer.
+#[inline]
+fn clamp_rows(n: usize, stride: usize, buf_len: usize) -> usize {
+    if stride == 0 {
+        return 0;
+    }
+    n.min(buf_len / stride)
+}
+
 /// A persistent pool of parked worker threads reused across `par_*` calls.
 pub struct Pool {
     job_txs: Vec<Sender<Job>>,
@@ -198,7 +234,13 @@ fn worker_loop(index: usize, rx: Receiver<Job>) {
         hook(index);
     }
     IN_POOL.with(|c| c.set(true)); // mark this thread so nested par_* run serial
-    while let Ok(job) = rx.recv() { // audit-allow: recv's only Err is Disconnected = clean shutdown
+    loop {
+        // `recv`'s only error is `Disconnected`: the pool dropped its sender, so
+        // this worker retires.
+        let job = match rx.recv() {
+            Ok(job) => job,
+            Err(std::sync::mpsc::RecvError) => break,
+        };
         // SAFETY: `job.task.0` points to a `dyn Fn + Sync` owned by the dispatcher's
         // stack frame, which blocks on `job.done` (and its siblings) before that
         // frame unwinds — so this deref cannot dangle; `Sync` makes the read defined.
@@ -270,14 +312,29 @@ impl Pool {
         let assignments = plan_assignments(n, w, WORKER_GROUPS.get().map(|g| g.as_slice()));
         let mut sent = 0usize;
         let mut abort_from: Option<usize> = None;
+        // The inline-fallback loops below run the caller's closure on THIS
+        // thread while dispatched workers still hold `TaskPtr(erased)` into this
+        // frame. Letting a panic there unwind past the barrier would free the
+        // frame under them — so catch it, reach the barrier, and re-raise after.
+        let mut inline_panic: Option<Box<dyn std::any::Any + Send>> = None;
+        let run_inline = |start: usize, end: usize, slot: &mut Option<Box<dyn std::any::Any + Send>>| {
+            if slot.is_some() {
+                return; // already unwinding; the remaining ranges are moot
+            }
+            if let Err(p) = catch_unwind(AssertUnwindSafe(|| {
+                for i in start..end {
+                    f(i);
+                }
+            })) {
+                *slot = Some(p);
+            }
+        };
         for &(worker, start, end) in &assignments {
             let job = Job { task, start, end, done: done_tx.clone(), panicked: Arc::clone(&panicked) };
             if self.job_txs[worker].send(job).is_err() {
                 // a worker is gone (shutdown race): finish this range inline and
                 // remember to run every not-yet-sent range inline too.
-                for i in start..end {
-                    f(i);
-                }
+                run_inline(start, end, &mut inline_panic);
                 abort_from = Some(sent + 1);
                 break;
             }
@@ -285,18 +342,28 @@ impl Pool {
         }
         if let Some(from) = abort_from {
             for &(_, start, end) in assignments.iter().skip(from) {
-                for i in start..end {
-                    f(i);
-                }
+                run_inline(start, end, &mut inline_panic);
             }
         }
-        // Barrier — the soundness invariant above. A recv error means the done
-        // channel closed (no further signal can ever arrive), so stop waiting.
+        // Barrier — the soundness invariant above. Every dispatched chunk MUST
+        // be waited for: returning early while a worker still holds `task` frees
+        // this frame under it. `done_tx` is alive here (it is dropped after this
+        // loop), so `recv` can only block, never fail, until each signal lands.
+        drop(done_tx); // now recv() ends exactly when the last worker signals
         for _ in 0..sent {
-            if done_rx.recv().is_err() {
-                note_advisory("pool barrier: done channel closed early");
-                break;
+            if let Err(e) = done_rx.recv() {
+                // Unreachable: a worker that took a job always signals (its own
+                // panic is caught). If it ever happened, a worker would still be
+                // holding a pointer into this frame, so returning is not an
+                // option — abort rather than corrupt memory.
+                note_advisory("pool barrier: done channel closed with jobs outstanding");
+                eprintln!("peregrine-par: fatal — worker vanished without signalling ({e}); aborting to avoid use-after-free");
+                std::process::abort();
             }
+        }
+        if let Some(p) = inline_panic {
+            // Re-raise the caller's panic now that no worker holds `task`.
+            resume_unwind(p);
         }
         if panicked.load(Ordering::Relaxed) {
             // debug/unwind builds only (release aborts on panic); never a deadlock.
@@ -308,6 +375,10 @@ impl Pool {
     /// of `out`, in parallel (serial below `min_parallel`). Bit-identical to the
     /// serial loop: rows are disjoint, no cross-row reduction.
     pub fn par_rows_mut(&self, out: &mut [f32], stride: usize, n: usize, min_parallel: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
+        // `n * stride` addresses raw memory, so a caller whose arithmetic
+        // overshoots `out` would hand workers slices past the end. Clamp to
+        // what `out` actually holds rather than trusting the count.
+        let n = clamp_rows(n, stride, out.len());
         let base = SendPtr(out.as_mut_ptr());
         let g = move |i: usize| {
             // SAFETY: rows are `stride` apart and each `i` is dispatched exactly
@@ -332,6 +403,8 @@ impl Pool {
     ) {
         let (a, b, c) = bufs;
         let [sa, sb, sc] = strides;
+        // clamp against every buffer — see `par_rows_mut`
+        let n = clamp_rows(n, sa, a.len()).min(clamp_rows(n, sb, b.len())).min(clamp_rows(n, sc, c.len()));
         let (pa, pb, pc) = (SendPtr(a.as_mut_ptr()), SendPtr(b.as_mut_ptr()), SendPtr(c.as_mut_ptr()));
         let g = move |i: usize| {
             // SAFETY: three disjoint row-strided buffers; each `i` dispatched once.
@@ -353,16 +426,24 @@ impl Pool {
     pub fn par_map<R: Send>(&self, n: usize, min_parallel: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
         let mut out: Vec<R> = Vec::with_capacity(n);
         let base: SendPtr<R> = SendPtr(out.as_mut_ptr());
-        let g = move |i: usize| {
+        // Which slots hold a value. A panicking task leaves *gaps*, not a
+        // prefix, so the cleanup guard needs per-slot truth: without it every
+        // already-written `R` leaks (`set_len` never runs on the unwind path).
+        let filled: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+        let filled_ref = &filled;
+        let g = |i: usize| {
             let val = f(i);
             // SAFETY: slot `i` is written exactly once (disjoint dispatch) into
             // uninitialized capacity, so a raw write (no drop of a prior value) is
             // correct. `run_ranges` writes all `n` slots before it returns.
             unsafe { base.get().add(i).write(val) };
+            filled_ref[i].store(true, Ordering::Release);
         };
+        let mut guard = PartialInit { ptr: SendPtr(out.as_mut_ptr()), filled: filled_ref, armed: true };
         self.run_ranges(n, min_parallel, &g);
-        // SAFETY: the barrier in `run_ranges` initialized all `n` slots (or unwound
-        // before reaching here on a task panic, so this line never runs partial).
+        guard.armed = false; // completed: `out` takes ownership below
+        // SAFETY: the barrier in `run_ranges` initialized all `n` slots (it does
+        // not return until every dispatched chunk has signalled).
         unsafe { out.set_len(n) };
         out
     }
@@ -375,6 +456,7 @@ impl Pool {
     /// `f` does per row must be independent → bit-identical to processing all rows
     /// in one serial call.
     pub fn par_chunks_mut(&self, out: &mut [f32], stride: usize, n: usize, min_parallel: usize, f: impl Fn(usize, usize, &mut [f32]) + Sync) {
+        let n = clamp_rows(n, stride, out.len()); // see `par_rows_mut`
         if n == 0 {
             return;
         }
@@ -609,5 +691,53 @@ mod tests {
             })
         }));
         assert!(r.is_err(), "a panicking parallel task must surface, not deadlock");
+    }
+
+    #[test]
+    fn panicking_par_map_drops_written_values() {
+        // A panic mid-batch leaves gaps of already-written slots. `set_len` never
+        // runs on that path, so the values must be dropped by the guard — else
+        // every heap-owning `R` produced before the panic leaks.
+        use std::sync::atomic::AtomicUsize;
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        /// Owns a heap allocation, so a missed drop is a real leak. The payload
+        /// is the amount it contributes to `LIVE`, read back on drop.
+        struct Tracked(Box<usize>);
+        impl Tracked {
+            fn new() -> Tracked {
+                LIVE.fetch_add(1, Ordering::Relaxed);
+                Tracked(Box::new(1))
+            }
+        }
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                LIVE.fetch_sub(*self.0, Ordering::Relaxed);
+            }
+        }
+
+        let pool = Pool::new(4);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            pool.par_map(64, 2, |i| {
+                if i == 40 {
+                    assert_eq!(1, 2, "intentional test panic");
+                }
+                Tracked::new()
+            })
+        }));
+        assert!(r.is_err(), "the panic must surface");
+        assert_eq!(LIVE.load(Ordering::Relaxed), 0, "every written value must be dropped, not leaked");
+    }
+
+    #[test]
+    fn row_apis_clamp_an_oversized_row_count() {
+        // A caller whose arithmetic overshoots the buffer must not have workers
+        // form slices past its end: the count is clamped to what `out` holds.
+        let pool = Pool::new(4);
+        let mut out = vec![0f32; 8 * 4]; // 8 rows of 4
+        pool.par_rows_mut(&mut out, 4, 64, 2, |i, row| row.fill(i as f32)); // 64 >> 8
+        assert_eq!(out.len(), 32);
+        assert!(out.chunks(4).enumerate().all(|(i, r)| r.iter().all(|&v| v == i as f32)));
+        // stride 0 would divide by zero — it degenerates to "no rows".
+        pool.par_rows_mut(&mut out, 0, 4, 2, |_, _| {});
     }
 }

@@ -10,7 +10,7 @@
 use peregrine_core::{Error, QtFmt, QtInfo, SafeTensors};
 use peregrine_io::Bytes;
 use peregrine_kernels::{
-    dot_i2i8, matmul_i4_from_f32, matmul_i4g_from_f32, matmul_i8_from_f32, qrow_i8,
+    dot_i2i8, matmul_i4_from_f32, matmul_i4g_from_f32, matmul_i8_from_f32, qrow_i8, ActScratch, MatShape,
 };
 
 /// The quantized formats the compute path supports. F32 is rejected at load, so
@@ -25,15 +25,16 @@ pub enum QuantFmt {
 }
 
 impl QuantFmt {
-    /// Narrow a detected container format to a computable one; `F32` (a tensor
-    /// with no `.qs` scale sibling) has no quantized compute path here.
+    /// Narrow a detected container format to a computable one. `F32` (a tensor
+    /// with no `.qs` scale sibling) and `Unknown` (a payload matching no
+    /// container for the requested shape) have no quantized compute path.
     pub fn from_qt(f: QtFmt) -> Option<QuantFmt> {
         match f {
             QtFmt::Int8 => Some(QuantFmt::Int8),
             QtFmt::Int4 => Some(QuantFmt::Int4),
             QtFmt::Int4Grouped => Some(QuantFmt::Int4Grouped),
             QtFmt::Int2 => Some(QuantFmt::Int2),
-            QtFmt::F32 => None,
+            QtFmt::F32 | QtFmt::Unknown => None,
         }
     }
 }
@@ -77,12 +78,22 @@ impl QtWeight {
     /// Load a container weight `[O, I]` (`name` + `name.qs`) from a model dir.
     pub fn load(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<QtWeight, Error> {
         let info = QtInfo::detect(st, name, o as i64, i as i64);
-        let fmt = QuantFmt::from_qt(info.fmt).ok_or_else(|| {
-            Error::Format(format!(
-                "weight '{name}': no `.qs` scale sibling (runtime-f32 weights are not \
-                 supported on the quantized expert path)"
-            ))
-        })?;
+        let fmt = match QuantFmt::from_qt(info.fmt) {
+            Some(f) => f,
+            None if info.fmt == QtFmt::Unknown => {
+                return Err(Error::Format(format!(
+                    "weight '{name}': {} bytes match no quantized container for [{o},{i}] \
+                     (truncated tensor, or the shape disagrees with the checkpoint)",
+                    st.uncompressed_nbytes(name).unwrap_or(0)
+                )))
+            }
+            None => {
+                return Err(Error::Format(format!(
+                    "weight '{name}': no `.qs` scale sibling (runtime-f32 weights are not \
+                     supported on the quantized expert path)"
+                )))
+            }
+        };
         let nb = match fmt {
             QuantFmt::Int8 => o * i,
             QuantFmt::Int4 | QuantFmt::Int4Grouped => o * (i.div_ceil(2)),
@@ -113,10 +124,10 @@ impl QtWeight {
     /// scratch `xq[s_n*I]`, per-row scale scratch `sx[s_n]`, and output `y`.
     pub fn apply(&self, x: &[f32], s_n: usize, xq: &mut [i8], sx: &mut [f32], y: &mut [f32]) {
         match self.fmt {
-            QuantFmt::Int8 => matmul_i8_from_f32(y, x, self.as_i8(), &self.scale, s_n, self.i, self.o, xq, sx),
-            QuantFmt::Int4 => matmul_i4_from_f32(y, x, &self.q[..], &self.scale, s_n, self.i, self.o, xq, sx),
+            QuantFmt::Int8 => matmul_i8_from_f32(y, x, self.as_i8(), &self.scale, MatShape::new(s_n, self.i, self.o), ActScratch { xq, sx }),
+            QuantFmt::Int4 => matmul_i4_from_f32(y, x, &self.q[..], &self.scale, MatShape::new(s_n, self.i, self.o), ActScratch { xq, sx }),
             QuantFmt::Int4Grouped => {
-                matmul_i4g_from_f32(y, x, &self.q[..], &self.scale, s_n, self.i, self.o, self.gs, xq, sx)
+                matmul_i4g_from_f32(y, x, &self.q[..], &self.scale, MatShape::new(s_n, self.i, self.o), self.gs, ActScratch { xq, sx })
             }
             QuantFmt::Int2 => {
                 // Quantize activations, then int2·int8 dot each row (AVX2 when
@@ -176,44 +187,60 @@ impl QtWeight {
     /// `kv_b` rows rather than a batched matmul.
     pub fn dequant_row(&self, o: usize) -> Vec<f32> {
         let mut out = vec![0f32; self.i];
+        self.dequant_row_into(o, &mut out);
+        out
+    }
+
+    /// [`Self::dequant_row`] into a caller-owned buffer — the allocation-free
+    /// form for hot loops. The MLA absorb core calls this once per (head,
+    /// output element) per token per layer; allocating a fresh `Vec` each time
+    /// cost on the order of a million allocations per decoded token, all of them
+    /// re-deriving the same immutable weight.
+    ///
+    /// `out` must hold at least `self.i` floats; a shorter buffer is left
+    /// untouched (the caller sized it wrong).
+    pub fn dequant_row_into(&self, o: usize, out: &mut [f32]) {
+        if out.len() < self.i {
+            return;
+        }
+        let out = &mut out[..self.i];
         match self.fmt {
             QuantFmt::Int8 => {
                 let s = self.scale[o];
                 let q = self.as_i8();
-                for i in 0..self.i {
-                    out[i] = q[o * self.i + i] as f32 * s;
+                for (i, dst) in out.iter_mut().enumerate() {
+                    *dst = q[o * self.i + i] as f32 * s;
                 }
             }
             QuantFmt::Int4 => {
                 let s = self.scale[o];
                 let rb = self.i.div_ceil(2);
-                for i in 0..self.i {
+                for (i, dst) in out.iter_mut().enumerate() {
                     let byte = self.q[o * rb + (i >> 1)];
                     let nib = if i & 1 == 0 { (byte & 0x0F) as i32 } else { (byte >> 4) as i32 };
-                    out[i] = (nib - 8) as f32 * s;
+                    *dst = (nib - 8) as f32 * s;
                 }
             }
             QuantFmt::Int4Grouped => {
                 let rb = self.i.div_ceil(2);
                 let ng = self.i.div_ceil(self.gs);
-                for i in 0..self.i {
+                for (i, dst) in out.iter_mut().enumerate() {
                     let s = self.scale[o * ng + i / self.gs];
                     let byte = self.q[o * rb + (i >> 1)];
                     let nib = if i & 1 == 0 { (byte & 0x0F) as i32 } else { (byte >> 4) as i32 };
-                    out[i] = (nib - 8) as f32 * s;
+                    *dst = (nib - 8) as f32 * s;
                 }
             }
             QuantFmt::Int2 => {
                 let s = self.scale[o];
                 let rb = self.i.div_ceil(4);
-                for i in 0..self.i {
+                for (i, dst) in out.iter_mut().enumerate() {
                     let byte = self.q[o * rb + (i >> 2)];
                     let field = ((byte >> (2 * (i & 3))) & 0x03) as i32;
-                    out[i] = (field - 2) as f32 * s;
+                    *dst = (field - 2) as f32 * s;
                 }
             }
         }
-        out
     }
 
     /// Dequantize to a full f32 `[O, I]` matrix — for reference/validation paths.
