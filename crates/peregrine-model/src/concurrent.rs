@@ -22,7 +22,7 @@ use crate::gpu::{GpuTier, HeatTable};
 use crate::lane::LaneTimingsAccum;
 use crate::mlp::Mlp;
 use crate::predict::RouteHistory;
-use crate::router::{batch_union, route, routed_at};
+use crate::router::{batch_union, route, routed_at, RouterCfg};
 use crate::weight::{QtWeight, QuantFmt};
 
 /// Shared per-forward state threaded through the layer/MoE compute: the
@@ -484,7 +484,7 @@ pub fn moe_forward_concurrent(
     }
     let hidden = cfg.hidden as usize;
     let (e_n, mi, k) = (cfg.n_experts as usize, cfg.moe_inter as usize, cfg.topk as usize);
-    let r = route(x, router_w, router_bias, s_n, hidden, e_n, k, cfg.norm_topk, cfg.routed_scale);
+    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale });
 
     // Partition the batch-union into GPU-resident (compute on device) and disk
     // (stream + CPU) experts, assigning each a global `pos` in batch-union order
@@ -496,19 +496,34 @@ pub fn moe_forward_concurrent(
     // Number of experts per layer — needed to look up per-expert heat in the
     // flat counts slice (fallback to 0 when the balancer is disabled).
     let n_experts_layer = cfg.n_experts as usize;
-    for &e in uniq.iter() {
-        let e = e as usize;
-        let mut rows: Vec<usize> = Vec::new();
-        let mut rw: Vec<f32> = Vec::new();
-        for s in 0..s_n {
-            for kk in 0..r.keff[s] as usize {
-                if r.idx[s * r.k + kk] as usize == e {
-                    rows.push(s);
-                    rw.push(r.w[s * r.k + kk]);
-                    break;
-                }
+    // Bucket every position's routed experts in ONE pass over the routing table.
+    // The previous shape rescanned the whole table per unique expert
+    // (O(|union| × S × K)); at prefill scale that is millions of comparisons per
+    // sparse layer, on the critical path before any lane can be dispatched.
+    // Emission order (batch-union) and per-expert row order (ascending `s`,
+    // first matching `kk`) are unchanged, so the reduce stays bit-identical.
+    let mut rows_of: Vec<(Vec<usize>, Vec<f32>)> = uniq.iter().map(|_| (Vec::new(), Vec::new())).collect();
+    let mut slot_of: std::collections::HashMap<usize, usize> = std::collections::HashMap::with_capacity(uniq.len());
+    for (i, &e) in uniq.iter().enumerate() {
+        // `batch_union` only yields ids the router selected, and the router
+        // never emits a negative id — a conversion failure would mean corrupt
+        // routing, so skip the entry rather than indexing with a wrapped value.
+        let Ok(e) = usize::try_from(e) else { continue };
+        slot_of.entry(e).or_insert(i);
+    }
+    for s in 0..s_n {
+        for kk in 0..(r.keff[s].max(0) as usize).min(r.k) {
+            let Ok(e) = usize::try_from(r.idx[s * r.k + kk]) else { continue };
+            let Some(&i) = slot_of.get(&e) else { continue };
+            if rows_of[i].0.last() == Some(&s) {
+                continue; // one row per position per expert (the old `break`)
             }
+            rows_of[i].0.push(s);
+            rows_of[i].1.push(r.w[s * r.k + kk]);
         }
+    }
+    for (&e, (rows, rw)) in uniq.iter().zip(rows_of) {
+        let Ok(e) = usize::try_from(e) else { continue };
         if rows.is_empty() {
             continue;
         }
@@ -618,8 +633,8 @@ pub fn moe_forward_concurrent(
                     // split the claimed range into warm-tier hits (dispatch now) and
                     // misses (one deep async submit on this ring)
                     let mut miss: Vec<usize> = Vec::new();
-                    for idx in start..end {
-                        let key = (layer as u32, plans_ref[idx].expert as u32);
+                    for (idx, plan) in plans_ref.iter().enumerate().take(end).skip(start) {
+                        let key = (layer as u32, plan.expert as u32);
                         let hit = ecache.and_then(|c| c.lock().get(key));
                         match hit {
                             Some(bytes) => {
@@ -698,7 +713,7 @@ pub fn moe_forward_concurrent(
                         }
                         Err(e) => {
                             if res_tx.send(Err(e)).is_err() {
-                                peregrine_io::note_advisory_err("cpu lane error forward", &"collector already gone");
+                                peregrine_io::note_advisory_err("gpu lane error forward", &"collector already gone");
                             }
                         }
                     }
@@ -711,7 +726,14 @@ pub fn moe_forward_concurrent(
             let job_rx = job_rx.clone();
             let res_tx = res_tx.clone();
             scope.spawn(move || {
-                while let Ok((idx, bytes)) = job_rx.recv() { // audit-allow: recv's only Err is Disconnected = clean shutdown
+                loop {
+                    // `recv`'s only error is `Disconnected`, which is this
+                    // pool's shutdown signal: every ring has finished and
+                    // dropped its sender.
+                    let (idx, bytes) = match job_rx.recv() {
+                        Ok(job) => job,
+                        Err(crossbeam_channel::RecvError) => break,
+                    };
                     let plan = &plans_ref[idx];
                     // Slab bytes consumed by this expert — the bandwidth-governor
                     // numerator (counted before the regions move into the Mlp).
@@ -752,26 +774,64 @@ pub fn moe_forward_concurrent(
 
         let mut slots: Vec<Option<EOut>> = (0..n).map(|_| None).collect();
         let mut got = 0usize;
+        // A lane error must NOT return straight out of this closure: `res_rx`
+        // lives in the caller's frame, so leaving it undrained lets the still-
+        // running lanes fill the bounded result channel and block forever in
+        // `send` — `thread::scope`'s join at the end of this closure would then
+        // never complete and the whole decode wedges with no error surfaced.
+        // Record the failure, stop collecting, and drain until every sender is
+        // gone so all lanes can finish and be joined.
+        let mut failure: Option<Error> = None;
         loop {
             match res_rx.recv() {
                 Ok(Ok((pos, eo))) => {
-                    slots[pos] = Some(eo);
+                    // Two results for one position would silently drop an
+                    // expert's contribution from the layer output.
+                    match slots.get_mut(pos) {
+                        Some(slot) if slot.is_none() => *slot = Some(eo),
+                        Some(_) => {
+                            failure = Some(Error::Format(format!(
+                                "concurrent MoE: duplicate result for expert slot {pos}"
+                            )));
+                            break;
+                        }
+                        None => {
+                            failure = Some(Error::Format(format!(
+                                "concurrent MoE: result slot {pos} out of range ({n} experts)"
+                            )));
+                            break;
+                        }
+                    }
                     got += 1;
                     if got == n {
                         break;
                     }
                 }
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => {
+                    failure = Some(e);
+                    break;
+                }
                 // channel closed: fine only if every expert already arrived
                 Err(recv_err) => {
                     if got == n {
                         break;
                     }
-                    return Err(Error::Format(format!(
-                        "concurrent MoE: io/cpu lane ended early ({got}/{n} experts): {recv_err}"
+                    // `completed` counts what the lanes finished computing, which
+                    // distinguishes "a lane died before computing" from "results
+                    // were computed but never delivered".
+                    let done = completed_ref.load(Ordering::Relaxed);
+                    failure = Some(Error::Format(format!(
+                        "concurrent MoE: io/cpu lane ended early ({got}/{n} experts collected, \
+                         {done} computed): {recv_err}"
                     )));
+                    break;
                 }
             }
+        }
+        if let Some(e) = failure {
+            // Unblock every lane still queued on a full channel, then report.
+            while res_rx.recv().is_ok() {}
+            return Err(e);
         }
         Ok(slots)
     });

@@ -39,9 +39,23 @@ pub struct IoTuner {
     max_workers: u32,
     /// EWMA weight ([0, 1]). Higher = more reactive.
     alpha_bp: u32, // basis points
+    /// Samples folded into the EWMA (distinguishes "unseeded" from "the average
+    /// is genuinely zero").
+    samples: AtomicU64,
+    /// Calls to [`Self::step`], for the internal adjustment cadence.
+    ticks: AtomicU64,
+    /// Whether tuning is on, resolved once at construction. Previously a
+    /// process-wide `OnceLock`, so whichever call site ran first froze the
+    /// decision for every instance — and the tests could not exercise their own
+    /// kill switch.
+    enabled: bool,
 }
 
 impl IoTuner {
+    /// Forwards between cap adjustments. Matches the period the telemetry
+    /// design assumed, and holds regardless of how often a caller ticks.
+    const STEP_PERIOD: u64 = 16;
+
     /// Start with `(bounded, unbounded)` at `initial`. `min_workers`/`max_workers`
     /// clamp future adjustments.
     pub fn new(initial: IowqCap, min_workers: u32, max_workers: u32) -> IoTuner {
@@ -54,6 +68,9 @@ impl IoTuner {
             min_workers,
             max_workers,
             alpha_bp: 3000, // α = 0.30
+            samples: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+            enabled: enabled(),
         }
     }
 
@@ -62,8 +79,13 @@ impl IoTuner {
     pub fn note_read(&self, read_us: u64, sq_full_delta: u64) {
         // EWMA in fixed-point (basis-points weighting); floors at the raw sample
         // on the first call.
+        // Seed on the first *sample*, not on "the EWMA happens to be 0": a run of
+        // sub-microsecond warm-cache-served forwards drives the average to zero,
+        // and treating that as unseeded made the next sample replace it wholesale
+        // (the filter reacting to a single spike as if it were steady state).
+        let seen = self.samples.fetch_add(1, Ordering::Relaxed);
         let prev = self.ewma_read_us.load(Ordering::Relaxed);
-        let next = if prev == 0 {
+        let next = if seen == 0 {
             read_us
         } else {
             let alpha = self.alpha_bp as u128;
@@ -90,7 +112,7 @@ impl IoTuner {
     /// The current recommendation. `None` if tuning is disabled — callers keep
     /// their fixed defaults.
     pub fn recommend(&self) -> Option<IowqCap> {
-        if !enabled() {
+        if !self.enabled {
             return None;
         }
         Some(IowqCap {
@@ -104,8 +126,16 @@ impl IoTuner {
     /// pressure); grows by one otherwise when the EWMA read-latency exceeds
     /// `latency_target_us`. Idempotent on stable workloads.
     pub fn step(&self, latency_target_us: u64, sq_full_before: u64) {
-        if !enabled() {
+        if !self.enabled {
             return;
+        }
+        // Adjust on a fixed cadence regardless of how often the caller ticks:
+        // the α = 0.30 EWMA needs several samples to mean anything, and a
+        // per-forward step walked the cap from 4 to the ceiling in under 30
+        // forwards (with a `set_iowq_max_workers` syscall on every change).
+        let tick = self.ticks.fetch_add(1, Ordering::Relaxed);
+        if !(tick + 1).is_multiple_of(Self::STEP_PERIOD) {
+            return; // first adjustment lands once a full period of samples exists
         }
         let sq_full_now = self.sq_full();
         let sq_full_delta = sq_full_now.saturating_sub(sq_full_before);
@@ -119,14 +149,34 @@ impl IoTuner {
             self.cur_unbounded.store(u, Ordering::Relaxed);
             return;
         }
-        // No pressure: grow slowly while we're above the latency target.
+        // No pressure: grow slowly while we're above the latency target...
         let ewma = self.ewma_us();
         if ewma > latency_target_us {
             let b = (self.cur_bounded.load(Ordering::Relaxed) + 1).min(self.max_workers);
             let u = (self.cur_unbounded.load(Ordering::Relaxed) + 1).min(self.max_workers);
             self.cur_bounded.store(b, Ordering::Relaxed);
             self.cur_unbounded.store(u, Ordering::Relaxed);
+        } else if ewma > 0 && ewma * 2 < latency_target_us {
+            // ...and give workers back when there is real headroom. Without this
+            // the control law was one-way: a device at its IOPS ceiling raises
+            // latency, which added workers, which deepened the queue and raised
+            // latency again — and since a saturated (not queue-full) device
+            // never signals SQ-full, the cap ratcheted to the ceiling and stayed
+            // there for the life of the process.
+            let b = self.cur_bounded.load(Ordering::Relaxed).saturating_sub(1).max(self.min_workers);
+            let u = self.cur_unbounded.load(Ordering::Relaxed).saturating_sub(1).max(self.min_workers);
+            self.cur_bounded.store(b, Ordering::Relaxed);
+            self.cur_unbounded.store(u, Ordering::Relaxed);
         }
+    }
+}
+
+impl IoTuner {
+    /// Force tuning on for a test, independent of the process environment.
+    #[cfg(test)]
+    fn forced_on(mut self) -> IoTuner {
+        self.enabled = true;
+        self
     }
 }
 
@@ -163,6 +213,42 @@ mod tests {
             assert!(rec.bounded <= 8 && rec.bounded >= 1);
             assert!(rec.unbounded <= 8 && rec.unbounded >= 1);
         }
+    }
+
+    #[test]
+    fn cap_shrinks_again_when_latency_has_headroom() {
+        // The control law used to be one-way: it grew whenever latency exceeded
+        // the target and only ever shrank on an SQ-full event. A device at its
+        // IOPS ceiling raises latency without ever signalling SQ-full, so the
+        // cap ratcheted to the maximum and stayed there for the process's life.
+        let t = IoTuner::new(IowqCap { bounded: 4, unbounded: 4 }, 1, 16).forced_on();
+        // Latency far above target → grow.
+        for _ in 0..(16 * 4) {
+            t.note_read(10_000, 0);
+            t.step(1_000, t.sq_full());
+        }
+        let grown = t.recommend().map(|r| r.bounded).unwrap_or(0);
+        assert!(grown > 4, "cap must grow while latency is above target (got {grown})");
+        // Latency now well under target → give the workers back.
+        for _ in 0..(16 * 8) {
+            t.note_read(10, 0);
+            t.step(1_000, t.sq_full());
+        }
+        let shrunk = t.recommend().map(|r| r.bounded).unwrap_or(u32::MAX);
+        assert!(shrunk < grown, "cap must shrink again with headroom ({grown} -> {shrunk})");
+        assert!(shrunk >= 1, "never below min_workers");
+    }
+
+    #[test]
+    fn adjustments_follow_a_fixed_cadence() {
+        // One `step` per forward walked the cap to the ceiling long before the
+        // α = 0.30 EWMA meant anything (and issued a syscall on each change).
+        let t = IoTuner::new(IowqCap { bounded: 4, unbounded: 4 }, 1, 16).forced_on();
+        t.note_read(10_000, 0);
+        for _ in 0..(IoTuner::STEP_PERIOD - 1) {
+            t.step(1_000, t.sq_full());
+        }
+        assert_eq!(t.recommend().map(|r| r.bounded), Some(4), "no adjustment before a full period");
     }
 
     #[test]

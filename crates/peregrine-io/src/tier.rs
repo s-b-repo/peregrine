@@ -24,7 +24,13 @@ pub fn lfru_score(heat: u32, last: u32, clock: u32) -> u64 {
 
 /// Pick a pinned slot to replace using LFRU. Port of `tier_pick_lfru`.
 pub fn pick_lfru(heat: &[u32], last: &[u32], clock: u32, pinned: &[usize]) -> Option<Swap> {
-    if heat.is_empty() || last.is_empty() || pinned.is_empty() {
+    // Every index below comes from the caller. A `last` shorter than `heat`, or
+    // a pinned slot past the end, would index out of bounds — an abort in
+    // release. Mismatched inputs mean "no decision", not a crash.
+    if heat.is_empty() || last.len() != heat.len() || pinned.is_empty() {
+        return None;
+    }
+    if pinned.iter().any(|&p| p >= heat.len()) {
         return None;
     }
     // coldest pinned slot
@@ -58,7 +64,9 @@ pub fn pick_lfru(heat: &[u32], last: &[u32], clock: u32, pinned: &[usize]) -> Op
 
 /// Frequency-only swap pick. Port of `tier_pick_swap`.
 pub fn pick_swap(heat: &[u32], pinned: &[usize]) -> Option<Swap> {
-    if heat.is_empty() || pinned.is_empty() {
+    // Pinned slots index `heat`; an out-of-range one would abort (see
+    // [`pick_lfru`]).
+    if heat.is_empty() || pinned.is_empty() || pinned.iter().any(|&p| p >= heat.len()) {
         return None;
     }
     let mut cold = 0usize;
@@ -69,12 +77,12 @@ pub fn pick_swap(heat: &[u32], pinned: &[usize]) -> Option<Swap> {
     }
     let mut hot: Option<usize> = None;
     let mut fh = 0u32;
-    for e in 0..heat.len() {
+    for (e, &h) in heat.iter().enumerate() {
         if pinned.contains(&e) {
             continue;
         }
-        if heat[e] > fh {
-            fh = heat[e];
+        if h > fh {
+            fh = h;
             hot = Some(e);
         }
     }
@@ -130,5 +138,18 @@ mod tests {
         let mut h = [8u32, 3, 0];
         decay(&mut h);
         assert_eq!(h, [4, 1, 0]);
+    }
+
+    #[test]
+    fn mismatched_inputs_yield_no_decision_not_a_crash() {
+        // These are public entry points; the indices come from the caller, and
+        // an out-of-range one used to index out of bounds (an abort in release).
+        let heat = [10u32, 20, 30];
+        let last = [0u32, 0, 0];
+        assert_eq!(pick_lfru(&heat, &last, 0, &[7]), None, "pinned slot past the end");
+        assert_eq!(pick_lfru(&heat, &[0u32], 0, &[0]), None, "last shorter than heat");
+        assert_eq!(pick_swap(&heat, &[9]), None, "pinned slot past the end");
+        // A well-formed call still works.
+        assert!(pick_lfru(&heat, &last, 0, &[0]).is_some());
     }
 }

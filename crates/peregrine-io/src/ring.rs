@@ -67,6 +67,26 @@ mod uring {
         slab: SlabPool,
     }
 
+    impl Drop for Reactor {
+        /// Unregister the kernel-pinned buffers and files before the ring goes
+        /// away. Correctness here previously rested on field declaration order
+        /// (the ring closing first happens to unpin them); stating it in code
+        /// means a future field reshuffle cannot silently turn this into a
+        /// use-after-free of pinned pages.
+        fn drop(&mut self) {
+            if !self.registered_bufs.is_empty() {
+                if let Err(e) = self.ring.submitter().unregister_buffers() {
+                    crate::note_advisory_err("io_uring unregister_buffers at shutdown", &e);
+                }
+            }
+            if !self.registered.is_empty() {
+                if let Err(e) = self.ring.submitter().unregister_files() {
+                    crate::note_advisory_err("io_uring unregister_files at shutdown", &e);
+                }
+            }
+        }
+    }
+
     impl Reactor {
         /// `entries` = submission-queue depth (rounded up to a power of two by the
         /// kernel). Cold NVMe streaming wants this ≥ the per-layer expert count.
@@ -111,6 +131,23 @@ mod uring {
         /// Same contract as `submission().push`: any buffer the entry points at
         /// must stay live until its completion is reaped (every caller here
         /// waits on the completion before reusing buffers).
+        /// Turn a negative io_uring result into an `io::Error`. Uses checked
+        /// negation: `-(i64::MIN)` overflows (a panic in debug, and in release it
+        /// wraps back to `i64::MIN`, truncating to errno 0 — an error whose
+        /// message reads "Success").
+        fn errno_from_result(n: i64) -> io::Error {
+            match n.checked_neg().and_then(|e| i32::try_from(e).ok()) {
+                Some(e) => io::Error::from_raw_os_error(e),
+                None => io::Error::other(format!("io_uring returned an unrepresentable result code {n}")),
+            }
+        }
+
+        /// High bit of `user_data`, set on advisory (non-read) submissions.
+        /// Read completions live in the low range, so a stray advisory
+        /// completion can never be mistaken for a read result and scribble into
+        /// another batch's results vector.
+        const ADVISORY_TAG: u64 = 1 << 63;
+
         unsafe fn push_counted(&mut self, e: &squeue::Entry) -> io::Result<()> {
             // SAFETY: forwarded caller contract (see above).
             if unsafe { self.ring.submission().push(e) }.is_err() {
@@ -148,7 +185,7 @@ mod uring {
                     self.read_many(&mut reqs)?[0]
                 };
                 if n < 0 {
-                    return Err(io::Error::from_raw_os_error((-n) as i32));
+                    return Err(Self::errno_from_result(n));
                 }
                 if n == 0 {
                     return Err(io::Error::new(
@@ -245,12 +282,18 @@ mod uring {
                 // SAFETY: buffer outlives the op — completion reaped below.
                 unsafe { self.push_counted(&e) }?;
                 self.ring.submit_and_wait(1)?;
-                let mut n = i64::MIN;
+                let mut n: Option<i64> = None;
                 for cqe in self.ring.completion() {
-                    n = cqe.result() as i64;
+                    n = Some(cqe.result() as i64);
                 }
+                // No completion at all is its own failure, not a negative result:
+                // the old `i64::MIN` sentinel negated to itself and reported
+                // "errno 0 = Success" in release builds.
+                let Some(n) = n else {
+                    return Err(io::Error::other("io_uring read_fixed completion missing"));
+                };
                 if n < 0 {
-                    return Err(io::Error::from_raw_os_error((-n) as i32));
+                    return Err(Self::errno_from_result(n));
                 }
                 if n == 0 {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read_fixed hit EOF"));
@@ -293,7 +336,7 @@ mod uring {
                 n = cqe.result() as i64;
             }
             if n < 0 {
-                return Err(io::Error::from_raw_os_error((-n) as i32));
+                return Err(Self::errno_from_result(n));
             }
             Ok(())
         }
@@ -340,63 +383,161 @@ mod uring {
             let mut i = 0;
             while i < regions.len() {
                 let end = (i + self.cap).min(regions.len());
-                for j in i..end {
-                    let (fd, off, len) = regions[j];
+                let mut pushed = 0usize;
+                let mut push_err = None;
+                for (j, &(fd, off, len)) in regions.iter().enumerate().take(end).skip(i) {
                     let e = opcode::Fadvise::new(types::Fd(fd), len as libc::off_t, POSIX_FADV_WILLNEED)
                         .offset(off)
                         .build()
-                        .user_data(j as u64);
-                    // SAFETY: Fadvise carries no buffer.
-                    // SAFETY: buf outlives the op (completions reaped before return);
-                    // Fadvise entries carry no buffer.
-                    unsafe { self.push_counted(&e) }?;
+                        // Advisory ops live in their own user_data namespace so a
+                        // stray completion can never be mistaken for a read's.
+                        .user_data(Self::ADVISORY_TAG | j as u64);
+                    // SAFETY: Fadvise entries carry no buffer.
+                    match unsafe { self.push_counted(&e) } {
+                        Ok(()) => pushed += 1,
+                        Err(e) => {
+                            push_err = Some(e);
+                            break;
+                        }
+                    }
                 }
-                self.ring.submit_and_wait(end - i)?;
-                // drain the completions we asked to wait for; ignore per-op codes
-                // (advisory).
-                for _ in self.ring.completion() {}
+                // Whatever was pushed is already visible to the kernel: it must be
+                // submitted and reaped before returning, or it would surface as a
+                // stray completion during the caller's next read.
+                let submitted = self.drain_pushed(pushed);
+                if let Some(e) = push_err {
+                    return Err(e);
+                }
+                submitted?;
                 i = end;
             }
             Ok(())
+        }
+
+        /// Submit `pushed` queued entries and reap exactly that many completions,
+        /// discarding their results. Used to return the ring to a clean state on
+        /// an error path — an abandoned SQE is visible to the kernel, so leaving
+        /// one queued means the kernel may still write into a buffer the caller
+        /// is about to free, and its completion would corrupt the next batch's
+        /// results.
+        fn drain_pushed(&mut self, pushed: usize) -> io::Result<()> {
+            if pushed == 0 {
+                return Ok(());
+            }
+            let r = self.ring.submit_and_wait(pushed);
+            let mut seen = 0usize;
+            for _ in self.ring.completion() {
+                seen += 1;
+            }
+            // A short reap means completions are still in flight; wait them out so
+            // the ring is genuinely empty before the caller reuses it.
+            while r.is_ok() && seen < pushed {
+                self.ring.submit_and_wait(pushed - seen)?;
+                let mut progressed = false;
+                for _ in self.ring.completion() {
+                    seen += 1;
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            r.map(|_| ())
         }
 
         /// Submit all `reqs` (chunked to the ring depth) and wait for every
         /// completion. Returns per-request result codes in `reqs` order. The
         /// buffers are filled directly by the kernel.
         pub fn read_many(&mut self, reqs: &mut [ReadReq]) -> io::Result<Vec<i64>> {
-            let mut results = vec![i64::MIN; reqs.len()];
+            // `None` = no completion seen yet. A sentinel value would be
+            // indistinguishable from a real result: the old `i64::MIN` flowed
+            // into `-n` and reported "errno 0 = Success" in release builds.
+            let mut results: Vec<Option<i64>> = vec![None; reqs.len()];
             let mut i = 0;
             while i < reqs.len() {
                 let end = (i + self.cap).min(reqs.len());
-                for j in i..end {
-                    let (ptr, len) = (reqs[j].buf.as_mut_ptr(), reqs[j].buf.len() as u32);
-                    let off = reqs[j].offset;
+                let mut pushed = 0usize;
+                let mut push_err = None;
+                for (j, req) in reqs.iter_mut().enumerate().take(end).skip(i) {
+                    // A single op cannot carry more than u32 bytes; truncating
+                    // would silently issue a short (or zero-length) read.
+                    let Ok(len32) = u32::try_from(req.buf.len()) else {
+                        push_err = Some(io::Error::other(format!(
+                            "read request {j} is {} bytes; io_uring reads are limited to {} per op",
+                            req.buf.len(),
+                            u32::MAX
+                        )));
+                        break;
+                    };
+                    let ptr = req.buf.as_mut_ptr();
+                    let off = req.offset;
                     // registered fd → fixed-file read (skips per-op fd lookup)
-                    let fixed = self.registered.iter().position(|&f| f == reqs[j].fd);
+                    let fixed = self.registered.iter().position(|&f| f == req.fd);
                     let mut e = match fixed {
-                        Some(idx) => opcode::Read::new(types::Fixed(idx as u32), ptr, len).offset(off).build(),
-                        None => opcode::Read::new(types::Fd(reqs[j].fd), ptr, len).offset(off).build(),
+                        Some(idx) => opcode::Read::new(types::Fixed(idx as u32), ptr, len32).offset(off).build(),
+                        None => opcode::Read::new(types::Fd(req.fd), ptr, len32).offset(off).build(),
                     }
                     .user_data(j as u64);
                     if self.force_async {
                         e = e.flags(squeue::Flags::ASYNC);
                     }
                     // SAFETY: buf outlives the op — read_many blocks until every
-                    // completion for this chunk is reaped below.
-                    // SAFETY: buf outlives the op (completions reaped before return);
-                    // Fadvise entries carry no buffer.
-                    unsafe { self.push_counted(&e) }?;
+                    // completion for this chunk is reaped (including on the error
+                    // paths below, which drain before returning).
+                    match unsafe { self.push_counted(&e) } {
+                        Ok(()) => pushed += 1,
+                        Err(e) => {
+                            push_err = Some(e);
+                            break;
+                        }
+                    }
                 }
-                self.ring.submit_and_wait(end - i)?;
+                if let Some(err) = push_err {
+                    // Entries already pushed are visible to the kernel and point
+                    // at buffers the caller is about to drop — drain before
+                    // surfacing the error. A drain failure is reported but does
+                    // not replace the original error, which is the real cause.
+                    if let Err(drain_err) = self.drain_pushed(pushed) {
+                        crate::note_advisory_err("io_uring drain after failed submit", &drain_err);
+                    }
+                    return Err(err);
+                }
+                self.ring.submit_and_wait(pushed)?;
                 let mut got = 0;
                 for cqe in self.ring.completion() {
-                    results[cqe.user_data() as usize] = cqe.result() as i64;
-                    got += 1;
+                    let ud = cqe.user_data();
+                    if ud & Self::ADVISORY_TAG != 0 {
+                        continue; // stray advisory completion — not a read result
+                    }
+                    match usize::try_from(ud).ok().and_then(|k| results.get_mut(k)) {
+                        Some(slot) => {
+                            *slot = Some(cqe.result() as i64);
+                            got += 1;
+                        }
+                        None => {
+                            return Err(io::Error::other(format!(
+                                "io_uring completion for unknown request {ud}"
+                            )))
+                        }
+                    }
                 }
-                debug_assert_eq!(got, end - i);
+                if got != pushed {
+                    return Err(io::Error::other(format!(
+                        "io_uring returned {got} completions for {pushed} submitted reads"
+                    )));
+                }
                 i = end;
             }
-            Ok(results)
+            let mut out = Vec::with_capacity(results.len());
+            for (j, r) in results.into_iter().enumerate() {
+                match r {
+                    Some(v) => out.push(v),
+                    None => {
+                        return Err(io::Error::other(format!("io_uring completion missing for request {j}")))
+                    }
+                }
+            }
+            Ok(out)
         }
 
         /// Size the internal aligned-buffer pool used by [`Reactor::read_direct_many`].
@@ -415,7 +556,10 @@ mod uring {
         /// shard), so `results[j] == reqs[j].buf.len()` on success. Requires the fd
         /// to be opened `O_DIRECT`; the buffer/offset/len alignment is handled here.
         pub fn read_direct_many(&mut self, reqs: &mut [ReadReq]) -> io::Result<Vec<i64>> {
-            let mut results = vec![i64::MIN; reqs.len()];
+            // Every entry is written before this returns (each region is completed
+            // in the loop below or the whole call errors), so 0 is a safe start
+            // rather than a sentinel that could escape as a bogus result code.
+            let mut results = vec![0i64; reqs.len()];
             for (j, r) in reqs.iter_mut().enumerate() {
                 let want = r.buf.len();
                 if want == 0 {
@@ -454,7 +598,7 @@ mod uring {
                             self.read_many(&mut sub)?[0]
                         };
                         if n < 0 {
-                            return Err(io::Error::from_raw_os_error((-n) as i32));
+                            return Err(Self::errno_from_result(n));
                         }
                         if n == 0 {
                             return Err(io::Error::new(
@@ -463,6 +607,19 @@ mod uring {
                             ));
                         }
                         done += n as usize;
+                        // O_DIRECT requires block-aligned offsets and buffers. The
+                        // kernel only returns an unaligned count at EOF, so a short
+                        // read that leaves `done` unaligned cannot be continued —
+                        // retrying would fail with a bare EINVAL that says nothing
+                        // about the real cause.
+                        if done < need && !done.is_multiple_of(ALIGN) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                format!(
+                                    "O_DIRECT short read at unaligned boundary ({done} of {need} bytes) —                                      the region extends past the end of the file"
+                                ),
+                            ));
+                        }
                     }
                     r.buf.copy_from_slice(&ab.as_slice()[head..need]);
                     Ok(())
@@ -514,7 +671,7 @@ mod uring {
                         self.read_many(&mut sub)?[0]
                     };
                     if n < 0 {
-                        return Err(io::Error::from_raw_os_error((-n) as i32));
+                        return Err(Self::errno_from_result(n));
                     }
                     if n == 0 {
                         return Err(io::Error::new(

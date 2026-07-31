@@ -12,12 +12,14 @@
 pub mod compress;
 pub mod config;
 pub mod dtype;
+pub mod durable;
 pub mod pack;
 pub mod qt;
 pub mod safetensors;
 
 pub use compress::{decode, encode, Compression};
 pub use config::Cfg;
+pub use durable::{commit_atomic, temp_sibling, write_atomic};
 /// Re-export of the shared advisory-failure reporter (`COLI_DEBUG=1` surfaces
 /// best-effort failures on stderr) so downstream crates that only depend on
 /// `peregrine-core` reach it through one canonical path.

@@ -74,7 +74,14 @@ impl HeatTable {
 
     /// Record one routing of `expert` in `layer` (lock-free; out-of-range ignored).
     pub fn bump(&self, layer: usize, expert: usize) {
-        if let Some(c) = self.counts.get(layer * self.n_experts + expert) {
+        // Bound the expert *within its layer*: checking only the flattened index
+        // let `expert == n_experts` credit (layer+1, 0), and a wildly out-of-range
+        // id wrap the multiply in release (no overflow checks) into a valid but
+        // wrong slot.
+        if expert >= self.n_experts {
+            return;
+        }
+        if let Some(c) = layer.checked_mul(self.n_experts).and_then(|b| b.checked_add(expert)).and_then(|i| self.counts.get(i)) {
             c.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -82,7 +89,15 @@ impl HeatTable {
     /// One slot's current count (0 for out-of-range) — a single atomic load, so
     /// hot paths (cache-admission gating) can consult it without a snapshot.
     pub fn get(&self, layer: usize, expert: usize) -> u32 {
-        self.counts.get(layer * self.n_experts + expert).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0)
+        if expert >= self.n_experts {
+            return 0; // see `bump`: the expert id is bounded within its layer
+        }
+        layer
+            .checked_mul(self.n_experts)
+            .and_then(|b| b.checked_add(expert))
+            .and_then(|i| self.counts.get(i))
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// A plain snapshot of the counts, row-major `[layer * n_experts + expert]`.
@@ -94,10 +109,18 @@ impl HeatTable {
     /// the shorter of the two). Used by the cross-session persistence path so a
     /// fresh model starts with the previous session's routing heat instead of a
     /// cold zero table.
-    pub fn restore(&self, snapshot: &[u32]) {
+    pub fn restore(&self, snapshot: &[u32]) -> bool {
+        // Exact shape or nothing: `zip` silently truncates, so a snapshot from a
+        // model with a different expert count would reinterpret a flat
+        // row-major array against the new stride and land every count on the
+        // wrong (layer, expert) pair. Heat is additive, so that never washes out.
+        if snapshot.len() != self.counts.len() {
+            return false;
+        }
         for (c, &v) in self.counts.iter().zip(snapshot.iter()) {
             c.store(v, Ordering::Relaxed);
         }
+        true
     }
 
     /// Total slots (`n_layers * n_experts`) — length of [`Self::snapshot`].
@@ -125,38 +148,64 @@ pub fn solve_residency_greedy(
     bytes_per_expert: usize,
     budget: usize,
 ) -> Vec<(usize, usize)> {
-    if bytes_per_expert == 0 || n_experts == 0 || first_dense >= n_layers || budget == 0 {
+    solve_residency_sized(counts, n_layers, first_dense, n_experts, budget, |_, _| bytes_per_expert)
+}
+
+/// [`solve_residency_greedy`] with a per-candidate size, which is what makes it
+/// a knapsack rather than a top-N: `bytes_of(layer, expert)` reports what THAT
+/// expert will actually occupy, so a tier that promotes some residents to f32
+/// (8× the int4 footprint) still fits its VRAM budget. Ordering is by heat
+/// density (`heat / bytes`), deterministic on ties.
+pub fn solve_residency_sized(
+    counts: &[u32],
+    n_layers: usize,
+    first_dense: usize,
+    n_experts: usize,
+    budget: usize,
+    bytes_of: impl Fn(usize, usize) -> usize,
+) -> Vec<(usize, usize)> {
+    if n_experts == 0 || first_dense >= n_layers || budget == 0 {
         return Vec::new();
     }
-    // All-zero → deterministic fallback to the round-robin cold start.
+    // All-zero → deterministic fallback to the round-robin cold start, sized by
+    // the first candidate (uniform on a cold tier).
     let total: u64 = counts.iter().map(|&c| c as u64).sum();
     if total == 0 {
-        return plan_residency(n_layers, first_dense, n_experts, bytes_per_expert, budget);
+        let uniform = bytes_of(first_dense, 0);
+        if uniform == 0 {
+            return Vec::new();
+        }
+        return plan_residency(n_layers, first_dense, n_experts, uniform, budget);
     }
-    // Score each candidate by ratio (heat / bytes). Since sizes are currently
-    // uniform per expert, this equals heat-sorted — but the shape is right for
-    // when sizes vary (Batch 5 uses this to handle heterogeneous inter-sizes).
-    let mut cand: Vec<((usize, usize), u32)> = Vec::new();
+    // Score each candidate by heat density (heat per byte), so a small expert
+    // with modest heat can outrank a larger cold one. Compared as a cross
+    // product to avoid integer-division ties collapsing distinct ratios.
+    let mut cand: Vec<((usize, usize), u32, usize)> = Vec::new();
     for e in 0..n_experts {
         for layer in first_dense..n_layers {
             let heat = counts.get(layer * n_experts + e).copied().unwrap_or(0);
-            cand.push(((layer, e), heat));
+            let bytes = bytes_of(layer, e);
+            if bytes == 0 || bytes > budget {
+                continue; // cannot be resident at any ordering
+            }
+            cand.push(((layer, e), heat, bytes));
         }
     }
-    // Sort: highest heat first; ties by (layer, expert) ascending for determinism.
-    cand.sort_by(|a, b| b.1.cmp(&a.1).then(a.0 .0.cmp(&b.0 .0)).then(a.0 .1.cmp(&b.0 .1)));
-    // Greedy fill until budget is exhausted.
+    cand.sort_by(|a, b| {
+        let lhs = a.1 as u128 * b.2 as u128; // heat_a / bytes_a vs heat_b / bytes_b
+        let rhs = b.1 as u128 * a.2 as u128;
+        rhs.cmp(&lhs).then(a.0 .0.cmp(&b.0 .0)).then(a.0 .1.cmp(&b.0 .1))
+    });
+    // Greedy fill; keep scanning past a too-large candidate so smaller ones can
+    // still use the remaining room.
     let mut out = Vec::new();
     let mut used = 0usize;
-    for (key, _) in cand {
-        if used + bytes_per_expert > budget {
+    for (key, _, bytes) in cand {
+        if used.saturating_add(bytes) > budget {
             continue;
         }
         out.push(key);
-        used += bytes_per_expert;
-        if used + bytes_per_expert > budget {
-            break;
-        }
+        used += bytes;
     }
     out
 }
@@ -211,6 +260,67 @@ pub fn rank_by_heat(counts: &[u32], n_layers: usize, first_dense: usize, n_exper
     cand.sort_by_key(|c| Reverse(heat(c))); // stable: equal heat keeps round-robin order
     cand.truncate(capacity);
     cand
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::{solve_residency_sized, HeatTable};
+
+    #[test]
+    fn sized_solver_respects_a_byte_budget_with_mixed_formats() {
+        // The failure this guards: a plan sized in *experts* while some
+        // residents are f32 (~8× the int4 footprint) overcommits VRAM, and every
+        // upload past the real limit fails — each reheat, forever.
+        let (n_layers, first_dense, n_experts) = (2usize, 0usize, 4usize);
+        // Layer 0 experts are "f32-promoted" (big), layer 1 stays int4 (small).
+        let (big, small) = (800usize, 100usize);
+        let bytes_of = |layer: usize, _e: usize| if layer == 0 { big } else { small };
+        // Hot: layer 0 expert 0, then layer 1 experts.
+        let mut counts = vec![0u32; n_layers * n_experts];
+        counts[0] = 100; // (0,0) big + hottest
+        counts[n_experts + 1] = 90; // (1,1) small
+        counts[n_experts + 2] = 80; // (1,2) small
+        let budget = 1000usize;
+        let plan = solve_residency_sized(&counts, n_layers, first_dense, n_experts, budget, bytes_of);
+        let total: usize = plan.iter().map(|&(l, e)| bytes_of(l, e)).sum();
+        assert!(total <= budget, "plan takes {total} bytes of a {budget} budget: {plan:?}");
+        assert!(!plan.is_empty(), "a workable plan exists");
+        // Density ordering: the two small hot experts beat the big one per byte.
+        assert!(plan.contains(&(1, 1)) && plan.contains(&(1, 2)), "hot small experts are selected: {plan:?}");
+    }
+
+    #[test]
+    fn sized_solver_skips_candidates_that_cannot_fit() {
+        let bytes_of = |_l: usize, e: usize| if e == 0 { 10_000 } else { 10 };
+        let counts = vec![100u32, 50, 25, 10];
+        let plan = solve_residency_sized(&counts, 1, 0, 4, 100, bytes_of);
+        assert!(!plan.contains(&(0, 0)), "an expert larger than the whole budget is skipped");
+        assert!(!plan.is_empty(), "smaller experts still use the room");
+    }
+
+    #[test]
+    fn heat_table_rejects_a_mismatched_snapshot() {
+        // A snapshot from a checkpoint with a different expert count would
+        // reinterpret a flat row-major array against the new stride, landing
+        // every count on the wrong (layer, expert) pair — and heat is additive,
+        // so it never washes out.
+        let t = HeatTable::new(2, 4); // 8 slots
+        assert!(!t.restore(&[1, 2, 3]), "short snapshot rejected");
+        assert!(!t.restore(&[1u32; 12]), "long snapshot rejected");
+        assert!(t.restore(&[7u32; 8]), "exact-shape snapshot accepted");
+        assert_eq!(t.get(1, 3), 7);
+    }
+
+    #[test]
+    fn heat_table_ignores_out_of_range_experts() {
+        let t = HeatTable::new(2, 4);
+        t.bump(0, 4); // == n_experts: used to credit (1, 0)
+        t.bump(0, usize::MAX); // used to wrap the multiply in release
+        assert_eq!(t.get(1, 0), 0, "no cross-slot credit");
+        assert_eq!(t.get(0, 4), 0, "out-of-range reads are zero, not a panic");
+        t.bump(0, 3);
+        assert_eq!(t.get(0, 3), 1);
+    }
 }
 
 #[cfg(test)]
@@ -425,6 +535,13 @@ mod real {
         device: i32,
         experts: HashMap<(usize, usize), GpuExpert>,
         capacity: usize,
+        /// VRAM the resident set may occupy. `capacity` alone could not express
+        /// this once adaptive precision existed: an f32-promoted expert is ~8×
+        /// its int4 size, so "N experts" silently became "up to 8N experts'
+        /// worth of VRAM" and `reheat` OOM'd every generation.
+        budget_bytes: usize,
+        /// Per-expert footprint in each residency format, `(int4, f32)`.
+        expert_bytes: (usize, usize),
         int4: bool,
         adaptive_f32_frac: Option<f32>,
         /// Current per-expert residency format (`true` = int4). Only consulted
@@ -483,7 +600,9 @@ mod real {
             // gate + up ([inter,hidden]) + down ([hidden,inter]); int4 = packed
             // nibbles + f32 row scales (~8× smaller than the f32 residency).
             let weights = 2 * inter * hidden + hidden * inter;
-            let bytes_per_expert = if int4 { weights / 2 + (2 * inter + hidden) * 4 } else { weights * 4 };
+            let int4_bytes = weights / 2 + (2 * inter + hidden) * 4;
+            let f32_bytes = weights * 4;
+            let bytes_per_expert = if int4 { int4_bytes } else { f32_bytes };
             let budget = free.saturating_sub(headroom_bytes);
 
             let placement = super::plan_residency(
@@ -493,10 +612,23 @@ mod real {
                 bytes_per_expert,
                 budget,
             );
-            let capacity = placement.len(); // fixed VRAM budget in experts, for reheat
+            let mut capacity = placement.len(); // expert-count view of the budget
             let mut experts = HashMap::new();
             for (layer, e) in placement {
-                experts.insert((layer, e), upload_expert(st, cfg, layer, e, device, int4)?);
+                match upload_expert(st, cfg, layer, e, device, int4) {
+                    Ok(ge) => {
+                        experts.insert((layer, e), ge);
+                    }
+                    // A tail-end upload can fail on allocation granularity even
+                    // though the byte arithmetic said it fits. Settle for the
+                    // experts that did land rather than failing the whole model
+                    // load, and shrink the capacity to match reality.
+                    Err(e_up) => {
+                        peregrine_io::note_advisory_err("gpu residency upload (tier truncated)", &e_up);
+                        capacity = experts.len();
+                        break;
+                    }
+                }
             }
 
             if experts.is_empty() {
@@ -506,11 +638,27 @@ mod real {
                 // that fraction of the hottest residents to f32 at each reheat.
                 // Meaningful only on an int4 tier (a f32 tier is already all-f32).
                 let adaptive_f32_frac = if int4 {
-                    std::env::var("COLI_GPU_F32_FRAC").ok().and_then(|v| v.trim().parse::<f32>().ok())
+                    std::env::var("COLI_GPU_F32_FRAC")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                        // "inf" and "NaN" both parse: inf clamps to 1.0 and
+                        // promotes *every* resident to f32 (the worst case for
+                        // the VRAM budget), while NaN silently disables the
+                        // feature. Neither is what the operator asked for.
+                        .filter(|f| f.is_finite() && (0.0..=1.0).contains(f))
                 } else {
                     None
                 };
-                Ok(Some(GpuTier { device, experts, capacity, int4, adaptive_f32_frac, precision: HashMap::new() }))
+                Ok(Some(GpuTier {
+                    device,
+                    experts,
+                    capacity,
+                    budget_bytes: budget,
+                    expert_bytes: (int4_bytes, f32_bytes),
+                    int4,
+                    adaptive_f32_frac,
+                    precision: HashMap::new(),
+                }))
             }
         }
 
@@ -520,6 +668,25 @@ mod real {
         /// between forwards with `&mut self`, so residency adapts to the workload
         /// without a rewrite. Returns the resident count after re-selection.
         pub fn reheat(&mut self, st: &SafeTensors, cfg: &Cfg, counts: &[u32]) -> Result<usize, Error> {
+            // Re-read free VRAM each generation: another process may have taken
+            // some since load, and the budget must reflect what is available now
+            // (plus what this tier already holds, which it is free to reuse).
+            let held: usize = self
+                .experts
+                .keys()
+                .map(|k| {
+                    let int4 = self.precision.get(k).copied().unwrap_or(self.int4);
+                    if int4 { self.expert_bytes.0 } else { self.expert_bytes.1 }
+                })
+                .sum();
+            let budget = match peregrine_cuda::mem_info(self.device) {
+                Ok((free, _)) => self.budget_bytes.min(free.saturating_add(held)),
+                // Query failure: keep the load-time budget rather than guessing.
+                Err(e) => {
+                    peregrine_io::note_advisory_err("gpu mem_info during reheat", &e);
+                    self.budget_bytes
+                }
+            };
             let want = super::rank_by_heat(
                 counts,
                 cfg.n_layers as usize,
@@ -527,10 +694,6 @@ mod real {
                 cfg.n_experts as usize,
                 self.capacity,
             );
-            let want_set: HashSet<(usize, usize)> = want.iter().copied().collect();
-            // evict experts that cooled off — their `Drop` frees the VRAM slot
-            self.experts.retain(|k, _| want_set.contains(k));
-            self.precision.retain(|k, _| want_set.contains(k));
             // Per-expert precision for this residency generation: adaptive
             // (hottest frac → f32) or the tier's uniform format.
             let precision_of: HashMap<(usize, usize), bool> = match self.adaptive_f32_frac {
@@ -540,6 +703,26 @@ mod real {
                     .collect(),
                 None => want.iter().map(|&k| (k, self.int4)).collect(),
             };
+            // Trim the wish list to what actually fits *in bytes*. With adaptive
+            // precision the hottest residents are f32 (~8× the int4 footprint),
+            // so a plan sized purely by expert count overcommits VRAM by up to
+            // that factor and every upload past the real limit fails.
+            let (int4_bytes, f32_bytes) = self.expert_bytes;
+            let mut fitted: Vec<(usize, usize)> = Vec::with_capacity(want.len());
+            let mut used = 0usize;
+            for key in want {
+                let bytes = if precision_of.get(&key).copied().unwrap_or(self.int4) { int4_bytes } else { f32_bytes };
+                if used.saturating_add(bytes) > budget {
+                    continue;
+                }
+                used += bytes;
+                fitted.push(key);
+            }
+            let want = fitted;
+            let want_set: HashSet<(usize, usize)> = want.iter().copied().collect();
+            // evict experts that cooled off — their `Drop` frees the VRAM slot
+            self.experts.retain(|k, _| want_set.contains(k));
+            self.precision.retain(|k, _| want_set.contains(k));
             for (layer, e) in want {
                 let key = (layer, e);
                 let want_int4 = precision_of.get(&key).copied().unwrap_or(self.int4);
@@ -553,9 +736,21 @@ mod real {
                 // Re-upload on a format change (remove first so the old tensor's
                 // Drop frees its VRAM before the new allocation).
                 self.experts.remove(&key);
-                let ge = upload_expert(st, cfg, layer, e, self.device, want_int4)?;
-                self.experts.insert(key, ge);
-                self.precision.insert(key, want_int4);
+                match upload_expert(st, cfg, layer, e, self.device, want_int4) {
+                    Ok(ge) => {
+                        self.experts.insert(key, ge);
+                        self.precision.insert(key, want_int4);
+                    }
+                    // Keep the generation that did upload instead of bailing with
+                    // the tier holding fewer experts than it thinks and no record
+                    // of which are missing. The next reheat retries from a
+                    // consistent state.
+                    Err(e_up) => {
+                        peregrine_io::note_advisory_err("gpu reheat upload (residency kept partial)", &e_up);
+                        self.precision.remove(&key);
+                        break;
+                    }
+                }
             }
             Ok(self.experts.len())
         }

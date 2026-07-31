@@ -192,8 +192,13 @@ fn submit_request(
     top_p: f32,
     priority: Priority,
     class: peregrine_model::TokenClass,
-) -> Result<mpsc::Receiver<EngineOut>, ApiError> {
-    let (tx, rx) = mpsc::channel::<EngineOut>(64);
+) -> Result<mpsc::UnboundedReceiver<EngineOut>, ApiError> {
+    // Unbounded on purpose: the engine thread emits into this channel for every
+    // active sequence, so a bounded channel lets one connected-but-not-reading
+    // client block the engine and freeze *every* concurrent stream. The queue is
+    // bounded in practice by `max_new` token ids (kilobytes), and the handler
+    // still paces the client.
+    let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
     let prompt: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
     let sampler = Sampler::new(temperature, top_p, seed());
     state.inner.engine.submit(EngineRequest { prompt, max_new, sampler, out: tx, priority, class })?;
@@ -266,11 +271,21 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(header_utf8)
         .and_then(|s| s.strip_prefix("Bearer "));
-    if got == Some(want) {
+    if got.is_some_and(|g| constant_time_eq(g.as_bytes(), want.as_bytes())) {
         Ok(())
     } else {
         Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid_request_error", "missing or invalid API key"))
     }
+}
+
+/// Compare two secrets without leaking their common prefix length through
+/// timing. `==` on strings returns at the first differing byte, which lets a
+/// caller recover the key byte-by-byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -298,37 +313,35 @@ async fn chat_completions(
     let mut rx = submit_request(&state, &ids, max_new, temperature, top_p, priority, class)?;
     let tokenizer = state.inner.tokenizer.clone();
 
+    let completion_id = format!("chatcmpl-{}", seed());
+    let created = unix_seconds();
+    let prompt_tokens = ids.len();
+
     if req.stream {
         // SSE: an async task decodes engine token ids into text deltas and pushes
         // OpenAI chunk events; the response streams them.
         let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
         let mid = model_id.clone();
+        let cid = completion_id.clone();
         tokio::spawn(async move {
-            let mut out_ids: Vec<u32> = Vec::new();
-            let mut prev = String::new();
+            // Token payloads split multi-byte characters, so deltas come from an
+            // incremental decoder that holds an unfinished character until the
+            // next token completes it (see `IncrementalDecoder`).
+            let mut dec = tok::IncrementalDecoder::new();
+            // OpenAI clients expect the role in the first chunk.
+            if sse_tx.send(Ok(chunk_event(&cid, &mid, created, None, Some("assistant"), None))).await.is_err() {
+                return; // client disconnected before the first frame
+            }
             while let Some(msg) = rx.recv().await {
                 match msg {
                     EngineOut::Token(t) => {
-                        out_ids.push(t);
-                        // incremental decode: emit the newly-completed suffix
-                        match tokenizer.decode(&out_ids) {
-                            Ok(text) => {
-                                if text.len() > prev.len() {
-                                    let ev = chunk_event(&mid, Some(&text[prev.len()..]), None);
-                                    if sse_tx.send(Ok(ev)).await.is_err() {
-                                        return; // client disconnected
-                                    }
-                                    prev = text;
-                                }
-                            }
-                            Err(e) => {
-                                // end the stream with an error event instead of
-                                // silently dropping the delta
-                                if sse_tx.send(Ok(sse_error(&format!("decode: {e}")))).await.is_err() {
-                                    peregrine_core::note_advisory_err("SSE decode-error event", &"client already disconnected");
-                                }
-                                return;
-                            }
+                        let delta = dec.push(&tokenizer.decode_bytes(&[t]));
+                        if delta.is_empty() {
+                            continue; // token only extended an unfinished character
+                        }
+                        let ev = chunk_event(&cid, &mid, created, Some(&delta), None, None);
+                        if sse_tx.send(Ok(ev)).await.is_err() {
+                            return; // client disconnected
                         }
                     }
                     EngineOut::Error(m) => {
@@ -340,7 +353,18 @@ async fn chat_completions(
                 }
             }
             // tail frames: a send error just means the client hung up first
-            if sse_tx.send(Ok(chunk_event(&mid, None, Some("stop")))).await.is_err()
+            let tail = dec.finish();
+            let tail_ev = if tail.is_empty() {
+                None
+            } else {
+                Some(chunk_event(&cid, &mid, created, Some(&tail), None, None))
+            };
+            let mut hung_up = false;
+            if let Some(ev) = tail_ev {
+                hung_up = sse_tx.send(Ok(ev)).await.is_err();
+            }
+            if hung_up
+                || sse_tx.send(Ok(chunk_event(&cid, &mid, created, None, None, Some("stop")))).await.is_err()
                 || sse_tx.send(Ok(Event::default().data("[DONE]"))).await.is_err()
             {
                 peregrine_core::note_advisory_err("SSE stream tail", &"client disconnected before [DONE]");
@@ -357,31 +381,58 @@ async fn chat_completions(
                 EngineOut::Error(m) => return Err(ApiError::internal(m)),
             }
         }
+        let completion_tokens = out_ids.len();
         let text = tk(tokenizer.decode(&out_ids))?;
         let body = serde_json::json!({
-            "id": format!("chatcmpl-{}", seed()),
+            "id": completion_id,
             "object": "chat.completion",
+            "created": created,
             "model": model_id,
             "choices": [{
                 "index": 0,
                 "message": { "role": "assistant", "content": text },
                 "finish_reason": "stop"
-            }]
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
         });
         Ok(Json(body).into_response())
     }
 }
 
-/// One streaming chunk in OpenAI `chat.completion.chunk` shape.
-fn chunk_event(model_id: &str, delta: Option<&str>, finish: Option<&str>) -> Event {
-    let delta_obj = match delta {
-        Some(d) => serde_json::json!({ "content": d }),
-        None => serde_json::json!({}),
-    };
+/// Wall-clock seconds since the epoch, for the OpenAI `created` field.
+fn unix_seconds() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// One streaming chunk in OpenAI `chat.completion.chunk` shape. `id`/`created`
+/// are stable across a response's chunks (clients correlate on them); `role` is
+/// set only on the opening chunk, `finish` only on the closing one.
+fn chunk_event(
+    id: &str,
+    model_id: &str,
+    created: u64,
+    delta: Option<&str>,
+    role: Option<&str>,
+    finish: Option<&str>,
+) -> Event {
+    let mut delta_obj = serde_json::Map::new();
+    if let Some(r) = role {
+        delta_obj.insert("role".into(), serde_json::json!(r));
+    }
+    if let Some(d) = delta {
+        delta_obj.insert("content".into(), serde_json::json!(d));
+    }
     let payload = serde_json::json!({
+        "id": id,
         "object": "chat.completion.chunk",
+        "created": created,
         "model": model_id,
-        "choices": [{ "index": 0, "delta": delta_obj, "finish_reason": finish }]
+        "choices": [{ "index": 0, "delta": serde_json::Value::Object(delta_obj), "finish_reason": finish }]
     });
     Event::default().data(payload.to_string())
 }

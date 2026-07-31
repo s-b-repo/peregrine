@@ -16,7 +16,7 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use peregrine_core::Error;
+use peregrine_core::{Context, Error};
 use peregrine_model::{pick_batch_greedy, Model, Sampler, SeqKv};
 
 // Match c/openai_server.py's framing sentinels.
@@ -76,7 +76,7 @@ fn run() -> Result<(), Error> {
             peregrine_model::save_automaton(&table, &dirp.join("automaton.json"))?;
             peregrine_model::save_macrostates(&macros, &dirp.join("macrostates.json"))?;
             let routes_json = serde_json::to_vec(&trace).map_err(|e| Error::Format(format!("serialize trace: {e}")))?;
-            std::fs::write(dirp.join("routes.json"), routes_json)?;
+            peregrine_core::write_atomic(&dirp.join("routes.json"), &routes_json)?;
             // layout schedule from the same trace (Louvain + 2-opt refinement)
             let mut ordered = peregrine_tools::order_experts(&trace, "louvain")?;
             for (l, row) in ordered.iter_mut().enumerate() {
@@ -89,9 +89,15 @@ fn run() -> Result<(), Error> {
             let vram_mb: u64 = std::env::var("COLI_TIER_VRAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let ram_mb: u64 = std::env::var("COLI_TIER_RAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             if vram_mb > 0 || ram_mb > 0 {
+                // Size an expert from what the checkpoint actually stores rather
+                // than assuming int4: an int8 model is twice as large per
+                // expert, so the hardcoded formula under-counted by 2× and the
+                // emitted tier plan overcommitted VRAM.
                 let hidden = model.cfg.hidden as u64;
                 let inter = model.cfg.moe_inter as u64;
-                let bytes_per_expert = (3 * inter * hidden) / 2; // int4 nibbles
+                let bytes_per_expert = model
+                    .expert_bytes_on_disk(model.cfg.first_dense as usize, 0)
+                    .unwrap_or_else(|| (3 * inter * hidden) / 2);
                 let n_layers = model.cfg.n_layers as usize;
                 let sparse0 = model.cfg.first_dense as usize;
                 let per_layer_v = (vram_mb << 20) / (n_layers.saturating_sub(sparse0).max(1) as u64);
@@ -123,30 +129,40 @@ fn run() -> Result<(), Error> {
         Some("compile-plan") => {
             let dir = args.get(2).ok_or_else(|| Error::Format("usage: peregrine compile-plan <model-dir>".into()))?;
             let dirp = Path::new(dir);
-            let read_json = |name: &str| -> Option<serde_json::Value> {
-                let bytes = std::fs::read(dirp.join(name)).ok()?;
-                serde_json::from_slice(&bytes).ok()
+            // A missing artifact is normal (that part of the plan is simply
+            // absent); a corrupt one is not, and silently omitting it produced a
+            // plan that looked complete while quietly dropping a section.
+            let read_json = |name: &str| -> Result<Option<serde_json::Value>, Error> {
+                let path = dirp.join(name);
+                let bytes = match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(Error::Io(e)).ctx(|| format!("read {}", path.display())),
+                };
+                let v: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| Error::Format(format!("{}: not valid JSON ({e})", path.display())))?;
+                Ok(Some(v))
             };
             let mut plan = serde_json::Map::new();
             plan.insert("version".into(), serde_json::json!(1));
             let mut parts: Vec<&str> = Vec::new();
-            if let Some(v) = read_json("automaton.json") {
+            if let Some(v) = read_json("automaton.json")? {
                 plan.insert("automaton".into(), v);
                 parts.push("automaton");
             }
-            if let Some(v) = read_json("macrostates.json") {
+            if let Some(v) = read_json("macrostates.json")? {
                 plan.insert("macrostates".into(), v);
                 parts.push("macrostates");
             }
-            if let Some(v) = read_json("schedule.json") {
+            if let Some(v) = read_json("schedule.json")? {
                 plan.insert("schedule".into(), v);
                 parts.push("schedule");
             }
-            if let Some(v) = read_json("tiers.json") {
+            if let Some(v) = read_json("tiers.json")? {
                 plan.insert("tiers".into(), v);
                 parts.push("tiers");
             }
-            if let Some(v) = read_json("route_stats.json") {
+            if let Some(v) = read_json("route_stats.json")? {
                 if let Some(learn) = v.get("learn") {
                     if !learn.is_null() {
                         plan.insert("learn".into(), learn.clone());
@@ -161,7 +177,7 @@ fn run() -> Result<(), Error> {
             }
             let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(plan))
                 .map_err(|e| Error::Format(format!("serialize plan: {e}")))?;
-            std::fs::write(dirp.join("plan.json"), bytes)?;
+            peregrine_core::write_atomic(&dirp.join("plan.json"), &bytes)?;
             eprintln!("compiled execution plan ({}) → {dir}/plan.json", parts.join(" + "));
             Ok(())
         }
@@ -347,7 +363,9 @@ fn run_demo() -> Result<(), Error> {
     println!("peregrine — demo");
     println!("  model: {} layers, vocab {}, hidden {}", model.cfg.n_layers, model.cfg.vocab, model.cfg.hidden);
     println!("  prompt {prompt:?} -> generated {toks:?}");
-    if !toks.iter().all(|&t| (t as i64) < model.cfg.vocab) {
+    // Both ends: a negative id is as out of range as an oversized one, and
+    // `< vocab` alone accepts every negative value.
+    if !toks.iter().all(|&t| (0..model.cfg.vocab).contains(&(t as i64))) {
         return Err(Error::Format("demo generated an out-of-range token id".into()));
     }
     std::fs::remove_dir_all(&dir)?;

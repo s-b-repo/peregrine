@@ -174,10 +174,14 @@ impl GigaTokenizer {
         out
     }
 
-    /// Decode token ids back to bytes. Unknown ids are skipped (mirrors the
-    /// lenient behavior serving needs — a stale id must not kill a stream).
+    /// Decode token ids back to bytes. Ids outside the vocabulary are skipped:
+    /// a model whose `lm_head` is padded past the tokenizer vocab can sample one,
+    /// and the inner decoder indexes its vocab directly, so filtering here is
+    /// what makes the documented lenient behavior true (a stale id must not kill
+    /// a stream — under `panic = "abort"` it would kill the whole server).
     pub fn decode(&self, ids: &[u32]) -> Vec<u8> {
-        let toks: Vec<TokenId> = ids.iter().map(|&i| TokenId(i)).collect();
+        let vocab = self.inner.vocab_size() as u32;
+        let toks: Vec<TokenId> = ids.iter().filter(|&&i| i < vocab).map(|&i| TokenId(i)).collect();
         self.inner.decode(&toks).collect()
     }
 
@@ -218,6 +222,20 @@ mod facade_tests {
             let bytes = t.decode(&ids);
             assert_eq!(String::from_utf8_lossy(&bytes), text, "round trip for {text:?}");
         }
+    }
+
+    #[test]
+    fn decode_skips_out_of_vocab_ids() {
+        // A model whose lm_head is padded past the tokenizer vocab can sample an
+        // id the vocab has no entry for. The inner decoder indexes its vocab
+        // directly, so without the facade's filter this aborts the process.
+        let mut t = gpt2();
+        let ids = t.encode("Hello world");
+        let vocab = t.vocab_size() as u32;
+        let mut padded = ids.clone();
+        padded.push(vocab);
+        padded.push(u32::MAX);
+        assert_eq!(t.decode(&padded), t.decode(&ids), "out-of-range ids are skipped, not fatal");
     }
 
     #[test]
