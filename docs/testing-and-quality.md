@@ -2,20 +2,28 @@
 
 # Testing & quality gates
 
-**282 tests passing, 0 warnings, clippy clean** (debug + release), plus a
+**373 tests passing, 0 warnings, clippy clean** (debug + release), plus a
 strict bad-patterns audit. This page is what to run, what each gate enforces,
 and the correctness philosophy behind the test suite.
 
 ## The gates
 
 ```bash
-cargo test --workspace                     # 282 tests, CPU-only, no GPU needed
+cargo test --workspace                     # 373 tests, CPU-only, no GPU needed
 cargo clippy --workspace --all-targets     # clean
-scripts/audit-bad-patterns.sh --strict     # panic-vector / UB gate (CI)
+scripts/audit-bad-patterns.sh --strict     # panic / UB / suppression / Cargo gate (CI)
+scripts/audit-reachability.py --list       # [R] shipped-but-unreachable pass
+cargo check --features cuda --all-targets -p peregrine-model -p peregrine-cuda
 cargo test -p peregrine-cuda --features cuda   # GPU-gated tests (NVIDIA host only)
 ```
 
 Run all of them after any change to the streaming, scheduler, or serve paths.
+
+`--all-targets` on the `cuda` check is not optional: without it `cargo check` skips
+test targets, so a signature change can leave the `#[cfg(all(test, feature = "cuda"))]
+modules uncompilable while the check still reports success. That is exactly how the
+`GpuTier::build` call sites in `gpu.rs` went stale. It does not link (no `nvcc` needed),
+so it runs anywhere.
 
 ## Correctness philosophy
 
@@ -34,8 +42,14 @@ The suite is built around **bit-identity anchors** rather than tolerances:
   position-keyed reduce).
 - **Chunked == whole.** Chunked prefill is bit-identical to whole-prompt
   prefill (`engine_chunked_prefill_matches_reference`).
-- **Adaptive knobs are bit-identical when off**, and correctness-neutral when
-  on (they may only change latency/residency, never token values).
+- **Adaptive knobs are bit-identical when off.** Almost all are also
+  correctness-neutral when on — they may change latency or residency, never
+  token values. **One exception, added deliberately:**
+  `COLI_ROUTE_MIN_SHARE` drops routed experts carrying a negligible share of the
+  gate mass, which removes a real (if small) term from the MoE sum. It is off by
+  default, and it is gated by `Model::prediction_flip_rate` rather than by an
+  equality assertion, because a lossy change fails every bit-identity anchor by
+  construction. `COLI_GATE_STATS` is how to size it before enabling it.
 - **Format round-trips.** Config / safetensors index / QT formats / dtype
   round-trips; zstd and kblock layouts decode byte-identically;
   `apply_layout_is_bit_identical` gates the physical checkpoint rewrite with
@@ -64,16 +78,29 @@ workspace-wide scan documented in [BAD_PATTERNS.md](BAD_PATTERNS.md):
   through `note_advisory_err` (surfaced by `COLI_DEBUG=1`), never vanish.
 - **[U] UB / concurrency footguns — must be zero.** `static mut`,
   `transmute`, `mem::forget`, `assume_init`.
+- **[C] Lint suppression — must be zero.** `#[allow(...)]`, item-level
+  `#[deny(...)]`, `#[ignore]`. The workspace removed all 14 of its `#[allow]`s by
+  fixing what they hid; this keeps that true by gate rather than by prose.
+- **[Q] Cargo.toml hygiene — must be zero.** Wildcard versions and unpinned git
+  dependencies. A dependency moving under you can shift the bit-identity anchors
+  this suite is built on without a commit to blame.
+- **[R] Shipped but unreachable — informational.** `pub fn`s no production path
+  reaches, via `scripts/audit-reachability.py`. This is the one class greps
+  cannot see and tests cannot catch — the code under test is correct, it simply
+  runs nowhere, and `pub` keeps clippy's `dead_code` quiet. Five instances had
+  shipped, each documented as live. **Run it before marking anything complete.**
 - **[I] `unsafe` outside the expected crates — informational.** `unsafe` is
   expected only in `peregrine-io` (io_uring, madvise/mbind, perf),
   `peregrine-cuda` (FFI), `peregrine-kernels` (SIMD); `peregrine-core` is
   `#![forbid(unsafe_code)]`, and `peregrine-serve` too.
 
-Current status: `--strict` green — **P=0, B=0, U=0, I=0** (51 files;
+Current status: `--strict` green — **P=0, B=0, U=0, C=0, Q=0, I=0** (52 files;
 `peregrine-token` excluded as vendored — its gate is the parity suite).
-Waivers use `// audit-allow:` comments; there is exactly one production
-`assert!` (KV-cache append order) guarding an invariant whose silent
-violation would corrupt attention output.
+Waivers use `// audit-allow:` comments, and none remain in first-party code.
+There are **zero production `assert!`s**: the last one (KV-cache append order)
+became `LayerKv::append -> Result`, so a violation fails that one request instead
+of aborting the process — the release profile sets `panic = "abort"`, which would
+have taken every concurrent sequence down with it.
 
 ## Error handling contract
 
@@ -96,6 +123,8 @@ at the workspace root tightens the lint set.
   `peregrine_core::Error` with `.ctx(|| …)` context.
 - New adaptive features must be env-gated, default-off (or
   default-historical), and bit-identical when off; add the A/B test proving it.
+  If a feature changes token values when on, say so at its definition, in its
+  knob-table row, and here — and gate it with a bounded flip rate, not equality.
 - New kernels need a scalar reference and a bit-exact comparison test.
 - Keep `unsafe` inside the three sanctioned crates; anything else will show
   up in the audit's [I] section.

@@ -136,7 +136,10 @@ mod tests {
 
     #[test]
     fn zstd_round_trip() -> Result<(), crate::Error> {
-        // Real weight-shaped bytes: repetitive quantized nibbles compress well.
+        // A periodic ramp — NOT representative of a quantized payload (it is
+        // ~1900x more compressible than real packed nibbles; see
+        // `quantized_nibbles_compress_by_entropy_only` for the real figure).
+        // It is here purely so the codec has non-degenerate input to round-trip.
         let mut raw = Vec::with_capacity(1 << 16);
         for i in 0..(1 << 16) {
             raw.push((i % 251) as u8);
@@ -146,6 +149,46 @@ mod tests {
         // Compression ratio is a byproduct — assert on round-trip only.
         let back = decode(&enc, Compression::Zstd, raw.len())?;
         assert_eq!(back, raw);
+        Ok(())
+    }
+
+    /// What zstd actually achieves on the payload the cache and the VRAM tier
+    /// hold: per-row packed int4 nibbles from trained-looking weights.
+    ///
+    /// The entire gain is entropy coding, not repetition. Quantizing a bell-shaped
+    /// weight distribution onto 16 levels concentrates the nibbles near the middle
+    /// of the range (~3.1 of 4 bits of entropy), and zstd's FSE/Huffman stage wins
+    /// that back — but there are no repeated byte sequences for the LZ stage to
+    /// match. Two consequences worth keeping pinned down by a test:
+    ///
+    /// - the realistic ratio is ~1.2x (1.18x on this fixture, ~1.26x on true
+    ///   Gaussian weights), *not* the 2-3x that prose once claimed;
+    /// - an LZ-only codec (LZ4, Snappy) would score ~1.0x here, so swapping the
+    ///   codec for a faster non-entropy one would silently give up the whole win.
+    #[test]
+    fn quantized_nibbles_compress_by_entropy_only() -> Result<(), crate::Error> {
+        const O: usize = 256;
+        const I: usize = 512;
+        // Deterministic bell-shaped weights: sum of 4 LCG uniforms (CLT), so the
+        // test needs no rand dependency and never varies between runs.
+        let mut s: u32 = 0x9E3779B9;
+        let mut next = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 8) as f32 / (1 << 24) as f32
+        };
+        let w: Vec<f32> =
+            (0..O * I).map(|_| (next() + next() + next() + next() - 2.0) * 0.02).collect();
+        let (packed, _scales) = crate::pack::quant_i4(&w, O, I);
+
+        let enc = encode(&packed, Compression::Zstd, 3)?;
+        let ratio = packed.len() as f64 / enc.len() as f64;
+        assert!(
+            (1.10..1.45).contains(&ratio),
+            "packed int4 nibbles compress ~1.2x (entropy only); got {ratio:.3}x. \
+             A ratio near 1.0 means the entropy stage was lost (LZ-only codec); \
+             a ratio above 1.45 means this fixture stopped resembling trained weights."
+        );
+        assert_eq!(decode(&enc, Compression::Zstd, packed.len())?, packed);
         Ok(())
     }
 

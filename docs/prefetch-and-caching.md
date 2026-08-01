@@ -55,7 +55,7 @@ slab.
 | Feature | Gate | What it does |
 |---|---|---|
 | Bloom filter | always on | 2048-bit, two hashes, short-circuits the miss path in `WarmCache::get`; rebuilt on eviction so the hint stays tight |
-| Transparent zstd | `COLI_CACHE_COMPRESS=1` | compress slabs on admit (~2–3× smaller resident footprint), decode on hit |
+| Transparent zstd | `COLI_CACHE_COMPRESS=1` | compress slabs on admit (~1.2× smaller resident footprint — measured), decode on hit |
 | Idle recompression | `COLI_CACHE_COMPRESS_IDLE=1` | the serve engine converts the coldest raw slot to zstd per idle tick, interruptible the moment a request arrives |
 | Negative TTL | `COLI_CACHE_NEGATIVE_TTL=<N>` | evict never-hit slots older than N clock ticks ahead of LRU order (unprotected slots only; always keeps at least one) |
 | Admission gate | `COLI_CACHE_ADMIT_MIN_HEAT=<N>` | admit an expert only once its routing heat reaches N (heat bumps post-reduce, so `1` = "cache from the second routing on", filtering one-off experts; `0` = admit all) |
@@ -70,7 +70,8 @@ slab.
   counters, the substrate every residency/admission decision reads.
 - **Dynamic VRAM residency**: `reheat()` re-selects the hottest experts every
   256 steps; initial placement is a greedy heat/bytes knapsack
-  (`solve_residency_greedy`) with deterministic ties.
+  (`solve_residency_sized`) with deterministic ties, seeded from the previous
+  session's `route_stats.json` heat when one is present.
 - **Replication**: `COLI_REPLICATE_K` warms the top-K hottest GPU residents
   into the RAM cache as well, so a lane-balancer downgrade costs no disk read.
 

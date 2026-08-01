@@ -117,7 +117,7 @@ Details in [Serving](serving.md).
 
 `peregrine_io::PerfCounter` is a real `perf_event_open(2)` LLC-miss counter
 (thread-following, user-space-only, hand-declared `PERF_ATTR_SIZE_VER0` attr
-layout). `telemetry::open_l3_miss_counter` gates it on `COLI_PERF_COUNTERS=1`;
+layout). `telemetry::open_l3_miss_counter` gates it on `COLI_PERF_COUNTERS=1` — **though nothing currently calls it, so the knob is inert;** 
 every constructor degrades to `None` when the kernel refuses (containers,
 `perf_event_paranoid ≥ 3`, no PMU) — the counter is an optimization input,
 never a dependency.

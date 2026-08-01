@@ -18,6 +18,7 @@ use peregrine_core::{Cfg, Error};
 
 /// Per-layer KV cache holding the compressed latents and roped keys. Positions
 /// are appended in order (`pos == len`), matching sequential prefill/decode.
+#[derive(Clone)]
 pub struct LayerKv {
     pub lc: Vec<f32>, // [len, kv_lora]
     pub rc: Vec<f32>, // [len, qk_rope]
@@ -66,6 +67,25 @@ impl LayerKv {
             self.lc.truncate(new_len * self.kv_lora);
             self.rc.truncate(new_len * self.qk_rope);
             self.len = new_len;
+        }
+    }
+
+    /// Resident bytes of the cached latents (excludes the fixed struct fields).
+    pub fn bytes(&self) -> usize {
+        (self.lc.len() + self.rc.len()) * std::mem::size_of::<f32>()
+    }
+
+    /// A copy holding only the first `n` positions. Copies just that prefix
+    /// rather than cloning and truncating, so sharing a short prefix of a long
+    /// cached prompt does not first duplicate the whole thing.
+    pub fn clone_prefix(&self, n: usize) -> LayerKv {
+        let n = n.min(self.len);
+        LayerKv {
+            lc: self.lc[..n * self.kv_lora].to_vec(),
+            rc: self.rc[..n * self.qk_rope].to_vec(),
+            len: n,
+            kv_lora: self.kv_lora,
+            qk_rope: self.qk_rope,
         }
     }
 }

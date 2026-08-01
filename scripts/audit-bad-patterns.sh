@@ -130,9 +130,44 @@ L_TOTAL="$(printf '%s' "$LETELSE" | grep -c . || true)"
 echo "[L] let-else Ok(..) err-discards (INFO): $L_TOTAL"
 [ "$L_TOTAL" -gt 0 ] && [ "$STRICT" -eq 0 ] && printf '%s\n' "$LETELSE" | sed 's/^/      /'
 
+# C: suppression attributes — hiding a lint instead of fixing it. The workspace
+# removed all 14 of these by fixing what they suppressed; this keeps it that way,
+# so the claim in docs/BAD_PATTERNS.md is enforced rather than asserted.
+# `#[deny(...)]` belongs at the crate root, not sprinkled per-item; `#[ignore]`
+# rots a test silently.
+C_PATTERNS=(
+  '#\[allow\(' '#\[ignore' '#\[deny\('
+)
+echo "[C] lint suppression            (STRICT)"; run_section C_TOTAL "${C_PATTERNS[@]}"
+
+# Q: Cargo.toml hygiene — a wildcard or unpinned-git dependency makes the build
+# non-reproducible, which for a numerics engine means the bit-identity anchors
+# can move under you without a commit.
+Q_TOTAL=0
+QHITS="$(grep -rEn '^[[:space:]]*[a-z0-9_-]+[[:space:]]*=[[:space:]]*"\*"' --include=Cargo.toml . 2>/dev/null | grep -v '/target/' || true)"
+QHITS="$QHITS$(grep -rEn 'git[[:space:]]*=[[:space:]]*"[^"]+"' --include=Cargo.toml . 2>/dev/null | grep -v '/target/' | grep -vE '(rev|tag|branch)[[:space:]]*=' || true)"
+Q_TOTAL="$(printf '%s' "$QHITS" | grep -c . || true)"
+echo "[Q] Cargo.toml hygiene          (STRICT): $Q_TOTAL"
+[ "$Q_TOTAL" -gt 0 ] && [ "$STRICT" -eq 0 ] && printf '%s\n' "$QHITS" | sed 's/^/      /'
+
+# R: reachability — code that compiles, passes its own tests, is documented as
+# live, and no production path reaches it. Grep cannot see this class; it needs a
+# definition/reference pass, so it lives in a companion script. Informational: a
+# workspace legitimately exposes API its binaries don't call. The signal is a
+# symbol here that a doc or todo.md calls shipped. See docs/BAD_PATTERNS.md [R].
+R_TOTAL=0
+if command -v python3 >/dev/null 2>&1 && [ -x scripts/audit-reachability.py ]; then
+  R_LINE="$(scripts/audit-reachability.py $([ "$STRICT" -eq 0 ] && echo --list))"
+  printf '%s\n' "$R_LINE" | head -1
+  [ "$STRICT" -eq 0 ] && printf '%s\n' "$R_LINE" | tail -n +2
+  R_TOTAL="$(printf '%s' "$R_LINE" | head -1 | grep -oE '[0-9]+$' || echo 0)"
+else
+  echo "[R] reachability (INFO): skipped (needs python3)"
+fi
+
 echo "---"
-echo "P=$P_TOTAL (strict)  B=$B_TOTAL (strict)  U=$U_TOTAL (strict)  I=$I_TOTAL (info)  L=$L_TOTAL (info)"
-if [ "$STRICT" -eq 1 ] && { [ "$P_TOTAL" -gt 0 ] || [ "$B_TOTAL" -gt 0 ] || [ "$U_TOTAL" -gt 0 ]; }; then
+echo "P=$P_TOTAL (strict)  B=$B_TOTAL (strict)  U=$U_TOTAL (strict)  C=$C_TOTAL (strict)  Q=$Q_TOTAL (strict)  I=$I_TOTAL (info)  L=$L_TOTAL (info)  R=$R_TOTAL (info)"
+if [ "$STRICT" -eq 1 ] && { [ "$P_TOTAL" -gt 0 ] || [ "$B_TOTAL" -gt 0 ] || [ "$U_TOTAL" -gt 0 ] || [ "$C_TOTAL" -gt 0 ] || [ "$Q_TOTAL" -gt 0 ]; }; then
   echo "FAIL: strict-section hits present"; exit 1
 fi
 echo "OK"

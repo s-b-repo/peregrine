@@ -49,7 +49,7 @@ is the audited per-item roadmap.
 
 ## Status
 
-**282 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
+**373 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
 numeric kernel is ported from colibrì's `c/glm.c` and validated; the scalar
 integer-dot kernels are the token-exactness reference and the SIMD variants are
 checked bit-for-bit against them. The 2026-07-30 "adaptive-runtime wave" added
@@ -75,8 +75,8 @@ faster than HF `tokenizers` on this box** (204 vs 6 MB/s, the per-line serve
 pattern; the whole-buffer and parallel-batch paths run 3–7× higher still — see
 [docs/tokenizer.md](docs/tokenizer.md#throughput-anatomy)), id-for-id parity-gated
 (the HF crate remains only as the test-suite oracle). See
-[`todo.md`](todo.md) for the audited roadmap (**~87% strict / ~88% weighted of
-95 tracked items — every open item is hardware-gated**).
+[`todo.md`](todo.md) for the audited roadmap (**~82% strict / ~85% weighted of
+108 tracked items**).
 
 | Area | Crate(s) | Status | Validated by |
 |---|---|---|---|
@@ -96,13 +96,25 @@ pattern; the whole-buffer and parallel-batch paths run 3–7× higher still — 
 | Compression | `peregrine-core` (`compress.rs`), `peregrine-io` (`warmcache.rs`) | ✅ | zstd end-to-end on disk (`Blob::with_compression`, header carries the tag + original size); optional transparent zstd on WarmCache admissions (`COLI_CACHE_COMPRESS`) |
 | Tokenizer fast path | `peregrine-token`, `peregrine-serve` (`tok.rs`) | ✅ | vendored gigatoken BPE subset (stable toolchain, no libpython); id-for-id parity vs HF `tokenizers` on the committed GPT-2 fixture; cross-request memo cache; sole runtime tokenizer (HF crate is test-oracle only); `--bench-tokenizer` (34× locally) |
 
-### Not yet done (all hardware-gated)
-Every remaining roadmap item needs hardware this workspace lacks: CUDA Graphs
-wired into the decode loop, persistent CUDA kernels, GPU-side fused reduce and
-a `cudaMallocAsync` pool (`nvcc` + GPU); CPU/GPU split GEMM and idle-cycle GPU
-compute (GPU); PCIe bandwidth scheduling and GPUDirect Storage (vendor stack);
-multi-GPU expert ownership / NVLink placement / VRAM replication (≥ 2 GPUs);
-distributed inference (multiple hosts). See [`todo.md`](todo.md).
+### Not yet done
+**Ten of the nineteen open items need hardware this workspace lacks**: CUDA Graphs
+wired into the decode loop, persistent CUDA kernels, GPU-side fused reduce and a
+`cudaMallocAsync` pool (`nvcc` + GPU); idle-cycle GPU compute (GPU); GPUDirect
+Storage (vendor stack); multi-GPU expert ownership / NVLink placement / VRAM
+replication (≥ 2 GPUs); distributed inference (multiple hosts).
+
+**Eight need no hardware at all** — fusing prefill into the decode batch, KV
+quantization, paged KV, int2 checkpoint conversion, and heat-tiered on-disk
+precision. Each is a substantial change to a core invariant rather than a blocked
+one, and that is where the remaining throughput is: measured cross-token expert
+locality is 0.6%, so the wins left are in moving *fewer* bytes per token, not in
+moving 11.3 GB faster.
+
+One item is open **by choice rather than by hardware**: CPU/GPU split GEMM. The
+plumbing is small, but the CPU half computes int4 and the GPU half f32, and a
+split point derived from wall-clock timings would make low-order output bits
+depend on machine timing — the same prompt giving different logits run to run.
+See [`todo.md`](todo.md).
 
 ## Architecture
 
@@ -139,7 +151,7 @@ server) are mapped in [`DESIGN.md`](DESIGN.md#concurrency--parallelism-map-where
 ## Build & test
 
 ```bash
-cargo test --workspace          # 282 tests, CPU-only, no GPU needed
+cargo test --workspace          # 373 tests, CPU-only, no GPU needed
 cargo build --release           # optimized (fat LTO)
 cargo clippy --workspace --all-targets    # clean
 scripts/audit-bad-patterns.sh --strict   # quality gate: no panic-vectors/UB (see docs/BAD_PATTERNS.md)
@@ -214,10 +226,15 @@ token stream is unchanged. (Annotated reference with deep-dive links:
 | `COLI_LANE_BALANCE` | off | `LaneBalancer` overrides static residency: downgrade cold GPU residents to CPU when GPU is bottlenecked |
 | `COLI_REPLICATE_K` | 0 | Top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
 | `COLI_NUMA_PIN` | off | Pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
-| `COLI_PERF_COUNTERS` | off | Open a `perf_event_open` LLC-miss counter (needs `perf_event_paranoid ≤ 2`) |
+| `COLI_PERF_COUNTERS` | — | **not wired** — the counter exists, nothing calls the opener |
 | `COLI_DEBUG` | off | Surface advisory-operation failures (madvise/fadvise hints, NUMA pinning, route-stats persistence) on stderr |
 | `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
 | `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |
+| `COLI_PCIE_BUDGET_MB` | unlimited | Cap on per-`reheat` PCIe upload bytes (cuda) |
+| `COLI_PREFILL_CHUNK_DIV` | 0 (fixed 64) | Adaptive prefill chunk `pos/d`; output-neutral, cuts quadratic KV reconstruction |
+| `COLI_GATE_STATS` | off | Tally negligible-gate-share routed experts (`[gate]` line) |
+| `COLI_PREFIX_CACHE_MB` | 0 (off) | Cross-request KV prefix cache budget |
+| `COLI_ROUTE_MIN_SHARE` | 0 (off) | Drop negligible-gate-share routed experts (**changes token values**) |
 
 #### Governors & learning
 | Var | Default | Effect |

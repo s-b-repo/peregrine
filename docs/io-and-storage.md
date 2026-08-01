@@ -16,7 +16,8 @@ batched-submit / io-wq-worker-cap ownership the design needs.
 - **Registered files** (`IOSQE_FIXED_FILE`) plus `SINGLE_ISSUER` and
   `COOP_TASKRUN` ring flags.
 - **Registered buffers**: `register_read_buffers()` + `IORING_OP_READ_FIXED`
-  (the streaming path keeps plain reads by default — see `COLI_REGBUF`).
+  are implemented and tested, but **not reachable from the streaming path** —
+  nothing calls them outside tests, and `COLI_REGBUF` is read by no code.
 - **Batched submits**: `read_many()` / `read_experts_batched()` merge
   contiguous regions before submit; the streaming lane keeps
   `COLI_IO_BATCH` experts × 6 regions ≈ 96 reads in flight per ring.
@@ -52,8 +53,9 @@ deliberate choice over mmap.
 
 A lock-free pool of aligned slabs for expert landing buffers.
 `checkout_tagged` / `checkin_tagged` return and verify a generation-tagged
-`SlabHandle { gen }`, so a straggler speculative load can never write into a
-recycled slab; use-after-checkin is caught in debug builds. Expert reads are
+`SlabHandle { gen }` so a straggler speculative load cannot write into a recycled
+slab — **but nothing calls them**. The live path is the untagged
+`checkout`/`checkin`, so that protection is implemented and not in effect. Expert reads are
 zero-copy into the weight: the landing region is a `peregrine_io::Bytes` the
 streamed `QtWeight` moves in, and kernels read it via `Deref<[u8]>`.
 
@@ -74,7 +76,7 @@ One shared zstd codec threads through both storage levels:
   `"compression": "zstd"` + `"uncompressed_nbytes"` and reads decompress
   transparently. See [Model format](model-format.md#safetensors-header-extensions).
 - **In RAM** — `COLI_CACHE_COMPRESS` zstd-compresses warm-cache slabs on
-  admit (~2–3× smaller) and decodes on hit.
+  admit (~1.2× smaller — measured) and decodes on hit.
 
 ## Memory hints (`mem.rs`)
 

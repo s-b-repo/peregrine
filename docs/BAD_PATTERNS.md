@@ -7,10 +7,12 @@ and UB that `cargo clippy` does not flag by default, workspace-wide (per-crate
 
 ```bash
 scripts/audit-bad-patterns.sh            # full report (shows offending lines)
-scripts/audit-bad-patterns.sh --strict   # exit non-zero on any P/U hit — the CI gate
+scripts/audit-bad-patterns.sh --strict   # exit non-zero on any strict hit — the CI gate
+scripts/audit-reachability.py --list     # the [R] pass, also invoked by the above
 ```
 
-Scope: Rust under `crates/*/src`; comment lines are ignored.
+Scope: Rust under `crates/*/src`; comment lines are ignored. Strict sections are
+**P, B, U, C, Q**; **I, L, R** are informational.
 
 ## [P] Panicking error handling — **strict, must be zero**
 
@@ -65,6 +67,27 @@ bare statements — the bool is informational by documented contract.
 `unwrap_unchecked`. None belong in this codebase; the legitimate low-level work
 is confined to the crates below.
 
+## [C] Lint suppression — **strict, must be zero**
+
+`#[allow(...)]`, `#[deny(...)]` on an item, `#[ignore]` on a test.
+
+The workspace removed all 14 of its `#[allow]`s by fixing what each one hid
+(`too_many_arguments` by introducing `MatShape`/`RouterCfg`/`MoeCfg`,
+`should_implement_trait` by implementing `FromStr`, and so on). That was a
+claim in prose; this makes it a gate, so the next one has to be argued rather
+than merged. `#[deny]` belongs at the crate root, not per-item, and `#[ignore]`
+rots a test in place — delete it or fix it.
+
+## [Q] Cargo.toml hygiene — **strict, must be zero**
+
+A wildcard version (`dep = "*"`) or a git dependency without `rev`/`tag`/`branch`.
+
+Both make the build non-reproducible. That matters more here than in most
+projects: this engine's correctness rests on bit-identity anchors — SIMD kernels
+checked bit-for-bit against scalar references, `to_bits()`-exact parallel-vs-serial
+tests — and a transitive dependency moving under you can shift those without a
+commit to blame.
+
 ## [I] `unsafe` outside the expected crates — informational
 
 `unsafe` is expected and reviewed in three domains only:
@@ -97,12 +120,63 @@ non-`NotFound` failure would otherwise be indistinguishable from "not present" �
 `engine/main.rs` (`compile-plan` now separates a corrupt artifact from a missing
 one). The remaining sites are genuine either-way probes.
 
+## [R] Shipped but unreachable — informational, and the one grep cannot see
+
+Code that compiles, passes its own unit tests, is documented as live, and **no
+production path reaches it**. Every other section here is a regex over lines;
+this one needs a definition-and-reference pass, so it lives in a companion
+script:
+
+```bash
+scripts/audit-reachability.py --list     # also run by the main audit
+```
+
+It reports `pub fn`s whose only references are their own definition, a
+re-export, or a `#[cfg(test)]` region. Informational by nature — a workspace
+legitimately exposes API its binaries don't call — so the number is not a gate.
+**The signal is a symbol appearing in this list that a doc or `todo.md` calls
+shipped.** Run it before marking anything complete.
+
+It exists because five instances shipped, and every one was found by hand:
+
+| What | Claimed | Reality |
+|---|---|---|
+| `solve_residency_greedy` / `_sized` | ✅ in `todo.md`; `docs/gpu-cuda.md` described it as the initial-placement policy | zero production callers — placement was round-robin by index |
+| `Placement::GpuSpill` | produced by `LaneBalancer::choose`, unit-tested | the sole consumer matched `Placement::Gpu`, so a spill verdict silently became CPU |
+| `COLI_REGBUF` → `register_read_buffers` / `read_fixed` | ✅ in `todo.md`; an operator-settable knob in `docs/configuration.md` | no code reads the variable; the `IORING_OP_READ_FIXED` path has no caller. It was then set in a published benchmark arm |
+| `COLI_PERF_COUNTERS` → `open_l3_miss_counter` | ✅ twice in `todo.md`, plus `DESIGN.md`, `README.md`, `docs/configuration.md`, `docs/io-and-storage.md`, `docs/adaptive-runtime.md` — "consumers feed `PerfCounter::read` deltas into the prefetch tuner" | that consumer does not exist; nothing calls the opener |
+| `SlabPool::checkout_tagged` / `checkin_tagged` | ✅ in `todo.md` as recycling-by-generation; `docs/io-and-storage.md` describes the safety property as active | untagged `checkout`/`checkin` are used (7 and 5 sites); the generation-tagged variants that stop a straggler write into a recycled slab have zero callers, including tests |
+
+The common shape is worth naming: **the feature was built, the documentation was
+written from the intent, and the wiring was never done.** Tests do not catch it
+because the code under test is genuinely correct — it simply runs nowhere. Nor
+does clippy: `pub` items are reachable by definition from outside the crate, so
+`dead_code` stays quiet. The audit's other sections are all "this line is
+dangerous"; this one is "this line never runs."
+
 ## What is intentionally NOT flagged
 
-Unlike the security-tool original, the noisy sections don't apply to a numeric
-kernel engine: numeric `as` casts (`as usize`/`as f32`/…) and array indexing are
-pervasive and intentional; there is no async/HTTP/SQL/crypto surface. Those sections
-are omitted rather than waived en masse. Also not flagged: `Ok(_) => {}` arms
+The upstream rustsploit catalogue runs to 125+ patterns across A–Q. Most of its
+categories describe a different program — an async, network-facing module
+framework — and are omitted here rather than waived en masse:
+
+- **Network / HTTP / SQL / crypto / mass-scan wrappers** (its G2, H, K0, L, M):
+  no such surface exists in an inference engine.
+- **Async and blocking** (its F): peregrine's engine thread is *deliberately*
+  blocking and owns the model; `std::thread::sleep` and `std::fs` are correct
+  there, not defects.
+- **Numeric `as` casts** (its E1/E2) and **array indexing** (its D): pervasive and
+  intentional in kernel code, where bounds are structurally guaranteed by shape.
+  Gating them would produce thousands of hits and teach the team to ignore the
+  audit — the failure mode a gate must not have.
+- **`assert!` in production** (its A15): peregrine had exactly one, on KV-cache
+  append order, and it was removed for a different reason — the release profile
+  sets `panic = "abort"`, so an assert would have taken every concurrent sequence
+  down with the one bad request. It is now a propagated `Result`.
+
+What *was* worth adopting: **C** (lint suppression) and **Q** (Cargo hygiene),
+both mechanical and both already at zero, so gating them costs nothing and keeps
+prose claims honest. Also not flagged: `Ok(_) => {}` arms
 (ignoring a success *value* inside a full `match` is normal — the `Err` arm is
 what the gate cares about, and it is covered) and `unwrap_or(`/`unwrap_or_else(`
 with a used binding (the grep can't tell `Option` defaults from `Result`
@@ -110,8 +184,13 @@ swallows; the ignored-closure form `…or_else(|_e|` *is* gated).
 
 ## Current status
 
-`--strict` is green: **P=0, B=0, U=0, I=0** (L=26 informational let-else
-sites; 51 files; `peregrine-token` excluded as vendored). **No `// audit-allow:`
+`--strict` is green: **P=0, B=0, U=0, C=0, Q=0, I=0** (informational: L=28
+let-else sites, R=49 unreferenced `pub fn`s; 52 files; `peregrine-token` excluded
+as vendored). Of the R list, five entries were confirmed as genuine unreachable
+features and are catalogued in [R] above; the rest are library API the binaries
+do not happen to call. Two of the five — the `perf_event_open` counter and the
+slab pool's generation tagging — were downgraded from ✅ to 🟡 in `todo.md` when
+this pass found them. **No `// audit-allow:`
 waivers and no `#[allow(...)]` attributes remain anywhere in first-party code** —
 the waiver mechanism still exists, but every former use was replaced with real
 handling (see below). Note: the root-level `audit-bad-patterns.sh` was previously a stale
