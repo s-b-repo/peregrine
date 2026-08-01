@@ -25,7 +25,7 @@ The `COLI_` prefix is kept from colibrì for drop-in compatibility.
 | `COLI_IO_RINGS` | 4 | io_uring rings for the streaming lane, each on its own thread |
 | `COLI_IO_BATCH` | 16 | expert reads in flight per submit (× 6 regions ≈ 96) |
 | `COLI_DIRECT` | off | O_DIRECT lane: DMA straight into aligned buffers, bypassing the page cache |
-| `COLI_REGBUF` | off | registered fixed read buffers (`IORING_OP_READ_FIXED`) on the streaming path |
+| `COLI_REGBUF` | — | **not wired.** `register_read_buffers()`/`IORING_OP_READ_FIXED` exist and are tested, but no code reads this variable and the streaming path always uses the plain read. Listed here because operators have set it expecting an effect |
 | `COLI_FADVISE_MAIN` | on | `POSIX_FADV_WILLNEED` batched before every main-path read |
 | `COLI_FADVISE_DROP` | off | `POSIX_FADV_DONTNEED` after each streamed read (RSS-bounded runs) |
 | `COLI_IO_TUNE` | on | adaptive `set_iowq_max_workers` from the `IoTuner` EWMA |
@@ -40,7 +40,7 @@ The `COLI_` prefix is kept from colibrì for drop-in compatibility.
 | `COLI_LANE_BALANCE` | off | `LaneBalancer` overrides static residency: downgrade cold GPU residents to CPU when GPU is bottlenecked |
 | `COLI_REPLICATE_K` | 0 | top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
 | `COLI_NUMA_PIN` | off | pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
-| `COLI_PERF_COUNTERS` | off | open a `perf_event_open` LLC-miss counter (needs `perf_event_paranoid ≤ 2`) |
+| `COLI_PERF_COUNTERS` | — | **not wired.** The counter (`PerfCounter::open_cache_misses`) works, but `open_l3_miss_counter` has no caller, so setting this has no effect. Listed because the docs advertised it as live |
 | `COLI_SHAPE_SPECIALIZE` | off | per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
 
 ## Governors & learning
@@ -104,6 +104,11 @@ The `COLI_` prefix is kept from colibrì for drop-in compatibility.
 | `COLI_GPU` | off | enable the GPU lane |
 | `COLI_GPU_INT4` | off | int4 VRAM expert tier (needs per-row int4 experts) |
 | `COLI_GPU_F32_FRAC` | unset | adaptive per-expert precision: hottest fraction of residents promoted to f32 |
+| `COLI_PCIE_BUDGET_MB` | unlimited | cap on bytes one `reheat` generation may upload across PCIe; the coldest deferred to the next generation. Unset = unlimited = unchanged behaviour |
+| `COLI_PREFILL_CHUNK_DIV` | 0 | prefill chunk becomes `max(64, pos/d)`. A fixed chunk makes prefill quadratic in prompt length, since attention re-derives every cached position per call. Chunk size cannot change output — only how long one prefill step blocks decode |
+| `COLI_GATE_STATS` | off | tally, per routed expert, whether its gate share is below 0.5/1/2/5% of its position's mass; printed as `[gate]` at shutdown. Diagnostics only |
+| `COLI_PREFIX_CACHE_MB` | 0 | byte budget for the cross-request KV prefix cache. A new request is seeded from the longest cached prefix of its prompt, so a shared system prompt is prefilled once rather than once per request. Entries are matched by comparing tokens, not hashing. `0` disables it |
+| `COLI_ROUTE_MIN_SHARE` | 0 | drop trailing routed experts carrying less than this share of a position's gate mass, renormalizing the survivors. **Unlike every other knob here, this one changes token values** — it removes a real (if small) term from the MoE sum. Size it with `COLI_GATE_STATS` and gate it with `Model::prediction_flip_rate`. `0` disables it |
 | `COLI_CUDA_PROFILE` | off | accumulate per-call H2D/kernel/D2H timings |
 | `COLI_CUDA_TC_*` | vary | Tensor Core int4/W4A16 gates, min-row thresholds |
 

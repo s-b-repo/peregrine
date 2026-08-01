@@ -159,6 +159,55 @@ pub fn quant_i8(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<f32>) {
     (q, sc)
 }
 
+/// Quantize a weight `[O, I]` to per-row packed int2 (colibrì fmt 3): returns
+/// `(bytes[O*ceil(I/4)], scale[O])`. Four 2-bit fields per byte, low field first;
+/// each is biased by `+2` into `[0,3]`.
+///
+/// **This is the format's first producer.** int2 has been fully *consumable*
+/// since M1 — the container detector, the scalar and AVX2 dot kernels, the
+/// dequantizer and the CUDA `row_bytes`/`weight_at` decode all handle fmt 3 —
+/// but nothing could write it, so no checkpoint ever used it. At GLM-5.2 shapes
+/// it halves the payload that dominates a disk-bound run: 18.92 → 9.48 MB per
+/// expert, 11.35 → 5.69 GB per token.
+///
+/// ## The scale convention (defined here, because none existed)
+///
+/// The decoders read a field as `field - 2`, so the representable levels are
+/// `{-2, -1, 0, +1}` — **asymmetric**, unlike int8's `[-128, 127]` or int4's
+/// `[-8, 7]` where the positive max is what the scale divides by. Following the
+/// same rule (`scale = amax / max_positive_level`) gives `amax / 1`, so the
+/// largest positive weight maps exactly to `+1` and nothing clips.
+///
+/// The trade that buys: because `|v| <= amax` by construction, `v / s` never
+/// reaches `-2`, so this convention uses three of the four levels and is
+/// effectively ternary. Reaching `-2` requires a scale below `amax`, which clips
+/// the positive extreme instead — a straight swap of one distortion for another,
+/// and which wins is an accuracy question that needs a real checkpoint to answer.
+/// No-clipping is the safer default to establish; revisit it with
+/// `Model::prediction_flip_rate` and a real model, not by intuition.
+///
+/// Lossy by construction — 2 bits cannot round-trip. Gate a checkpoint built with
+/// this on `Model::prediction_flip_rate`, not on a bit-identity test.
+pub fn quant_i2(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<f32>) {
+    let rb = i.div_ceil(4);
+    let mut q = vec![0u8; o * rb];
+    let mut sc = vec![0f32; o];
+    for oo in 0..o {
+        let row = &w[oo * i..oo * i + i];
+        let amax = row.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        // `/ 1.0` is the max *positive* level, matching int4's `/ 7.0` and int8's
+        // `/ 127.0`. Written out rather than elided so the convention is legible.
+        let s = (amax / 1.0).max(1e-12);
+        sc[oo] = s;
+        for ii in 0..i {
+            let v = (row[ii] / s).round_ties_even().clamp(-2.0, 1.0) as i32;
+            let field = (v + 2) as u8 & 0x03;
+            q[oo * rb + (ii >> 2)] |= field << ((ii & 3) * 2);
+        }
+    }
+    (q, sc)
+}
+
 /// Quantize a weight `[O, I]` to per-row packed int4: returns
 /// `(bytes[O*ceil(I/2)], scale[O])`. Nibbles are biased by +8 into `[0,15]`.
 pub fn quant_i4(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<f32>) {
@@ -217,6 +266,72 @@ pub fn quant_i4_grouped(w: &[f32], o: usize, i: usize, gs: usize) -> (Vec<u8>, V
 mod tests {
     use super::*;
     use crate::{QtFmt, QtInfo, SafeTensors};
+
+    /// Decode one packed int2 field exactly as every consumer does
+    /// (`idot.rs::dot_i2i8_scalar`, `weight.rs`, `backend_cuda.cu::weight_at`):
+    /// the `2·(i&3)`-shifted 2-bit field of byte `i>>2`, biased by −2.
+    fn decode_i2(q: &[u8], row: usize, rb: usize, i: usize) -> i32 {
+        let byte = q[row * rb + (i >> 2)];
+        (((byte >> (2 * (i & 3))) & 0x03) as i32) - 2
+    }
+
+    #[test]
+    fn quant_i2_packs_four_fields_per_byte_in_decoder_order() {
+        // The producer must agree with the decoders that already shipped. One row
+        // spanning both level extremes and the middle.
+        let (o, i) = (1usize, 8usize);
+        // amax = 4.0 → s = 4.0, so each value lands at round_ties_even(v/4).
+        let w = vec![4.0f32, -4.0, 0.0, 2.0, -4.0, 1.0, -2.0, 3.9];
+        let (q, sc) = quant_i2(&w, o, i);
+        assert_eq!(q.len(), o * i.div_ceil(4), "ceil(I/4) bytes per row");
+        assert!((sc[0] - 4.0).abs() < 1e-6, "scale is amax / max-positive-level");
+        let rb = i.div_ceil(4);
+        let got: Vec<i32> = (0..i).map(|k| decode_i2(&q, 0, rb, k)).collect();
+        // 1, -1, 0, 0.5→0 (ties-even), -1, 0.25→0, -0.5→0 (ties-even), 0.975→1.
+        assert_eq!(got, vec![1, -1, 0, 0, -1, 0, 0, 1]);
+    }
+
+    #[test]
+    fn quant_i2_clamps_to_the_asymmetric_level_range() {
+        // Levels are {-2,-1,0,+1}: positives cannot exceed +1, negatives reach -2.
+        // A row whose extreme is negative must not wrap or overflow the field.
+        let (o, i) = (1usize, 4usize);
+        let w = vec![-10.0f32, 10.0, -10.0, 10.0];
+        let (q, _) = quant_i2(&w, o, i);
+        let rb = i.div_ceil(4);
+        for k in 0..i {
+            let v = decode_i2(&q, 0, rb, k);
+            assert!((-2..=1).contains(&v), "field {k} decoded to {v}, outside [-2,1]");
+        }
+    }
+
+    #[test]
+    fn quant_i2_halves_int4_and_matches_the_container_detector() -> Result<(), crate::Error> {
+        // Byte count must be exactly half int4's, and `QtInfo::detect` must
+        // classify the payload as fmt 3 from its size alone — that inference is
+        // the only thing that tells the loader what it is reading.
+        let (o, i) = (4usize, 64usize);
+        let w: Vec<f32> = (0..o * i).map(|k| ((k % 17) as f32 - 8.0) * 0.1).collect();
+        let (q2, sc2) = quant_i2(&w, o, i);
+        let (q4, _) = quant_i4(&w, o, i);
+        assert_eq!(q2.len() * 2, q4.len(), "int2 is exactly half of int4");
+
+        let dir = std::env::temp_dir().join(format!("coli_i2_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        write_safetensors(
+            &dir,
+            &[
+                Blob::new("w2", "U8", vec![o as i64, (i / 4) as i64], q2),
+                Blob::new("w2.qs", "F32", vec![o as i64], f32_bytes(&sc2)),
+            ],
+        )?;
+        let st = SafeTensors::open(&dir)?;
+        assert_eq!(QtInfo::detect(&st, "w2", o as i64, i as i64).fmt, QtFmt::Int2, "byte count must infer fmt 3");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 
     #[test]
     fn written_model_reads_back() -> Result<(), crate::Error> {

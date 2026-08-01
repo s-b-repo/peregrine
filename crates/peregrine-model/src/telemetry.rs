@@ -22,6 +22,59 @@ pub struct RuntimeTelemetry {
     pub prefetch_accuracy: Option<f32>,
     /// Warm cache hit rate; `None` when the warm cache is off.
     pub cache_hit_rate: Option<f32>,
+    /// Cumulative GPU expert-group transfer counters. All zero on a build
+    /// without the `cuda` feature, and the millisecond fields are zero unless
+    /// `COLI_CUDA_PROFILE` is also set (the CUDA event timing is opt-in because
+    /// it costs four events and a sync per call).
+    pub gpu: GpuTransferStats,
+}
+
+/// PCIe-side observables for the GPU expert lane, mirrored out of
+/// `peregrine_cuda::GroupStats` so this module stays compilable without the
+/// optional `cuda` dependency.
+///
+/// These counters existed but were read by nothing outside one unit test —
+/// the same "measured but never reported" gap the warm cache's compression
+/// counters had. A transfer-bound GPU lane is invisible without them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuTransferStats {
+    pub calls: u64,
+    pub experts: u64,
+    pub rows: u64,
+    pub h2d_ms: f64,
+    pub kernel_ms: f64,
+    pub d2h_ms: f64,
+}
+
+impl GpuTransferStats {
+    /// Read the process-global counters. Zeros without the `cuda` feature.
+    pub fn read() -> GpuTransferStats {
+        #[cfg(feature = "cuda")]
+        {
+            let g = peregrine_cuda::group_stats();
+            GpuTransferStats {
+                calls: g.calls,
+                experts: g.experts,
+                rows: g.rows,
+                h2d_ms: g.h2d_ms,
+                kernel_ms: g.kernel_ms,
+                d2h_ms: g.d2h_ms,
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        GpuTransferStats::default()
+    }
+
+    /// Share of measured GPU-lane time spent moving bytes rather than computing.
+    /// `None` until `COLI_CUDA_PROFILE` has produced timings. A high value is the
+    /// signal a PCIe budget (`COLI_PCIE_BUDGET_MB`) is meant to act on.
+    pub fn transfer_fraction(&self) -> Option<f64> {
+        let total = self.h2d_ms + self.kernel_ms + self.d2h_ms;
+        if total <= 0.0 {
+            return None;
+        }
+        Some((self.h2d_ms + self.d2h_ms) / total)
+    }
 }
 
 /// Coordinator that reads all the tuners each forward and nudges the knobs.
@@ -92,6 +145,7 @@ impl PlanOptimizer {
             iowq: io.recommend(),
             prefetch_accuracy: cache.and_then(|c| ratio(c.prefetch_used, c.prefetch_used + c.prefetch_wasted)),
             cache_hit_rate: cache.and_then(|c| ratio(c.hits, c.hits + c.misses)),
+            gpu: GpuTransferStats::read(),
         }
     }
 }
@@ -126,6 +180,36 @@ pub fn open_l3_miss_counter() -> Option<peregrine_io::PerfCounter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_fraction_is_none_until_profiling_produces_timings() {
+        // The counters tick without COLI_CUDA_PROFILE, but the millisecond fields
+        // stay zero — reporting 0% transfer then would read as "compute-bound"
+        // when the truth is "not measured".
+        let counted = GpuTransferStats { calls: 12, experts: 300, rows: 900, ..Default::default() };
+        assert!(counted.transfer_fraction().is_none());
+        assert!(GpuTransferStats::default().transfer_fraction().is_none());
+    }
+
+    #[test]
+    fn transfer_fraction_splits_movement_from_compute() {
+        let g = GpuTransferStats { h2d_ms: 3.0, kernel_ms: 2.0, d2h_ms: 5.0, ..Default::default() };
+        // 8 ms moving bytes out of 10 ms total → PCIe-bound.
+        assert_eq!(g.transfer_fraction(), Some(0.8));
+        let compute_bound = GpuTransferStats { h2d_ms: 0.0, kernel_ms: 4.0, d2h_ms: 0.0, ..Default::default() };
+        assert_eq!(compute_bound.transfer_fraction(), Some(0.0));
+    }
+
+    #[test]
+    fn snapshot_carries_gpu_stats() {
+        // Zeros on a CPU-only build, but the field must be populated rather than
+        // silently absent — that is the gap this closes.
+        let opt = PlanOptimizer::new();
+        let io = IoTuner::new(IowqCap { bounded: 4, unbounded: 4 }, 1, 16);
+        let t = opt.snapshot(Bias::Balanced, &io, LaneTimings::default(), None);
+        assert_eq!(t.gpu.calls, 0);
+        assert!(t.gpu.transfer_fraction().is_none());
+    }
 
     #[test]
     fn optimizer_returns_telemetry_each_tick() {

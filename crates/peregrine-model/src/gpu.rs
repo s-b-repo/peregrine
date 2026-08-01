@@ -241,6 +241,194 @@ pub fn plan_precision(
         .collect()
 }
 
+/// Plan a mixed-precision resident set that actually fits `budget` bytes.
+///
+/// [`plan_precision`] promotes a fraction of an *already chosen* resident set,
+/// which is circular: promoting to a wider format shrinks how many experts fit,
+/// which changes the set the fraction was taken over. Done naively — rank the
+/// hottest `capacity` experts (a count derived from the *narrow* format), then
+/// promote `frac` of them, then drop whatever overruns — the wide residents eat
+/// the budget before the narrow tail is ever reached. At the repo's GLM-5.2
+/// shape (18.9 MB int4 / 151 MB f32) with a 10 GB budget and `frac = 0.25`,
+/// that turns 542 residents into ~67: a 25% *quality* request costing 88% of
+/// *residency*.
+///
+/// Solved directly instead. If the final set holds `R` experts of which
+/// `frac·R` are wide, then `budget = R·(frac·hi + (1-frac)·lo)`, so
+/// `R = budget / (frac·hi + (1-frac)·lo)`. Ranking every sparse candidate and
+/// promoting the hottest `frac·R` makes the fraction self-consistent with the
+/// set it describes, and the greedy fit then packs the narrow tail into any
+/// remainder. Pure — unit-testable without a GPU.
+/// `bytes` is `(wide, narrow)` — the per-expert footprint of each format.
+pub fn plan_precision_fitted(
+    counts: &[u32],
+    n_layers: usize,
+    first_dense: usize,
+    n_experts: usize,
+    budget: usize,
+    hi_frac: f32,
+    bytes: (usize, usize),
+) -> Vec<((usize, usize), ExpertPrecision)> {
+    let (hi_bytes, lo_bytes) = bytes;
+    if n_experts == 0 || first_dense >= n_layers || budget == 0 || lo_bytes == 0 {
+        return Vec::new();
+    }
+    let hi_frac = hi_frac.clamp(0.0, 1.0) as f64;
+    // Self-consistent resident count, then the wide share of it.
+    let avg = hi_frac * hi_bytes as f64 + (1.0 - hi_frac) * lo_bytes as f64;
+    let n_hi = if avg > 0.0 { ((budget as f64 / avg) * hi_frac).ceil() as usize } else { 0 };
+
+    // Candidates in round-robin order, so equal heat (including a cold all-zero
+    // table) reproduces `plan_residency`'s static placement — same tiebreak as
+    // `rank_by_heat`.
+    let mut cand: Vec<(usize, usize)> = Vec::with_capacity((n_layers - first_dense) * n_experts);
+    for e in 0..n_experts {
+        for layer in first_dense..n_layers {
+            cand.push((layer, e));
+        }
+    }
+    let heat = |&(l, e): &(usize, usize)| counts.get(l * n_experts + e).copied().unwrap_or(0);
+    cand.sort_by_key(|c| Reverse(heat(c))); // stable: equal heat keeps round-robin order
+
+    // Greedy fit over the full ranked list. Keep scanning past a candidate that
+    // does not fit so the narrow tail can still use the remaining room.
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for (rank, key) in cand.into_iter().enumerate() {
+        // A promoted candidate that no longer fits at the wide size falls back to
+        // the narrow one rather than being dropped. Without this the *hottest*
+        // expert is the one evicted whenever the remaining room is smaller than a
+        // wide slot — precisely backwards, since rank is what earned it residency.
+        let (prec, bytes) = match rank < n_hi {
+            true if used.saturating_add(hi_bytes) <= budget => (ExpertPrecision::F32, hi_bytes),
+            _ => (ExpertPrecision::Int4, lo_bytes),
+        };
+        if used.saturating_add(bytes) > budget {
+            continue;
+        }
+        used += bytes;
+        out.push((key, prec));
+    }
+    out
+}
+
+/// How many of `costs` a single reheat generation may upload before hitting
+/// `budget_bytes`. `costs` is in placement order, which is heat order, so the
+/// answer is a prefix length.
+///
+/// `reheat` otherwise re-uploads every expert whose heat rank moved, unbounded,
+/// once per 256 decode steps — at ~18.9 MB (int4) or ~151 MB (f32) each, a
+/// churny generation can push gigabytes across PCIe in one burst and stall the
+/// lane it is supposed to be feeding. Capping the burst spreads the same
+/// migration over several generations; the experts deferred here are the coldest
+/// in the plan, and the next generation reconsiders them.
+///
+/// `budget_bytes == 0` means unlimited — the default, and bit-identical to having
+/// no governor at all. A budget smaller than the first upload still admits one,
+/// so residency always makes progress instead of deadlocking on a too-tight knob.
+///
+/// Pure — no CUDA measurement is involved; the byte costs are known from the
+/// residency format alone.
+pub fn admit_uploads(costs: &[usize], budget_bytes: usize) -> usize {
+    if budget_bytes == 0 {
+        return costs.len();
+    }
+    let mut used = 0usize;
+    for (i, &c) in costs.iter().enumerate() {
+        if used.saturating_add(c) > budget_bytes {
+            return i.max(1).min(costs.len()); // never stall completely
+        }
+        used += c;
+    }
+    costs.len()
+}
+
+/// Per-generation PCIe upload budget in bytes from `COLI_PCIE_BUDGET_MB`.
+/// `0`/unset/invalid → unlimited, which is the untouched behaviour.
+pub fn pcie_budget_bytes() -> usize {
+    std::env::var("COLI_PCIE_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(0)
+}
+
+/// Group job indices by residency format, preserving each group's relative order.
+///
+/// The CUDA expert-group kernel picks its dispatch path from `all_s4`, computed
+/// over the *whole* call (`backend_cuda.cu:638,645`): if any expert in the group
+/// is f32, every expert in that call falls off the int4 Tensor-Core and packed-W4
+/// ladders onto the generic scalar path. Issuing one call per format class keeps
+/// the int4 majority on the fast path.
+///
+/// Returns one index list per non-empty class (int4 first, then f32) — never an
+/// empty list, since the kernel rejects a group with no rows. A homogeneous input
+/// yields exactly one class, i.e. the single call made today.
+///
+/// Pure — testable without a GPU.
+pub fn partition_by_format(fmt: &[bool]) -> Vec<Vec<usize>> {
+    let mut int4: Vec<usize> = Vec::new();
+    let mut f32s: Vec<usize> = Vec::new();
+    for (i, &is_int4) in fmt.iter().enumerate() {
+        if is_int4 {
+            int4.push(i);
+        } else {
+            f32s.push(i);
+        }
+    }
+    [int4, f32s].into_iter().filter(|c| !c.is_empty()).collect()
+}
+
+/// Undo [`partition_by_format`]: place each class's results back at their original
+/// job positions.
+///
+/// `results[c][i]` is the output for job `classes[c][i]`. Returns `None` if the
+/// shapes disagree or an index is out of range or repeated — the caller turns that
+/// into an error rather than silently emitting misaligned outputs, which would
+/// attach every expert's result to the wrong rows with no other symptom.
+pub fn scatter_by_index<T>(total: usize, classes: &[Vec<usize>], results: Vec<Vec<T>>) -> Option<Vec<T>> {
+    if classes.len() != results.len() {
+        return None;
+    }
+    let mut slots: Vec<Option<T>> = (0..total).map(|_| None).collect();
+    for (idxs, vals) in classes.iter().zip(results) {
+        if idxs.len() != vals.len() {
+            return None;
+        }
+        for (&i, v) in idxs.iter().zip(vals) {
+            let slot = slots.get_mut(i)?;
+            if slot.is_some() {
+                return None; // duplicate index — the permutation is not a bijection
+            }
+            *slot = Some(v);
+        }
+    }
+    slots.into_iter().collect()
+}
+
+/// Whether `reheat` must evict and re-upload a resident expert this generation.
+///
+/// Re-upload is expensive — a full host dequantize (~151 MB for an f32 expert)
+/// plus the PCIe transfer — so it must happen only on a real format change.
+///
+/// The subtle case is `unsatisfiable`: an expert whose source is grouped-int4 or
+/// int8 cannot be int4-resident, so an int4 request lands f32. The wanted format
+/// is recomputed from the tier's uniform format every generation and keeps asking,
+/// while the resident is recorded f32 — so a plain `cur != want` test never
+/// converges and re-uploads that expert every 256 decode steps forever. Recording
+/// the *landed* format does not fix it; the request side has to stop asking.
+///
+/// Pure — the churn bug is unit-testable without a GPU.
+pub fn needs_reupload(resident: bool, cur_int4: bool, want_int4: bool, unsatisfiable: bool) -> bool {
+    if !resident {
+        return true; // not there yet — must upload
+    }
+    if want_int4 && unsatisfiable {
+        return false; // asked once, answered f32; asking again changes nothing
+    }
+    cur_int4 != want_int4
+}
+
 /// Rank sparse `(layer, expert)` pairs by heat and take the hottest `capacity`.
 /// Ties (equal heat — including a cold all-zero table) keep the round-robin order
 /// of [`plan_residency`], so cold start reproduces the static placement and
@@ -358,6 +546,171 @@ mod precision_tests {
         let f32s: Vec<usize> = plan.iter().filter(|&&(_, p)| p == ExpertPrecision::F32).map(|&((_, e), _)| e).collect();
         assert_eq!(f32s, vec![0, 1], "lowest ids win the tie");
     }
+
+    // GLM-5.2 shape, from `peregrine-cuda/src/lib.rs`: 18.9 MB per int4 expert,
+    // 151 MB per f32 expert, 75 layers x 256 experts, ~10 GB of usable VRAM.
+    const INT4_B: usize = 18_900_000;
+    const F32_B: usize = 151_000_000;
+    const BUDGET: usize = 10 * 1024 * 1024 * 1024;
+    const LAYERS: usize = 75;
+    const EXPERTS: usize = 256;
+
+    /// The regression this planner exists for: promoting a fraction of residents
+    /// to f32 must not gut the resident set.
+    ///
+    /// The old path ranked the hottest `capacity` experts — a count derived from
+    /// the *int4* footprint — promoted `frac` of them to f32, then dropped
+    /// whatever overran the budget. Because f32 is ~8x int4, the promotions alone
+    /// exhausted VRAM and the int4 tail was never reached: 542 residents became
+    /// ~67. Sizing the set and its f32 share together keeps the count sane.
+    #[test]
+    fn promotion_does_not_collapse_residency() {
+        let counts: Vec<u32> = (0..LAYERS * EXPERTS).map(|i| (i % 977) as u32).collect();
+        let plan = super::plan_precision_fitted(&counts, LAYERS, 0, EXPERTS, BUDGET, 0.25, (F32_B, INT4_B));
+
+        let n_f32 = plan.iter().filter(|&&(_, p)| p == ExpertPrecision::F32).count();
+        let total = plan.len();
+        // Naive count-then-promote lands near 67 here; anything in that range means
+        // the collapse is back.
+        assert!(total > 150, "promotion collapsed residency to {total} experts");
+        // The f32 share must match what was actually asked for, not just be small.
+        let share = n_f32 as f64 / total as f64;
+        assert!((0.20..0.30).contains(&share), "f32 share {share:.3} should be ~0.25");
+        // And it must genuinely fit.
+        let used: usize = plan
+            .iter()
+            .map(|&(_, p)| if p == ExpertPrecision::F32 { F32_B } else { INT4_B })
+            .sum();
+        assert!(used <= BUDGET, "plan overruns the budget: {used} > {BUDGET}");
+    }
+
+    #[test]
+    fn zero_fraction_matches_a_pure_int4_tier() {
+        let counts: Vec<u32> = (0..LAYERS * EXPERTS).map(|i| (i % 977) as u32).collect();
+        let plan = super::plan_precision_fitted(&counts, LAYERS, 0, EXPERTS, BUDGET, 0.0, (F32_B, INT4_B));
+        assert!(plan.iter().all(|&(_, p)| p == ExpertPrecision::Int4));
+        // Every slot the budget can hold is used.
+        assert_eq!(plan.len(), BUDGET / INT4_B);
+    }
+
+    #[test]
+    fn unset_pcie_budget_admits_every_upload() {
+        // The knob defaults off, and off must mean "exactly what it did before".
+        let costs = vec![INT4_B; 40];
+        assert_eq!(super::admit_uploads(&costs, 0), 40);
+        assert_eq!(super::admit_uploads(&[], 0), 0);
+    }
+
+    #[test]
+    fn pcie_budget_caps_the_generation_at_a_heat_ordered_prefix() {
+        // 4 int4 uploads fit in a 4-expert budget; the 5th waits for next time.
+        let costs = vec![INT4_B; 10];
+        assert_eq!(super::admit_uploads(&costs, 4 * INT4_B), 4);
+        assert_eq!(super::admit_uploads(&costs, 4 * INT4_B + INT4_B / 2), 4);
+        // Mixed costs: one f32 promotion crowds out several int4 uploads.
+        let mixed = vec![F32_B, INT4_B, INT4_B, INT4_B];
+        assert_eq!(super::admit_uploads(&mixed, F32_B + 2 * INT4_B), 3);
+    }
+
+    #[test]
+    fn a_too_tight_budget_still_makes_progress() {
+        // A budget smaller than a single upload must not freeze residency
+        // forever — one is always admitted.
+        assert_eq!(super::admit_uploads(&[F32_B, F32_B], 1), 1);
+        assert_eq!(super::admit_uploads(&[F32_B], 0_usize.saturating_add(1)), 1);
+    }
+
+    #[test]
+    fn homogeneous_group_makes_one_class() {
+        // The common case must stay exactly what it is today: a single call.
+        assert_eq!(super::partition_by_format(&[true, true, true]), vec![vec![0, 1, 2]]);
+        assert_eq!(super::partition_by_format(&[false, false]), vec![vec![0, 1]]);
+        // Empty input yields no classes — the kernel rejects a group with no rows,
+        // so an empty class must never be issued.
+        assert!(super::partition_by_format(&[]).is_empty());
+        assert_eq!(super::partition_by_format(&[true]), vec![vec![0]]);
+    }
+
+    #[test]
+    fn mixed_group_splits_preserving_relative_order() {
+        // int4 class first, then f32; within each, original order is kept.
+        let classes = super::partition_by_format(&[true, false, true, false, true]);
+        assert_eq!(classes, vec![vec![0, 2, 4], vec![1, 3]]);
+    }
+
+    #[test]
+    fn scatter_inverts_partition_exactly() {
+        // scatter ∘ partition == identity, for every mix including the edges.
+        for fmt in [
+            vec![true, false, true, false, true],
+            vec![true; 4],
+            vec![false; 4],
+            vec![false, true],
+            vec![true],
+        ] {
+            let classes = super::partition_by_format(&fmt);
+            // Each job's "result" is just its own index, so the round-trip is
+            // checkable by equality with 0..n.
+            let per_class: Vec<Vec<usize>> = classes.to_vec();
+            let got = super::scatter_by_index(fmt.len(), &classes, per_class);
+            assert_eq!(got, Some((0..fmt.len()).collect::<Vec<_>>()), "round-trip failed for {fmt:?}");
+        }
+    }
+
+    #[test]
+    fn scatter_rejects_malformed_input_instead_of_misaligning() {
+        // A misaligned scatter would silently attach every expert's output to the
+        // wrong rows, so these must be errors, not best-effort results.
+        let classes = vec![vec![0usize, 2], vec![1usize]];
+        // Wrong number of result groups.
+        assert!(super::scatter_by_index(3, &classes, vec![vec![0, 2]]).is_none());
+        // Group length mismatch.
+        assert!(super::scatter_by_index(3, &classes, vec![vec![0], vec![1]]).is_none());
+        // Index out of range.
+        assert!(super::scatter_by_index(2, &classes, vec![vec![0, 2], vec![1]]).is_none());
+        // Duplicate index (not a bijection) leaves a hole.
+        let dup = vec![vec![0usize, 0], vec![1usize]];
+        assert!(super::scatter_by_index(3, &dup, vec![vec![0, 0], vec![1]]).is_none());
+    }
+
+    /// The regression: an expert whose source cannot be int4 must be asked once,
+    /// not once per generation. Before `forced_f32`, an int4 tier holding a
+    /// grouped-int4 or int8 expert evicted and re-uploaded it every 256 decode
+    /// steps forever, because the wanted format is recomputed unconditionally and
+    /// the resident is recorded f32 — so the two never agreed.
+    #[test]
+    fn unsatisfiable_int4_request_settles_after_one_upload() {
+        // Not yet resident → upload, whatever the formats say.
+        assert!(super::needs_reupload(false, true, true, false));
+        assert!(super::needs_reupload(false, false, true, true));
+        // Resident and already in the wanted format → leave it alone.
+        assert!(!super::needs_reupload(true, true, true, false));
+        assert!(!super::needs_reupload(true, false, false, false));
+        // Resident, wants int4, source could do it but the resident is f32 →
+        // a real format change, re-upload.
+        assert!(super::needs_reupload(true, false, true, false));
+        // Same, but the source can never be int4 → must NOT re-upload. This is
+        // the case that used to churn forever.
+        assert!(!super::needs_reupload(true, false, true, true));
+        // Demotion to f32 is still honoured even for an unsatisfiable source —
+        // `unsatisfiable` only suppresses the int4 *request*.
+        assert!(super::needs_reupload(true, true, false, true));
+    }
+
+    #[test]
+    fn fitted_plan_is_heat_ordered_and_deterministic() {
+        // Distinct heats: expert 0 hottest, descending. The hottest must be the
+        // one promoted, and two runs must agree exactly.
+        let mut counts = vec![0u32; 2 * 4];
+        for (e, slot) in counts.iter_mut().take(4).enumerate() {
+            *slot = (4 - e) as u32; // layer 0
+        }
+        let a = super::plan_precision_fitted(&counts, 2, 0, 4, 3 * INT4_B, 0.34, (F32_B, INT4_B));
+        let b = super::plan_precision_fitted(&counts, 2, 0, 4, 3 * INT4_B, 0.34, (F32_B, INT4_B));
+        assert_eq!(a, b, "planning is deterministic");
+        assert!(!a.is_empty());
+        assert_eq!(a[0].0, (0, 0), "the hottest expert is placed first");
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -387,7 +740,9 @@ mod gpu_residency_tests {
         build_tiny_model(&dir)?;
         let st = SafeTensors::open(&dir)?;
         let cfg = Cfg::load(&dir)?;
-        let tier = GpuTier::build(&st, &cfg, 0)?; // headroom 0: tiny experts always fit
+        // headroom 0: tiny experts always fit. `&[]` = cold heat table, which
+        // `solve_residency_sized` answers with the round-robin spread this asserts.
+        let tier = GpuTier::build(&st, &cfg, 0, &[])?;
         std::fs::remove_dir_all(&dir)?;
         let Some(tier) = tier else {
             return Ok(()); // no CUDA device on this host → skip
@@ -410,7 +765,7 @@ mod gpu_residency_tests {
         build_tiny_model(&dir)?;
         let st = SafeTensors::open(&dir)?;
         let cfg = Cfg::load(&dir)?;
-        let tier = GpuTier::build(&st, &cfg, 0)?;
+        let tier = GpuTier::build(&st, &cfg, 0, &[])?;
         let Some(mut tier) = tier else {
             std::fs::remove_dir_all(&dir)?;
             return Ok(()); // no CUDA device on this host → skip
@@ -439,7 +794,7 @@ mod gpu_residency_tests {
         build_tiny_model(&dir)?;
         let st = SafeTensors::open(&dir)?;
         let cfg = Cfg::load(&dir)?;
-        let tier = GpuTier::build_with(&st, &cfg, 0, true)?;
+        let tier = GpuTier::build_with(&st, &cfg, 0, true, &[])?;
         std::fs::remove_dir_all(&dir)?;
         let Some(tier) = tier else {
             return Ok(()); // no CUDA device on this host → skip
@@ -544,52 +899,87 @@ mod real {
         expert_bytes: (usize, usize),
         int4: bool,
         adaptive_f32_frac: Option<f32>,
-        /// Current per-expert residency format (`true` = int4). Only consulted
-        /// on the adaptive path; uniform tiers leave it empty.
+        /// Current per-expert residency format (`true` = int4), recorded for
+        /// every resident on every path — `build` and `reheat` both insert the
+        /// format that actually landed, so this is authoritative for uniform and
+        /// adaptive tiers alike. Dispatch reads it to group same-format experts.
         precision: HashMap<(usize, usize), bool>,
+        /// Residents whose source cannot be int4 (grouped-int4 or int8), so an
+        /// int4 request fell back to f32. Without this the tier re-asks every
+        /// generation: `reheat` wants `self.int4` for every expert on a uniform
+        /// tier, the resident is recorded f32, the formats never match, and the
+        /// expert is evicted and re-uploaded (a full ~151 MB host dequantize plus
+        /// PCIe transfer) every 256 decode steps forever.
+        forced_f32: std::collections::HashSet<(usize, usize)>,
     }
 
     /// Load and upload one expert to VRAM: raw per-row int4 (`fmt=2`, ~8× denser)
     /// when `int4` and the source is per-row int4, else dequantized f32. Shared by
     /// [`GpuTier::build`] and [`GpuTier::reheat`] so both formats stay in one place.
-    fn upload_expert(st: &SafeTensors, cfg: &Cfg, layer: usize, e: usize, device: i32, int4: bool) -> Result<GpuExpert, Error> {
+    /// Upload one expert's three projections to VRAM. Returns the expert and the
+    /// format it actually landed in (`true` = int4-resident).
+    ///
+    /// `int4` is a *preference*, not a requirement. int4 residency needs per-row
+    /// int4 sources; a grouped-int4 or int8 expert falls back to the dequantized
+    /// f32 path for that expert alone. Previously this returned `Err`, which
+    /// truncated the whole tier at the first non-int4 expert (the caller treats an
+    /// upload error as "stop, keep what landed") — so one odd expert could cost
+    /// every expert behind it. Residency is therefore mixed-format, which the byte
+    /// accounting already models via the per-expert `precision` map.
+    fn upload_expert(
+        st: &SafeTensors,
+        cfg: &Cfg,
+        layer: usize,
+        e: usize,
+        device: i32,
+        int4: bool,
+    ) -> Result<(GpuExpert, bool), Error> {
         let hidden = cfg.hidden as usize;
         let inter = cfg.moe_inter as usize;
         let pe = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
         let gate = QtWeight::load(st, &pe("gate_proj.weight"), inter, hidden)?;
         let up = QtWeight::load(st, &pe("up_proj.weight"), inter, hidden)?;
         let down = QtWeight::load(st, &pe("down_proj.weight"), hidden, inter)?;
-        if int4 {
-            use crate::weight::QuantFmt;
-            if gate.fmt != QuantFmt::Int4 || up.fmt != QuantFmt::Int4 || down.fmt != QuantFmt::Int4 {
-                return Err(Error::Format(format!(
-                    "COLI_GPU_INT4 needs per-row int4 experts; layer {layer} expert {e} is {:?} \
-                     (grouped int4 / int8 sources need the f32 tier or a requantize first)",
-                    gate.fmt
-                )));
-            }
-            GpuExpert::upload_int4(device, gate.raw(), up.raw(), down.raw(), hidden, inter)
+        use crate::weight::QuantFmt;
+        let all_int4 = gate.fmt == QuantFmt::Int4 && up.fmt == QuantFmt::Int4 && down.fmt == QuantFmt::Int4;
+        if int4 && all_int4 {
+            Ok((GpuExpert::upload_int4(device, gate.raw(), up.raw(), down.raw(), hidden, inter)?, true))
         } else {
-            GpuExpert::upload(device, &gate.dequant(), &up.dequant(), &down.dequant(), hidden, inter)
+            Ok((
+                GpuExpert::upload(device, &gate.dequant(), &up.dequant(), &down.dequant(), hidden, inter)?,
+                false,
+            ))
         }
     }
 
     impl GpuTier {
-        /// Build the tier by dequantizing routed experts to f32 and uploading as
-        /// many as fit within `free VRAM - headroom`, iterating sparse layers and
-        /// experts in order. `Ok(None)` when CUDA is unavailable or nothing fits.
-        /// Build the tier, choosing int4-resident (8× denser) vs f32 residency from
-        /// the `COLI_GPU_INT4` env var. See [`Self::build_with`].
-        pub fn build(st: &SafeTensors, cfg: &Cfg, headroom_bytes: usize) -> Result<Option<GpuTier>, Error> {
-            Self::build_with(st, cfg, headroom_bytes, std::env::var("COLI_GPU_INT4").is_ok())
+        /// Build the tier by uploading as many routed experts as fit within
+        /// `free VRAM - headroom`, choosing int4-resident (8× denser) vs f32
+        /// residency from the `COLI_GPU_INT4` env var. `counts` is last session's
+        /// routing heat (empty for a cold start). `Ok(None)` when CUDA is
+        /// unavailable or nothing fits. See [`Self::build_with`].
+        pub fn build(
+            st: &SafeTensors,
+            cfg: &Cfg,
+            headroom_bytes: usize,
+            counts: &[u32],
+        ) -> Result<Option<GpuTier>, Error> {
+            Self::build_with(st, cfg, headroom_bytes, std::env::var("COLI_GPU_INT4").is_ok(), counts)
         }
 
         /// Build by uploading as many routed experts as fit `free VRAM − headroom`,
-        /// spread round-robin across all sparse layers. `int4` uploads per-row int4
-        /// weights directly (~8× denser; needs per-row int4 sources), else
-        /// dequantized f32. `Ok(None)` when CUDA is unavailable or nothing fits.
-        /// Takes `int4` explicitly so it is testable without racing process env.
-        pub fn build_with(st: &SafeTensors, cfg: &Cfg, headroom_bytes: usize, int4: bool) -> Result<Option<GpuTier>, Error> {
+        /// placed by the heat/bytes knapsack over `counts`. `int4` uploads per-row
+        /// int4 weights directly (~8× denser), falling back to dequantized f32 per
+        /// expert for sources that aren't per-row int4. `Ok(None)` when CUDA is
+        /// unavailable or nothing fits. Takes `int4` and `counts` explicitly so it
+        /// is testable without racing process env.
+        pub fn build_with(
+            st: &SafeTensors,
+            cfg: &Cfg,
+            headroom_bytes: usize,
+            int4: bool,
+            counts: &[u32],
+        ) -> Result<Option<GpuTier>, Error> {
             if peregrine_cuda::init(&[0]) < 1 {
                 return Ok(None);
             }
@@ -605,19 +995,43 @@ mod real {
             let bytes_per_expert = if int4 { int4_bytes } else { f32_bytes };
             let budget = free.saturating_sub(headroom_bytes);
 
-            let placement = super::plan_residency(
+            // Heat-density knapsack over the persisted routing counts. On a cold
+            // table (no `route_stats.json`, or a fingerprint mismatch) this falls
+            // back internally to the same round-robin `plan_residency` placement,
+            // so a first run is byte-for-byte what it always was.
+            let placement = super::solve_residency_sized(
+                counts,
                 cfg.n_layers as usize,
                 cfg.first_dense as usize,
                 cfg.n_experts as usize,
-                bytes_per_expert,
                 budget,
+                |_, _| bytes_per_expert,
             );
             let mut capacity = placement.len(); // expert-count view of the budget
             let mut experts = HashMap::new();
+            let mut precision: HashMap<(usize, usize), bool> = HashMap::new();
+            let mut forced_f32: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+            // Track bytes as uploaded, not as planned: an expert that falls back
+            // from int4 to f32 costs 8× what the placement budgeted for it, so a
+            // few fallbacks would otherwise overrun VRAM.
+            let mut used = 0usize;
             for (layer, e) in placement {
                 match upload_expert(st, cfg, layer, e, device, int4) {
-                    Ok(ge) => {
+                    Ok((ge, landed_int4)) => {
+                        let bytes = if landed_int4 { int4_bytes } else { f32_bytes };
+                        if used.saturating_add(bytes) > budget {
+                            // This one doesn't fit at its real size. Drop it and
+                            // stop — the placement is heat-ordered, so everything
+                            // after it is colder and no more valuable.
+                            capacity = experts.len();
+                            break;
+                        }
+                        used += bytes;
                         experts.insert((layer, e), ge);
+                        precision.insert((layer, e), landed_int4);
+                        if int4 && !landed_int4 {
+                            forced_f32.insert((layer, e)); // source can't be int4 — don't re-ask
+                        }
                     }
                     // A tail-end upload can fail on allocation granularity even
                     // though the byte arithmetic said it fits. Settle for the
@@ -636,8 +1050,10 @@ mod real {
             } else {
                 // Adaptive per-expert precision: COLI_GPU_F32_FRAC=<0..1> promotes
                 // that fraction of the hottest residents to f32 at each reheat.
-                // Meaningful only on an int4 tier (a f32 tier is already all-f32).
-                let adaptive_f32_frac = if int4 {
+                // Meaningful only when some resident is int4 (an all-f32 tier has
+                // nothing left to promote).
+                let any_int4 = precision.values().any(|&p| p);
+                let adaptive_f32_frac = if any_int4 {
                     std::env::var("COLI_GPU_F32_FRAC")
                         .ok()
                         .and_then(|v| v.trim().parse::<f32>().ok())
@@ -649,6 +1065,9 @@ mod real {
                 } else {
                     None
                 };
+                // Registered before the value exists so the matching `Drop` can
+                // never run against a count that was not incremented.
+                LIVE_TIERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 Ok(Some(GpuTier {
                     device,
                     experts,
@@ -657,7 +1076,8 @@ mod real {
                     expert_bytes: (int4_bytes, f32_bytes),
                     int4,
                     adaptive_f32_frac,
-                    precision: HashMap::new(),
+                    precision,
+                    forced_f32,
                 }))
             }
         }
@@ -687,42 +1107,77 @@ mod real {
                     self.budget_bytes
                 }
             };
-            let want = super::rank_by_heat(
-                counts,
-                cfg.n_layers as usize,
-                cfg.first_dense as usize,
-                cfg.n_experts as usize,
-                self.capacity,
-            );
-            // Per-expert precision for this residency generation: adaptive
-            // (hottest frac → f32) or the tier's uniform format.
-            let precision_of: HashMap<(usize, usize), bool> = match self.adaptive_f32_frac {
-                Some(frac) => super::plan_precision(counts, cfg.n_experts as usize, &want, frac)
-                    .into_iter()
-                    .map(|(k, p)| (k, matches!(p, super::ExpertPrecision::Int4)))
-                    .collect(),
-                None => want.iter().map(|&k| (k, self.int4)).collect(),
-            };
-            // Trim the wish list to what actually fits *in bytes*. With adaptive
-            // precision the hottest residents are f32 (~8× the int4 footprint),
-            // so a plan sized purely by expert count overcommits VRAM by up to
-            // that factor and every upload past the real limit fails.
             let (int4_bytes, f32_bytes) = self.expert_bytes;
-            let mut fitted: Vec<(usize, usize)> = Vec::with_capacity(want.len());
-            let mut used = 0usize;
-            for key in want {
-                let bytes = if precision_of.get(&key).copied().unwrap_or(self.int4) { int4_bytes } else { f32_bytes };
-                if used.saturating_add(bytes) > budget {
-                    continue;
-                }
-                used += bytes;
-                fitted.push(key);
-            }
-            let want = fitted;
+            // Per-expert precision for this residency generation.
+            let (want, precision_of): ResidencyGeneration =
+                match self.adaptive_f32_frac {
+                    // Adaptive: size the resident set and its f32 share together,
+                    // over every sparse candidate. Ranking only `self.capacity`
+                    // first would cap the pool at a count derived from the int4
+                    // footprint, and the f32 promotions (~8× each) would then eat
+                    // that budget before the int4 tail was ever considered.
+                    Some(frac) => {
+                        let plan = super::plan_precision_fitted(
+                            counts,
+                            cfg.n_layers as usize,
+                            cfg.first_dense as usize,
+                            cfg.n_experts as usize,
+                            budget,
+                            frac,
+                            (f32_bytes, int4_bytes),
+                        );
+                        let prec = plan
+                            .iter()
+                            .map(|&(k, p)| (k, matches!(p, super::ExpertPrecision::Int4)))
+                            .collect();
+                        (plan.into_iter().map(|(k, _)| k).collect(), prec)
+                    }
+                    // Uniform format: every resident is the same size, so the
+                    // count-based rank already respects the byte budget.
+                    None => {
+                        let want = super::rank_by_heat(
+                            counts,
+                            cfg.n_layers as usize,
+                            cfg.first_dense as usize,
+                            cfg.n_experts as usize,
+                            self.capacity,
+                        );
+                        let uniform = if self.int4 { int4_bytes } else { f32_bytes };
+                        let fit = budget / uniform.max(1);
+                        let prec = want.iter().map(|&k| (k, self.int4)).collect();
+                        (want.into_iter().take(fit).collect(), prec)
+                    }
+                };
             let want_set: HashSet<(usize, usize)> = want.iter().copied().collect();
             // evict experts that cooled off — their `Drop` frees the VRAM slot
             self.experts.retain(|k, _| want_set.contains(k));
             self.precision.retain(|k, _| want_set.contains(k));
+            // `forced_f32` is a property of the *source*, not of residency, but
+            // pruning it with the rest keeps it bounded by the resident set instead
+            // of growing across every expert the tier ever touched.
+            self.forced_f32.retain(|k| want_set.contains(k));
+
+            // Which of `want` would actually cross PCIe this generation, in heat
+            // order, and what each would cost. Everything else is already resident
+            // in the wanted format and is free.
+            let fmt_of = |key: &(usize, usize)| precision_of.get(key).copied().unwrap_or(self.int4);
+            let upload_costs: Vec<usize> = want
+                .iter()
+                .filter(|key| {
+                    let want_int4 = fmt_of(key);
+                    let cur_int4 = self.precision.get(key).copied().unwrap_or(self.int4);
+                    super::needs_reupload(
+                        self.experts.contains_key(key),
+                        cur_int4,
+                        want_int4,
+                        self.forced_f32.contains(key),
+                    )
+                })
+                .map(|key| if fmt_of(key) { int4_bytes } else { f32_bytes })
+                .collect();
+            // Unlimited by default, so this is bit-identical with the knob unset.
+            let mut upload_quota = super::admit_uploads(&upload_costs, super::pcie_budget_bytes());
+
             for (layer, e) in want {
                 let key = (layer, e);
                 let want_int4 = precision_of.get(&key).copied().unwrap_or(self.int4);
@@ -730,16 +1185,28 @@ mod real {
                 // tier's uniform format — treat missing as that, so a non-adaptive
                 // reheat never re-uploads a format-correct resident.
                 let cur_int4 = self.precision.get(&key).copied().unwrap_or(self.int4);
-                if self.experts.contains_key(&key) && cur_int4 == want_int4 {
+                let resident = self.experts.contains_key(&key);
+                if !super::needs_reupload(resident, cur_int4, want_int4, self.forced_f32.contains(&key)) {
                     continue;
                 }
+                if upload_quota == 0 {
+                    // Budget spent. Leave the rest for the next generation rather
+                    // than bursting: they are the coldest in the plan, and an expert
+                    // that stays non-resident simply streams from the CPU lane.
+                    break;
+                }
+                upload_quota -= 1;
                 // Re-upload on a format change (remove first so the old tensor's
                 // Drop frees its VRAM before the new allocation).
                 self.experts.remove(&key);
                 match upload_expert(st, cfg, layer, e, self.device, want_int4) {
-                    Ok(ge) => {
+                    // Record the format that actually landed, not the one asked for.
+                    Ok((ge, landed_int4)) => {
                         self.experts.insert(key, ge);
-                        self.precision.insert(key, want_int4);
+                        self.precision.insert(key, landed_int4);
+                        if want_int4 && !landed_int4 {
+                            self.forced_f32.insert(key);
+                        }
                     }
                     // Keep the generation that did upload instead of bailing with
                     // the tier holding fewer experts than it thinks and no record
@@ -782,38 +1249,79 @@ mod real {
             if jobs.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut refs = Vec::with_capacity(jobs.len());
-            let mut rows = Vec::with_capacity(jobs.len());
-            let mut x = Vec::new();
+            // Validate every job up front, so a ragged input fails before any
+            // kernel is dispatched rather than after the first class has run.
             for (e, xg) in jobs {
-                let ge = self
-                    .experts
-                    .get(&(layer, *e))
-                    .ok_or_else(|| Error::Format(format!("gpu expert ({layer},{e}) not resident")))?;
+                if !self.experts.contains_key(&(layer, *e)) {
+                    return Err(Error::Format(format!("gpu expert ({layer},{e}) not resident")));
+                }
                 if hidden == 0 || !xg.len().is_multiple_of(hidden) {
                     return Err(Error::Format("gpu compute: ragged gathered rows".into()));
                 }
-                refs.push(ge);
-                rows.push((xg.len() / hidden) as i32);
-                x.extend_from_slice(xg);
             }
-            let y = peregrine_cuda::expert_group(&refs, &rows, &x, hidden)?;
-            let mut out = Vec::with_capacity(jobs.len());
-            let mut off = 0usize;
-            for &r in &rows {
-                let n = r as usize * hidden;
-                out.push(y[off..off + n].to_vec());
-                off += n;
+            // One call per residency format: a single f32 resident in the group
+            // would otherwise drop every expert in the call off the int4 fast
+            // paths. A homogeneous group still makes exactly one call.
+            let fmt: Vec<bool> =
+                jobs.iter().map(|(e, _)| self.precision.get(&(layer, *e)).copied().unwrap_or(self.int4)).collect();
+            let classes = super::partition_by_format(&fmt);
+
+            let mut per_class = Vec::with_capacity(classes.len());
+            for idxs in &classes {
+                let mut refs = Vec::with_capacity(idxs.len());
+                let mut rows = Vec::with_capacity(idxs.len());
+                let mut x = Vec::new();
+                for &i in idxs {
+                    let (e, xg) = &jobs[i];
+                    let ge = self
+                        .experts
+                        .get(&(layer, *e))
+                        .ok_or_else(|| Error::Format(format!("gpu expert ({layer},{e}) not resident")))?;
+                    refs.push(ge);
+                    rows.push((xg.len() / hidden) as i32);
+                    x.extend_from_slice(xg);
+                }
+                let y = peregrine_cuda::expert_group(&refs, &rows, &x, hidden)?;
+                let mut outs = Vec::with_capacity(idxs.len());
+                let mut off = 0usize;
+                for &r in &rows {
+                    let n = r as usize * hidden;
+                    let end = off.checked_add(n).filter(|&e| e <= y.len()).ok_or_else(|| {
+                        Error::Format("gpu compute: expert_group returned a short buffer".into())
+                    })?;
+                    outs.push(y[off..end].to_vec());
+                    off = end;
+                }
+                per_class.push(outs);
             }
-            Ok(out)
+            // Back to job order: `concurrent.rs` zips the returned Vec positionally
+            // against its plans, and the reduce accumulates in that order — so the
+            // permutation must not escape this function.
+            super::scatter_by_index(jobs.len(), &classes, per_class)
+                .ok_or_else(|| Error::Format("gpu compute: format partition is not a bijection".into()))
         }
     }
 
+    /// One residency generation: the experts to hold, plus each one's format
+    /// (`true` = int4). Produced together because the format decides the byte
+    /// cost, which decides how many fit.
+    type ResidencyGeneration = (Vec<(usize, usize)>, HashMap<(usize, usize), bool>);
+
+    /// Live `GpuTier`s in this process. `peregrine_cuda::shutdown()` is global —
+    /// it loops every device context — so a tier that called it from its own
+    /// `Drop` would tear down the CUDA state its siblings are still using, and
+    /// their `GpuExpert` handles would then free against destroyed contexts. Only
+    /// the last tier out shuts the backend down.
+    static LIVE_TIERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     impl Drop for GpuTier {
         fn drop(&mut self) {
-            // GpuExpert handles free themselves; release the device contexts too.
+            // GpuExpert handles free themselves; the contexts outlive them unless
+            // this is the last tier in the process.
             self.experts.clear();
-            peregrine_cuda::shutdown();
+            if LIVE_TIERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                peregrine_cuda::shutdown();
+            }
         }
     }
 }
@@ -829,7 +1337,12 @@ mod stub {
     }
 
     impl GpuTier {
-        pub fn build(_st: &SafeTensors, _cfg: &Cfg, _headroom_bytes: usize) -> Result<Option<GpuTier>, Error> {
+        pub fn build(
+            _st: &SafeTensors,
+            _cfg: &Cfg,
+            _headroom_bytes: usize,
+            _counts: &[u32],
+        ) -> Result<Option<GpuTier>, Error> {
             Ok(None)
         }
         pub fn has(&self, _layer: usize, _e: usize) -> bool {

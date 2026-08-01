@@ -53,7 +53,7 @@ pub fn moe_forward(
 ) -> Vec<f32> {
     let MoeCfg { s_n, hidden, k, norm_topk, routed_scale } = cfg;
     let e_n = experts.len();
-    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk, routed_scale });
+    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk, routed_scale, min_share: crate::router::route_min_share() });
     let mut out = vec![0f32; s_n * hidden];
 
     // Gather each routed expert's positions (+ gate weights) in batch-union order.
@@ -181,7 +181,7 @@ mod tests {
         let out = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), MoeCfg { s_n, hidden, k, norm_topk: true, routed_scale: 2.5 });
 
         // Reference: identical routing (f32 router), f32 expert compute.
-        let r = route(&x, &router_w, &router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: true, routed_scale: 2.5 });
+        let r = route(&x, &router_w, &router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: true, routed_scale: 2.5, min_share: 0.0 });
         let mut refout = vec![0f32; s_n * hidden];
         for s in 0..s_n {
             for kk in 0..k {
@@ -219,7 +219,7 @@ mod tests {
         let par = moe_forward(&x, &router_w, &router_bias, &experts, Some(&shared), MoeCfg { s_n, hidden, k, norm_topk: true, routed_scale: 2.5 });
 
         // serial oracle: gather → swiglu → scatter, in batch-union order
-        let r = route(&x, &router_w, &router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: true, routed_scale: 2.5 });
+        let r = route(&x, &router_w, &router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: true, routed_scale: 2.5, min_share: 0.0 });
         let mut ser = vec![0f32; s_n * hidden];
         for &e in batch_union(&r, s_n).iter() {
             let e = e as usize;

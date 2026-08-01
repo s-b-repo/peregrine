@@ -182,7 +182,7 @@ pub fn moe_streamed(
 ) -> Result<Vec<f32>, Error> {
     let MoeCfg { s_n, hidden, k: topk, norm_topk, routed_scale } = cfg;
     let e_n = experts.len();
-    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k: topk, norm_topk, routed_scale });
+    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k: topk, norm_topk, routed_scale, min_share: 0.0 });
     let uniq = batch_union(&r, s_n);
 
     // partition the batch-union by residency

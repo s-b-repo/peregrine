@@ -230,6 +230,14 @@ pub enum Placement {
     /// Prefer the GPU lane (already resident, no upload needed).
     Gpu,
     /// Prefer the GPU lane with an on-demand upload for this forward (spill).
+    ///
+    /// **Currently advisory only — the scheduler treats this as [`Self::Cpu`].**
+    /// Acting on it means uploading a non-resident expert mid-forward, which
+    /// needs `&mut GpuTier` during the forward (the tier is shared `&` across the
+    /// lane threads) and pushes ~19–151 MB across PCIe per spill, so it belongs
+    /// behind the `COLI_PCIE_BUDGET_MB` budget. Kept as a distinct variant, and
+    /// matched exhaustively at the call site, so wiring a real spill is a compile
+    /// error to ignore rather than a silent fall-through.
     GpuSpill,
 }
 
@@ -250,8 +258,14 @@ impl LaneBalancer {
     }
 
     /// Decide where to compute `expert` given whether it is GPU-resident and its
-    /// routing heat. Correctness-neutral: the numerics on either lane are already
-    /// bit-identical; only *where* the compute lands changes.
+    /// routing heat.
+    ///
+    /// Output-affecting, not correctness-neutral: a GPU-resident expert computes
+    /// in f32 while the CPU lane computes int4, so moving an expert between lanes
+    /// shifts low-order bits (see the numerics note in [`crate::gpu`]). The result
+    /// stays deterministic because the placement is a function of the residency
+    /// set and the heat table, and the reduce is position-keyed — but it is not
+    /// bit-identical to a different placement.
     pub fn choose(&self, gpu_resident: bool, heat: u32) -> Placement {
         match self.bias {
             Bias::TowardCpu if !gpu_resident && heat >= self.spill_threshold => Placement::GpuSpill,
@@ -322,6 +336,10 @@ mod tests {
     #[test]
     fn balancer_upgrades_hot_expert_when_cpu_bound() {
         let b = LaneBalancer::new(Bias::TowardCpu, 10);
+        // The policy still *recommends* a spill for a hot non-resident expert.
+        // Note the scheduler currently resolves this to the CPU lane — there is no
+        // mid-forward upload path — so this asserts the recommendation, not an
+        // observable placement. See `Placement::GpuSpill`.
         assert_eq!(b.choose(false, 20), Placement::GpuSpill);
         assert_eq!(b.choose(false, 5), Placement::Cpu, "cold expert stays on CPU");
         assert_eq!(b.choose(true, 20), Placement::Gpu, "already-resident just runs on GPU");
