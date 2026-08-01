@@ -1,0 +1,3 @@
+peregrine: O_DIRECT streaming enabled
+peregrine bench: loaded 78 layers, vocab 154880, in 10.7s
+    [ecache] disk_reads this batch: 1800

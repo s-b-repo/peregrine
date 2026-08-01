@@ -63,5 +63,14 @@ env configurations, and threats to validity.
 
 **Caveat:** the study's measurements predate the adaptive-runtime and
 completion sweeps — every knob those added is env-gated and bit-identical
-when off, so the numbers stand as the baseline; re-running with the knobs
-live is the next benchmarking pass.
+when off, so the numbers stand as the baseline. That re-run has now happened:
+[**Benchmark pass 2026-08-01**](benchmark-2026-08-01.md) measures the knobs
+live (no measurable throughput gain) and reports the first CUDA-lane numbers
+(1.09× at B=16).
+
+**Harness caveat:** a single `bench 1 4 16` invocation runs every batch point
+in one process, and the later points inherit the earlier ones' allocator and
+cache state — baseline B=16 measures 0.143 tok/s in-sweep vs 0.224 isolated.
+Use it to observe batch scaling *within* one configuration; to compare
+configurations against each other, run one batch size per fresh process (see
+the 2026-08-01 pass for a runner that does).
