@@ -1,0 +1,30 @@
+== arm baseline: target/release/peregrine  batches=[1 4 16] steps=3
+   rc=0
+  batch   steps   tokens    seconds     agg tok/s   per-seq tok/s
+      1       3        3      66.47         0.045          0.0451
+      4       3       12     136.86         0.088          0.0219
+     16       3       48     334.73         0.143          0.0090
+   wall_s 561.14
+   peak_rss_gb 17.43
+   major_faults 0
+
+== arm improved: target/release/peregrine  batches=[1 4 16] steps=3
+   rc=0
+  batch   steps   tokens    seconds     agg tok/s   per-seq tok/s
+      1       3        3     108.68         0.028          0.0276
+      4       3       12     106.90         0.112          0.0281
+     16       3       48     232.24         0.207          0.0129
+   wall_s 474.12
+   peak_rss_gb 17.11
+   major_faults 1
+
+== arm gpu: target/cuda/release/peregrine  batches=[1 4 16] steps=3
+   rc=0
+  batch   steps   tokens    seconds     agg tok/s   per-seq tok/s
+      1       3        3      52.52         0.057          0.0571
+      4       3       12      95.53         0.126          0.0314
+     16       3       48     204.24         0.235          0.0147
+   wall_s 375.93
+   peak_rss_gb 16.82
+   major_faults 509
+
