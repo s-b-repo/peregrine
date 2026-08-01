@@ -1,0 +1,5 @@
+peregrine: O_DIRECT streaming enabled
+[CUDA] device 0: NVIDIA GeForce RTX 3060, 12.5 GB VRAM, sm_86
+peregrine: GPU tier holds 62 experts in VRAM
+peregrine bench: loaded 78 layers, vocab 154880, in 18.3s
+    [ecache] disk_reads this batch: 7867
