@@ -21,3 +21,15 @@ flamegraph.svg
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Ad-hoc benchmark working dirs (curated results live in bench-data/)
+/bench-results/
+/b1-isolate/
+/b16-repeat/
+/bench-results.log
+/b1-isolate.log
+/b16-repeat.log
+
+# Python bytecode (scripts/ carries runstat.py + audit-reachability.py)
+__pycache__/
+*.pyc

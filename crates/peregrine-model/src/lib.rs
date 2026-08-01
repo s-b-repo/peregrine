@@ -49,7 +49,7 @@ pub use wmma_tune::{KernelShape, TileConfig, WmmaTuner};
 pub use workload::{classify_str, PhaseTracker, TokenClass};
 pub use predict::{Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 pub use mtp::speculative_sample;
-pub use router::{batch_union, route, Routed, RouterCfg};
+pub use router::{batch_union, gate_share_below, gate_stats_snapshot, route, Routed, RouterCfg};
 pub use sample::{argmax, pick_batch_greedy, Sampler};
 pub use weight::{QtWeight, QuantFmt};
 

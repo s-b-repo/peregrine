@@ -274,6 +274,44 @@ fn serve(model: &mut Model) -> Result<(), Error> {
                         let fadv = model.ecache_fadvise_hints().unwrap_or(0);
                         let vm = model.ecache_verify_mismatch().unwrap_or(0);
                         eprintln!("[prefetch] used={used} wasted={wasted} accuracy={acc:.1}% fadvise={fadv} verify_mismatch={vm}");
+                        // Compression only reports when COLI_CACHE_COMPRESS is on.
+                        // Printing the achieved ratio keeps the feature honest: the
+                        // payload is packed int4 nibbles, so ~1.2x is the ceiling and
+                        // a value near 1.0 means every hit pays a decode for nothing.
+                        if let Some(r) = model.ecache_compression_ratio() {
+                            eprintln!("[ecache-compress] ratio={r:.2}x");
+                        }
+                    }
+                    // GPU expert-lane transfer counters. Silent when the lane never
+                    // ran (no CUDA build, or COLI_GPU unset), so a CPU-only run is
+                    // unchanged. `transfer_frac` needs COLI_CUDA_PROFILE; when it is
+                    // high the lane is PCIe-bound and COLI_PCIE_BUDGET_MB is the knob.
+                    // Routing gate mass (COLI_GATE_STATS=1). Each routed expert costs a
+                    // full weight read regardless of its gate weight, so the share
+                    // below each threshold is the share of the disk budget that
+                    // bought almost nothing. Silent unless asked.
+                    if let Some((below, total)) = peregrine_model::gate_stats_snapshot() {
+                        let pct = |n: u64| 100.0 * n as f64 / total as f64;
+                        eprintln!(
+                            "[gate] routed={total} below_0.5%={:.1}% below_1%={:.1}% below_2%={:.1}% below_5%={:.1}%",
+                            pct(below[0]),
+                            pct(below[1]),
+                            pct(below[2]),
+                            pct(below[3])
+                        );
+                    }
+                    let g = model.telemetry().gpu;
+                    if g.calls > 0 {
+                        match g.transfer_fraction() {
+                            Some(f) => eprintln!(
+                                "[gpu] calls={} experts={} rows={} h2d={:.1}ms kernel={:.1}ms d2h={:.1}ms transfer_frac={:.0}%",
+                                g.calls, g.experts, g.rows, g.h2d_ms, g.kernel_ms, g.d2h_ms, 100.0 * f
+                            ),
+                            None => eprintln!(
+                                "[gpu] calls={} experts={} rows={} (set COLI_CUDA_PROFILE=1 for transfer timings)",
+                                g.calls, g.experts, g.rows
+                            ),
+                        }
                     }
                 }
                 Ok(_) => {}

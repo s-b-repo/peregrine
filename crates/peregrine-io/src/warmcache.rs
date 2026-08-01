@@ -267,6 +267,25 @@ impl WarmCache {
         self
     }
 
+    /// The compression ratio actually achieved across every admission so far
+    /// (uncompressed ÷ admitted), or `None` when nothing has been admitted with
+    /// compression enabled.
+    ///
+    /// Worth reporting rather than assuming: the payload is packed int4 nibbles,
+    /// whose only compressible structure is nibble-value skew, so the realistic
+    /// ratio is ~1.2x. A value near 1.0 means compression is paying a decode on
+    /// every hit to save nothing, and `COLI_CACHE_COMPRESS` should be turned off
+    /// for that checkpoint.
+    pub fn compression_ratio(&self) -> Option<f64> {
+        // Both counters are bumped on every admission, compressed or not, so with
+        // the feature off they are equal and the ratio is a meaningless 1.00x.
+        // Report nothing rather than a number that looks like a measurement.
+        if !self.compress_on_admit || self.compressed_bytes_seen == 0 || self.uncompressed_bytes_seen == 0 {
+            return None;
+        }
+        Some(self.uncompressed_bytes_seen as f64 / self.compressed_bytes_seen as f64)
+    }
+
     /// Compress the coldest still-raw slot in place, freeing the byte
     /// difference from the budget accounting. Designed for idle ticks — the
     /// engine calls this between forwards when no requests are pending, so a
@@ -642,6 +661,11 @@ mod tests {
     /// A slab whose bytes are deterministic and non-uniform, so zstd actually
     /// finds redundancy (all-zero payloads compress to ~4 bytes each and don't
     /// stress the round-trip machinery interestingly).
+    ///
+    /// Deliberately NOT representative of a real payload: these periodic ramps
+    /// compress ~1900x better than the packed int4 nibbles a real expert holds
+    /// (~1.2x — see `peregrine_core::compress` tests). Tests over this fixture
+    /// may only assert *that* compression round-trips, never how much it saves.
     fn patterned_slab(w: usize, s: usize) -> ExpertSlab {
         let mkw: Vec<u8> = (0..w).map(|k| (k % 251) as u8).collect();
         let mks: Vec<u8> = (0..s).map(|k| (k.wrapping_add(17) % 253) as u8).collect();
@@ -757,13 +781,29 @@ mod tests {
             assert_eq!(&w[..], &expected_bytes[i].0[..], "region {i} weight bytes");
             assert_eq!(&s[..], &expected_bytes[i].1[..], "region {i} scale bytes");
         }
-        // Resident footprint should be smaller than the raw slab (4096+128)*3.
-        assert!(
-            c.compressed_bytes_seen < c.uncompressed_bytes_seen,
-            "compression must shrink the footprint: uncompressed={} compressed={}",
-            c.uncompressed_bytes_seen,
-            c.compressed_bytes_seen
-        );
+        // Both counters must have moved, so `compression_ratio()` has something to
+        // report. Deliberately NOT asserting how much was saved: this fixture is a
+        // periodic ramp, and any magnitude measured on it says nothing about the
+        // real payload (see `patterned_slab`). The honest figure is pinned by
+        // `peregrine_core::compress`'s `quantized_nibbles_compress_by_entropy_only`.
+        assert!(c.uncompressed_bytes_seen > 0, "raw footprint must be counted");
+        assert!(c.compressed_bytes_seen > 0, "admitted footprint must be counted");
+        assert!(c.compression_ratio().is_some(), "ratio must be reportable after a compressed admit");
+    }
+
+    #[test]
+    fn compression_ratio_is_none_until_a_compressed_admit_lands() {
+        // Nothing admitted yet.
+        let mut c = WarmCache::new(1 << 20).with_compression(true);
+        assert!(c.compression_ratio().is_none(), "no admissions yet");
+        // Compression off: the counters stay untouched, so there is no ratio to
+        // report rather than a misleading 1.00x.
+        let mut off = WarmCache::new(1 << 20).with_compression(false);
+        off.insert((0, 1), patterned_slab(4096, 128));
+        assert!(off.compression_ratio().is_none(), "compression disabled reports nothing");
+        // Compression on: a ratio becomes available.
+        c.insert((0, 1), patterned_slab(4096, 128));
+        assert!(c.compression_ratio().is_some_and(|r| r > 1.0), "compressed admit reports a ratio");
     }
 
     #[test]

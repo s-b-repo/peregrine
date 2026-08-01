@@ -228,6 +228,22 @@ impl SeqKv {
             k.truncate(new_len);
         }
     }
+
+    /// Resident bytes across every layer — what a cache of these must budget by.
+    pub fn bytes(&self) -> usize {
+        self.layers.iter().map(|k| k.bytes()).sum()
+    }
+
+    /// A copy holding only the first `n` positions of every layer.
+    ///
+    /// This is what makes a prompt prefix shareable: two prompts agreeing on
+    /// their first `n` tokens produce identical KV for those positions, because
+    /// each position attends only its causal prefix. So a cached sequence can
+    /// seed any prompt it is a prefix of, and the result is the same as having
+    /// prefilled those tokens directly.
+    pub fn clone_prefix(&self, n: usize) -> SeqKv {
+        SeqKv { layers: self.layers.iter().map(|k| k.clone_prefix(n)).collect() }
+    }
 }
 
 /// `MemAvailable` from `/proc/meminfo`, in bytes (0 if unreadable).
@@ -592,6 +608,48 @@ pub fn save_macrostates(table: &crate::predict::MacroTable, path: &std::path::Pa
 /// neutral (heat and route history only affect prefetch/eviction, not output).
 fn route_stats_persist_enabled() -> bool {
     !matches!(std::env::var("COLI_ROUTE_STATS_PERSIST").as_deref(), Ok("0") | Ok("false"))
+}
+
+/// Read just the heat snapshot out of `<dir>/route_stats.json`, before a
+/// [`Model`] exists.
+///
+/// Initial VRAM residency is a knapsack over routing heat, but the heat table is
+/// only restored (in `try_load_route_stats`) well after the tier is built — and
+/// it is itself only created when a tier exists. That circularity is why initial
+/// placement had no heat to rank by. Peeking the file first breaks it: last
+/// session's routing decides what lands in VRAM this session, and `reheat` then
+/// refines it live.
+///
+/// Returns an empty vec whenever anything is off — persistence disabled, no
+/// file, unparseable, or a config fingerprint mismatch — which
+/// [`gpu::solve_residency_sized`] treats as a cold table and answers with the
+/// deterministic round-robin placement. Correctness-neutral either way.
+fn peek_persisted_heat(dir: &std::path::Path, cfg: &Cfg) -> Vec<u32> {
+    if !route_stats_persist_enabled() {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(dir.join("route_stats.json")) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    // Same fingerprint gate as `try_load_route_stats`: heat is a flat
+    // `[layer * n_experts + expert]` array, so restoring it under a different
+    // expert count maps every count onto the wrong pair.
+    if v.get("tag").and_then(|t| t.as_str()) != Some(config_tag(cfg).as_str()) {
+        return Vec::new();
+    }
+    let Some(arr) = v.get("heat").and_then(|h| h.as_array()) else {
+        return Vec::new();
+    };
+    let snap: Vec<u32> = arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
+    // A short/long array would silently misalign layers; take it only at the
+    // exact expected shape.
+    if snap.len() != (cfg.n_layers as usize) * (cfg.n_experts as usize) {
+        return Vec::new();
+    }
+    snap
 }
 
 /// Entropy-adaptive prefetch breadth: when on (`COLI_ENTROPY_ADAPT=1`),
@@ -1233,9 +1291,13 @@ impl Model {
         // Optional GPU VRAM tier (opt-in via COLI_GPU): dequantize as many experts
         // as fit to f32 and upload. Reserve 2 GB headroom for activations/context.
         let gpu = if std::env::var("COLI_GPU").is_ok() {
-            let tier = GpuTier::build(&st, &cfg, 2 * 1024 * 1024 * 1024)?;
+            // Last session's routing heat, if any, so the residency knapsack has
+            // something to rank by (empty → deterministic round-robin placement).
+            let warm_heat = peek_persisted_heat(dir, &cfg);
+            let tier = GpuTier::build(&st, &cfg, 2 * 1024 * 1024 * 1024, &warm_heat)?;
             if let Some(t) = &tier {
-                eprintln!("peregrine: GPU tier holds {} experts in VRAM", t.len());
+                let src = if warm_heat.is_empty() { "cold" } else { "heat-ranked" };
+                eprintln!("peregrine: GPU tier holds {} experts in VRAM ({src})", t.len());
             }
             tier
         } else {
@@ -1560,6 +1622,14 @@ impl Model {
     /// correct system; nonzero signals an I/O bug).
     pub fn ecache_verify_mismatch(&self) -> Option<u64> {
         self.ecache.as_ref().map(|c| c.lock().verify_mismatch)
+    }
+
+    /// The warm cache's achieved compression ratio (uncompressed ÷ admitted).
+    /// `None` without a cache or when `COLI_CACHE_COMPRESS` is off. Around 1.2x
+    /// is the expected figure for packed int4 experts; near 1.0 means the decode
+    /// on every hit is buying nothing.
+    pub fn ecache_compression_ratio(&self) -> Option<f64> {
+        self.ecache.as_ref().and_then(|c| c.lock().compression_ratio())
     }
 
     /// Prefetch accuracy = `used / (used + wasted)` — the share of speculative reads
@@ -2654,6 +2724,29 @@ impl Model {
         Ok(out)
     }
 
+    /// Fraction of teacher-forcing positions where two runs predict a different
+    /// token — `0.0` means the runs agree everywhere. `None` on a length mismatch
+    /// or an empty comparison, so "no data" cannot read as "no change".
+    ///
+    /// The repo's quality gates are all bit-identity anchors
+    /// (`docs/testing-and-quality.md`), which is right for lossless work but leaves
+    /// nothing to gate an *approximation* with: a lossy change fails an
+    /// `assert_eq!` by construction, so there is no way to say how much it cost.
+    /// This is that missing gate in its simplest honest form — turn the
+    /// `assert_eq!` in `peregrine-tools/tests/apply_layout.rs` into a bounded flip
+    /// rate and any future approximation becomes measurable.
+    ///
+    /// Top-1 agreement only. [`Self::teacher_forcing`] returns argmax ids, so a
+    /// distributional metric (NLL, KL) needs per-position logit capture first —
+    /// deliberately not added here, since nothing consumes it yet.
+    pub fn prediction_flip_rate(a: &[i32], b: &[i32]) -> Option<f64> {
+        if a.len() != b.len() || a.is_empty() {
+            return None;
+        }
+        let flips = a.iter().zip(b).filter(|(x, y)| x != y).count();
+        Some(flips as f64 / a.len() as f64)
+    }
+
     /// Teacher-forcing predictions: greedy argmax at each position of a single
     /// full forward over `tokens`. The shape the oracle gate compares against.
     pub fn teacher_forcing(&mut self, tokens: &[i32]) -> Result<Vec<i32>, Error> {
@@ -3339,6 +3432,33 @@ mod tests {
         let (used, _) = m.ecache_prefetch_effectiveness().ok_or_else(|| Error::Format("no ecache".into()))?;
         assert!(used > 0, "accuracy counters must populate (used={used})");
         assert!(m.prefetch_accuracy().unwrap_or(-1.0) >= 0.0, "accuracy is well-defined");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn flip_rate_measures_disagreement_and_refuses_to_guess() {
+        // Identical runs: the answer a lossless change must produce.
+        assert_eq!(Model::prediction_flip_rate(&[1, 2, 3, 4], &[1, 2, 3, 4]), Some(0.0));
+        // One position in four moved.
+        assert_eq!(Model::prediction_flip_rate(&[1, 2, 3, 4], &[1, 2, 9, 4]), Some(0.25));
+        assert_eq!(Model::prediction_flip_rate(&[1], &[2]), Some(1.0));
+        // No data is not the same as no change — both must be `None` rather than
+        // a tempting 0.0 that would silently pass a gate.
+        assert_eq!(Model::prediction_flip_rate(&[], &[]), None);
+        assert_eq!(Model::prediction_flip_rate(&[1, 2], &[1]), None);
+    }
+
+    #[test]
+    fn flip_rate_is_zero_between_two_identical_forwards() -> Result<(), peregrine_core::Error> {
+        // End-to-end sanity: the harness reports agreement on a real (tiny) model,
+        // so a nonzero rate later means the change under test, not the harness.
+        let dir = tmp_model_dir("fliprate")?;
+        let mut m = Model::load(&dir)?;
+        let toks: Vec<i32> = (0..12).map(|k| (k * 5 + 1) % 32).collect();
+        let a = m.teacher_forcing(&toks)?;
+        let b = m.teacher_forcing(&toks)?;
+        assert_eq!(Model::prediction_flip_rate(&a, &b), Some(0.0), "a model must agree with itself");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

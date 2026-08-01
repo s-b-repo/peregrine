@@ -484,7 +484,7 @@ pub fn moe_forward_concurrent(
     }
     let hidden = cfg.hidden as usize;
     let (e_n, mi, k) = (cfg.n_experts as usize, cfg.moe_inter as usize, cfg.topk as usize);
-    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale });
+    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale, min_share: crate::router::route_min_share() });
 
     // Partition the batch-union into GPU-resident (compute on device) and disk
     // (stream + CPU) experts, assigning each a global `pos` in batch-union order
@@ -538,7 +538,14 @@ pub fn moe_forward_concurrent(
         let route_to_gpu = match (ctx.balancer, ctx.heat_counts) {
             (Some(bal), Some(counts)) => {
                 let heat = counts.get(layer * n_experts_layer + e).copied().unwrap_or(0);
-                matches!(bal.choose(gpu_resident, heat), crate::lane::Placement::Gpu)
+                // Exhaustive on purpose: `GpuSpill` would need a mid-forward
+                // upload path that does not exist, so it resolves to the CPU
+                // lane. Spelling it out means adding a real spill is a compile
+                // error here rather than a verdict that silently does nothing.
+                match bal.choose(gpu_resident, heat) {
+                    crate::lane::Placement::Gpu => true,
+                    crate::lane::Placement::Cpu | crate::lane::Placement::GpuSpill => false,
+                }
             }
             _ => gpu_resident,
         };

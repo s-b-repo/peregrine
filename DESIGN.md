@@ -174,7 +174,7 @@ correctness-neutral (only latency and residency change, never the reduced values
 - **Warm cache extras** — 2048-bit Bloom over resident keys short-circuits `WarmCache::get`'s
   miss path; a negative-TTL pass (`COLI_CACHE_NEGATIVE_TTL`) evicts unhit slots early; transparent
   zstd (`COLI_CACHE_COMPRESS`, `SlotBytes::Compressed { six, orig_lens }`) shrinks resident bytes
-  by ~2-3× at the cost of one decode per hit. Two admission/maintenance companions: a
+  by ~1.2× at the cost of one decode per hit. Two admission/maintenance companions: a
   **heat-threshold admission gate** (`COLI_CACHE_ADMIT_MIN_HEAT` — an expert is cached only once
   its routing heat reaches N, filtering one-off experts; heat is bumped post-reduce so N=1 means
   "cache from the second routing on"), and **idle-tick background recompression**

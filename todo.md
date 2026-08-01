@@ -17,24 +17,48 @@ concurrent CPU/GPU/SSD scheduler + `io_uring`.
 
 | Scope | ✅ Done | 🟡 Partial | ⬜ Not started | Total | Completion |
 |---|---:|---:|---:|---:|---:|
-| **Full roadmap** | 83 | 2 | 10 | 95 | **~87% strict · ~88% weighted** |
+| **Full roadmap** | 89 | 6 | 13 | 108 | **~82% strict · ~85% weighted** |
 | **Priority shortlist** | 15 | 1 | 3 | 19 | **~79% strict · ~82% weighted** |
 
 *Strict = Done ÷ Total. Weighted = (Done + ½·Partial) ÷ Total. "Fast matrix multiplication" is excluded.
-Total is 95: the 93 source items plus 2 shipped extras tracked in §6 (adaptive prefill/decode window,
-telemetry feedback loop). Counts are generated from the checkboxes below — recount with
+Total is 108: the 93 source items, 2 shipped extras tracked in §6 (adaptive prefill/decode window,
+telemetry feedback loop), 2 VRAM-residency fixes in §3, 1 open dispatch item in §2, and the 10 items
+of §12-§13 — an axis the original 11 sections had no category for (attention/serving memory, and
+reading fewer experts rather than reading them faster). Adding them *lowers* the percentage, which is
+the honest reading: the roadmap was ~89% done against a scope that excluded them. Counts are generated from the checkboxes below — recount with
 `awk '/^## 1\./,/^## ❄️/' todo.md | grep -c '^- \[x\]'`.*
 
-**Per-section:** Prefetch **9/9 ✅** · GPU 4/8 · Caching **10/10 ✅** · I/O 10/11 · Memory/NUMA
-**5/5 ✅** · Scheduling 15/18 · Disk-layout **10/10 ✅** · Workload **5/5 ✅** · Compilation
-**5/5 ✅** · Self-optimizing **10/10 ✅** · Multi-GPU 0/4.
+**Per-section:** Prefetch **9/9 ✅** · GPU 5/9 · Caching **12/12 ✅** · I/O 9/11 · Memory/NUMA
+**4/5** · Scheduling 16/18 · Disk-layout **10/10 ✅** · Workload **5/5 ✅** · Compilation
+**5/5 ✅** · Self-optimizing 9/10 · Multi-GPU 0/4 · Attention/serving 2/5 · Workload-reduction 3/5.
 
-**Every remaining open item is hardware-gated** (user decision to skip): §2 persistent CUDA kernels,
-CUDA-graph decode wiring 🟡, GPU-side fused reduce 🟡, GPU defrag pool; §4 GPUDirect Storage; §6
-CPU/GPU split GEMM, idle-cycle GPU compute, PCIe bandwidth scheduler; §11 multi-GPU ×3 + distributed
-hosts. All need `nvcc` + NVIDIA hardware (or ≥ 2 GPUs / GDS drivers / multiple machines) to build
-and verify. Training-loop and research-scale items were completed in their user-approved pragmatic
-forms, marked **pragmatic** inline.
+**The 19 open items fall into three groups**, and only the first is blocked by this workspace:
+
+1. **Needs hardware (10).** §2 persistent CUDA kernels, CUDA-graph decode wiring 🟡, GPU-side fused
+   reduce 🟡, GPU defrag pool; §4 GPUDirect Storage; §6 idle-cycle GPU compute; §11 multi-GPU ×3 +
+   distributed hosts. All need `nvcc` + NVIDIA hardware (or ≥ 2 GPUs / GDS drivers / multiple
+   machines) to build and verify. Note `build.rs` *succeeds* when `nvcc` is absent, so a `.cu` edit
+   here is never even syntax-checked — writing one blind is the worst-value work on this list.
+2. **Open by choice (1).** §6 CPU/GPU split GEMM. The plumbing is small (row sets are disjoint, so
+   the `pos`-keyed reduce order is untouched), but the CPU half computes int4 and the GPU half f32,
+   and a split point taken from the bubble tuner's wall-clock EWMA would make low-order output bits a
+   function of machine timing — the same prompt giving different logits run to run. Today's
+   divergence is at expert granularity and deterministic given the residency set; this would be
+   strictly worse. It also *adds* a streamed disk read, since the CPU half needs whole weight
+   matrices. Reopen only with a timing-independent split policy and an explicitly downgraded guarantee.
+3. **Pure CPU work, nothing blocking but effort (8).** §12 fuse prefill into the decode batch, KV
+   quantization, paged/block-pooled KV; §13 int2 checkpoint conversion 🟡, heat-tiered on-disk
+   precision. These need no hardware at all — they are open because each is a substantial change to a
+   core invariant (the batched one-token-per-sequence API, the `pos == len` append contract, or a
+   requantizing converter this repo does not have), plus three features that ship tested
+   but unreachable and only need wiring: §4's registered-buffer read path, §1/§10's
+   `perf_event_open` counter, and §5's slab generation tagging — all found by the [R]
+   reachability pass (`docs/BAD_PATTERNS.md`). **This is where the remaining throughput is**,
+   and it is now measured rather than inferred: the [2026-08-01 pass](docs/benchmark-2026-08-01.md)
+   put nine §1–§11 knobs together at **1.004×** with byte-identical disk reads.
+
+Training-loop and research-scale items were completed in their user-approved pragmatic forms, marked
+**pragmatic** inline.
 
 **Headline:** the big **adaptive-runtime wave** landed this pass. The three lanes are now instrumented
 (`LaneTimings` + `BubbleTuner`) and the placement decision they drive (`LaneBalancer`) is live; the
@@ -59,7 +83,27 @@ co-activation-driven expert fusion + hypergraph scheduling, macro-state routing 
 `galactic` one-shot preprocessing pass, Hilbert / 2-opt / tier-placement layout methods, physical
 checkpoint self-rewrite (`--apply`), online bandit + Q-learning schedulers, per-shape dispatch
 specialization, kblock tensor-layout auto-conversion, and the `compile-plan` profile-guided
-execution plan. Only hardware-gated work remains (see the dashboard note). Beyond the roadmap, the serve layer gained the **vendored gigatoken BPE tokenizer** (`peregrine-token`, MIT, stable-toolchain subset) as its sole runtime tokenizer — parity-gated id-for-id against the HF `tokenizers` test oracle, 34× measured locally.
+execution plan. Beyond the roadmap, the serve layer gained the **vendored gigatoken BPE tokenizer** (`peregrine-token`, MIT, stable-toolchain subset) as its sole runtime tokenizer — parity-gated id-for-id against the HF `tokenizers` test oracle, 34× measured locally.
+
+**Since then, three further waves.** A **VRAM-residency pass** fixed defects the roadmap's own
+bookkeeping had hidden: the heat/bytes residency knapsack was ✅ and documented as live while having
+*zero production callers* (initial placement was round-robin by index); promoting residents to f32
+collapsed the resident set ~3× because the count and the promoted fraction were sized independently;
+one non-per-row-int4 expert truncated the whole tier; and an f32-fallback expert was re-uploaded on
+every reheat generation forever. It also shipped format-split expert dispatch and a PCIe upload budget.
+
+Then an **attention/serving pass** opened §12–§13 — an axis the original eleven sections had no
+category for. `docs/benchmarks.md` measures cross-token expert locality at **0.6%**, which is why
+caching and prefetch plateau: the remaining wins are not in moving 11.3 GB/token faster but in moving
+less of it. Landed: **adaptive prefill chunking** (a fixed 64-token chunk made prefill *quadratic* —
+an 8192-token prompt re-derived ~524k KV rows instead of 8192, per layer, across 78 layers), a
+**cross-request KV prefix cache** (a shared system prompt was prefilled once per request), **adaptive
+top-k**, and the **first int2 producer** for a format that had been consumable-but-unwritable since M1.
+
+Two measurement tools shipped alongside, because the remaining levers are lossy and the suite is built
+entirely on bit-identity anchors — which a lossy change fails by construction, leaving no way to say
+what it cost. `COLI_GATE_STATS` tallies how much of the routed set carries a negligible gate share;
+`Model::prediction_flip_rate` is the first non-equality quality gate in the repo.
 
 ---
 
@@ -99,7 +143,7 @@ Highest expected throughput per unit effort. **15 done, 1 partial, 3 to go.**
 - [ ] ⬜ **GPUDirect Storage** — no direct SSD→VRAM path _(needs GDS driver stack)_
 - [x] ✅ **Dynamic prefetch distance tuning** — `PrefetchTuner` EWMA over used/wasted adapts warm breadth
 - [x] ✅ **Learned cache admission & eviction** — predictive protected-set eviction (predictor + heat → cache priority); pragmatic (heuristic, not a trained model)
-- [x] ✅ **Hardware-counter-driven scheduler feedback** — real `perf_event_open` LLC-miss counter (`PerfCounter::open_cache_misses`, hand-declared VER0 attr layout), thread-following, `read()`/`reset()`; opened via `telemetry::open_l3_miss_counter` under `COLI_PERF_COUNTERS=1` `peregrine-io/src/perf.rs`
+- [ ] 🟡 **Hardware-counter-driven scheduler feedback** — the counter itself is real and works: `PerfCounter::open_cache_misses` (`perf_event_open`, hand-declared VER0 attr layout, thread-following) with `read()`/`reset()`, and `telemetry::open_l3_miss_counter` gates it on `COLI_PERF_COUNTERS=1`. **But nothing calls the opener.** The documented consumer — "feed `PerfCounter::read` deltas into the prefetch tuner: rising misses → widen prefetch distance" — does not exist, so the knob does nothing. Found by the [R] reachability pass `perf.rs`, `telemetry.rs`
 - [x] ✅ **Offline checkpoint re-layout from routing traces** — `peregrine-layout-reorg` binary consumes `dump-routes` JSON and emits `schedule.json`; loader picks it up and orders `EPlan`s by the schedule `crates/peregrine-tools/src/reorg.rs`, `model.rs::load_layout_schedule`
 - [x] ✅ **Online kernel autotuning** — `WmmaTuner` records per-shape `(D, I, count, max_rows) → TileConfig` EWMAs and persists across sessions; picks the winning tile per shape `wmma_tune.rs` _(dispatch-side wiring in `backend_cuda.cu` is CUDA-only follow-up)_
 - [x] ✅ **Pipeline bubble detection & rebalancing** — `BubbleTuner` hysteresis (α = 0.3, dominance 1.5, k = 3 consecutive); consumed by the LaneBalancer `lane.rs::BubbleTuner`
@@ -130,33 +174,36 @@ pool (`COLI_PREFETCH_LANES`) — each concurrent stream predicts + prefetches fr
 **`PredictSource::PhaseAware`** — wraps any inner source and boosts newest-frame vote when Jaccard
 distance between the top two frames exceeds a basis-points threshold.
 
-## 2. GPU Execution — 5/8
+## 2. GPU Execution — 5/9
 
 - [ ] ⬜ Persistent CUDA kernels _(★★★★★ · Hard, CUDA-only)_ — kernels launched per-batch, no threadblock loop
 - [ ] 🟡 CUDA Graphs — capture/instantiate/launch implemented + tested, **not integrated into decode** (needs `forward_layer` moved onto the CUDA stream via existing `coli_cuda_pipe_*` primitives) `backend_cuda.cu:453-496` _(★★★★☆ · Medium, CUDA-only)_
 - [ ] 🟡 Fused MoE pipeline — `expert_group` fuses gate/up/silu/down on GPU; layer-level accumulation still separate/deterministic `backend_cuda.cu:626-752`
 - [x] ✅ Zero-copy GPU uploads via pinned memory `backend_cuda.cu:356-359,610-611` _(★★★☆☆ · Easy)_
 - [x] ✅ Persistent GPU memory pools — 24 pre-allocated scratch slots reused across layers `backend_cuda.cu:892-899`
+- [x] ✅ Format-split expert dispatch — `all_s4` is computed over the whole routed group (`backend_cuda.cu:638,645`), so **one** wider-precision resident dropped every expert in that `expert_group` call off the int4 Tensor-Core and packed-W4 fast paths. `GpuTier::compute` now issues one `expert_group` per residency format via the pure `partition_by_format` / `scatter_by_index` pair, restoring job order before returning so `concurrent.rs`'s positional zip and the `pos`-keyed reduce are untouched. Repeated calls per layer are safe: the kernel syncs before returning (`backend_cuda.cu:745-750`) and scratch is per-device grow-only (`:341-359`). Partition/scatter pure and unit-tested (round-trip is a bijection, malformed input errors rather than misaligning); the dispatch loop is type-checked under `--features cuda`. **Does not always reach Tensor Cores** — `:674` additionally gates TC on *every* job in the call clearing `tc_min` rows, a separate partition axis `gpu.rs` _(★★★☆☆ · Medium, CUDA-only)_
 - [ ] ⬜ GPU memory defragmentation during decode — residents fixed at startup; `cudaMallocAsync` pool is the planned fix (CUDA-only)
 - [x] ✅ Online kernel autotuning for GEMM tile sizes — `WmmaTuner` records per-shape kernel_ms and picks the best tile config, persists as `kernel_tuning.json`; the CUDA-side dispatch selector is a follow-up `wmma_tune.rs`
 - [x] ✅ Runtime SIMD kernel selection (CPU) — AVX2 vs AVX-VNNI chosen at runtime `idot.rs:40-61`
 
-## 3. Caching & VRAM Residency — 8/10
+## 3. Caching & VRAM Residency — 12/12 ✅
 
 - [x] ✅ Adaptive expert cache — LFRU (frequency dominates recency 256×), hysteresis to avoid ping-pong `tier.rs:18-56`, `gpu.rs:56-107` _(★★★★☆ · Medium)_
-- [x] ✅ Quantized RAM cache — warm cache holds quantized bytes verbatim; hits return a byte-identical `ExpertSlab`; **transparent zstd compression** on admit under `COLI_CACHE_COMPRESS` shrinks the resident footprint at the cost of one decode per hit `warmcache.rs`
+- [x] ✅ Quantized RAM cache — warm cache holds quantized bytes verbatim; hits return a byte-identical `ExpertSlab`; **transparent zstd compression** on admit under `COLI_CACHE_COMPRESS` shrinks the resident footprint **~1.2x** (measured — the payload is packed int4 nibbles whose only structure is nibble-value skew, so the entropy stage is the whole win and an LZ-only codec would score ~1.0x) at the cost of one decode per hit; `WarmCache::compression_ratio` reports the achieved figure at shutdown `warmcache.rs`
 - [x] ✅ Dynamic GPU residency — `reheat()` heat-ranked VRAM re-selection `gpu.rs:363-382` _(★★★★☆ · Hard)_
 - [x] ✅ Heat-wave scheduling — `PhaseTracker` (Jaccard EWMA) + `PredictSource::PhaseAware` blend a boost vote onto the newest frame during a shift `workload.rs`, `predict.rs`
 - [x] ✅ "Negative" caching — `COLI_CACHE_NEGATIVE_TTL` evicts unhit slots ahead of pure-LRU order (unprotected slots only, guarded by keep-at-least-one) `warmcache.rs::evict_to_budget`
-- [x] ✅ Persistent Expert Residency Solver — `gpu.rs::solve_residency_greedy` — heat / bytes-per-expert knapsack; deterministic ties; falls back to round-robin on a cold heat table `gpu.rs`
+- [x] ✅ Persistent Expert Residency Solver — `gpu.rs::solve_residency_sized` — heat / bytes-per-expert knapsack; deterministic ties; falls back to round-robin on a cold heat table. **Now actually wired**: `build_with` called round-robin `plan_residency` and the solver had zero production callers, so the item shipped ✅ while the feature was dead code. Initial placement is additionally seeded from the previous session's `route_stats.json` via `peek_persisted_heat` (the heat table is otherwise restored *after* the tier is built, so a warm start had no heat to rank by) `gpu.rs`, `model.rs`
 - [x] ✅ Cache admission from estimated future reuse — heat-threshold gate: a streamed expert is admitted only once its routing heat reaches `COLI_CACHE_ADMIT_MIN_HEAT` (default 0 = admit all; 1 = cache from the second routing on, filtering one-off experts) `concurrent.rs::cache_admit_min_heat`, `HeatTable::get`
 - [x] ✅ Learned cache admission & eviction — predictive protected-set eviction (predictor + heat → opaque cache priority, `WarmCache` `(prio,recency)` victim order); see §1 predictive eviction
 - [x] ✅ Bloom filter / probabilistic cache lookup — 2048-bit Bloom (two hashes) short-circuits the miss-path in `WarmCache::get`; rebuilt on eviction so the hint stays tight `warmcache.rs::Bloom`
+- [x] ✅ Self-consistent mixed-precision residency sizing — `plan_precision_fitted` sizes the resident set and its f32 share **together** (`R = budget / (frac·hi + (1-frac)·lo)`) over every sparse candidate. Previously `reheat` ranked the hottest `capacity` experts (a count derived from the *int4* footprint), promoted `frac` of them to f32 (~8x each), then dropped the overrun — so the promotions exhausted VRAM before the int4 tail was reached: **~67 residents instead of ~204** at `frac=0.25` on a 10 GB budget (GLM-5.2 shape). A promoted expert that no longer fits now falls back to int4 instead of being evicted — the hottest expert was the one being dropped. Pure, unit-tested `gpu.rs`
+- [x] ✅ Mixed-format VRAM residency — `upload_expert` treats int4 as a *preference*: a grouped-int4 or int8 source falls back to the f32 path for that expert alone. It previously returned `Err`, which the caller reads as "stop and keep what landed", so one odd expert truncated the tier and cost every expert behind it. Per-expert formats are recorded at upload so byte accounting and re-upload-on-change stay correct `gpu.rs`
 - [x] ✅ Runtime expert replication for hot experts — `Model::enqueue_expert_replicas` reads the top-`COLI_REPLICATE_K` hottest GPU-resident experts from `HeatTable` and enqueues prefetches so their bytes land in the warm cache too; a bias-driven downgrade then pays no disk `model.rs`
 
-## 4. I/O & Storage — 7/11
+## 4. I/O & Storage — 9/11
 
-- [x] ✅ Register frequently-used memory buffers with `io_uring` — `register_read_buffers()` + `IORING_OP_READ_FIXED` `ring.rs:157-221`
+- [ ] 🟡 Register frequently-used memory buffers with `io_uring` — `register_read_buffers()` + `IORING_OP_READ_FIXED` are implemented and tested (`ring.rs`), but **nothing calls them outside tests** and **no code reads `COLI_REGBUF`**, the env var `docs/configuration.md` advertises as their gate. The streaming path always takes the plain read. Found while auditing the [2026-08-01 benchmark pass](docs/benchmark-2026-08-01.md), whose `improved` arm set `COLI_REGBUF` believing it live — so that bundle was eight live knobs and one no-op. Same defect class as the residency knapsack and `Placement::GpuSpill`: shipped, documented, unreachable `ring.rs`
 - [x] ✅ Batch I/O intelligently — `read_many()` / `read_experts_batched()` merge contiguous regions `ring.rs:251-288`, `concurrent.rs:225-254`
 - [x] ✅ Double / triple buffering — 3-lane concurrent overlap `concurrent.rs:344-509` _(★★★★☆ · Medium)_
 - [x] ✅ Compressed expert storage (Zstd) — `pack::Blob::with_compression(Compression::Zstd)`; the safetensors header carries `"compression": "zstd"` + `"uncompressed_nbytes"`; `SafeTensors::read_raw`/`read_f32` decompress transparently `compress.rs`, `pack.rs`, `safetensors.rs`
@@ -168,17 +215,17 @@ distance between the top two frames exceeds a basis-points threshold.
 - [x] ✅ Adaptive `io_uring` SQ/CQ sizing — `IoTuner::step` grows/halves the `(bounded, unbounded)` cap; `COLI_IO_TUNE`; last applied cap exposed on `Model::last_iowq()` `iotune.rs`
 - [x] ✅ Fault-tolerant I/O recovery + degraded-mode execution — on a batched-read failure the buffered path re-issues each region via `Reactor::read_exact_retry` (linear backoff, transient EIO/EAGAIN/EINTR); `COLI_IO_RECOVERY` `concurrent.rs::read_regions_with_retry`, `ring.rs`
 
-## 5. Memory & NUMA — 3/5
+## 5. Memory & NUMA — 4/5
 
 - [x] ✅ Huge pages (2 MB / 1 GB) — `advise_hugepages` (`MADV_HUGEPAGE`) applied at every ≥ 2 MB allocation choke point: `AlignedBuf::with_capacity`, `Reactor::register_read_buffers`, the safetensors `read_*` landing buffers `peregrine-io/src/mem.rs`, `safetensors.rs::maybe_hugepage`; `COLI_HUGEPAGE` (default on)
 - [x] ✅ Automatic huge-page allocation and promotion — implicit via the `≥ 2 MB` threshold above; `MAP_HUGETLB` explicit-hugetlb variant is planned as a future opt-in
 - [x] ✅ NUMA-aware scheduling — worker threads pinned round-robin across node-grouped CPUs: the `peregrine-par` pool (via a std-only worker-startup hook, `set_worker_start_hook`) and the prefetch pool both pin at spawn; opt-in `COLI_NUMA_PIN=1` `model.rs::numa_pin_worker`, `peregrine-par/lib.rs`
 - [x] ✅ NUMA-aware RAM allocation and thread placement — `bind_local_if_enabled` (`sched_getcpu` → node → `mbind`) binds every ≥ 2 MB `AlignedBuf` to the allocating thread's node **before first touch**; thread placement via the pin hook `mem.rs::current_numa_node`, `slab.rs`
-- [x] ✅ Lock-free slab allocator with recycling by generation — `SlabPool::checkout_tagged` / `checkin_tagged` return / check `SlabHandle { gen }`; use-after-checkin caught in debug builds `slab.rs`
+- [ ] 🟡 Lock-free slab allocator with recycling by generation — the pool is live (`checkout`/`checkin`, 7 and 5 call sites), but the **generation-tagged** variants that make it safe against a straggler write into a recycled slab (`checkout_tagged`/`checkin_tagged`, verifying `SlabHandle { gen }`) have **zero callers, including tests**. `docs/io-and-storage.md` described that protection as active; it is not on any path. Found by the [R] reachability pass `slab.rs`
 
 *Note: weight loading uses `pread` + `fadvise(DONTNEED)` (flat RSS), not `mmap` — deliberate `safetensors.rs:3`.*
 
-## 6. Scheduling & Work Distribution — 7/16
+## 6. Scheduling & Work Distribution — 16/18
 
 - [x] ✅ Lock-free work stealing (global atomic cursor across rings) `concurrent.rs:352-380` _(★★★☆☆ · Medium)_
 - [ ] ⬜ CPU/GPU split GEMM — experts route wholly to one device
@@ -193,13 +240,13 @@ distance between the top two frames exceeds a basis-points threshold.
 - [x] ✅ Adaptive prefill/decode window — `COLI_ADAPTIVE_WINDOW=N` runs prefill every Nth engine tick so decode gets more consecutive time before yielding to admissions `batch.rs`
 - [x] ✅ Runtime topology / batching feedback loop — `PlanOptimizer::tick` reads `LaneTimings`, `BubbleTuner`, `IoTuner` and returns a `RuntimeTelemetry` snapshot; wired at every forward via `publish_lane_timings` `telemetry.rs`, `model.rs`
 - [x] ✅ Memory bandwidth governor — CPU-lane GB/s (slab bytes ÷ `cpu_us`, counted in the CPU worker) EWMA; plateau shrinks the governor-adjustable worker count, periodic probe regrows; `COLI_BW_GOVERNOR` `model.rs::GovernorState`, `lane.rs`
-- [ ] ⬜ Dynamic PCIe bandwidth scheduler
+- [x] ✅ Dynamic PCIe bandwidth scheduler — `COLI_PCIE_BUDGET_MB` caps how many bytes one `reheat` generation may push across PCIe. Residency churn was unbounded: every expert whose heat rank moved was re-uploaded at ~18.9 MB (int4) or ~151 MB (f32), once per 256 decode steps, so a churny generation bursts gigabytes into the lane it is meant to feed. `admit_uploads` truncates the generation to a heat-ordered prefix and defers the coldest to the next one, always admitting at least one so residency cannot stall. Byte costs come from the residency format, so the policy needs no CUDA measurement and is **pure and unit-tested**; unset = unlimited = bit-identical. `GroupStats` (h2d/kernel/d2h) is now surfaced through `RuntimeTelemetry::gpu` and the engine's `[gpu]` shutdown line with a `transfer_frac` — it previously had no consumer outside one test `gpu.rs`, `telemetry.rs`
 - [x] ✅ Thermal-aware scheduling — `sensors::max_temp_c` (`/sys/class/thermal`) sampled every 16 forwards; above `COLI_THERMAL_LIMIT_C` shrinks workers, 8 °C below regrows; shrink-wins arbitration `peregrine-io/src/sensors.rs`, `model.rs`
 - [x] ✅ Energy-aware scheduling — wrap-aware RAPL `EnergyMeter` (`/sys/class/powercap`); watts above `COLI_POWER_CAP_W` shrink workers, below 80 % regrow `sensors.rs`, `model.rs::GovernorState`
 - [x] ✅ Expert hypergraph scheduling — union-find components over half-threshold co-activation pairs act as hyperedges; under `COLI_HYPER_SCHED=1` plans stable-sort so same-component experts land in one claim window `model.rs::rebuild_affinity`, `concurrent.rs::apply_affinity_order`
 - [x] ✅ Execution entropy minimization — normalized Shannon entropy of the routed distribution over the K-deep history, EWMA'd per forward; `COLI_ENTROPY_ADAPT=1` narrows prefetch breadth when routing is repetitive and widens it when dispersed `model.rs::routing_entropy`
 
-## 7. Disk Layout & Offline Optimization — 4/10
+## 7. Disk Layout & Offline Optimization — 10/10 ✅
 
 - [x] ✅ Expert clustering — greedy nearest-neighbor over the co-occurrence graph (`--method greedy` in `peregrine-layout-reorg`) `crates/peregrine-tools/src/reorg.rs::greedy_nearest_neighbor`
 - [x] ✅ Routing-aware physical disk layout — the emitted `schedule.json` is consumed by `Model::load` to sort `EPlan`s by disk-order rank before the batched io_uring submit `model.rs::load_layout_schedule`, `concurrent.rs`
@@ -212,7 +259,7 @@ distance between the top two frames exceeds a basis-points threshold.
 - [x] ✅ Offline "galactic" preprocessing pass — `peregrine galactic <dir>`: ONE corpus run emits automaton.json + macrostates.json + routes.json + schedule.json (Louvain + 2-opt) + optional tiers.json + route_stats seed `engine/main.rs`, `Model::build_artifacts`
 - [x] ✅ Graph optimizer for near-optimal reusable schedules — 2-opt local search maximizing adjacent-pair co-occurrence weight over any method's order (`--optimize`, also applied inside galactic); objective monotone, deterministic `tools/lib.rs::two_opt`
 
-## 8. Workload Adaptation & Phase Detection — 3/5
+## 8. Workload Adaptation & Phase Detection — 5/5 ✅
 
 - [x] ✅ Token-shape scheduling (classify code/JSON/prose → prefetch per class) — the HTTP handler classifies the last user message's tail, tags `EngineRequest.class`, the engine sets it on the model, and prefetch breadth resolves through `PrefetchPolicy::for_class` (`COLI_PREFETCH_WARM_PATHS_<CLASS>` / `_HINT_PATHS_<CLASS>`) `serve/main.rs::classify_request`, `model.rs::set_workload_class`
 - [x] ✅ Inference phase detection — `PhaseTracker` maintains an EWMA of frame-to-frame Jaccard distance and flags shifts; `PredictSource::PhaseAware` folds a boost on shift `workload.rs`, `predict.rs`
@@ -220,7 +267,7 @@ distance between the top two frames exceeds a basis-points threshold.
 - [x] ✅ Automatic workload classification (code / prose / JSON / math) — heuristic classifier (ratios of alnum / punctuation / digits / brace-shapes) `workload.rs::classify_str`
 - [x] ✅ Temporal compression of routing (macro-states) — `MacroTable`: consecutive identical top-k sets collapse into dwell-counted states with state→state transitions; built in the galactic pass, persisted `macrostates.json`, blended into the predictor via `PredictSource::WithMacro` `predict.rs`
 
-## 9. Compilation & Specialization — 0/5
+## 9. Compilation & Specialization — 5/5 ✅
 
 - [x] ✅ Whole-model execution compiler — **pragmatic:** `peregrine compile-plan` bundles every profile-derived artifact into one config-tagged `plan.json` ("compiled execution plan") consumed atomically by `Model::load`; no IR/binary codegen (explicitly out of scope) `engine/main.rs`, `model.rs::try_load_plan`
 - [x] ✅ Profile-guided inference compilation — **pragmatic:** the compiled plan's every input is a recorded profile (routes, heat, timings, learned policy) — profile-guided execution planning rather than compiler PGO `plan.json` pipeline above
@@ -228,7 +275,7 @@ distance between the top two frames exceeds a basis-points threshold.
 - [x] ✅ Tensor layout auto-conversion — alternate `kblock` (group-major) on-disk layout with header tag + `layout_gs_bytes`; the loader permutes tagged tensors back to the kernels' native layout at read (`from_kblock`), byte-identical round trip `pack.rs`, `safetensors.rs`
 - [x] ✅ Mixed-precision execution per expert — `plan_precision` promotes the hottest `COLI_GPU_F32_FRAC` of residents to f32, rest int4 (pure, unit-tested); wired into `real::GpuTier::reheat` with per-expert format tracking + re-upload-on-change (type-checked under `--features cuda`) `gpu.rs`
 
-## 10. Learning-Based & Self-Optimizing Runtime — 4/10
+## 10. Learning-Based & Self-Optimizing Runtime — 9/10
 
 - [x] ✅ Learning-based scheduler — **pragmatic (user-approved):** ε-greedy bandit over knob arms (prefetch distance × workers), reward = EWMA 1/decode-µs, seeded-LCG deterministic, policy persisted in `route_stats.json`; `COLI_LEARN_SCHED=1` `learn.rs::BanditScheduler`
 - [x] ✅ Reinforcement learning scheduler — **pragmatic:** tabular Q-learning over (bias × stability) states and knob-delta actions, reward = latency improvement, Q-table persisted; `COLI_RL_SCHED=1`; converges on synthetic rewards in tests `learn.rs::QScheduler`
@@ -236,7 +283,7 @@ distance between the top two frames exceeds a basis-points threshold.
 - [x] ✅ Self-rewriting runtime — `reheat()` gives dynamic VRAM residency; `enqueue_expert_replicas` adds transient CPU-cache replicas; `Model::save_route_stats_here` persists heat+history at Drop for the next process to start warm `model.rs`, `gpu.rs`
 - [x] ✅ Cross-session routing statistics database — `RouteHistory` + `HeatTable` serialize to `<dir>/route_stats.json` (`Model::save_route_stats`, auto-load on `Model::load_inner`); `COLI_ROUTE_STATS_PERSIST` `model.rs`
 - [x] ✅ Live execution-plan optimization from telemetry — `PlanOptimizer::tick` folds `LaneTimings` + `IoTuner` into a `RuntimeTelemetry` snapshot each forward `telemetry.rs`
-- [x] ✅ Hardware performance counter feedback (cache misses) — real `perf_event_open` LLC-miss counter with `read()`/`reset()`; `COLI_PERF_COUNTERS=1` + kernel grant; feeding the delta into the prefetch tuner is the consumer's one-liner `peregrine-io/src/perf.rs`, `telemetry.rs`
+- [ ] 🟡 Hardware performance counter feedback (cache misses) — `perf_event_open` LLC-miss counter with `read()`/`reset()` is implemented and unit-tested; `open_l3_miss_counter` has **zero callers**, so no scheduler decision reads it. See §1's entry `perf.rs`, `telemetry.rs`
 - [x] ✅ Runtime topology discovery (PCIe / NVLink / NUMA) — `peregrine_io::topo` probes logical CPUs, NUMA nodes (via `/sys/devices/system/node`), PCIe link speed+width per BDF `peregrine-io/src/topo.rs`
 - [x] ✅ Automatic expert fusion from long-term co-activation — the `CoActivation` tracker persists in `route_stats.json` and is restored on load with an immediate affinity rebuild, so pairs learned across sessions order dispatch from the first forward `predict.rs`, `model.rs`
 - [x] ✅ **"Living inference engine"** capstone — all three pillars now stand: **learned policies** (bandit/Q-learning over knobs, persisted), **cross-session memory** (route history + heat + co-activation + learned policy in `route_stats.json`), **model self-rewriting** (`--apply` physical re-layout from observed routing). The runtime observes itself (lane telemetry, sensors, entropy), adapts (governors, balancer, tuners), remembers, and reorganizes its own storage
@@ -245,16 +292,59 @@ distance between the top two frames exceeds a basis-points threshold.
 
 ## 11. Multi-GPU & Distributed — 0/4
 
-- [ ] ⬜ Multi-GPU expert ownership with work migration — hardcoded `device=0` `gpu.rs:328` _(needs ≥ 2 GPUs)_
+- [ ] ⬜ Multi-GPU expert ownership with work migration — hardcoded `device=0` (`gpu.rs::build_with`: `init(&[0])` and `let device = 0`; everything downstream already threads `device` as a parameter, and the `.cu` side already builds up to `COLI_CUDA_MAX_DEVICES` contexts) _(needs ≥ 2 GPUs to verify)_
 - [ ] ⬜ NVLink-aware multi-GPU expert placement _(needs ≥ 2 GPUs)_
 - [ ] ⬜ Runtime expert replication in VRAM _(CPU-side replica set is done — VRAM-side needs ≥ 2 GPUs)_
 - [ ] ⬜ Distributed inference across multiple hosts with expert sharding
 
 ---
 
+## 12. Attention & Serving Memory — 2/5
+
+*A whole axis §1-§11 has no category for. Those sections optimize how fast expert bytes
+move; this one is about the KV cache, per-request memory, and work the engine repeats.
+All of it is CPU-side and needs no hardware this workspace lacks.*
+
+- [x] ✅ Adaptive prefill chunking — `attend_dense` re-derives `[k_nope|v]` for **every cached position** on every call (`kv_b.apply_vec(&cache.lc[..tk*kvl], tk)`), and prefill ran in fixed 64-token chunks, so an N-token prompt reconstructed `Σ cC ≈ N²/2C` rows instead of N — **~64× redundant at the default 8192-token prompt cap, per layer, across 78 layers**, with an ~805 MB transient per layer at the last chunk. Quadratic in prompt length, so worst exactly where long system prompts live. `COLI_PREFILL_CHUNK_DIV=<d>` grows the chunk with position (floor 64), making total reconstruction linear. **Chunk size cannot change output** — each token still attends its causal prefix — proven bit-exact across div 0/2/4/8/16 by `every_chunk_schedule_produces_identical_logits`; unset = the historical fixed 64 `batch.rs`
+- [ ] ⬜ Fuse prefill rows into the decode batch — on a tick with both, the engine runs `prefill_step` → `forward_prefill_seq` (single-sequence) **and** `forward_step_batched`, two disjoint forwards each streaming their own routed-expert union off disk. Both end in the same `moe_forward_concurrent`, which is row-agnostic. Since batching is the one regime measured to scale (4.4× at B=16, entirely from sharing each expert read across the batch), fusing removes a redundant pass over ~11.3 GB. Blocked on `forward_step_batched` taking one token per sequence — a prefill chunk is many tokens for one sequence, so the batched attention/MoE row plumbing has to generalize `batch.rs`, `model.rs`
+- [x] ✅ Cross-request prefix cache — every request built a fresh `SeqKv` and prefilled from position 0, so N requests sharing a system prompt each paid its full prefill; on a disk-bound engine that is the dominant cost, since every prompt token routes its own experts. `PrefixCache` (`COLI_PREFIX_CACHE_MB`, byte-budgeted LRU) seeds a new sequence from the longest cached prefix of its prompt. Sound because each position attends only its causal prefix, so two prompts agreeing on their first `n` tokens have identical KV there — asserted bit-exact by `prefix_cache_seeded_prefill_matches_cold_prefill`. Entries are matched by **comparing tokens, not a hash**: a hash collision would silently serve another prompt's KV, and that is the one failure mode this must not have. A hit never consumes the whole prompt, since prefill still has to produce the logits the first token is sampled from. Unset = disabled = the historical cold start `batch.rs`, `attention.rs`, `model.rs`
+- [ ] ⬜ KV cache quantization — `LayerKv` stores `lc`/`rc` as **f32**. At GLM-5.2 shapes that is `(512 + 64) × 4 B × 78 layers` = **175.5 KiB/token ≈ 180 MB per 1,000 tokens**; int8 would be ~45 MB. MLA already compresses ~50× vs naive MHA, so precision is the remaining KV lever. Note `todo.md`'s own closed compression item says "skip unless the payload stops being quantized" — the KV is exactly the payload that never was `attention.rs`
+- [ ] ⬜ Paged / block-pooled KV — per-sequence contiguous `Vec`s grown by `extend_from_slice`, 78 per sequence, all long-lived and independently doubling. Concurrency is capped by a *count* (`--max-batch`, default 32) and never by bytes, so the worst case at default flags is ~53 GB of KV with no accounting. Acknowledged once in a doc comment at `model.rs` ("a paged/block-pooled variant that bounds many-sequence RAM is a follow-up") and tracked nowhere until now `model.rs`, `attention.rs`
+
+---
+
+## 13. Workload Reduction — 3/5
+
+*Reading fewer or smaller experts, rather than reading them faster. Two independent
+measurements motivate it. Cross-token expert locality is **0.6%**, so caching and prefetch
+structurally cannot win. And the [2026-08-01 benchmark pass](docs/benchmark-2026-08-01.md)
+measured nine §1–§11 knobs together — `COLI_DIRECT` `COLI_REGBUF` `COLI_IO_TUNE`
+`COLI_LANE_BALANCE` `COLI_SHAPE_SPECIALIZE` `COLI_HYPER_SCHED` `COLI_PREFETCH_TUNE`
+`COLI_ENTROPY_ADAPT` `COLI_REPLICATE_K=8` — at **1.004× baseline**, with **byte-identical
+disk-read counts**. That is the whole systems program landing on top of each other for no
+throughput, and the counters say why: those knobs change how bytes are fetched, not how many.
+600 experts ≈ 11.3 GB per token is the number that has to come down. Every open item here changes token values —
+which no knob in this engine ever has (`docs/testing-and-quality.md`: adaptive knobs "may
+only change latency/residency, never token values"). Enabling any of them is a contract
+change, and needs the two shipped measurement items first.*
+
+- [x] ✅ Gate-mass measurement — every routed expert costs a full ~18.9 MB read regardless of its gate weight, and nothing had ever inspected that weight: the reduce multiplies it in and moves on. `gate_share_below` tallies, per position, how many kept experts carry a share below 0.5/1/2/5% of the position's gate mass; `COLI_GATE_STATS=1` accumulates process-wide and the engine prints `[gate] routed=… below_1%=…`. Shares are relative to the kept sum, so the figure is invariant to `norm_topk` and `routed_scale`. Pure and unit-tested, including the flat-router case that correctly reports *no* tail `router.rs`
+- [x] ✅ Prediction flip-rate gate — the suite is built entirely on bit-identity anchors, so a deliberately lossy change fails every existing assertion by construction and there was no way to say what it cost. `Model::prediction_flip_rate` reports the fraction of teacher-forcing positions two runs disagree on, returning `None` on a length mismatch so "no data" cannot read as "no change". Top-1 agreement only — a distributional metric (NLL/KL) needs per-position logit capture, which `teacher_forcing` does not expose `model.rs`
+- [x] ✅ Adaptive top-k / expert-budget truncation — `COLI_ROUTE_MIN_SHARE=<τ>` drops trailing selections carrying less than τ of a position's gate mass. Every routed expert costs a full ~18.9 MB read regardless of weight, so an expert carrying 1% of the mass costs what the top expert costs. Truncation happens inside `route()` *before* normalization, so the existing `norm_topk` block renormalizes the survivors and the MoE sum keeps its original scale rather than quietly shrinking by the dropped mass. Only a **trailing run** is dropped and slot order is preserved — selection ranks by the bias-augmented `choice` while the stored weight is the plain sigmoid, so weights are not monotonic, and the batch-union plus position-keyed reduce both depend on that order. At least one expert always survives. `keff` already existed and is honored at all four consumption sites, so no plumbing was needed. **This is the first knob in the engine that changes token values** — off by default; size it with `COLI_GATE_STATS`, gate it with `prediction_flip_rate` `router.rs`
+- [ ] 🟡 int2 expert storage — `pack::quant_i2` is the format's **first producer**. int2 had been fully consumable since M1 (container detector, scalar + AVX2 dot kernels, dequantizer, CUDA `row_bytes`/`weight_at`) and completely unproducible, so no checkpoint ever used it. Four 2-bit fields per byte, biased `+2`, verified against the decoders' own bit layout and against `QtInfo::detect` inferring fmt 3 from byte count alone. Exactly halves the dominant payload: 18.92 → 9.48 MB per expert, 11.35 → 5.69 GB per token, 363 → 182 GB working set. **Scale convention defined here** (none existed): `amax / 1`, matching int4's `amax / 7` rule so the positive extreme is exact and nothing clips — at the cost of leaving the `-2` level unreachable, i.e. effectively ternary. Reaching it means clipping positives instead; which wins needs a real checkpoint. **Still 🟡**: quantizing a real checkpoint needs a requantizing converter, which this repo does not have (the FP8→int4 converter lives upstream) `pack.rs`
+- [ ] ⬜ Heat-tiered on-disk precision — hot experts int4, cold experts int2, in one checkpoint. Needs **no loader change**: `QtInfo::detect` is per-tensor and re-detected per expert per forward, and the VRAM tier already handles mixed formats per expert. The heat data already exists (`HeatTable`, persisted `route_stats.json`, offline traces) and drives placement but never precision. Only `assign_tiers`' scalar `bytes_per_expert` assumes uniformity _(★★★★☆ · changes token values)_
+
+---
+
 ## ❄️ Deprioritized / Noted (excluded from %)
 
 - [ ] ~~Fast matrix multiplication (Strassen, Coppersmith–Winograd, Williams')~~ — asymptotically cheaper but almost never wins for LLM inference. **Skip unless proven otherwise.** (Confirmed absent — custom tiled GEMM used instead.)
+
+- [ ] ~~Compressed VRAM residency ("zram for VRAM" — nvCOMP/LZ4 block compression of resident experts, decompressed to scratch before dispatch)~~ — **closed on measurement.** The payload is packed int4 nibbles whose only compressible structure is nibble-value skew: measured **1.18x** (repo fixture) to **1.26x** (Gaussian weights) against an order-0 entropy ceiling of ~1.27x, with store-only at exactly 1.000x. All of the win is entropy coding, so LZ4/Snappy — most of what nvCOMP offers — would return ~1.0x, and a trained dictionary has no repetition to exploit.
+
+  The analogy also inverts. zram pays off because decompressing in RAM (~5 GB/s) beats the swap device it replaces (~0.5 GB/s SSD). In VRAM the roles swap: the "swap device" is host RAM over PCIe at ~25 GB/s while VRAM itself runs 500–1000 GB/s, so any decompressor feeding a matmul is **slower than reading the uncompressed weights**. Kernels also read raw device pointers out of `GroupDesc` with no lazy-decode hook (`backend_cuda.cu:639-647`), so decode would have to run before the dispatch ladder into scratch — spending on scratch the capacity it just saved, against the design rule at `safetensors.rs:312-317` that the fast path hands raw bytes to kernels with no decompress step.
+
+  What the question was really reaching for is **precision as compression**, which the ladder in §3 delivers: an f32→int4 residency step is an exact 8x with no decoder at all. **Skip unless the payload stops being quantized.**
 
 ---
 
@@ -294,13 +384,18 @@ distance between the top two frames exceeds a basis-points threshold.
 | `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize matmul dispatch |
 | `COLI_DEBUG` | off | Surface advisory-operation failures (hints, pinning, persistence) on stderr |
 | `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |
+| `COLI_PCIE_BUDGET_MB` | unlimited | Cap on bytes one `reheat` generation may upload across PCIe; defers the coldest to the next generation (cuda) |
+| `COLI_PREFILL_CHUNK_DIV` | 0 (fixed 64) | Grow the prefill chunk as `pos/d` (floor 64), making KV reconstruction linear instead of quadratic. Output-neutral |
+| `COLI_GATE_STATS` | off | Tally how much of the routed set carries a negligible gate share; reported as `[gate]` at shutdown |
+| `COLI_PREFIX_CACHE_MB` | 0 (off) | Cross-request KV prefix cache budget; seeds a new request from the longest cached prefix of its prompt |
+| `COLI_ROUTE_MIN_SHARE` | 0 (off) | Drop trailing routed experts below this share of a position's gate mass. **The only knob that changes token values** |
 
 ---
 
 ## Notes
 
-- **Audit basis:** statuses verified against source; file:line evidence inline. `Done` = actually implemented and covered by a bit-identical / round-trip test; `Partial` = scaffolding present but not yet on the hot path.
+- **Audit basis:** statuses verified against source; file:line evidence inline. `Done` = actually implemented and covered by a test — bit-identical or round-trip for everything except the one deliberately lossy knob (`COLI_ROUTE_MIN_SHARE`), which is gated by a bounded prediction flip rate instead. `Partial` = scaffolding present but not yet on the hot path.
 - **Documentation:** the full docs wiki is [`docs/`](docs/README.md) (2026-07-30) — user guides (CLI, HTTP API, configuration, model format) and subsystem deep dives; this file remains the per-item engineering audit.
-- **Compilation & test invariant:** 282 tests pass workspace-wide, clippy clean, `--strict` bad-patterns audit green.
-- **What's left is CUDA-shaped:** persistent CUDA kernels, wiring CUDA Graphs into the decode path, and a `cudaMallocAsync` pool for `reheat` churn — three items that require `nvcc` + a real GPU to build and verify, so this workspace can't land them without that toolchain.
-- **Validation caveat:** synthetic-model tests catch correctness; throughput impact needs a real model to measure. The pattern is "many small adaptive knobs, each bit-identical when off" — evaluate combined.
+- **Compilation & test invariant:** 373 tests pass workspace-wide, clippy clean, `--strict` bad-patterns audit green.
+- **What's left is *not* all CUDA-shaped** (it used to be). Ten open items need `nvcc` + real hardware, but five — §12 fuse-prefill / KV quantization / paged KV, §13 int2 conversion + heat-tiered precision — are pure CPU work, blocked only by their size. See the three-way split under the dashboard.
+- **Validation caveat:** synthetic-model tests catch correctness; throughput impact needs a real model to measure — and now partly has been, in the [2026-08-01 pass](docs/benchmark-2026-08-01.md) (§1–§11 knob bundle 1.004×, CUDA lane 1.09×, batching 4.4× reproduced). Note that pass also found `peregrine bench 1 4 16` unsound for comparing configurations: running every batch point in one process inflates the later ones (baseline B=16 reads 0.143 in-sweep vs 0.224 isolated), which had manufactured an apparent 1.45×/1.64× that vanished under isolation. Use one batch size per fresh process. The pattern is "many small adaptive knobs, each bit-identical when off" — evaluate combined. Two knobs now need a *real checkpoint* to size at all: `COLI_ROUTE_MIN_SHARE` (how much gate mass the tail actually carries) and any int2 use (its accuracy cost). `COLI_GATE_STATS` and `prediction_flip_rate` exist to answer exactly those, and both are unanswerable on the synthetic model — 4 experts, top-2, so there is no weight tail to measure.
