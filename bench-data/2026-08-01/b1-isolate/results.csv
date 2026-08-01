@@ -1,0 +1,11 @@
+variant,rep,seconds,agg_tok_s,peak_rss_gb
+baseline,1,52.58,0.057,17.30
+direct_only,1,47.69,0.063,16.76
+bundle_nodirect,1,51.67,0.058,17.26
+improved,1,48.14,0.062,16.42
+gpu,1,45.03,0.067,16.77
+baseline,2,55.15,0.054,16.91
+direct_only,2,46.34,0.065,16.50
+bundle_nodirect,2,74.89,0.040,17.23
+improved,2,61.19,0.049,16.94
+gpu,2,80.83,0.037,16.90

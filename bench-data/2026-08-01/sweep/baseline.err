@@ -1,0 +1,4 @@
+peregrine bench: loaded 78 layers, vocab 154880, in 21.7s
+    [ecache] disk_reads this batch: 1800
+    [ecache] disk_reads this batch: 3918
+    [ecache] disk_reads this batch: 7957
