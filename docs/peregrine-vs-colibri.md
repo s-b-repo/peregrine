@@ -448,7 +448,16 @@ OOM, by different means.
 - **Short runs** (8–16 tokens) to keep wall-clock tractable at ~0.05 tok/s; longer runs would tighten
   the averages but not change the disk-bound conclusion.
 - **LUKS-encrypted NVMe** adds read overhead vs colibrì's published raw-NVMe boxes — a reason to treat
-  the absolute tok/s as *this box's* number, not a universal one.
+  the absolute tok/s as *this box's* number, not a universal one. A second LUKS box (i5-1235U laptop,
+  2026-08-01) isolated the I/O lanes with no model loaded and measured the same ordering, wider:
+  **colibrì 2.02 GB/s vs peregrine 0.84 GB/s** at 8-way `O_DIRECT`. On dm-crypt, reads are CPU-bound on
+  decryption, so *N* blocking `pread`s keep *N* cores decrypting where the ring can leave cores idle —
+  evidence that §5.1's throughput gap is an I/O-lane property, not a prefill-batching artifact. See
+  [Benchmarks](benchmarks.md#second-box-glm-52-on-a-7-gb-laptop).
+- **The dense set bounds the minimum box.** Measured from container headers, GLM-5.2's always-resident
+  (non-expert) weights are **10.59 GB** of a 374 GB int4 container; the routed experts stream. A machine
+  with less than ~16 GB of RAM+swap OOM-kills *both* engines during load, so "744B on a small box" has a
+  hard floor that no amount of expert streaming removes.
 - **Interface differences:** peregrine's serve protocol takes token ids; colibrì takes a text prompt
   (GLM chat template). Decode tok/s (steady-state) is the comparable axis and is largely prompt-independent.
 - colibrì's Metal/multi-GPU/community numbers come from **other hardware**; they are context, not
