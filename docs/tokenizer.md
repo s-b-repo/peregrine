@@ -85,6 +85,21 @@ differs is everything around the engine:
 | `gigatoken/par12 p1` | `encode_batch`, cold (includes one-time worker construction) | 275 |
 | `gigatoken/par12 p2` | `encode_batch`, steady state (warm persistent pool) | **872** |
 
+The same laptop on the **GLM-5.2 vocabulary** (154 880 tokens vs GPT-2's
+50 257), 98.6 MB corpus, 27.8 M ids:
+
+| Row | MB/s | vs GPT-2 above |
+|---|---:|---|
+| `gigatoken/line` | 105 | 0.81× |
+| `gigatoken/whole` | 259 | 0.67× |
+| `gigatoken/par12 p1` | 236 | 0.86× |
+| `gigatoken/par12 p2` | **707** | 0.81× |
+
+A ~3× larger merge table costs ~20–35 % throughput — the ratios between the four
+regimes hold. For reference, Python `tokenizers` (HF) on the identical corpus and
+vocabulary manages **1.71 MB/s** line-at-a-time, so the comparable `gigatoken/line`
+row is **61× faster**.
+
 For serving, none of this is a bottleneck: a request is one encode over one
 prompt (µs) against a model forward (ms–s). The bulk paths exist for corpus
 work and to keep the vendored subset honest against upstream's numbers.

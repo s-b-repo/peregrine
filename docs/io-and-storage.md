@@ -49,6 +49,29 @@ the reference box it raised raw device read rate by ~21 % (see
 Weight loading itself is `pread` + `fadvise(DONTNEED)` for flat RSS — a
 deliberate choice over mmap.
 
+### Measuring the lane in isolation
+
+[`examples/iobench.rs`](../crates/peregrine-io/examples/iobench.rs) drives the
+`Reactor` against any file with no model loaded, mirroring colibrì's `iobench`
+argument order so the two are directly comparable:
+
+```bash
+cargo run --release -p peregrine-io --example iobench -- FILE BLK_MB ITERS RINGS DIRECT
+```
+
+Each ring submits its whole batch in one `read_direct_many`/`read_many` call, so
+queue depth = `ITERS` — a depth-1 loop measures per-request latency, not the
+device's parallel read rate, and reads ~40 % low.
+
+**Known gap (measured 2026-08-01, i5-1235U laptop, LUKS NVMe):** this lane
+sustains 0.84 GB/s at 8 rings where colibrì's threaded `pread` + O_DIRECT
+harness reaches 2.02 GB/s — a 2.4× deficit, direction-consistent with the
+reference box's 710 vs 870 MB/s. On a dm-crypt volume reads are CPU-bound on
+decryption, so *N* blocking `pread`s keep *N* cores decrypting while the ring's
+completion model can leave cores idle. The example does not enable `COLI_REGBUF`
+or multi-ring tuning, so its number is a floor. See
+[Benchmarks](benchmarks.md#second-box-glm-52-on-a-7-gb-laptop).
+
 ## Slab pool (`slab.rs`)
 
 A lock-free pool of aligned slabs for expert landing buffers.

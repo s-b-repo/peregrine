@@ -17,7 +17,7 @@ CPU-streaming decode.
 | Decode, single sequence (steady state) | 0.054 tok/s | **0.077 tok/s** |
 | **Batched decode, B=16 (aggregate)** | **0.280 tok/s** (4.4× over B=1) | — |
 | Warm cache on a repeated forward | **3.58×** (100 % hit, 0 disk) | learned pin |
-| Raw device read rate (after I/O ports) | **~980 MB/s** | ~870 MB/s |
+| Raw device read rate (after I/O ports) | **~980 MB/s** | ~870 MB/s — but see [the laptop re-measurement](#second-box-glm-52-on-a-7-gb-laptop), which inverts this |
 | Cross-token expert locality | 0.6 % (measured) | — |
 | Tokenizer throughput | **204 MB/s** (gigatoken) | — (HF: 6 MB/s) |
 
@@ -74,3 +74,63 @@ cache state — baseline B=16 measures 0.143 tok/s in-sweep vs 0.224 isolated.
 Use it to observe batch scaling *within* one configuration; to compare
 configurations against each other, run one batch size per fresh process (see
 the 2026-08-01 pass for a runner that does).
+
+## Second box: GLM-5.2 on a 7 GB laptop
+
+A same-hardware A/B on a much smaller machine than the reference box, against a
+**freshly converted GLM-5.2 container** (`zai-org/GLM-5.2-FP8` → colibrì's
+`convert_fp8_to_int4.py`, per-row int4 experts / int8 embed+lm_head, DSA and MTP
+skipped; 141 shards, **349 GB**).
+
+**Box:** Intel i5-1235U (2P+8E, 12 threads), **7.4 GB RAM + 7.6 GB swap**,
+LUKS-encrypted NVMe, no GPU.
+
+| Metric | peregrine | colibrì |
+|---|---|---|
+| Tokenizer, whole-buffer (GLM-5.2 vocab) | **258.8 MB/s** | n/a — consumes ids |
+| Tokenizer, pooled parallel ×12 (warm) | **707.0 MB/s** | n/a |
+| *reference: HF `tokenizers`, same corpus* | *1.71 MB/s* | — |
+| Disk read, O_DIRECT, 8-way | 0.84 GB/s | **2.02 GB/s** |
+| Disk read, O_DIRECT, 1-way | 0.54 GB/s | **0.84 GB/s** |
+| Disk read, buffered, 8-way | 1.40 GB/s | **1.64 GB/s** |
+| Decode, any batch size | ⛔ OOM at load | ⛔ OOM at load |
+
+**Decode does not run on this box, for either engine.** Measured from the
+container headers, the always-resident (non-expert) weights are **10.59 GB**
+against ~5.8 GB of free RAM+swap, so both engines are OOM-killed part-way
+through load. That is a hardware-envelope result, not an engine defect, and it
+hits both sides identically — the box needs ≥ 16 GB of RAM+swap to produce
+decode rows at all.
+
+**The I/O rows invert the headline table above.** On this machine colibrì's
+threaded-pread `O_DIRECT` harness sustains **2.4× peregrine's io_uring lane**.
+The likely mechanism is dm-crypt: on a LUKS volume, reads are CPU-bound on
+decryption, and *N* blocking `pread`s keep *N* cores busy decrypting, whereas
+the ring's completion model can leave cores idle. This independently corroborates
+the direction of [the full study's](peregrine-vs-colibri.md) §5.1 finding
+(colibrì ~870 MB/s vs peregrine ~710 MB/s effective, also on LUKS) and is the
+most actionable gap on the list: both engines are disk-bandwidth-bound during
+MoE decode.
+
+*Caveat on the peregrine number:* it comes from
+[`crates/peregrine-io/examples/iobench.rs`](../crates/peregrine-io/examples/iobench.rs),
+which drives the `Reactor` directly with batched submissions but does **not**
+enable registered fixed buffers (`COLI_REGBUF`) or the engine's multi-ring
+tuning. Treat 0.84 GB/s as a floor for the lane, not a verdict on io_uring.
+
+Reproducing the two engine-comparable rows:
+
+```bash
+# io_uring read rate: FILE BLK_MB ITERS RINGS DIRECT
+cargo run --release -p peregrine-io --example iobench -- \
+    /path/to/model/out-00100.safetensors 64 4 8 1
+# colibrì's equivalent: file blkMB n threads direct
+make -C c iobench && ./c/iobench /path/to/model/out-00101.safetensors 64 16 8 1
+
+# tokenizer, no weights loaded
+cargo run --release -p peregrine-serve -- --model /path/to/model \
+    --bench-tokenizer corpus.txt
+```
+
+Single run per cell, no variance bars; a different container shard per
+measurement so no row is served from page cache.
