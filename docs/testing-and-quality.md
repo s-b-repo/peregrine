@@ -47,7 +47,7 @@ The suite is built around **bit-identity anchors** rather than tolerances:
   prefill (`engine_chunked_prefill_matches_reference`).
 - **Adaptive knobs are bit-identical when off.** Almost all are also
   correctness-neutral when on — they may change latency or residency, never
-  token values. **Three deliberate exceptions:**
+  token values. **Four deliberate exceptions:**
   - `COLI_ROUTE_MIN_SHARE` drops routed experts carrying a negligible share of the
     gate mass, which removes a real (if small) term from the MoE sum. It is off by
     default, and it is gated by `Model::prediction_flip_rate` rather than by an
@@ -61,6 +61,16 @@ The suite is built around **bit-identity anchors** rather than tolerances:
     and it has not been measured on a real checkpoint. Off by default, and its
     test asserts only what is verifiable — inert when unset, genuinely wired when
     set — rather than an invented closeness bound.
+  - `COLI_KV_DTYPE=f16` stores the KV latents rounded, halving resident KV
+    exactly. Unlike the two above, its cost is *bounded by construction* on the
+    absorb path — the latent is dotted in f32, so the error is f16's own
+    precision (1.8e-4 measured) — while the dense path measures ~100× worse,
+    1.7e-2. That gap is **not** f16: `kv_b.apply_vec` quantizes activations to
+    int8 at `amax / 127`, so a perturbation that moves a row's maximum rescales
+    the whole grid. Recorded as a per-core tolerance in
+    `f16_kv_halves_the_bytes_and_tracks_f32_closely`, which also asserts the two
+    dtypes *do* differ — a lossy knob whose test would pass unchanged if the
+    knob did nothing is not testing the knob.
   - **A requantized checkpoint** (`peregrine-requantize`) changes token values by
     existing, not by being toggled, so it has no knob row. int4 → int2 is a double
     quantization; measure it with `prediction_flip_rate` against the source

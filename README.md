@@ -237,7 +237,9 @@ token stream is unchanged. (Annotated reference with deep-dive links:
 | `COLI_PCIE_BUDGET_MB` | unlimited | Cap on per-`reheat` PCIe upload bytes (cuda) |
 | `COLI_PREFILL_CHUNK_DIV` | 0 (fixed 64) | Adaptive prefill chunk `pos/d`; output-neutral, cuts quadratic KV reconstruction |
 | `COLI_GATE_STATS` | off | Tally negligible-gate-share routed experts (`[gate]` line) |
-| `COLI_PREFIX_CACHE_MB` | 0 (off) | Cross-request KV prefix cache budget |
+| `COLI_PREFIX_CACHE_MB` | 0 (off) | Cross-request KV prefix cache budget; a hit shares the prefix by refcount, it is not copied |
+| `COLI_KV_BUDGET_MB` | 0 (off) | Resident-KV byte ceiling for admission, alongside the `--max-batch` count |
+| `COLI_KV_DTYPE` | `f32` | KV latent element type; `f16` halves resident KV (**changes token values** — pair with `COLI_MLA_ABSORB`) |
 | `COLI_ROUTE_MIN_SHARE` | 0 (off) | Drop negligible-gate-share routed experts (**changes token values**) |
 
 #### Governors & learning

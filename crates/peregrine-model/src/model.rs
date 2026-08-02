@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use peregrine_core::{Cfg, Context, Error, SafeTensors};
 use peregrine_io::{Reactor, WarmCache};
 
-use crate::attention::{mla_attention, mla_attention_absorb, mla_attention_batched, AttnWeights, LayerKv};
+use crate::attention::{mla_attention, mla_attention_absorb, mla_attention_batched, AttnWeights, KvDtype, LayerKv};
 use crate::concurrent::{default_workers, experts_per_batch, moe_forward_concurrent, ForwardCtx};
 use crate::gpu::{GpuTier, HeatTable};
 use crate::math::rmsnorm;
@@ -220,11 +220,41 @@ pub struct SeqKv {
     layers: Vec<LayerKv>,
 }
 
+/// `COLI_KV_DTYPE`: the element type every KV cache in this process is built
+/// with. Default `f32` — the historical, output-neutral layout.
+///
+/// An unrecognised value is **reported and ignored**, not silently coerced: a
+/// typo'd dtype that quietly halved precision would change token values with
+/// nothing in the output saying so.
+pub fn kv_dtype() -> KvDtype {
+    static V: std::sync::OnceLock<KvDtype> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let Some(s) = std::env::var("COLI_KV_DTYPE").ok() else { return KvDtype::F32 };
+        match KvDtype::parse(&s) {
+            Some(dt) => dt,
+            None => {
+                peregrine_core::note_advisory_err(
+                    "COLI_KV_DTYPE",
+                    &format!("unrecognised value {s:?}; using f32 (accepted: f32, f16)"),
+                );
+                KvDtype::F32
+            }
+        }
+    })
+}
+
 impl SeqKv {
-    /// A fresh, empty cache sized for a model with `cfg`'s dimensions.
+    /// A fresh, empty cache sized for a model with `cfg`'s dimensions, in the
+    /// process-wide [`kv_dtype`].
     pub fn new(cfg: &Cfg) -> SeqKv {
+        SeqKv::with_dtype(cfg, kv_dtype())
+    }
+
+    /// [`Self::new`] at an explicit element type, so a test can exercise the
+    /// narrow path without a process-wide environment variable.
+    pub fn with_dtype(cfg: &Cfg, dt: KvDtype) -> SeqKv {
         let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
-        SeqKv { layers: (0..cfg.n_layers).map(|_| LayerKv::new(kvl, qkr)).collect() }
+        SeqKv { layers: (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, dt)).collect() }
     }
 
     /// Positions cached so far (the sequence length); all layers share it.
@@ -1376,7 +1406,7 @@ impl Model {
             layers.push(load_layer(&st, i, &cfg, stream_experts)?);
         }
 
-        let kv = (0..cfg.n_layers).map(|_| LayerKv::new(kvl, qkr)).collect();
+        let kv = (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, kv_dtype())).collect();
         // The concurrent MoE lane needs its own ring, set up once, so a layer's
         // experts stream while the CPU pool computes. Only in streaming mode.
         let io_reactors: Vec<Mutex<Reactor>> = if stream_experts {
@@ -1634,7 +1664,7 @@ impl Model {
     pub fn reset(&mut self) {
         let (kvl, qkr) = (self.cfg.kv_lora as usize, self.cfg.qk_rope as usize);
         for k in &mut self.kv {
-            *k = LayerKv::new(kvl, qkr);
+            *k = LayerKv::with_dtype(kvl, qkr, kv_dtype());
         }
         if let Some(h) = &self.route_hist {
             h.lock().clear();
@@ -3848,6 +3878,47 @@ mod tests {
         let external = m.forward_prefill_seq(&toks, &mut seq, 0)?;
         assert_eq!(internal, external, "external-KV prefill must equal internal forward_step");
         assert_eq!(seq.len(), toks.len());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn f16_kv_survives_the_whole_path_and_halves_the_sequence_bytes() -> Result<(), peregrine_core::Error> {
+        // `COLI_KV_DTYPE=f16` has to hold up across prefill, batched decode and
+        // the byte accounting admission reads — not just inside the attention
+        // core where it is unit-tested. The saving is exact, so assert it as an
+        // equality rather than a bound.
+        let dir = tmp_model_dir("kv_f16")?;
+        let m = Model::load(&dir)?;
+        let prompt = [1i32, 5, 9, 2, 6, 3];
+        let mut wide = SeqKv::with_dtype(&m.cfg, KvDtype::F32);
+        let mut narrow = SeqKv::with_dtype(&m.cfg, KvDtype::F16);
+        let lw = m.forward_prefill_seq(&prompt, &mut wide, 0)?;
+        let ln = m.forward_prefill_seq(&prompt, &mut narrow, 0)?;
+        assert_eq!(narrow.len(), wide.len());
+        assert_eq!(narrow.bytes() * 2, wide.bytes(), "f16 must be exactly half the resident bytes");
+        assert_eq!(narrow.owned_bytes() * 2, wide.owned_bytes());
+        assert_eq!(lw.len(), ln.len());
+
+        // Decode continues on both, and the narrowed cache tracks the wide one.
+        // This is a *lossy* knob, so the assertion is closeness, not equality —
+        // `Model::prediction_flip_rate` on a real checkpoint is the real gate.
+        let mut a: [&mut SeqKv; 1] = [&mut wide];
+        let dw = m.forward_step_batched(&[7], &mut a, &[prompt.len()], None)?;
+        let mut b: [&mut SeqKv; 1] = [&mut narrow];
+        let dn = m.forward_step_batched(&[7], &mut b, &[prompt.len()], None)?;
+        assert_eq!(narrow.len(), wide.len(), "both advanced by one position");
+        assert_eq!(narrow.bytes() * 2, wide.bytes(), "…and the halving holds after decode");
+        let span = dw.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+        for (k, (p, q)) in dw.iter().zip(&dn).enumerate() {
+            assert!((p - q).abs() < 5e-2 * span, "logit {k}: {p} vs {q}");
+        }
+
+        // Sharing composes with the element type: a narrowed prefix is still
+        // frozen once and viewed by refcount.
+        let entry = narrow.clone_prefix(4);
+        let seeded = entry.clone_prefix(4);
+        assert_eq!(entry.shared_prefix(), seeded.shared_prefix(), "narrowing must not defeat sharing");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
