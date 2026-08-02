@@ -31,6 +31,11 @@ use crate::weight::{QtWeight, QuantFmt};
 /// so the layer/MoE entry points stay small (no long argument lists).
 pub struct ForwardCtx<'a> {
     pub st: &'a SafeTensors,
+    /// Run MLA attention through weight absorption instead of the dense
+    /// reconstruction (`COLI_MLA_ABSORB`). Carried on the context rather than
+    /// read from the environment per forward, so tests can exercise both paths
+    /// without mutating process-global state that parallel tests share.
+    pub absorb: bool,
     /// A **pool of io_uring rings** for the I/O lane — one dedicated ring per I/O
     /// worker thread, so N reads proceed in parallel (each ring is locked only by
     /// its owner, so the lock is uncontended). Empty in resident mode.
@@ -235,8 +240,10 @@ fn tplan(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<TPlan, Erro
 /// - **buffered** — one deep `read_many` submit fills plain landing `Vec`s directly
 ///   (the kernel writes the caller's buffer, so this is already zero userspace copy);
 ///   any short read is completed per region.
+/// - **pread** — `COLI_IO_ENGINE=pread`: N OS threads of blocking `pread`,
+///   bypassing io_uring entirely. See [`io_engine`] for why this exists.
 fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) -> Result<Vec<Bytes>, Error> {
-    if direct {
+    if direct && io_engine() != IoEngine::Pread {
         return r
             .read_direct_aligned(regions)
             .ctx(|| "io_uring O_DIRECT zero-copy expert read".to_string());
@@ -248,7 +255,36 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
             .zip(regions)
             .map(|(b, &(fd, off, _))| ReadReq { fd, offset: off, buf: b.as_mut_slice(), tag: 0 })
             .collect();
-        let res = r.read_many(&mut reqs).ctx(|| "io_uring batched expert read".to_string())?;
+        // Same request set either way, so the two engines are directly
+        // comparable and produce byte-identical results — only the syscall shape
+        // differs. The short-read completion below is shared, because a
+        // positioned read may return short on either path.
+        let res = match io_engine() {
+            IoEngine::Pread => peregrine_io::pread_many_threaded(&mut reqs, pread_threads()),
+            IoEngine::RegBuf => {
+                // Registered buffers must exist before the first read. Sizing
+                // them needs the largest region in the batch, which is only
+                // known here, so registration is lazy and grows once. A failure
+                // is not fatal: fall back to the plain submit rather than lose
+                // the request, since this engine is a measurement option.
+                let want = reqs.iter().map(|q| q.buf.len()).max().unwrap_or(0);
+                match ensure_fixed_buffers(r, want) {
+                    Ok(()) => r.read_fixed_many(&mut reqs).ctx(|| "io_uring fixed-buffer expert read".to_string())?,
+                    Err(e) => {
+                        // ENOMEM here almost always means RLIMIT_MEMLOCK, not
+                        // RAM: registered buffers are pinned pages, and a pool
+                        // sized for ~6 MB expert regions needs far more lockable
+                        // memory than the 8 MB most distros default to.
+                        peregrine_io::note_advisory_err(
+                            "register fixed buffers (raise RLIMIT_MEMLOCK / ulimit -l?); using plain submit",
+                            &e,
+                        );
+                        r.read_many(&mut reqs).ctx(|| "io_uring batched expert read".to_string())?
+                    }
+                }
+            }
+            IoEngine::Uring => r.read_many(&mut reqs).ctx(|| "io_uring batched expert read".to_string())?,
+        };
         for (i, &n) in res.iter().enumerate() {
             if n < 0 {
                 return Err(Error::Io(std::io::Error::from_raw_os_error((-n) as i32)));
@@ -262,6 +298,87 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
         }
     }
     Ok(bufs.into_iter().map(Bytes::from).collect())
+}
+
+/// Which syscall shape the streaming lane uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoEngine {
+    /// io_uring — the historical default, batched submit through the [`Reactor`].
+    Uring,
+    /// N threads of blocking `pread`.
+    Pread,
+    /// io_uring through pre-registered fixed buffers (`IORING_OP_READ_FIXED`).
+    RegBuf,
+}
+
+/// How many registered buffers the `regbuf` engine keeps (`COLI_REGBUF_SLOTS`).
+/// One in-flight op per buffer, so this is the engine's queue depth.
+const REGBUF_SLOTS_DEFAULT: usize = 16;
+
+/// Register fixed buffers of at least `want` bytes, if not already adequate.
+///
+/// Grow-only and idempotent: re-registering unregisters the previous set, which
+/// is a syscall plus re-pinning every page, so it must not happen per read.
+fn ensure_fixed_buffers(r: &mut Reactor, want: usize) -> std::io::Result<()> {
+    if want == 0 {
+        return Ok(());
+    }
+    if r.fixed_buffer_count() > 0 && r.fixed_buffer_capacity() >= want {
+        return Ok(());
+    }
+    let slots = std::env::var("COLI_REGBUF_SLOTS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(REGBUF_SLOTS_DEFAULT);
+    r.register_read_buffers(vec![vec![0u8; want]; slots])
+}
+
+/// The streaming read engine (`COLI_IO_ENGINE=uring|pread`), default `uring`.
+///
+/// **Why this knob exists.** peregrine's own measurement has its io_uring
+/// O_DIRECT lane at **0.84 GB/s against colibrì's 2.02 GB/s** from eight
+/// blocking-`pread` threads on the same drive (`docs/benchmarks.md` §Second
+/// box). The repo's standing explanation is the dm-crypt tax — on LUKS, reads
+/// are CPU-bound on decryption, and N blocking preads keep N cores decrypting
+/// where the ring's completion model can leave cores idle. That hypothesis has
+/// never been tested on the real streaming path, only in `iobench`.
+///
+/// Output is byte-identical either way: same regions, same offsets, same
+/// destination buffers. Only the syscall shape changes, so this can be A/B'd
+/// against a bit-identity assertion rather than eyeballed.
+///
+/// `pread` also implies **no O_DIRECT**: the direct lane's whole value is the
+/// aligned zero-copy DMA path in `read_direct_aligned`, which is io_uring-only.
+/// Setting both is not an error — `pread` simply wins, and `read_regions` says
+/// so at its branch — because the point of the knob is to compare engines, and
+/// silently honouring `COLI_DIRECT` here would compare something else.
+fn io_engine() -> IoEngine {
+    static V: std::sync::OnceLock<IoEngine> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("COLI_IO_ENGINE").as_deref() {
+        Ok("pread") => IoEngine::Pread,
+        Ok("regbuf") => IoEngine::RegBuf,
+        // Historical spelling: `COLI_REGBUF=1` was documented and benchmarked
+        // for a year while being read by no code at all. Honour it here so the
+        // knob finally means something, rather than deleting it and silently
+        // changing what a published benchmark arm did.
+        _ if matches!(std::env::var("COLI_REGBUF").as_deref(), Ok("1") | Ok("true")) => IoEngine::RegBuf,
+        _ => IoEngine::Uring,
+    })
+}
+
+/// Worker threads for the `pread` engine (`COLI_IO_THREADS`), defaulting to the
+/// same worker count the rest of the streaming lane uses. Eight is colibrì's
+/// harness figure and the one the 2.02 GB/s came from.
+fn pread_threads() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_IO_THREADS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(default_workers)
+    })
 }
 
 /// Pack six in-order region [`Bytes`] into an [`ExpertSlab`] (gate/up/down ×

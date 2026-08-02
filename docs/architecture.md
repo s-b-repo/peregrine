@@ -39,7 +39,7 @@ crates/
                      WmmaTuner, PlanOptimizer, the N-ring concurrent lane (concurrent.rs),
                      top-level Model
   peregrine-io       io_uring Reactor (registered files, O_DIRECT, fadvise, batched hint),
-                     LRU cache, LFRU tiering, warm cache (Bloom + optional zstd),
+                     priority-weighted LRU cache, warm cache (Bloom + optional zstd),
                      mem hints (hugepages, NUMA pinning), topology probe, perf counters,
                      aligned slab pool
   peregrine-cuda     FFI to cuda/backend_cuda.cu (feature = "cuda")
@@ -66,7 +66,7 @@ one three-tier hierarchy:
 
 ```
 GPU VRAM  ──  hottest experts, heat-ranked, re-selected by reheat() every 256 steps
-RAM       ──  warm expert cache (LFRU + Bloom filter, optional zstd compression)
+RAM       ──  warm expert cache (priority-weighted LRU + Bloom filter, optional zstd)
 SSD       ──  everything else, streamed per token over io_uring
 ```
 

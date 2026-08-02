@@ -233,8 +233,13 @@ impl std::fmt::Debug for Bytes {
 /// A checked-out slab plus its generation tag — bumped every time the pool
 /// takes the buffer back, so a stale [`SlabHandle`] can't accidentally be used
 /// after a subsequent checkout hands the same allocation to someone else. The
-/// generation is checked by [`SlabPool::checkin`] in debug builds; misuse is
-/// silently accepted in release (never a UB path, just a diagnostic aid).
+/// generation is checked by [`SlabPool::checkin_tagged`] — **not** by
+/// [`SlabPool::checkin`], which validates capacity and free-list length only.
+/// Neither tagged variant has a caller (including in tests), so this protection
+/// is written and not in force; the live path is the untagged pair. Note also
+/// that `checkin_tagged`'s assertion cannot detect the double-return its own doc
+/// advertises: any previously-issued handle satisfies `gen < self.gen`. Fix that
+/// before wiring it, or the wiring installs a check that never fires.
 pub struct SlabHandle {
     pub buf: AlignedBuf,
     pub gen: u32,

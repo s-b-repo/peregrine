@@ -320,6 +320,24 @@ impl WarmCache {
     pub fn budget(&self) -> usize {
         self.budget
     }
+
+    /// Lower the byte budget and evict down to it, returning bytes freed.
+    ///
+    /// The RSS guard's hands. A projection made before load is an estimate —
+    /// colibrì recorded one overshooting by ~40 GB and taking three kernel kills
+    /// with it — so something has to correct against *measured* footprint while
+    /// the process runs. Lowering the budget (rather than evicting once) is what
+    /// stops the cache simply refilling to the old ceiling on the next token.
+    /// Correctness-neutral: an evicted slab is re-read from disk on the next hit.
+    pub fn shrink_budget(&mut self, new_budget: usize) -> usize {
+        if new_budget >= self.budget {
+            return 0;
+        }
+        let before = self.used;
+        self.budget = new_budget;
+        self.evict_to_budget(None);
+        before.saturating_sub(self.used)
+    }
     pub fn used(&self) -> usize {
         self.used
     }

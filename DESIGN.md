@@ -335,7 +335,7 @@ crates/
 | **M2** | io_uring streaming + LRU/pin tiers on the **real 744B model**, CPU-only | coherent decode; hit-rate/disk-wait counters same order as `./glm`; warm-cache A/B within "valid forward" tolerance |
 | **M3** | CUDA expert lane via FFI (still phased): link `backend_cuda.o`, upload VRAM tier, route VRAM experts through `coli_cuda_expert_group` | `tools/benchmark_cuda_fixture.py` on 313M fixture; CPU vs CUDA same tokens |
 | **M4** | **The concurrent 3-lane scheduler** (centerpiece): completion-driven dispatch, CPU∥GPU∥SSD on the same layer, sharded/indexed accumulation, PILOT via ring | **tok/s beats C engine** on a matched box; argmax stream unchanged vs M3; profiler shows GPU busy during CPU/disk |
-| **M5** | MLA weight-absorption + DSA lightning indexer (top-2048, auto-detected from `out-idx-*`) | DSA-off reproduces dense attention token-for-token (README:67); absorption TF 32/32 |
+| **M5** | MLA weight-absorption (`COLI_MLA_ABSORB`, opt-in) + DSA lightning indexer — **absorption is wired; DSA is not.** `dsa.rs`'s `Indexer` is never constructed and `mla_attention_dsa` has no caller outside tests, so the sparse path cannot run and nothing auto-detects `out-idx-*` | absorption: `absorb_approximates_dense` (one call, 10% relative — not bit-equal); DSA: unshipped |
 | **M6** | MTP speculative decode (int8 head draft + batch-union verify) | 39–59% acceptance / 2.2–2.8 tok/fw on int8-head model (README:60); rejection-sampling correct under sampling |
 | **M7** | serve / OpenAI drop-in: stdio `READY`/`END`/`CANCEL` child | `openai_server.py` spawns Rust binary unchanged; `curl` chat streams; web UI works |
 

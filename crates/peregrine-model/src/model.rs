@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use peregrine_core::{Cfg, Context, Error, SafeTensors};
 use peregrine_io::{Reactor, WarmCache};
 
-use crate::attention::{mla_attention, mla_attention_batched, AttnWeights, LayerKv};
+use crate::attention::{mla_attention, mla_attention_absorb, mla_attention_batched, AttnWeights, LayerKv};
 use crate::concurrent::{default_workers, experts_per_batch, moe_forward_concurrent, ForwardCtx};
 use crate::gpu::{GpuTier, HeatTable};
 use crate::math::rmsnorm;
@@ -75,7 +75,17 @@ pub type OfflineArtifacts = (TransitionTable, crate::predict::MacroTable, Vec<Ve
 
 pub struct Model {
     pub cfg: Cfg,
-    embed: Vec<f32>, // [vocab, hidden], dequantized
+    /// `[vocab, hidden]`, kept **packed**. Only one row per token is ever read
+    /// (`dequant_row_into`), so dequantizing the whole table cost 3.81 GB of f32
+    /// against 0.95 GB packed at GLM-5.2 shapes — 2.85 GB of resident set for
+    /// rows that are never touched. Row `r` is bit-identical either way:
+    /// `dequant()` is defined as a loop over `dequant_row`.
+    embed: QtWeight, // [vocab, hidden], packed
+    /// `COLI_MLA_ABSORB`, resolved once at load (see `absorb_enabled`).
+    absorb: bool,
+    /// RSS ceiling the guard enforces, in bytes; 0 disables it.
+    /// `COLI_RSS_GUARD_GB`, else the projected peak recorded at load.
+    rss_limit_bytes: u64,
     layers: Vec<LayerW>,
     final_norm: Vec<f32>,
     lm_head: QtWeight,
@@ -302,6 +312,22 @@ fn stream_transient_reserve(io_rings: usize, workers: usize, per_expert_bytes: u
 fn cap_ecache_budget(requested: usize, mem_available: usize, transient_reserve: usize, safety: usize) -> usize {
     let headroom = mem_available.saturating_sub(transient_reserve.saturating_add(safety));
     requested.min(headroom)
+}
+
+/// Tokens between RSS-guard checks. Frequent enough to catch growth before the
+/// kernel does, rare enough that one small `/proc` read costs nothing. colibrì
+/// checks on the same cadence.
+const RSS_GUARD_EVERY: usize = 16;
+
+/// Whether MLA weight absorption runs on the shared attention path
+/// (`COLI_MLA_ABSORB`). Default **off**: absorb is algebraically equal to the
+/// dense reconstruction but not numerically identical, since the dense path
+/// pushes the cached latent back through the quantized `kv_b` and absorb folds
+/// that weight into the query instead. It therefore changes token values, which
+/// puts it in the same class as `COLI_ROUTE_MIN_SHARE` — size the cost with
+/// `Model::prediction_flip_rate` before turning it on.
+fn absorb_enabled() -> bool {
+    matches!(std::env::var("COLI_MLA_ABSORB").ok().as_deref(), Some("1") | Some("true"))
 }
 
 /// Whether O_DIRECT streaming is requested via `COLI_DIRECT`. Default **off** —
@@ -624,16 +650,44 @@ fn route_stats_persist_enabled() -> bool {
 /// file, unparseable, or a config fingerprint mismatch — which
 /// [`gpu::solve_residency_sized`] treats as a cold table and answers with the
 /// deterministic round-robin placement. Correctness-neutral either way.
+/// Read and parse an optional sidecar artifact (`plan.json`, `tiers.json`,
+/// `automaton.json`, `macrostates.json`, `route_stats.json`).
+///
+/// **Absent** returns `None` in silence — every one of these is optional, and a
+/// model directory without them is the normal case, not a problem.
+///
+/// **Present but unreadable or malformed** also returns `None`, but says so
+/// through `note_advisory_err`. That distinction is the point: these loaders
+/// used to treat a corrupt artifact exactly like a missing one, so a
+/// syntax error in `plan.json` left the engine running default behavior with
+/// nothing anywhere to explain why the file the operator had just written had no
+/// effect. Correctness is unaffected either way — that is what makes it
+/// advisory rather than fatal — but `COLI_DEBUG=1` now names the file and the
+/// reason.
+fn read_optional_artifact(dir: &std::path::Path, file: &str) -> Option<serde_json::Value> {
+    let path = dir.join(file);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            peregrine_io::note_advisory_err(&format!("read optional artifact {file}"), &e);
+            return None;
+        }
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            peregrine_io::note_advisory_err(&format!("parse optional artifact {file} (ignored)"), &e);
+            None
+        }
+    }
+}
+
 fn peek_persisted_heat(dir: &std::path::Path, cfg: &Cfg) -> Vec<u32> {
     if !route_stats_persist_enabled() {
         return Vec::new();
     }
-    let Ok(bytes) = std::fs::read(dir.join("route_stats.json")) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Vec::new();
-    };
+    let Some(v) = read_optional_artifact(dir, "route_stats.json") else { return Vec::new(); };
     // Same fingerprint gate as `try_load_route_stats`: heat is a flat
     // `[layer * n_experts + expert]` array, so restoring it under a different
     // expert count maps every count onto the wrong pair.
@@ -1061,7 +1115,18 @@ fn forward_layer(
     let d = cfg.hidden as usize;
     let eps = cfg.eps;
     let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
-    let attn = mla_attention(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?;
+    // Weight absorption is the decode-shaped form of the same algebra: it works
+    // in the 512-wide latent space instead of reconstructing `[k_nope|v]` for
+    // every cached position on every step, which is what makes the dense path
+    // cost grow with context. It is **not** bit-identical — `absorb_approximates_dense`
+    // holds it to a 10% relative bound, because the dense path quantizes the
+    // reconstruction through `kv_b` and absorb never materializes it. So this is
+    // opt-in and off by default, like every other knob that can move a token.
+    let attn = if ctx.absorb {
+        mla_attention_absorb(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?
+    } else {
+        mla_attention(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?
+    };
     for z in 0..s_n * d {
         x[z] += attn[z];
     }
@@ -1196,6 +1261,76 @@ impl Model {
         // straight to the kernels, which would produce garbage. Force resident
         // mode when any tensor is compressed. Emit a note so a user forcing
         // streaming knows why it was overridden.
+        //
+        // This override MUST precede the RAM preflight below. It used to sit
+        // after it, so on a compressed checkpoint the projection was computed for
+        // streaming — charging zero bytes for the routed experts — and the engine
+        // then loaded all of them resident. The guard passed and the kernel killed
+        // the process anyway, which is the exact failure the preflight exists to
+        // prevent.
+        let stream_experts = if stream_experts && st.has_compressed_tensors() {
+            eprintln!("[peregrine] compressed checkpoint detected — disabling expert streaming (compressed reads decompress on read)");
+            false
+        } else {
+            stream_experts
+        };
+
+        // Preflight: can this machine hold what is about to be loaded? Every byte
+        // needed is already in the headers, so the verdict costs no extra I/O and
+        // lands before the first allocation. Without it an over-large model is a
+        // silent SIGKILL minutes into loading, with nothing in the log to read.
+        let rss_limit_bytes: u64 = {
+            // `uncompressed_nbytes`, not `nbytes`: the latter is the *on-disk*
+            // length, which for a zstd tensor is the compressed payload, while
+            // what the process actually holds is the decompressed size. A 2.5:1
+            // container would have projected at 40% of its real footprint —
+            // under-reporting in precisely the direction that gets a run killed.
+            let total_bytes: u64 = st.tensors().iter().map(|t| t.uncompressed_nbytes.max(0) as u64).sum();
+            let proj = crate::ram::project_load(&crate::ram::ProjectInputs {
+                dense_disk: total_bytes.saturating_sub(routed_bytes),
+                expert_disk: routed_bytes,
+                stream_experts,
+                ecache: ecache_budget_bytes() as u64,
+                stream_transient: stream_transient_reserve(
+                    io_rings(),
+                    default_workers(),
+                    4 * max_expert_region_bytes(&st),
+                ) as u64,
+                kv_pool: crate::ram::kv_pool_bytes(
+                    cfg.kv_lora as u64,
+                    cfg.qk_rope as u64,
+                    cfg.n_layers as u64,
+                    crate::ram::DEFAULT_PROJECTED_CTX,
+                ),
+                buffered_reads: !direct_enabled(),
+            });
+            let avail = mem_available_bytes();
+            eprintln!("{}", crate::ram::summary(&proj, avail));
+            let overcommit =
+                matches!(std::env::var("COLI_RAM_OVERCOMMIT").ok().as_deref(), Some("1") | Some("true"));
+            if let Err(msg) = crate::ram::ram_verdict(&proj, avail, overcommit) {
+                return Err(Error::Format(msg));
+            }
+            // The guard's ceiling: an explicit override, else the peak we just
+            // projected. Using the projection means the guard corrects the
+            // estimate against reality rather than needing a second one.
+            match std::env::var("COLI_RSS_GUARD_GB").ok().as_deref().map(str::trim) {
+                Some(v) if !v.is_empty() => match v.parse::<f64>() {
+                    Ok(g) if g >= 0.0 => (g * 1e9) as u64,
+                    _ => {
+                        eprintln!("peregrine: COLI_RSS_GUARD_GB is not a number — using the projected peak");
+                        proj.peak
+                    }
+                },
+                _ => proj.peak,
+            }
+        };
+
+        // Compressed checkpoints require the decompressing read path in
+        // `read_raw` / `read_f32`; the streaming lane hands raw on-disk bytes
+        // straight to the kernels, which would produce garbage. Force resident
+        // mode when any tensor is compressed. Emit a note so a user forcing
+        // streaming knows why it was overridden.
         let stream_experts = if stream_experts && st.has_compressed_tensors() {
             eprintln!("[peregrine] compressed checkpoint detected — disabling expert streaming (compressed reads decompress on read)");
             false
@@ -1207,7 +1342,7 @@ impl Model {
         let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
         let vocab = cfg.vocab as usize;
 
-        let embed = QtWeight::load(&st, "model.embed_tokens.weight", vocab, d)?.dequant();
+        let embed = QtWeight::load(&st, "model.embed_tokens.weight", vocab, d)?;
         let lm_head = QtWeight::load(&st, "lm_head.weight", vocab, d)?;
         let final_norm = load_f32(&st, "model.norm.weight", d)?;
 
@@ -1327,6 +1462,8 @@ impl Model {
             route_hist_epoch: std::sync::atomic::AtomicBool::new(false),
             cfg,
             embed,
+            absorb: absorb_enabled(),
+            rss_limit_bytes,
             layers,
             final_norm,
             lm_head,
@@ -1396,8 +1533,7 @@ impl Model {
     /// each goes through the same validation as its standalone file. Applied
     /// after the standalone artifacts, so a plan wins where both exist.
     fn try_load_plan(&mut self, dir: &std::path::Path) {
-        let Ok(bytes) = std::fs::read(dir.join("plan.json")) else { return };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
+        let Some(v) = read_optional_artifact(dir, "plan.json") else { return };
         let tag = config_tag(&self.cfg);
         if let Some(av) = v.get("automaton") {
             if let Some(table) = TransitionTable::from_json(av) {
@@ -1437,8 +1573,7 @@ impl Model {
     /// warms for the RAM-tier experts — bounded at 256 entries so a huge plan
     /// can't stall load. No-op without a prefetch pool / warm cache.
     fn try_seed_tiers(&self, dir: &std::path::Path) {
-        let Ok(bytes) = std::fs::read(dir.join("tiers.json")) else { return };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
+        let Some(v) = read_optional_artifact(dir, "tiers.json") else { return };
         self.seed_tiers_from_value(&v);
     }
 
@@ -1787,12 +1922,7 @@ impl Model {
     /// momentum fallback). A missing, malformed, or stale artifact is silently ignored
     /// (the model stays on momentum). Correctness-neutral.
     fn try_attach_automaton(&mut self, dir: &std::path::Path) {
-        let Ok(bytes) = std::fs::read(dir.join("automaton.json")) else {
-            return;
-        };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return;
-        };
+        let Some(v) = read_optional_artifact(dir, "automaton.json") else { return; };
         let Some(table) = TransitionTable::from_json(&v) else {
             return;
         };
@@ -1806,12 +1936,7 @@ impl Model {
     /// after [`Self::try_attach_automaton`] so it composes over whichever base
     /// source won. Missing/stale artifacts are silently ignored.
     fn try_attach_macrostates(&mut self, dir: &std::path::Path) {
-        let Ok(bytes) = std::fs::read(dir.join("macrostates.json")) else {
-            return;
-        };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return;
-        };
+        let Some(v) = read_optional_artifact(dir, "macrostates.json") else { return; };
         let Some(table) = crate::predict::MacroTable::from_json(&v) else {
             return;
         };
@@ -1830,12 +1955,7 @@ impl Model {
         if !route_stats_persist_enabled() {
             return;
         }
-        let Ok(bytes) = std::fs::read(dir.join("route_stats.json")) else {
-            return;
-        };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return;
-        };
+        let Some(v) = read_optional_artifact(dir, "route_stats.json") else { return; };
         let tag = config_tag(&self.cfg);
         // The file carries the config fingerprint it was written under, but only
         // the history checked it. Heat is a flat `[layer * n_experts + expert]`
@@ -2187,6 +2307,48 @@ impl Model {
     /// bytes saved this call; `0` when there was nothing to do. The batch
     /// engine calls this while no requests are pending, so the pause is off
     /// every request's critical path. Gated on `COLI_CACHE_COMPRESS_IDLE=1`.
+    /// Tokens between RSS-guard checks. Frequent enough to catch growth before
+    /// the kernel does, rare enough that one small `/proc` read is free.
+    /// colibrì checks on the same cadence.
+    /// Correct the pre-load projection against **measured** footprint.
+    ///
+    /// The projection is an estimate, and colibrì's experience is that estimates
+    /// drift: it recorded one at 74.4 GB against a real 115.6 GB and took three
+    /// kernel kills. So this reads actual RSS every `RSS_GUARD_EVERY` tokens and,
+    /// when the process is meaningfully over budget, shrinks the warm cache by
+    /// the overshoot — *lowering the budget*, not just evicting, so the cache
+    /// cannot refill to the old ceiling on the next token.
+    ///
+    /// Correctness-neutral by construction: an evicted slab is re-read from disk
+    /// on its next hit, producing the same bytes. The budget is the only lever
+    /// available — resident weights and the KV cache cannot be handed back — so
+    /// this bounds growth rather than guaranteeing a ceiling.
+    ///
+    /// `COLI_RSS_GUARD_GB` sets the limit; unset uses the projected peak recorded
+    /// at load. Zero disables it.
+    fn rss_guard(&self) {
+        let Some(cache) = self.ecache.as_ref() else {
+            return; // resident mode: no cache to give back
+        };
+        let limit = self.rss_limit_bytes;
+        if limit == 0 {
+            return;
+        }
+        let rss = crate::ram::read_rss_bytes();
+        // `parking_lot::Mutex` does not poison, so there is no error case here.
+        let mut c = cache.lock();
+        if let Some(new_budget) = crate::ram::rss_guard_decide(rss, limit, c.budget()) {
+            let freed = c.shrink_budget(new_budget);
+            eprintln!(
+                "peregrine: [ram] RSS {:.1} GB over the {:.1} GB budget — warm cache lowered to                  {:.1} GB, freed {:.1} GB",
+                rss as f64 / 1e9,
+                limit as f64 / 1e9,
+                new_budget as f64 / 1e9,
+                freed as f64 / 1e9,
+            );
+        }
+    }
+
     pub fn idle_maintenance(&self) -> usize {
         if !matches!(std::env::var("COLI_CACHE_COMPRESS_IDLE").as_deref(), Ok("1") | Ok("true")) {
             return 0;
@@ -2420,7 +2582,7 @@ impl Model {
         let mut x = vec![0f32; s_n * d];
         for (s, &t) in tokens.iter().enumerate() {
             let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
-            x[s * d..s * d + d].copy_from_slice(&self.embed[tid * d..tid * d + d]);
+            self.embed.dequant_row_into(tid, &mut x[s * d..s * d + d]);
         }
 
         // This forward logs into `route_hist` (see the `route_log` field below),
@@ -2439,10 +2601,11 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, stream_experts, direct, io_reactors, ecache, route_hist, predictor, prefetch, gpu, heat, lane_timings, layout_schedule, ..
+                cfg, layers, kv, st, stream_experts, direct, io_reactors, ecache, route_hist, predictor, prefetch, gpu, heat, lane_timings, layout_schedule, absorb, ..
             } = self;
             let ctx = ForwardCtx {
                 st,
+                absorb: *absorb,
                 reactors: io_reactors,
                 gpu: gpu.as_ref(),
                 workers: eff_workers,
@@ -2559,6 +2722,7 @@ impl Model {
     fn forward_ctx(&self) -> ForwardCtx<'_> {
         ForwardCtx {
             st: &self.st,
+            absorb: self.absorb,
             reactors: &self.io_reactors,
             gpu: self.gpu.as_ref(),
             workers: self.effective_workers(),
@@ -2590,7 +2754,7 @@ impl Model {
         let mut x = vec![0f32; s_n * d];
         for (s, &t) in tokens.iter().enumerate() {
             let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
-            x[s * d..s * d + d].copy_from_slice(&self.embed[tid * d..tid * d + d]);
+            self.embed.dequant_row_into(tid, &mut x[s * d..s * d + d]);
         }
         let ctx = self.forward_ctx();
         for (li, l) in self.layers.iter().enumerate() {
@@ -2639,7 +2803,7 @@ impl Model {
         let mut x = vec![0f32; s_n * d];
         for (s, &t) in tokens.iter().enumerate() {
             let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
-            x[s * d..s * d + d].copy_from_slice(&self.embed[tid * d..tid * d + d]);
+            self.embed.dequant_row_into(tid, &mut x[s * d..s * d + d]);
         }
         // Built inline (not via `forward_ctx`) so the per-sequence history borrow and
         // the model borrows share one inferred lifetime.
@@ -2648,6 +2812,7 @@ impl Model {
         let aff = self.affinity_snapshot();
         let ctx = ForwardCtx {
             st: &self.st,
+            absorb: self.absorb,
             reactors: &self.io_reactors,
             gpu: self.gpu.as_ref(),
             workers: self.effective_workers(),
@@ -2717,6 +2882,9 @@ impl Model {
             let lg = self.forward_step(&[next], pos)?;
             next = sampler.pick(&lg[..vocab], -1) as i32;
             out.push(next);
+            if step.is_multiple_of(RSS_GUARD_EVERY) {
+                self.rss_guard();
+            }
             if self.cfg.stop_ids.contains(&next) {
                 break;
             }
@@ -2769,11 +2937,12 @@ impl Model {
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_lora as usize, self.cfg.qk_rope as usize);
 
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, stream_experts, cfg, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, stream_experts, cfg, absorb, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft without an MTP head".into()))?;
         let ctx = ForwardCtx {
             st,
+            absorb: *absorb,
             reactors: io_reactors,
             gpu: gpu.as_ref(),
             workers: *workers,
@@ -2798,7 +2967,9 @@ impl Model {
             // norm(embed(tok))
             let tid = (tok.max(0) as usize).min(vocab.saturating_sub(1));
             let mut e = vec![0f32; d];
-            rmsnorm(&mut e, &embed[tid * d..tid * d + d], &mtp.enorm, eps);
+            let mut erow = vec![0f32; d];
+            embed.dequant_row_into(tid, &mut erow);
+            rmsnorm(&mut e, &erow, &mtp.enorm, eps);
             // the incoming hidden: g==0 is the main model's hidden → apply final_norm
             // first; afterwards it is a prior MTP-layer output, used directly.
             if g == 0 {
@@ -2942,6 +3113,73 @@ mod tests {
         let logits = m.forward_step(&[1, 5, 9, 2], 0)?;
         assert_eq!(logits.len(), 4 * m.cfg.vocab as usize);
         assert!(logits.iter().all(|v| v.is_finite()), "logits must be finite");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn optional_artifacts_distinguish_absent_from_malformed() -> Result<(), peregrine_core::Error> {
+        // The whole point of the change: "you have no plan.json" and "your
+        // plan.json is corrupt" used to be the same silent `None`, so a typo in
+        // an artifact an operator had just written produced default behavior and
+        // no explanation anywhere. Both still return `None` — correctness must
+        // not depend on an optional file — but only one of them is silent.
+        let dir = std::env::temp_dir().join(format!("peregrine_artifact_{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+
+        assert!(read_optional_artifact(&dir, "plan.json").is_none(), "absent -> None");
+
+        std::fs::write(dir.join("plan.json"), b"{not json")?;
+        assert!(read_optional_artifact(&dir, "plan.json").is_none(), "malformed -> None, reported");
+
+        std::fs::write(dir.join("plan.json"), br#"{"version": 1}"#)?;
+        let v = read_optional_artifact(&dir, "plan.json");
+        assert!(v.is_some(), "valid -> Some");
+        assert_eq!(
+            v.and_then(|v| v.get("version").and_then(|n| n.as_i64())),
+            Some(1),
+            "and the parsed value is handed back intact"
+        );
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mla_absorb_knob_is_inert_when_off_and_live_when_on() -> Result<(), peregrine_core::Error> {
+        // Two claims, because a knob that changes token values has to prove both:
+        // unset reproduces the historical logits *exactly*, and set actually
+        // reaches a different code path (otherwise it is the `COLI_REGBUF` defect
+        // — documented, settable, and wired to nothing).
+        //
+        // The flag is set on the model, not read from the environment per
+        // forward, so this test does not mutate process-global state — `cargo
+        // test` runs these in parallel threads and an env write here corrupted
+        // `ecache_bit_identical` when it was written that way.
+        let dir = tmp_model_dir("absorb")?;
+        let baseline = Model::load(&dir)?.forward_step(&[1, 5, 9, 2], 0)?;
+        let again = Model::load(&dir)?.forward_step(&[1, 5, 9, 2], 0)?;
+        for (a, b) in baseline.iter().zip(&again) {
+            assert_eq!(a.to_bits(), b.to_bits(), "off must be bit-identical run to run");
+        }
+
+        let mut m = Model::load(&dir)?;
+        m.absorb = true;
+        let absorbed = m.forward_step(&[1, 5, 9, 2], 0)?;
+
+        assert_eq!(absorbed.len(), baseline.len());
+        assert!(absorbed.iter().all(|v| v.is_finite()), "absorb path must produce finite logits");
+        let differed = baseline.iter().zip(&absorbed).any(|(a, b)| a.to_bits() != b.to_bits());
+        assert!(differed, "COLI_MLA_ABSORB=1 changed nothing — the knob is not wired");
+
+        // Deliberately NOT asserting a closeness bound here. `absorb_approximates_dense`
+        // bounds one attention call at 10% relative; this is logits after a whole
+        // stack, where that per-layer difference compounds — measured max 2.6
+        // absolute on this synthetic model's untrained random weights. Whether
+        // that matters is a question about *predictions*, not logit magnitudes,
+        // and `Model::prediction_flip_rate` on a real checkpoint is the instrument
+        // for it. Asserting an invented bound here would be theatre: it would pass
+        // without evidence and fail for reasons unrelated to correctness.
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -3501,10 +3739,20 @@ mod tests {
         let mut m = Model::load(&dir)?;
         assert!(m.has_mtp(), "tiny model should carry an MTP head");
         let prompt = [3, 7, 1, 4];
-        let spec = m.generate_speculative(&prompt, 8, 3)?;
         let mut greedy = Sampler::new(0.0, 0.9, 1);
         let base = m.generate(&prompt, 8, &mut greedy)?;
-        assert_eq!(spec, base, "speculative output must equal greedy");
+        // Sweep the depths an operator can actually reach through `--draft`.
+        // The single depth-3 case this used to test left the recommended 4-6
+        // range unguarded — and depth is exactly the axis the "MTP is a net
+        // loss" figures were taken on (they used 2, where 2.46 accepted is
+        // already 82% of that configuration's ceiling of 3).
+        for g in [1usize, 2, 3, 4, 5, 6, 8] {
+            let spec = m.generate_speculative(&prompt, 8, g)?;
+            assert_eq!(spec, base, "speculative output must equal greedy at draft depth {g}");
+        }
+        // Depth 0 means "no drafting" and must degrade to the plain path rather
+        // than erroring or spinning: `g_draft == 0` is an explicit early return.
+        assert_eq!(m.generate_speculative(&prompt, 8, 0)?, base, "draft depth 0 is the plain path");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

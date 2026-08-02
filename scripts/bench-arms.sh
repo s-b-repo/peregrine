@@ -42,7 +42,8 @@ arm_env() {
     baseline) ;;
     improved | gpu)
         echo "COLI_DIRECT=1"          # O_DIRECT lane, bypass page cache
-        echo "COLI_REGBUF=1"          # registered fixed read buffers
+        # COLI_REGBUF deliberately NOT set: the reachability pass showed no code
+        # reads it, so this arm published a nine-knob bundle that was really eight.
         echo "COLI_IO_TUNE=1"         # adaptive iowq_max_workers
         echo "COLI_LANE_BALANCE=1"    # LaneBalancer placement override
         echo "COLI_SHAPE_SPECIALIZE=1" # probe-then-memoize matmul dispatch

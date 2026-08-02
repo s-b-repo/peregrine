@@ -63,9 +63,15 @@ slab.
 
 ## Tiering & GPU residency
 
-- **LFRU tier scoring** (`peregrine-io/src/tier.rs`): victim score is
-  `(heat << 8) | recency` — frequency dominates recency 256× — with
-  hysteresis against ping-pong.
+- **Warm-cache eviction** (`peregrine-io/src/warmcache.rs::evict_to_budget`):
+  the victim is the lowest `(priority, recency)` — a **priority-weighted LRU**.
+  Heat does not enter the victim score.
+- **LFRU tier scoring** (`peregrine-io/src/tier.rs`) computes
+  `(heat << 8) | recency` with hysteresis, and **nothing calls it.** It is
+  written, tested, and unreachable — the `[R]` defect class in
+  [BAD_PATTERNS](BAD_PATTERNS.md). This page previously described it, in the
+  present tense, as the policy in force; it never has been. Wire it into
+  `evict_to_budget` or delete the module — but do not read it as live.
 - **Heat table** (`gpu.rs::HeatTable`): lock-free atomic routing-frequency
   counters, the substrate every residency/admission decision reads.
 - **Dynamic VRAM residency**: `reheat()` re-selects the hottest experts every

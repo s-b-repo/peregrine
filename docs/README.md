@@ -16,6 +16,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Configuration](configuration.md) | the complete env-var reference — every tuning knob, none of which can change the token stream |
 | [Model format & artifacts](model-format.md) | model directory layout, weight naming, QT quant formats, safetensors extensions, every artifact JSON |
 | [Benchmarks](benchmarks.md) | headline numbers + how to reproduce; summary of the full [peregrine-vs-colibri study](peregrine-vs-colibri.md) |
+| [Validation runbook](validation-runbook.md) | what this workspace could not measure, and the procedure for settling it on a GPU box with the real checkpoint |
 | [Benchmark pass 2026-08-01](benchmark-2026-08-01.md) | post-improvement re-measure: adaptive knobs vs baseline vs the first CUDA-lane numbers, and a harness caveat |
 
 ## How it works
@@ -25,7 +26,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Architecture](architecture.md) | the phased-vs-concurrent thesis, workspace map, memory hierarchy, the five layers of concurrency, design invariants |
 | [The concurrent 3-lane scheduler](concurrent-scheduler.md) | task model, the GPU/CPU/I-O lanes, deterministic accumulation, dispatch-order shaping |
 | [Adaptive runtime](adaptive-runtime.md) | lane telemetry, bubble tuner & lane balancer, IoTuner, sensor governors, learned schedulers, cross-session persistence |
-| [Prefetch & caching](prefetch-and-caching.md) | the prediction spine, two-tier speculation, the warm RAM cache, LFRU tiering, GPU residency |
+| [Prefetch & caching](prefetch-and-caching.md) | the prediction spine, two-tier speculation, the warm RAM cache, GPU residency |
 | [I/O & storage](io-and-storage.md) | the io_uring reactor, O_DIRECT lane, slab pool, zstd, hugepages, NUMA, topology probe, perf counters |
 | [GPU / CUDA lane](gpu-cuda.md) | building with `cuda`, runtime gates, pinned staging & graphs, autotuning, what still needs hardware |
 | [Tokenizer](tokenizer.md) | the vendored gigatoken BPE fast path: what's vendored, what's dropped, parity gates |

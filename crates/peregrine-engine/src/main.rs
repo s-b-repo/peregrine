@@ -193,13 +193,68 @@ fn run() -> Result<(), Error> {
             eprintln!("wrote {n} forwards of routing trace to {out}");
             Ok(())
         }
+        // `route-stats <routes.json> [n_experts]`: read a trace written by
+        // `dump-routes`/`galactic` and report what the router actually does —
+        // consecutive-token expert overlap against the independence null, and
+        // union growth over speculative windows and batch proxies.
+        //
+        // This exists because the repo's headline "0.6% cross-token locality"
+        // is a **warm-cache hit rate** (58/9600 at a 10 GB cache,
+        // `docs/peregrine-vs-colibri.md` §5.2) that four documents then gloss as
+        // a statement about the router. Those are different quantities; only the
+        // first was ever measured. The routing figure is what decides whether
+        // batching amortizes expert reads and whether speculative verification
+        // is byte-neutral, so it needs measuring on its own terms.
+        //
+        // Takes the trace, not the model: it is pure analysis over recorded
+        // routing, so it runs on a box that cannot load the checkpoint.
+        Some("route-stats") => {
+            let path = args
+                .get(2)
+                .ok_or_else(|| Error::Format("usage: peregrine route-stats <routes.json> [n_experts]".into()))?;
+            let trace = peregrine_tools::read_routes(Path::new(path))?;
+            // The pool size is not recorded in the trace, so it is an argument.
+            // Defaulting it to 0 rather than guessing keeps the null honest: with
+            // no pool size the report prints no null instead of a wrong one.
+            let n_experts = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            if n_experts == 0 {
+                eprintln!(
+                    "peregrine: no expert-pool size given — reporting overlap without its \
+                     independence null. Pass it as the 3rd argument (GLM-5.2: 256)."
+                );
+            }
+            print!("{}", peregrine_tools::format_route_stats(&trace, n_experts));
+            Ok(())
+        }
         _ => {
-            let dir = std::env::var("COLI_MODEL").ok().or_else(|| args.get(1).cloned()).ok_or_else(|| {
-                Error::Format("usage: peregrine <model-dir>  (or COLI_MODEL=<dir>)  |  peregrine demo".into())
+            // The positional model dir is the first argument that is not a flag
+            // or a flag's value. Taking `args[1]` blindly made `peregrine
+            // --draft 4` (with COLI_MODEL unset) try to load a directory called
+            // "--draft" and report a file-not-found instead of the usage line.
+            let dir = std::env::var("COLI_MODEL").ok().or_else(|| positional_dir(&args)).ok_or_else(|| {
+                Error::Format(
+                    "usage: peregrine <model-dir> [--draft N]  (or COLI_MODEL=<dir>)  |  peregrine demo".into(),
+                )
             })?;
             let mut model = Model::load(Path::new(&dir))?;
+            // Speculative decode needs an MTP head, which only checkpoints
+            // converted with `--mtp` carry. Refuse loudly rather than silently
+            // decoding non-speculatively: an operator who asked for `--draft`
+            // and got the historical path with no signal would benchmark the
+            // wrong thing and conclude speculation does not help — which is
+            // precisely the reading this feature exists to re-test.
+            let draft = draft_depth(&args);
+            if draft > 0 && !model.has_mtp() {
+                return Err(Error::Format(format!(
+                    "--draft {draft} needs an MTP head, and this checkpoint has none \
+                     (convert with --mtp, or drop the flag)"
+                )));
+            }
+            if draft > 0 {
+                eprintln!("peregrine: MTP speculative decode on, {draft} draft tokens per round");
+            }
             // the peer closing the pipe mid-response is a normal end, not a failure
-            match serve(&mut model) {
+            match serve(&mut model, draft) {
                 Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
                 other => other,
             }
@@ -221,15 +276,63 @@ fn synth_corpus(vocab: usize, n: usize) -> Vec<i32> {
         .collect()
 }
 
+/// Draft depth for MTP speculative decode (`--draft N` or `COLI_DRAFT=N`);
+/// 0 = off, the historical non-speculative path.
+///
+/// **Why a default of 4–6 is the guidance and 2 is not.** `generate_speculative`
+/// has shipped complete, tested and reachable by nothing since M5, and the
+/// repo's stance ("MTP is a net loss on MoE decode") traces to two figures taken
+/// at draft depth 2 — where the theoretical ceiling is 3 accepted tokens, so the
+/// measured 2.46 was already 82% of what that configuration could ever reach.
+/// Production stacks run 5–6 draft tokens on this model class, and the GLM-5
+/// report measures an accept length of 2.76 at 4 steps.
+///
+/// The amortization only exists because the verify pass is *one* forward over
+/// `1+γ` rows through `batch_union` — a single shared expert read for every
+/// drafted token. Whether that is cheap depends on how much the routed union
+/// grows with γ, which is exactly what `peregrine route-stats` measures.
+fn draft_depth(args: &[String]) -> usize {
+    args.iter()
+        .position(|a| a == "--draft")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .or_else(|| std::env::var("COLI_DRAFT").ok().and_then(|s| s.trim().parse::<usize>().ok()))
+        .unwrap_or(0)
+}
+
+/// The first positional argument, skipping `--flag` tokens and the value that
+/// follows each one. `args[0]` is the binary name.
+///
+/// Kept separate and pure so the "is this a flag or the model dir" rule is one
+/// definition rather than a condition repeated at each call site — the shape
+/// that let `--draft` be mistaken for a directory in the first place.
+fn positional_dir(args: &[String]) -> Option<String> {
+    let mut i = 1;
+    while i < args.len() {
+        if args[i].starts_with("--") {
+            i += 2; // skip the flag and its value
+        } else {
+            return Some(args[i].clone());
+        }
+    }
+    None
+}
+
 /// stdio serve loop. Requests (one per line):
 ///   `GEN <ngen> <tok0> <tok1> ...`  → greedy-generate `ngen` tokens
 ///   `QUIT`                          → exit
 /// Each response is the space-separated generated token ids, then `END`.
 ///
+/// With `draft > 0` the MTP head drafts `draft` tokens per round and the main
+/// model verifies them in one batched forward. Greedy acceptance means the
+/// emitted sequence is **identical** to the non-speculative path — speculation
+/// buys wall-clock, never different tokens — which is what
+/// `speculative_matches_greedy` asserts.
+///
 /// Returns `Ok` on a clean shutdown (EOF/QUIT). A write error (e.g. the client
 /// closed the pipe) is propagated so the caller can exit quietly rather than
 /// panicking mid-response.
-fn serve(model: &mut Model) -> Result<(), Error> {
+fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut out = std::io::stdout();
@@ -256,8 +359,14 @@ fn serve(model: &mut Model) -> Result<(), Error> {
             // to stderr and answered with an empty frame (never silently coerced).
             match parse_gen(&mut it) {
                 Ok((ngen, prompt)) if ngen > 0 && !prompt.is_empty() => {
-                    let mut sampler = Sampler::new(0.0, 0.9, 1); // greedy = deterministic
-                    let toks = model.generate(&prompt, ngen, &mut sampler)?;
+                    let toks = if draft > 0 {
+                        // Greedy acceptance, so this returns exactly what the
+                        // line below would have.
+                        model.generate_speculative(&prompt, ngen, draft)?
+                    } else {
+                        let mut sampler = Sampler::new(0.0, 0.9, 1); // greedy = deterministic
+                        model.generate(&prompt, ngen, &mut sampler)?
+                    };
                     let rendered: Vec<String> = toks.iter().map(|t| t.to_string()).collect();
                     out.write_all(rendered.join(" ").as_bytes())?;
                     out.write_all(b"\n")?;
@@ -298,6 +407,19 @@ fn serve(model: &mut Model) -> Result<(), Error> {
                             pct(below[1]),
                             pct(below[2]),
                             pct(below[3])
+                        );
+                    }
+                    // Batch-union sharing (COLI_UNION_STATS=1). `share` is how many
+                    // routed selections each distinct expert read actually served —
+                    // the amortization batching is supposed to buy. benchmarks.md
+                    // credits the 4.4x aggregate gain at B=16 "entirely" to this,
+                    // while a union model over GLM-5.2's 256-expert top-8 layers
+                    // predicts only ~1.26x. This line reads it off the live engine
+                    // rather than deriving it. Silent unless asked.
+                    if let Some((sel, distinct, calls)) = peregrine_model::union_stats_snapshot() {
+                        let share = if distinct > 0 { sel as f64 / distinct as f64 } else { 0.0 };
+                        eprintln!(
+                            "[union] selections={sel} distinct={distinct} calls={calls} share={share:.3}x"
                         );
                     }
                     let g = model.telemetry().gpu;
@@ -408,4 +530,42 @@ fn run_demo() -> Result<(), Error> {
     }
     std::fs::remove_dir_all(&dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        std::iter::once("peregrine".to_string()).chain(rest.iter().map(|s| s.to_string())).collect()
+    }
+
+    #[test]
+    fn positional_dir_skips_flags_and_their_values() {
+        assert_eq!(positional_dir(&argv(&["/models/glm"])).as_deref(), Some("/models/glm"));
+        // The case that motivated this: the flag's *value* must not be mistaken
+        // for the directory either, so "4" is skipped along with "--draft".
+        assert_eq!(positional_dir(&argv(&["--draft", "4", "/models/glm"])).as_deref(), Some("/models/glm"));
+        assert_eq!(positional_dir(&argv(&["/models/glm", "--draft", "4"])).as_deref(), Some("/models/glm"));
+        // Flags only, no directory → None, so the caller prints usage instead of
+        // trying to load a path named "--draft".
+        assert_eq!(positional_dir(&argv(&["--draft", "4"])), None);
+        assert_eq!(positional_dir(&argv(&[])), None);
+    }
+
+    #[test]
+    fn draft_depth_defaults_off_and_reads_the_flag() {
+        // Off unless asked: the historical non-speculative path is the default.
+        // (COLI_DRAFT is process-wide, so this asserts the flag path and the
+        // no-flag path only when the env is unset — the same care
+        // `union_stats_are_silent_unless_asked` takes.)
+        assert_eq!(draft_depth(&argv(&["--draft", "6", "/m"])), 6);
+        assert_eq!(draft_depth(&argv(&["/m", "--draft", "1"])), 1);
+        if std::env::var("COLI_DRAFT").is_err() {
+            assert_eq!(draft_depth(&argv(&["/m"])), 0, "off by default");
+            // A malformed value is not silently taken as 1 or as "on".
+            assert_eq!(draft_depth(&argv(&["--draft", "banana", "/m"])), 0);
+            assert_eq!(draft_depth(&argv(&["--draft"])), 0, "flag with no value");
+        }
+    }
 }
