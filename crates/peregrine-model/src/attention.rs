@@ -90,13 +90,72 @@ impl LayerKv {
     }
 }
 
+/// An ordered view of cached KV that may be split across **two** contiguous
+/// runs: a shared, immutable prefix and this sequence's own tail.
+///
+/// **Why the readers stopped taking `&[f32]`.** Every KV improvement on the
+/// roadmap — sharing a prefix by refcount instead of copying it, block-pooling
+/// the allocation, narrowing the element type — makes the cache discontiguous
+/// or changes its type, and every reader here demanded one contiguous slice.
+/// That single requirement is what coupled four separate items into one
+/// refactor; this is the seam that decouples them.
+///
+/// Two runs rather than an arbitrary block list, deliberately: it is
+/// `Copy`, allocation-free, and index arithmetic stays two branches — enough
+/// for prefix+tail, which is the case that exists today. A block table
+/// generalises `row` and `runs` without touching any caller.
+///
+/// **Rows never straddle the boundary.** `head` always holds a whole number of
+/// rows, so `row` is a bounds check and an offset, never a stitch across two
+/// allocations. Callers construct spans from row-aligned prefixes only.
+#[derive(Clone, Copy)]
+pub struct KvSpan<'a> {
+    head: &'a [f32],
+    tail: &'a [f32],
+}
+
+impl<'a> KvSpan<'a> {
+    /// The whole cache in one run — what every caller had before.
+    pub fn contiguous(all: &'a [f32]) -> KvSpan<'a> {
+        KvSpan { head: all, tail: &[] }
+    }
+
+    /// A shared prefix followed by an owned tail.
+    pub fn split(head: &'a [f32], tail: &'a [f32]) -> KvSpan<'a> {
+        KvSpan { head, tail }
+    }
+
+    /// Row `t` of `width` floats, in causal order across both runs.
+    #[inline]
+    pub fn row(&self, t: usize, width: usize) -> &'a [f32] {
+        let hrows = self.head.len().checked_div(width).unwrap_or(0);
+        if t < hrows {
+            &self.head[t * width..t * width + width]
+        } else {
+            let k = t - hrows;
+            &self.tail[k * width..k * width + width]
+        }
+    }
+
+    /// Whole rows visible through this span.
+    pub fn rows(&self, width: usize) -> usize {
+        (self.head.len() + self.tail.len()).checked_div(width).unwrap_or(0)
+    }
+
+    /// The runs in causal order, skipping empties — for bulk operations that
+    /// work per row and can be applied run-by-run, then concatenated.
+    pub fn runs(&self) -> impl Iterator<Item = &'a [f32]> {
+        [self.head, self.tail].into_iter().filter(|r| !r.is_empty())
+    }
+}
+
 /// A view of one row's KV history for batched MLA decode: that row's own cached
 /// latents (`lc[len, kv_lora]`, `rc[len, qk_rope]`) and causal length `len`.
 /// Rows come from independent sequences, so each carries its own view.
 pub struct RowAttn<'a> {
     pub len: usize,
-    pub lc: &'a [f32],
-    pub rc: &'a [f32],
+    pub lc: KvSpan<'a>,
+    pub rc: KvSpan<'a>,
 }
 
 /// The five projection weights of one attention block.
@@ -286,18 +345,17 @@ fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg, 
 
             sc.clear();
             sc.resize(nt, 0.0);
-            for t in 0..nt {
-                let lt = &cache_lc[t * kvl..t * kvl + kvl];
-                let kr = &cache_rc[t * qk_rope..t * qk_rope + qk_rope];
-                sc[t] = (dot(&qabs, lt) + dot(q_rope, kr)) * c.attn_scale;
+            for (t, sct) in sc.iter_mut().enumerate().take(nt) {
+                let lt = cache_lc.row(t, kvl);
+                let kr = cache_rc.row(t, qk_rope);
+                *sct = (dot(&qabs, lt) + dot(q_rope, kr)) * c.attn_scale;
             }
             softmax(&mut sc);
 
             // clat = Σ_t sc[t] · Lc[t]; ctx = kv_b value rows · clat
             clat.fill(0.0);
-            for t in 0..nt {
-                let lt = &cache_lc[t * kvl..t * kvl + kvl];
-                let a = sc[t];
+            for (t, &a) in sc.iter().enumerate().take(nt) {
+                let lt = cache_lc.row(t, kvl);
                 for i in 0..kvl {
                     clat[i] += a * lt[i];
                 }
@@ -322,7 +380,11 @@ fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache:
     let rows: Vec<RowAttn> = (0..s_n)
         .map(|s| {
             let nt = pos_base + s + 1;
-            RowAttn { len: nt, lc: &cache.lc[..nt * kvl], rc: &cache.rc[..nt * qk_rope] }
+            RowAttn {
+                len: nt,
+                lc: KvSpan::contiguous(&cache.lc[..nt * kvl]),
+                rc: KvSpan::contiguous(&cache.rc[..nt * qk_rope]),
+            }
         })
         .collect();
     attend_absorb_batched(w, q, &rows, c, peregrine_par::PAR_ATTN_MIN)
@@ -406,7 +468,11 @@ pub fn mla_attention_batched(
         caches[s].append(pos_of[s], &lc_rows[s * kvl..s * kvl + kvl], &rc_rows[s * qk_rope..s * qk_rope + qk_rope])?;
     }
     let rows: Vec<RowAttn> = (0..s_n)
-        .map(|s| RowAttn { len: caches[s].len, lc: caches[s].lc.as_slice(), rc: caches[s].rc.as_slice() })
+        .map(|s| RowAttn {
+            len: caches[s].len,
+            lc: KvSpan::contiguous(caches[s].lc.as_slice()),
+            rc: KvSpan::contiguous(caches[s].rc.as_slice()),
+        })
         .collect();
     let ctx = attend_absorb_batched(w, &q, &rows, c, peregrine_par::PAR_ATTN_MIN);
     Ok(w.o.apply_vec(&ctx, s_n))
@@ -705,6 +771,76 @@ mod tests {
     }
 
     #[test]
+    fn kv_span_row_lookup_crosses_the_boundary_in_causal_order() {
+        // The span's one non-obvious job: rows before the split come from the
+        // head, rows after from the tail, and the numbering is continuous. An
+        // off-by-one here would silently attend the wrong position.
+        let head: Vec<f32> = (0..6).map(|k| k as f32).collect(); // 3 rows of 2
+        let tail: Vec<f32> = (6..12).map(|k| k as f32).collect(); // 3 more
+        let split = KvSpan::split(&head, &tail);
+        let all: Vec<f32> = (0..12).map(|k| k as f32).collect();
+        let contig = KvSpan::contiguous(&all);
+        assert_eq!(split.rows(2), 6);
+        assert_eq!(contig.rows(2), 6);
+        for t in 0..6 {
+            assert_eq!(split.row(t, 2), contig.row(t, 2), "row {t} must be the same either way");
+        }
+        // Degenerate shapes return empty rather than dividing by zero.
+        assert_eq!(KvSpan::contiguous(&[]).rows(2), 0);
+        assert_eq!(contig.rows(0), 0);
+        // `runs` skips empties, so a contiguous span is one run, not two.
+        assert_eq!(contig.runs().count(), 1);
+        assert_eq!(split.runs().count(), 2);
+        assert_eq!(KvSpan::split(&head, &[]).runs().count(), 1);
+    }
+
+    #[test]
+    fn kv_span_split_attention_is_bit_identical_to_contiguous() -> Result<(), peregrine_core::Error> {
+        // **The property the whole refactor rests on.** Sharing a prefix by
+        // refcount, block-pooling the cache, or narrowing its element type all
+        // make the KV discontiguous; none of them may move a single output bit.
+        //
+        // Achievable here — unlike vLLM's paged attention, which breaks batch
+        // invariance by reducing over cached and current K/V separately —
+        // because splitting changes only *where a row is read from*, never the
+        // order rows are accumulated in. This test is what keeps that true.
+        let c = cfg()?;
+        let (kvl, qkr) = (c.kv_lora as usize, c.qk_rope as usize);
+        let mut rng = Lcg(0xB0A75);
+        let w = make_weights(&c, 11);
+        let nt = 7usize;
+
+        let lc: Vec<f32> = (0..nt * kvl).map(|_| rng.f()).collect();
+        let rc: Vec<f32> = (0..nt * qkr).map(|_| rng.f()).collect();
+        let (h_n, qh) = (c.n_heads as usize, c.qk_head as usize);
+        let q: Vec<f32> = (0..h_n * qh).map(|_| rng.f()).collect();
+
+        let whole = attend_absorb_batched(
+            &w.view(),
+            &q,
+            &[RowAttn { len: nt, lc: KvSpan::contiguous(&lc), rc: KvSpan::contiguous(&rc) }],
+            &c,
+            usize::MAX,
+        );
+        // Every split point, including the degenerate ends, must agree.
+        for cut in 0..=nt {
+            let (lh, lt) = lc.split_at(cut * kvl);
+            let (rh, rt) = rc.split_at(cut * qkr);
+            let got = attend_absorb_batched(
+                &w.view(),
+                &q,
+                &[RowAttn { len: nt, lc: KvSpan::split(lh, lt), rc: KvSpan::split(rh, rt) }],
+                &c,
+                usize::MAX,
+            );
+            for (k, (a, b)) in whole.iter().zip(&got).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "split at row {cut}, output {k}: not bit-identical");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn attend_absorb_parallel_matches_serial() -> Result<(), peregrine_core::Error> {
         // attend_absorb_batched runs rows on the pool above its gate; the parallel
         // and forced-serial branches must be bit-identical (rows are independent).
@@ -718,7 +854,9 @@ mod tests {
         let q: Vec<f32> = (0..s_n * h_n * qh).map(|_| r.f()).collect();
         let lcs: Vec<Vec<f32>> = (0..s_n).map(|s| (0..lens[s] * kvl).map(|_| r.f()).collect()).collect();
         let rcs: Vec<Vec<f32>> = (0..s_n).map(|s| (0..lens[s] * qkr).map(|_| r.f()).collect()).collect();
-        let rows: Vec<RowAttn> = (0..s_n).map(|s| RowAttn { len: lens[s], lc: &lcs[s], rc: &rcs[s] }).collect();
+        let rows: Vec<RowAttn> = (0..s_n)
+            .map(|s| RowAttn { len: lens[s], lc: KvSpan::contiguous(&lcs[s]), rc: KvSpan::contiguous(&rcs[s]) })
+            .collect();
 
         let par = attend_absorb_batched(&w.view(), &q, &rows, &c, 2); // parallel (s_n >= 2)
         let ser = attend_absorb_batched(&w.view(), &q, &rows, &c, usize::MAX); // forced serial
