@@ -340,11 +340,49 @@ fn kv_admits(resident: usize, budget: usize, in_flight: usize) -> bool {
 }
 
 /// Bytes of KV currently held by every in-flight sequence, decoding and
-/// prefilling alike. Exact, not projected: `SeqKv::bytes()` sums the real
-/// per-layer allocations.
+/// prefilling alike.
+///
+/// Each sequence's private tail, plus **one** charge per distinct shared prefix
+/// however many sequences view it. That is what a refcounted prefix actually
+/// costs: `SeqKv::clone_prefix` hands out `Arc` views of a single allocation, so
+/// summing logical `bytes()` would charge a 2 k-token system prompt once per
+/// concurrent request and choke admission on RAM that was never allocated. The
+/// identity comes from the allocation itself, so two sequences sharing a prefix
+/// at different depths still count it once.
+///
+/// A prefix whose cache entry has since been evicted is still charged here,
+/// because a live sequence still holds it. What is *not* counted is a cache
+/// entry no in-flight sequence is using — that lives under the separate
+/// `COLI_PREFIX_CACHE_MB` budget, as it did before sharing existed.
 fn resident_kv(active: &[SeqState], pending: &VecDeque<Prefilling>) -> usize {
-    active.iter().map(|s| s.seq.bytes()).sum::<usize>()
-        + pending.iter().map(|p| p.seq.bytes()).sum::<usize>()
+    resident_kv_of(active.iter().map(|s| &s.seq).chain(pending.iter().map(|p| &p.seq)))
+}
+
+/// [`resident_kv`] over any set of sequences.
+fn resident_kv_of<'a>(seqs: impl Iterator<Item = &'a SeqKv>) -> usize {
+    dedup_kv_bytes(seqs.map(|s| (s.owned_bytes(), s.shared_prefix())))
+}
+
+/// Private bytes plus one charge per distinct shared allocation, over
+/// `(owned_bytes, shared_prefix)` pairs.
+///
+/// Pure in the pairs rather than in `SeqKv` so the dedup — the part that can
+/// actually be wrong — is testable without a loaded model to fill a cache with.
+fn dedup_kv_bytes(seqs: impl Iterator<Item = (usize, Option<(usize, usize)>)>) -> usize {
+    let mut total = 0usize;
+    // A linear scan, not a set: an in-flight batch is tens of sequences over a
+    // handful of distinct prefixes, so this never leaves L1.
+    let mut seen: Vec<usize> = Vec::new();
+    for (owned, shared) in seqs {
+        total += owned;
+        if let Some((id, bytes)) = shared {
+            if !seen.contains(&id) {
+                seen.push(id);
+                total += bytes;
+            }
+        }
+    }
+    total
 }
 
 /// The admission-loop form of [`kv_admits`]. Ordered so that the default-off
@@ -750,6 +788,22 @@ mod tests {
                 assert!(kv_admits(resident, 0, in_flight), "budget 0 must never refuse");
             }
         }
+    }
+
+    #[test]
+    fn a_shared_prefix_is_charged_once_not_once_per_sequence() {
+        // Byte-aware admission and refcounted prefix sharing have to agree or
+        // the first cancels the second: charging a shared system prompt to every
+        // concurrent request would refuse admissions over RAM that was never
+        // allocated. Four sequences, three of them sharing one 900-byte prefix.
+        let shared = Some((0xA11CE, 900));
+        let seqs = [(10, shared), (20, shared), (30, shared), (40, Some((0xB0B, 500)))];
+        assert_eq!(dedup_kv_bytes(seqs.into_iter()), 10 + 20 + 30 + 40 + 900 + 500);
+        // Sequences owning their KV privately are unaffected — the historical case.
+        assert_eq!(dedup_kv_bytes([(10, None), (20, None)].into_iter()), 30);
+        assert_eq!(dedup_kv_bytes(std::iter::empty()), 0);
+        // Distinct allocations are never merged, even at equal sizes.
+        assert_eq!(dedup_kv_bytes([(0, Some((1, 700))), (0, Some((2, 700)))].into_iter()), 1400);
     }
 
     #[test]
