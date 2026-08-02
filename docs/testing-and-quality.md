@@ -37,24 +37,45 @@ The suite is built around **bit-identity anchors** rather than tolerances:
   to serial execution (`f32::to_bits`-exact tests) for rmsnorm, resident MoE,
   per-row attention, and every matmul — fixed-order reduces make this
   possible.
-- **Concurrent == sequential.** The 3-lane scheduler's output equals the
-  sequential path regardless of lane interleaving (deterministic
-  position-keyed reduce).
+- **Concurrent == sequential.** Deterministic position-keyed reduce, so lane
+  interleaving cannot change the result. Read the anchor carefully though:
+  `concurrent_matches_sequential` lives in `peregrine-sched` and exercises
+  `moe_streamed` — the **two-lane ancestor no crate links**. The production
+  3-lane path (`peregrine-model/concurrent.rs`) is covered at the attention
+  level by `batched_matches_sequential`, not by the test whose name implies it.
 - **Chunked == whole.** Chunked prefill is bit-identical to whole-prompt
   prefill (`engine_chunked_prefill_matches_reference`).
 - **Adaptive knobs are bit-identical when off.** Almost all are also
   correctness-neutral when on — they may change latency or residency, never
-  token values. **One exception, added deliberately:**
-  `COLI_ROUTE_MIN_SHARE` drops routed experts carrying a negligible share of the
-  gate mass, which removes a real (if small) term from the MoE sum. It is off by
-  default, and it is gated by `Model::prediction_flip_rate` rather than by an
-  equality assertion, because a lossy change fails every bit-identity anchor by
-  construction. `COLI_GATE_STATS` is how to size it before enabling it.
+  token values. **Three deliberate exceptions:**
+  - `COLI_ROUTE_MIN_SHARE` drops routed experts carrying a negligible share of the
+    gate mass, which removes a real (if small) term from the MoE sum. It is off by
+    default, and it is gated by `Model::prediction_flip_rate` rather than by an
+    equality assertion, because a lossy change fails every bit-identity anchor by
+    construction. `COLI_GATE_STATS` is how to size it before enabling it.
+  - `COLI_MLA_ABSORB` swaps the dense attention reconstruction for weight
+    absorption. The two are algebraically equal but not numerically identical:
+    dense pushes the cached latent back through the quantized `kv_b`, absorb folds
+    that weight into the query instead. `absorb_approximates_dense` bounds *one
+    call* at 10% relative; end-to-end that difference compounds through the stack,
+    and it has not been measured on a real checkpoint. Off by default, and its
+    test asserts only what is verifiable — inert when unset, genuinely wired when
+    set — rather than an invented closeness bound.
+  - **A requantized checkpoint** (`peregrine-requantize`) changes token values by
+    existing, not by being toggled, so it has no knob row. int4 → int2 is a double
+    quantization; measure it with `prediction_flip_rate` against the source
+    container rather than assuming the halved bytes are free.
 - **Format round-trips.** Config / safetensors index / QT formats / dtype
   round-trips; zstd and kblock layouts decode byte-identically;
   `apply_layout_is_bit_identical` gates the physical checkpoint rewrite with
   teacher-forcing equality.
-- **io_uring reads validated byte-for-byte vs `pread`** on real hardware.
+- **io_uring reads validated byte-for-byte vs `pread`** — *when the harness can
+  run them.* Every such test returns `Ok(())` on a kernel without io_uring or a
+  filesystem that rejects O_DIRECT (tmpfs, overlayfs, many CI containers), and
+  `cargo test` swallows the `eprintln!` skip notice without `--nocapture`.
+  Nothing asserts that at least one of them executed, so a green run is
+  compatible with this whole story never having been exercised. Check it
+  explicitly on any machine you intend to trust the claim on.
 - **Tokenizer parity.** Id-for-id equality with the HF `tokenizers` oracle
   over an edge-case corpus (`crates/peregrine-serve/tests/tokenizer_parity.rs`);
   the HF crate exists *only* as this test oracle.
@@ -94,7 +115,7 @@ workspace-wide scan documented in [BAD_PATTERNS.md](BAD_PATTERNS.md):
   `peregrine-cuda` (FFI), `peregrine-kernels` (SIMD); `peregrine-core` is
   `#![forbid(unsafe_code)]`, and `peregrine-serve` too.
 
-Current status: `--strict` green — **P=0, B=0, U=0, C=0, Q=0, I=0** (52 files;
+Current status: `--strict` green — **P=0, B=0, U=0, C=0, Q=0, I=0** (55 files;
 `peregrine-token` excluded as vendored — its gate is the parity suite).
 Waivers use `// audit-allow:` comments, and none remain in first-party code.
 There are **zero production `assert!`s**: the last one (KV-cache append order)

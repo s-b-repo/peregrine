@@ -55,11 +55,23 @@ bug. The `while let Ok(…) = rx.recv()` worker loops were rewritten as explicit
 which *is* the concrete shutdown variant, so naming it is the fix.
 
 **Advisory operations** (madvise/fadvise hints, NUMA pinning, route-stats
-persistence, shutdown signalling) are correctness-neutral by design and must not
-become hard errors — they report through `peregrine_io::note_advisory_err`
-(re-exported from `peregrine-core`), which prints to stderr **only when
-`COLI_DEBUG=1`**. Bool-returning hint APIs (kernel may decline) are called as
-bare statements — the bool is informational by documented contract.
+persistence, shutdown signalling, optional-artifact loading) are
+correctness-neutral by design and must not become hard errors — they report
+through `peregrine_io::note_advisory_err` (re-exported from `peregrine-core`),
+which prints to stderr **only when `COLI_DEBUG=1`**. Bool-returning hint APIs
+(kernel may decline) are called as bare statements — the bool is informational by
+documented contract.
+
+**"Optional" is not a licence to be silent about a broken input.** The optional
+sidecars (`plan.json`, `tiers.json`, `automaton.json`, `macrostates.json`,
+`route_stats.json`) loaded with `let Ok(bytes) = fs::read(…) else { return }`,
+which collapsed three distinct situations into one: the file is absent (normal),
+the file is corrupt (the operator wants to know), and the file is for a different
+model (the fingerprint guard's job). `read_optional_artifact` now separates them
+— absent is silent, unreadable or malformed goes to `note_advisory_err`, stale
+stays silent because that guard exists to make mixing checkpoints a no-op. This
+closed twelve `[L]` findings (28 → 16), and `docs/model-format.md` no longer
+claims malformed files are "silently ignored", which contradicted this section.
 
 ## [U] UB / concurrency footguns — **strict, must be zero**
 
@@ -147,6 +159,50 @@ It exists because five instances shipped, and every one was found by hand:
 | `COLI_PERF_COUNTERS` → `open_l3_miss_counter` | ✅ twice in `todo.md`, plus `DESIGN.md`, `README.md`, `docs/configuration.md`, `docs/io-and-storage.md`, `docs/adaptive-runtime.md` — "consumers feed `PerfCounter::read` deltas into the prefetch tuner" | that consumer does not exist; nothing calls the opener |
 | `SlabPool::checkout_tagged` / `checkin_tagged` | ✅ in `todo.md` as recycling-by-generation; `docs/io-and-storage.md` describes the safety property as active | untagged `checkout`/`checkin` are used (7 and 5 sites); the generation-tagged variants that stop a straggler write into a recycled slab have zero callers, including tests |
 
+**The audit could not see its own headline example, until 2026-08-02.** It
+recorded one definition site per name (`defs.setdefault`) and excluded exactly
+that line from the reference scan. A symbol declared twice — the
+`#[cfg(target_os = "linux")]` implementation and its `#[cfg(not(...))]` stub —
+therefore had its second declaration counted as a *caller* of the first: the two
+vouched for each other and the symbol scored as reached. `register_read_buffers`
+is exactly that shape, so `COLI_REGBUF` — the row above, the case the script is
+named for — was invisible to the script. Now every definition site is recorded
+and excluded; the count went 49 → 55, newly surfacing `register_read_buffers`,
+`read_direct_many`, `fixed_buffer_count`, `is_registered`, `with_compression`
+and `pcie_link_by_bdf`. The lesson generalises: **a detector that cannot find
+the defect it was written for is not evidence of absence.** When this list
+shrinks, check that the symbol was wired or deleted — not that the scan stopped
+seeing it.
+
+### The 2026-08-02 triage
+
+A second sweep found **four instances larger than any of the five above**, none
+of which the script had surfaced — three because of the bare-name blind spot
+below, one because nobody had checked. Recorded here so the next run's *diff* is
+the signal rather than the count.
+
+| Feature | Claimed | Reality |
+|---|---|---|
+| **LFRU eviction** (`tier.rs`) | six doc sites + two ✅ roadmap entries; `todo.md` specifically said "**not** plain LRU" | zero callers anywhere. The live policy is `warmcache.rs::evict_to_budget` — priority-weighted LRU. Heat never enters the victim score |
+| **DSA sparse attention** (`dsa.rs`, `mla_attention_dsa`) | `DESIGN.md` M5, `model-format.md` "auto-detected", vs-colibrì feature table | `Indexer` is never constructed and nothing appends a key, so the path cannot run even if something called it |
+| **`peregrine-sched`** | `README.md` status table: ✅, "`moe_streamed` overlaps io_uring streaming ∥ CPU compute" | **no crate depends on it.** Production MoE is `peregrine-model/concurrent.rs`. It is not used as an oracle either — no test compares the two |
+| **MTP speculative decode** | vs-colibrì: "MTP head wired" | `generate_speculative` has no caller in either binary; there is no `--draft` flag or `DRAFT` knob |
+
+All four doc sets are now corrected. The code is left in place: deleting a
+tested subsystem is a product decision about intent, not a hygiene fix, and
+`todo.md` tracks each as 🟡 rather than ✅.
+
+**The scan's own limits, stated so absence is not read as proof.** References
+match by **bare name** with no type resolution, so any method sharing a name with
+something called elsewhere scores as reached — `Indexer::{load, select, reset}`
+are invisible for exactly this reason, which is why an entire unreachable module
+went unreported. Treat common method names (`new`, `load`, `get`, `push`, `len`,
+`clear`, `reset`, `select`) as **unchecked, not clean**. A separate bug fixed the
+same day: lines beginning `*` were skipped as comment continuations, which also
+ate dereference assignments, so `f16_to_f32` — reachable only via
+`*o = f16_to_f32(...)` — was reported dead. Block comments are now tracked
+properly.
+
 The common shape is worth naming: **the feature was built, the documentation was
 written from the intent, and the wiring was never done.** Tests do not catch it
 because the code under test is genuinely correct — it simply runs nowhere. Nor
@@ -184,8 +240,8 @@ swallows; the ignored-closure form `…or_else(|_e|` *is* gated).
 
 ## Current status
 
-`--strict` is green: **P=0, B=0, U=0, C=0, Q=0, I=0** (informational: L=28
-let-else sites, R=49 unreferenced `pub fn`s; 52 files; `peregrine-token` excluded
+`--strict` is green: **P=0, B=0, U=0, C=0, Q=0, I=0** (informational: L=16
+let-else sites, R=50 unreferenced `pub fn`s; 55 files; `peregrine-token` excluded
 as vendored). Of the R list, five entries were confirmed as genuine unreachable
 features and are catalogued in [R] above; the rest are library API the binaries
 do not happen to call. Two of the five — the `perf_event_open` counter and the

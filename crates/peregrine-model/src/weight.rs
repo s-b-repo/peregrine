@@ -10,7 +10,7 @@
 use peregrine_core::{Error, QtFmt, QtInfo, SafeTensors};
 use peregrine_io::Bytes;
 use peregrine_kernels::{
-    dot_i2i8, matmul_i4_from_f32, matmul_i4g_from_f32, matmul_i8_from_f32, qrow_i8, ActScratch, MatShape,
+    dot_i2i8, dot_i2i8_g64, dot_i3i8_g64, matmul_i4_from_f32, matmul_i4g_from_f32, matmul_i8_from_f32, qrow_i8, ActScratch, MatShape,
 };
 
 /// The quantized formats the compute path supports. F32 is rejected at load, so
@@ -22,6 +22,15 @@ pub enum QuantFmt {
     Int4,
     Int4Grouped,
     Int2,
+    /// int3 with per-group scales, group 64 (colibrì fmt 5) — 3.5 bits/weight.
+    Int3G64,
+    /// **affine** int2 with a scale *and* zero-point per 64-value group, the two
+    /// interleaved in the scale array as `[s, z]`. 3.0 bits/weight effective
+    /// (the two f32 per group cost a full bit/weight on top of the payload).
+    /// Unlike
+    /// [`QuantFmt::Int2`] all four levels carry weight, because the bias is the
+    /// group's own zero-point rather than a fixed `-2`.
+    Int2G64,
 }
 
 impl QuantFmt {
@@ -34,6 +43,8 @@ impl QuantFmt {
             QtFmt::Int4 => Some(QuantFmt::Int4),
             QtFmt::Int4Grouped => Some(QuantFmt::Int4Grouped),
             QtFmt::Int2 => Some(QuantFmt::Int2),
+            QtFmt::Int3G64 => Some(QuantFmt::Int3G64),
+            QtFmt::Int2G64 => Some(QuantFmt::Int2G64),
             QtFmt::F32 | QtFmt::Unknown => None,
         }
     }
@@ -62,8 +73,9 @@ impl QtWeight {
     /// For grouped-int4 use [`Self::new_grouped`].
     pub fn new(fmt: QuantFmt, o: usize, i: usize, q: impl Into<Bytes>, scale: Vec<f32>) -> QtWeight {
         debug_assert!(
-            matches!(fmt, QuantFmt::Int8 | QuantFmt::Int4 | QuantFmt::Int2),
-            "QtWeight::new is for per-row formats (got {fmt:?}); use new_grouped for grouped int4"
+            matches!(fmt, QuantFmt::Int8 | QuantFmt::Int4 | QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64),
+            "QtWeight::new is for formats with an implicit group layout (got {fmt:?}); \
+             use new_grouped for grouped int4, whose group size is a runtime value"
         );
         QtWeight { fmt, o, i, q: q.into(), scale, gs: 0 }
     }
@@ -98,6 +110,8 @@ impl QtWeight {
             QuantFmt::Int8 => o * i,
             QuantFmt::Int4 | QuantFmt::Int4Grouped => o * (i.div_ceil(2)),
             QuantFmt::Int2 => o * (i.div_ceil(4)),
+            QuantFmt::Int3G64 => o * i.div_ceil(peregrine_core::pack::I3_GROUP) * peregrine_core::pack::I3_GROUP_BYTES,
+            QuantFmt::Int2G64 => o * i.div_ceil(peregrine_core::pack::I2G_GROUP) * peregrine_core::pack::I2G_GROUP_BYTES,
         };
         let mut q = vec![0u8; nb];
         st.read_raw(name, &mut q)?;
@@ -143,6 +157,46 @@ impl QtWeight {
                     for s in 0..s_n {
                         let d = dot_i2i8(w, &xq[s * self.i..s * self.i + self.i], self.i) as f32;
                         y[s * self.o + o] = d * sc * sx[s];
+                    }
+                }
+            }
+            QuantFmt::Int3G64 => {
+                // Per-group scales, so the integer dot is accumulated and scaled
+                // per 64-value group — the same shape as grouped int4, which is
+                // why this composes with the int8-activation path at all.
+                for s in 0..s_n {
+                    sx[s] = qrow_i8(&x[s * self.i..s * self.i + self.i], &mut xq[s * self.i..s * self.i + self.i]);
+                }
+                let ng = self.i.div_ceil(peregrine_core::pack::I3_GROUP);
+                let rb = ng * peregrine_core::pack::I3_GROUP_BYTES;
+                for o in 0..self.o {
+                    let w = &self.q[o * rb..o * rb + rb];
+                    let sc = &self.scale[o * ng..o * ng + ng];
+                    for s in 0..s_n {
+                        let d = dot_i3i8_g64(w, &xq[s * self.i..s * self.i + self.i], sc, self.i);
+                        y[s * self.o + o] = d * sx[s];
+                    }
+                }
+            }
+            QuantFmt::Int2G64 => {
+                // Same grouped shape as int3-g64, with two scales per group
+                // instead of one. The affine zero-point is folded inside the
+                // kernel (`s·Σqx + z·Σx`), so nothing extra is needed here — and
+                // like int3, the per-row activation scale `sx[s]` multiplies the
+                // whole group-scaled sum, since `qrow_i8` is per row.
+                use peregrine_core::pack::{I2G_GROUP, I2G_GROUP_BYTES, I2G_SCALES_PER_GROUP};
+                for s in 0..s_n {
+                    sx[s] = qrow_i8(&x[s * self.i..s * self.i + self.i], &mut xq[s * self.i..s * self.i + self.i]);
+                }
+                let ng = self.i.div_ceil(I2G_GROUP);
+                let rb = ng * I2G_GROUP_BYTES;
+                let sw = ng * I2G_SCALES_PER_GROUP;
+                for o in 0..self.o {
+                    let w = &self.q[o * rb..o * rb + rb];
+                    let sc = &self.scale[o * sw..o * sw + sw];
+                    for s in 0..s_n {
+                        let d = dot_i2i8_g64(w, &xq[s * self.i..s * self.i + self.i], sc, self.i);
+                        y[s * self.o + o] = d * sx[s];
                     }
                 }
             }
@@ -238,6 +292,30 @@ impl QtWeight {
                     let byte = self.q[o * rb + (i >> 2)];
                     let field = ((byte >> (2 * (i & 3))) & 0x03) as i32;
                     *dst = (field - 2) as f32 * s;
+                }
+            }
+            QuantFmt::Int3G64 => {
+                use peregrine_core::pack::{i3_value, I3_GROUP, I3_GROUP_BYTES, I3_LOW_BYTES};
+                let ng = self.i.div_ceil(I3_GROUP);
+                let rb = ng * I3_GROUP_BYTES;
+                for (i, dst) in out.iter_mut().enumerate() {
+                    let (g, k) = (i / I3_GROUP, i % I3_GROUP);
+                    let gb = o * rb + g * I3_GROUP_BYTES;
+                    let v = i3_value(self.q[gb + (k >> 2)], self.q[gb + I3_LOW_BYTES + (k >> 3)], k);
+                    *dst = v as f32 * self.scale[o * ng + g];
+                }
+            }
+            QuantFmt::Int2G64 => {
+                use peregrine_core::pack::{i2g_field, I2G_GROUP, I2G_GROUP_BYTES, I2G_SCALES_PER_GROUP};
+                let ng = self.i.div_ceil(I2G_GROUP);
+                let rb = ng * I2G_GROUP_BYTES;
+                for (i, dst) in out.iter_mut().enumerate() {
+                    let (g, k) = (i / I2G_GROUP, i % I2G_GROUP);
+                    let si = (o * ng + g) * I2G_SCALES_PER_GROUP;
+                    // Affine: `q·s + z`, not `(q - bias)·s`.
+                    *dst = i2g_field(self.q[o * rb + g * I2G_GROUP_BYTES + (k >> 2)], k) as f32
+                        * self.scale[si]
+                        + self.scale[si + 1];
                 }
             }
         }
@@ -375,6 +453,133 @@ mod tests {
         assert_eq!(loaded.apply_vec(&x, 2), mem.apply_vec(&x, 2), "disk-loaded grouped == in-memory");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn int2_g64_apply_matches_its_dequantized_matmul() {
+        // Same contract as int3-g64 below, and it matters more here: the affine
+        // form splits into `s·Σqx + z·Σx`, so a kernel that dropped the second
+        // term would still produce plausible-looking numbers on centred weights.
+        // A deliberately *off-centre* weight distribution makes the zero-point
+        // carry real mass, so omitting it fails loudly.
+        use peregrine_core::pack::quant_i2_g64;
+        let (o, i, s_n) = (5usize, 128usize, 3usize);
+        let mut rng = Lcg(0xC0FFEE);
+        let wf: Vec<f32> = (0..o * i).map(|_| 2.0 + rng.f()).collect();
+        let xf: Vec<f32> = (0..s_n * i).map(|_| rng.f()).collect();
+        let (q, sc) = quant_i2_g64(&wf, o, i);
+        let w = QtWeight::new(super::QuantFmt::Int2G64, o, i, q, sc);
+
+        let y = w.apply_vec(&xf, s_n);
+        let wdq = w.dequant();
+        let mut yref = vec![0f32; s_n * o];
+        matmul_f32(&mut yref, &xf, &wdq, s_n, i, o);
+        for k in 0..s_n * o {
+            let tol = 0.05 * i as f32;
+            assert!((y[k] - yref[k]).abs() < tol, "k={k} kernel={} dequant-matmul={}", y[k], yref[k]);
+        }
+    }
+
+    #[test]
+    fn int3_g64_apply_matches_its_dequantized_matmul() {
+        // New format, new kernel: the contract is that `dot_i3i8_g64` computes
+        // the same thing as dequantizing and doing an f32 matmul, within the
+        // activation-quantization error the IDOT path already carries for every
+        // other format. Without this the kernel could decode the two planes in
+        // the wrong order and still produce plausible numbers.
+        use peregrine_core::pack::quant_i3_g64;
+        let (o, i, s_n) = (5usize, 128usize, 3usize);
+        let mut rng = Lcg(0xC0FFEE);
+        let wf: Vec<f32> = (0..o * i).map(|_| rng.f()).collect();
+        let xf: Vec<f32> = (0..s_n * i).map(|_| rng.f()).collect();
+        let (q, sc) = quant_i3_g64(&wf, o, i);
+        let w = QtWeight::new(super::QuantFmt::Int3G64, o, i, q, sc);
+
+        let y = w.apply_vec(&xf, s_n);
+        let wdq = w.dequant();
+        let mut yref = vec![0f32; s_n * o];
+        matmul_f32(&mut yref, &xf, &wdq, s_n, i, o);
+        for k in 0..s_n * o {
+            let tol = 0.05 * i as f32;
+            assert!((y[k] - yref[k]).abs() < tol, "k={k} kernel={} dequant-matmul={}", y[k], yref[k]);
+        }
+    }
+
+    #[test]
+    fn core_dequant_matches_qtweight() {
+        // `peregrine_core::pack::QtView` decodes container bytes for the offline
+        // tools, which depend on core alone and cannot reach `QtWeight`. Two
+        // implementations of one format is a drift risk, so this pins them: same
+        // bytes in, bit-identical floats out, for every format the tools touch.
+        use peregrine_core::pack::QtView;
+        use peregrine_core::qt::QtFmt;
+        let (o, i) = (6usize, 40usize);
+        let mut rng = Lcg(0x5EED);
+        let wf: Vec<f32> = (0..o * i).map(|_| rng.f()).collect();
+        let i2 = {
+            // int2 has no test_support constructor; build it from core's producer.
+            let (q, sc) = peregrine_core::pack::quant_i2(&wf, o, i);
+            QtWeight::new(super::QuantFmt::Int2, o, i, q, sc)
+        };
+        let i3g = {
+            let (q, sc) = peregrine_core::pack::quant_i3_g64(&wf, o, i);
+            QtWeight::new(super::QuantFmt::Int3G64, o, i, q, sc)
+        };
+        let i2g = {
+            let (q, sc) = peregrine_core::pack::quant_i2_g64(&wf, o, i);
+            QtWeight::new(super::QuantFmt::Int2G64, o, i, q, sc)
+        };
+        for (w, fmt, gs) in [
+            (quant_i8(&wf, o, i), QtFmt::Int8, 0usize),
+            (quant_i4(&wf, o, i), QtFmt::Int4, 0),
+            (i2, QtFmt::Int2, 0),
+            (quant_i4_grouped(&wf, o, i, 16), QtFmt::Int4Grouped, 16),
+            // The grouped formats were missing from this pin, so core and engine
+            // could have drifted on exactly the two decoders with the most
+            // arithmetic in them (two planes; a zero-point).
+            (i3g, QtFmt::Int3G64, 64),
+            (i2g, QtFmt::Int2G64, 64),
+        ] {
+            let (q, scale) = w.raw();
+            let view = QtView { fmt, o, i, gs, q, scale };
+            let mut a = vec![0f32; i];
+            let mut b = vec![0f32; i];
+            for r in 0..o {
+                w.dequant_row_into(r, &mut a);
+                view.dequant_row_into(r, &mut b);
+                for k in 0..i {
+                    assert_eq!(a[k].to_bits(), b[k].to_bits(), "{fmt:?} row {r} col {k}: core != engine");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dequant_row_into_is_bit_identical_to_the_full_matrix() {
+        // `Model::embed` keeps the table packed and pulls one row per token
+        // instead of materializing the whole `[vocab, hidden]` f32 matrix
+        // (2.85 GB of resident set at GLM-5.2 shapes). That substitution is only
+        // sound while row `r` of `dequant()` is bit-for-bit `dequant_row_into(r)`
+        // — true by construction today, asserted here so it stays true.
+        let (o, i) = (7usize, 48usize);
+        let mut rng = Lcg(0xB19);
+        let wf: Vec<f32> = (0..o * i).map(|_| rng.f()).collect();
+        for w in [quant_i8(&wf, o, i), quant_i4(&wf, o, i), quant_i4_grouped(&wf, o, i, 16)] {
+            let whole = w.dequant();
+            let mut row = vec![0f32; i];
+            for r in 0..o {
+                row.iter_mut().for_each(|v| *v = f32::NAN); // no stale-buffer pass
+                w.dequant_row_into(r, &mut row);
+                for k in 0..i {
+                    assert_eq!(
+                        row[k].to_bits(),
+                        whole[r * i + k].to_bits(),
+                        "fmt {:?} row {r} col {k}: row-wise dequant differs from the full matrix",
+                        w.fmt
+                    );
+                }
+            }
+        }
     }
 
     #[test]

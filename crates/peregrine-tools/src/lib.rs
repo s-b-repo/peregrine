@@ -4,9 +4,11 @@
 //!
 //! Everything is deterministic: same trace → same artifacts.
 
+pub mod requant;
+
 use peregrine_core::{Context, Error};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 pub fn read_routes(path: &Path) -> Result<Vec<Vec<Vec<i32>>>, Error> {
@@ -481,6 +483,219 @@ pub fn trace_heat(trace: &[Vec<Vec<i32>>], layer: usize) -> HashMap<i32, u64> {
     heat
 }
 
+/// Routing statistics for one layer of a trace.
+///
+/// **Why this exists.** `docs/benchmarks.md` reports "cross-token expert
+/// locality 0.6%", and the study records how it was obtained: 58 warm-cache
+/// hits out of 9,600 expert reads at a 10 GB cache
+/// (`docs/peregrine-vs-colibri.md` §5.2). That is a *cache-capacity* result —
+/// 16 tokens touch ~180 GB, so a 10 GB cache holds ~5% of the working set — and
+/// it was then glossed across four documents as "consecutive tokens route to
+/// ~disjoint expert sets", which is a claim about the *router*. The two are
+/// different quantities and only the first was ever measured. These functions
+/// measure the second.
+///
+/// The distinction is load-bearing: the routing figure is what decides whether
+/// batching amortizes expert reads and whether speculative verification is
+/// byte-neutral, and a cache hit rate cannot answer either.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlapStats {
+    /// Consecutive position pairs counted (both sides non-empty).
+    pub pairs: u64,
+    /// Mean `|A ∩ B| / |A|` — the share of a position's experts that the
+    /// previous position also routed. This is the quantity a perfect one-step
+    /// cache would hit, i.e. what "cross-token locality" should mean.
+    pub mean_overlap: f64,
+    /// Mean `|A ∩ B| / |A ∪ B|` (Jaccard). Reported alongside because
+    /// `PhaseTracker` steers on Jaccard distance, so the two stay comparable.
+    pub mean_jaccard: f64,
+    /// Mean routed-set size, so the reader can size the null below.
+    pub mean_set_size: f64,
+    /// Expected `mean_overlap` if consecutive positions routed *independently*:
+    /// each of A's experts lands in B with probability `|B| / n_experts`. A
+    /// measured value near this means the router carries no cross-token
+    /// structure; **below** it means routing is anti-correlated, which would be
+    /// a much stronger and stranger claim than "no locality".
+    pub independent_null: f64,
+}
+
+/// The routed set at `(position, layer)`: deduplicated, ordered, with padding
+/// (negative ids) removed — the same convention [`build_cooccurrence`] uses.
+///
+/// An absent position or layer yields the empty set, spelled out rather than
+/// defaulted: "this layer is dense" and "the trace is shorter than asked" must
+/// both read as empty here, and neither is an error worth propagating through
+/// every statistic.
+fn routed_set(trace: &[Vec<Vec<i32>>], pos: usize, layer: usize) -> BTreeSet<i32> {
+    match trace.get(pos).and_then(|f| f.get(layer)) {
+        Some(s) => s.iter().copied().filter(|&e| e >= 0).collect(),
+        None => BTreeSet::new(),
+    }
+}
+
+/// Consecutive-position expert overlap for `layer`.
+///
+/// `n_experts` is the layer's expert-pool size, used only to compute the
+/// independence null; pass 0 to skip it (the null is then reported as 0.0).
+/// Positions whose routed set is empty (dense layers, or a layer the trace
+/// never exercised) are skipped rather than counted as zero-overlap, which
+/// would silently drag the mean toward 0.
+pub fn consecutive_overlap(trace: &[Vec<Vec<i32>>], layer: usize, n_experts: usize) -> OverlapStats {
+    let sets: Vec<BTreeSet<i32>> = (0..trace.len()).map(|p| routed_set(trace, p, layer)).collect();
+    let (mut pairs, mut sum_ov, mut sum_ja, mut sum_sz, mut sz_n) = (0u64, 0f64, 0f64, 0f64, 0u64);
+    for s in &sets {
+        if !s.is_empty() {
+            sum_sz += s.len() as f64;
+            sz_n += 1;
+        }
+    }
+    for w in sets.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if a.is_empty() || b.is_empty() {
+            continue;
+        }
+        let inter = a.intersection(b).count() as f64;
+        let union = (a.len() + b.len()) as f64 - inter;
+        sum_ov += inter / a.len() as f64;
+        sum_ja += if union > 0.0 { inter / union } else { 0.0 };
+        pairs += 1;
+    }
+    let mean_set_size = if sz_n > 0 { sum_sz / sz_n as f64 } else { 0.0 };
+    let independent_null =
+        if n_experts > 0 { (mean_set_size / n_experts as f64).min(1.0) } else { 0.0 };
+    OverlapStats {
+        pairs,
+        mean_overlap: if pairs > 0 { sum_ov / pairs as f64 } else { 0.0 },
+        mean_jaccard: if pairs > 0 { sum_ja / pairs as f64 } else { 0.0 },
+        mean_set_size,
+        independent_null,
+    }
+}
+
+/// Mean `|∪ routed(t..t+w)| / |routed(t)|` over `layer` — how many times one
+/// position's expert bytes a `w`-position window costs.
+///
+/// With `w = γ+1` this is exactly the price of a speculative verify that drafts
+/// `γ` tokens: the verify forward reads the union of all `w` positions' experts
+/// in one batched pass. A ratio near 1 means verification is nearly free in
+/// bytes (speculation amortizes); a ratio near `w` means it multiplies them.
+///
+/// Windows are *consecutive* positions of one sequence, which is what
+/// speculation actually produces. For the independent-sequence case that
+/// batching produces, use [`union_growth_strided`].
+pub fn union_growth_consecutive(trace: &[Vec<Vec<i32>>], layer: usize, w: usize) -> f64 {
+    union_growth_over(trace, layer, w, 1)
+}
+
+/// Mean union growth over `b` positions spread across the trace by a stride, as
+/// a proxy for `b` **independent** sequences decoding in one batch.
+///
+/// A single-sequence trace cannot contain genuinely independent sequences, so
+/// this is a proxy and should be labelled as one — but it is a far better proxy
+/// than consecutive positions, which share whatever local structure exists. The
+/// stride is deterministic (`len / b`, floored at 1), so the same trace always
+/// yields the same figure.
+pub fn union_growth_strided(trace: &[Vec<Vec<i32>>], layer: usize, b: usize) -> f64 {
+    let stride = (trace.len() / b.max(1)).max(1);
+    union_growth_over(trace, layer, b, stride)
+}
+
+fn union_growth_over(trace: &[Vec<Vec<i32>>], layer: usize, w: usize, stride: usize) -> f64 {
+    if w == 0 {
+        return 0.0;
+    }
+    let at = |i: usize| routed_set(trace, i, layer);
+    let span = (w - 1) * stride;
+    let (mut n, mut sum) = (0u64, 0f64);
+    for start in 0..trace.len().saturating_sub(span) {
+        let base = at(start);
+        if base.is_empty() {
+            continue;
+        }
+        let mut u = base.clone();
+        for j in 1..w {
+            u.extend(at(start + j * stride));
+        }
+        sum += u.len() as f64 / base.len() as f64;
+        n += 1;
+    }
+    if n > 0 {
+        sum / n as f64
+    } else {
+        0.0
+    }
+}
+
+/// Expected union growth under independent routing: `w` draws of `k` experts
+/// from a pool of `n` cover `n·(1 − (1 − k/n)^w)` distinct experts, i.e. this
+/// multiple of one draw. The null every measured figure should be read against
+/// — reported next to it rather than left for the reader to compute.
+pub fn union_growth_null(n_experts: usize, k: usize, w: usize) -> f64 {
+    if n_experts == 0 || k == 0 || w == 0 {
+        return 0.0;
+    }
+    let (n, k) = (n_experts as f64, k as f64);
+    n * (1.0 - (1.0 - k / n).powi(w as i32)) / k
+}
+
+/// Render the whole-trace routing report: per-layer overlap against the
+/// independence null, then union growth for speculative windows and batch
+/// proxies. Returned as text rather than printed so the caller owns the stream
+/// and tests can assert on it.
+pub fn format_route_stats(trace: &[Vec<Vec<i32>>], n_experts: usize) -> String {
+    let n_layers = trace.iter().map(|f| f.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    out.push_str(&format!("positions={} layers={} experts/layer={}\n", trace.len(), n_layers, n_experts));
+
+    // Sparse layers only: a dense layer routes nothing and would report 0.0.
+    let sparse: Vec<usize> = (0..n_layers)
+        .filter(|&l| trace.iter().any(|f| f.get(l).is_some_and(|s| !s.is_empty())))
+        .collect();
+    let (mut ov, mut ja, mut null, mut sz) = (0f64, 0f64, 0f64, 0f64);
+    for &l in &sparse {
+        let s = consecutive_overlap(trace, l, n_experts);
+        ov += s.mean_overlap;
+        ja += s.mean_jaccard;
+        null += s.independent_null;
+        sz += s.mean_set_size;
+    }
+    let d = sparse.len().max(1) as f64;
+    out.push_str("\nconsecutive-token routing overlap (mean over sparse layers)\n");
+    out.push_str(&format!("  routed set size   {:.1}\n", sz / d));
+    out.push_str(&format!("  overlap |A∩B|/|A| {:.4}  ({:.2}%)\n", ov / d, 100.0 * ov / d));
+    out.push_str(&format!("  jaccard           {:.4}\n", ja / d));
+    out.push_str(&format!("  independence null {:.4}  ({:.2}%)\n", null / d, 100.0 * null / d));
+    out.push_str(
+        "  NOTE: this is a routing statistic. It is NOT the 0.6% in benchmarks.md,\n\
+         \x20       which is a warm-cache hit rate (58/9600 at a 10 GB cache).\n",
+    );
+
+    let k = (sz / d).round() as usize;
+    out.push_str("\nunion growth |∪ routed(t..t+w)| / |routed(t)|\n");
+    out.push_str("  w  consecutive  strided(proxy for B indep. seqs)  independent null\n");
+    for w in [2usize, 3, 4, 5, 6, 16] {
+        let (mut c, mut s) = (0f64, 0f64);
+        for &l in &sparse {
+            c += union_growth_consecutive(trace, l, w);
+            s += union_growth_strided(trace, l, w);
+        }
+        out.push_str(&format!(
+            "  {:<2} {:>11.3} {:>31.3} {:>17.3}\n",
+            w,
+            c / d,
+            s / d,
+            union_growth_null(n_experts, k, w)
+        ));
+    }
+    out.push_str(
+        "\nreading it: w=γ+1 consecutive is what a γ-token speculative verify pays\n\
+         (near 1.0 = speculation is nearly free in bytes; near w = it multiplies them).\n\
+         strided is the batching proxy; compare against the null to see whether the\n\
+         router carries structure or is behaving like independent draws.\n",
+    );
+    out
+}
+
 /// **Self-reorganizing checkpoint rewrite**: physically rewrite
 /// `model.safetensors` so each layer's expert tensors are stored in the
 /// computed schedule order — turning the runtime ordering hint into actual
@@ -583,6 +798,108 @@ pub fn write_schedule(dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlap_spans_identical_to_disjoint() {
+        // Identical consecutive sets → perfect overlap and Jaccard 1.
+        let same = vec![vec![vec![1, 2, 3, 4]], vec![vec![1, 2, 3, 4]]];
+        let s = consecutive_overlap(&same, 0, 256);
+        assert_eq!(s.pairs, 1);
+        assert!((s.mean_overlap - 1.0).abs() < 1e-12);
+        assert!((s.mean_jaccard - 1.0).abs() < 1e-12);
+
+        // Disjoint consecutive sets → zero on both.
+        let disj = vec![vec![vec![1, 2, 3, 4]], vec![vec![5, 6, 7, 8]]];
+        let s = consecutive_overlap(&disj, 0, 256);
+        assert_eq!(s.mean_overlap, 0.0);
+        assert_eq!(s.mean_jaccard, 0.0);
+
+        // Half-shared: |A∩B|=2, |A|=4 → 0.5; |A∪B|=6 → jaccard 1/3.
+        let half = vec![vec![vec![1, 2, 3, 4]], vec![vec![3, 4, 5, 6]]];
+        let s = consecutive_overlap(&half, 0, 256);
+        assert!((s.mean_overlap - 0.5).abs() < 1e-12);
+        assert!((s.mean_jaccard - 1.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn overlap_null_is_set_size_over_pool_and_negatives_are_skipped() {
+        // 8 experts of 256 → an independent draw would share 8/256 = 3.125%.
+        // This is the number a measured overlap has to be read against; the
+        // repo's "0.6%" is a cache hit rate and cannot be compared to it.
+        let t = vec![vec![vec![0, 1, 2, 3, 4, 5, 6, 7]], vec![vec![8, 9, 10, 11, 12, 13, 14, 15]]];
+        let s = consecutive_overlap(&t, 0, 256);
+        assert!((s.mean_set_size - 8.0).abs() < 1e-12);
+        assert!((s.independent_null - 8.0 / 256.0).abs() < 1e-12);
+
+        // Negative ids are padding, not experts — the whole file skips them.
+        let neg = vec![vec![vec![1, -1, 2]], vec![vec![1, -1, 2]]];
+        let s = consecutive_overlap(&neg, 0, 0);
+        assert!((s.mean_set_size - 2.0).abs() < 1e-12);
+        assert_eq!(s.independent_null, 0.0, "pool 0 means no null, not a divide by zero");
+    }
+
+    #[test]
+    fn empty_layers_are_skipped_not_counted_as_zero() {
+        // A dense layer routes nothing. Counting it as zero-overlap would drag
+        // the mean toward 0 and manufacture exactly the "no locality" reading
+        // this function exists to test.
+        let t = vec![vec![vec![1, 2], vec![]], vec![vec![1, 2], vec![]]];
+        let sparse = consecutive_overlap(&t, 0, 16);
+        let dense = consecutive_overlap(&t, 1, 16);
+        assert!((sparse.mean_overlap - 1.0).abs() < 1e-12);
+        assert_eq!(dense.pairs, 0, "a layer that never routes contributes no pairs");
+        assert_eq!(dense.mean_overlap, 0.0);
+    }
+
+    #[test]
+    fn union_growth_brackets_are_one_and_w() {
+        // Identical sets every position → the union never grows: 1.0 for any w.
+        let same = vec![vec![vec![1, 2]]; 8];
+        for w in [2usize, 3, 6] {
+            assert!((union_growth_consecutive(&same, 0, w) - 1.0).abs() < 1e-12, "w={w}");
+        }
+        // Fully disjoint sets → the union is exactly w times one position.
+        let disj: Vec<Vec<Vec<i32>>> = (0..8).map(|i| vec![vec![i * 2, i * 2 + 1]]).collect();
+        for w in [2usize, 3, 4] {
+            assert!((union_growth_consecutive(&disj, 0, w) - w as f64).abs() < 1e-12, "w={w}");
+        }
+    }
+
+    #[test]
+    fn union_growth_null_matches_the_coupon_collector_closed_form() {
+        // Two independent draws of k from n cover n(1-(1-k/n)^2) distinct, i.e.
+        // (2 - k/n) times one draw. At k=8, n=256 that is 1.96875.
+        assert!((union_growth_null(256, 8, 2) - (2.0 - 8.0 / 256.0)).abs() < 1e-12);
+        assert!((union_growth_null(256, 8, 1) - 1.0).abs() < 1e-12);
+        // Degenerate inputs return 0 rather than NaN/inf.
+        assert_eq!(union_growth_null(0, 8, 2), 0.0);
+        assert_eq!(union_growth_null(256, 0, 2), 0.0);
+        assert_eq!(union_growth_null(256, 8, 0), 0.0);
+    }
+
+    #[test]
+    fn union_growth_strided_is_deterministic_and_spreads() {
+        // Period-2 alternation: consecutive positions are disjoint (growth 2),
+        // but a stride of 2 lands on the same set every time (growth 1).
+        let t: Vec<Vec<Vec<i32>>> =
+            (0..8).map(|i| vec![if i % 2 == 0 { vec![1, 2] } else { vec![3, 4] }]).collect();
+        assert!((union_growth_consecutive(&t, 0, 2) - 2.0).abs() < 1e-12);
+        assert!((union_growth_strided(&t, 0, 4) - 1.0).abs() < 1e-12, "stride 2 hits one phase");
+        // Same trace, same answer — the stride is derived, never sampled.
+        assert_eq!(union_growth_strided(&t, 0, 4), union_growth_strided(&t, 0, 4));
+    }
+
+    #[test]
+    fn route_stats_report_distinguishes_itself_from_the_cache_hit_rate() {
+        // The whole point of the report is that it is not the 0.6% figure, so
+        // the disclaimer is part of the contract, not decoration.
+        let t = vec![vec![vec![1, 2, 3]], vec![vec![2, 3, 4]], vec![vec![3, 4, 5]]];
+        let s = format_route_stats(&t, 64);
+        assert!(s.contains("warm-cache hit rate"), "report must disown the 0.6% gloss");
+        assert!(s.contains("independence null"), "a measured overlap is meaningless without its null");
+        assert!(s.contains("union growth"));
+        assert!(s.contains("positions=3"));
+    }
 
     #[test]
     fn cooccurrence_is_symmetric_by_construction() {

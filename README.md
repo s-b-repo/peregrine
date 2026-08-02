@@ -82,13 +82,13 @@ pattern; the whole-buffer and parallel-batch paths run 3–7× higher still — 
 |---|---|---|---|
 | Model loaders | `peregrine-core` | ✅ | config / safetensors index / QT format / dtype round-trips |
 | CPU int4 forward | `peregrine-kernels`, `peregrine-model` | ✅ **runs end-to-end** | int8/int4 dots bit-exact on AVX-VNNI; MoE vs f32 ref; attention causality / decode==prefill; full `Model` load→forward→generate |
-| io_uring streaming | `peregrine-io` | ✅ | io_uring reads validated byte-for-byte vs `pread` on real hardware; LRU cache; LFRU tiering; **registered files** (`IOSQE_FIXED_FILE`) + `SINGLE_ISSUER`/`COOP_TASKRUN`; O_DIRECT zero-copy lane |
+| io_uring streaming | `peregrine-io` | ✅ | io_uring reads validated byte-for-byte vs `pread` on real hardware (see the skip caveat in [testing](docs/testing-and-quality.md)); priority-weighted LRU cache; **registered files** (`IOSQE_FIXED_FILE`) + `SINGLE_ISSUER`/`COOP_TASKRUN`; O_DIRECT zero-copy lane |
 | CUDA GPU lane | `peregrine-cuda` | ⚙️ FFI complete, host-gated | FFI to the vendored `cuda/backend_cuda.cu` (fused quant matmul, WMMA W4A16, SwiGLU, attention+RoPE) + `nvcc` build.rs behind the `cuda` feature; pinned staging, persistent stream, graph capture/replay (incl. multi-kernel). Default build is a stub — **GPU tests run on an NVIDIA box** |
-| Concurrent scheduler | `peregrine-sched`, `peregrine-model` | ✅ core | `moe_streamed` overlaps io_uring streaming ∥ CPU expert compute; `concurrent.rs` runs N rings with lock-free work-stealing ∥ CPU pool ∥ GPU lane, fixed-order reduce; output == sequential |
+| Concurrent scheduler | `peregrine-model` (`concurrent.rs`) | ✅ core | `moe_streamed` overlaps io_uring streaming ∥ CPU expert compute; `concurrent.rs` runs N rings with lock-free work-stealing ∥ CPU pool ∥ GPU lane, fixed-order reduce; output == sequential |
 | Data-parallel compute | `peregrine-par` | ✅ | persistent scoped pool for rmsnorm / resident MoE / per-row attention / every matmul; **bit-identical to serial** (`f32::to_bits`-exact), work-gated, nesting-safe |
 | Prefetch & prediction | `peregrine-model` (`predict.rs`) | ✅ | K-deep `RouteHistory` + momentum / offline transition automaton, per-layer look-ahead emission, EWMA distance tuner, predictive eviction — all correctness-neutral (a wrong guess just re-streams identical bytes) |
 | Continuous batching | `peregrine-serve` (`batch.rs`) | ✅ | one engine thread batches all in-flight requests; chunked prefill (64-token chunks) interleaved with decode, bit-identical to whole-prompt prefill (`engine_chunked_prefill_matches_reference`) |
-| MLA absorption / MTP | `peregrine-model` | ✅ absorption / core | `mla_attention_absorb` ≈ dense + causal; `speculative_sample` rejection sampling statistically lossless |
+| MLA absorption / MTP | `peregrine-model` | 🟡 absorption opt-in / MTP unreachable | `mla_attention_absorb` behind `COLI_MLA_ABSORB` (off by default; ≈ dense within 10% on one call, unmeasured end to end). `speculative_sample` is statistically lossless but `generate_speculative` has no caller in either binary |
 | Serve (stdio drop-in) | `peregrine-engine` | ✅ | `READY`/`END` handshake — a drop-in for colibrì's `c/glm` behind `openai_server.py` |
 | Serve (native HTTP) | `peregrine-serve` | ✅ | OpenAI-compatible `POST /v1/chat/completions` (SSE + non-streaming), `/v1/models`, `/health`; bearer auth, token caps, graceful shutdown, `#![forbid(unsafe_code)]`, two-tier priority queue via `X-Peregrine-Priority` |
 | Adaptive runtime | `peregrine-model` (`lane.rs`, `iotune.rs`, `telemetry.rs`, `workload.rs`) | ✅ | per-lane wall-time accum + `BubbleTuner` EWMA → `LaneBalancer` (CPU/GPU bias-driven downgrade); `IoTuner` adjusts `iowq_max_workers` between forwards; `PhaseTracker` + `PredictSource::PhaseAware`; per-class prefetch breadth from the serving layer's prompt classifier; heat-threshold cache admission; NUMA worker pinning; real `perf_event_open` LLC-miss counter; cross-session `route_stats.json` at Drop / auto-load on load |
@@ -106,9 +106,12 @@ replication (≥ 2 GPUs); distributed inference (multiple hosts).
 **Eight need no hardware at all** — fusing prefill into the decode batch, KV
 quantization, paged KV, int2 checkpoint conversion, and heat-tiered on-disk
 precision. Each is a substantial change to a core invariant rather than a blocked
-one, and that is where the remaining throughput is: measured cross-token expert
-locality is 0.6%, so the wins left are in moving *fewer* bytes per token, not in
-moving 11.3 GB faster.
+one, and that is where the remaining throughput is: caching and prefetch plateau
+on this workload, so the wins left are in moving *fewer* bytes per token, not in
+moving 11.3 GB faster. (The 0.6 % figure often cited for this is a **warm-cache
+hit rate**, not a routing statistic — see the correction in
+[the study](docs/peregrine-vs-colibri.md#52-cache--locality-analysis-peregrine-measured)
+and measure the routing quantity with `peregrine route-stats`.)
 
 One item is open **by choice rather than by hardware**: CPU/GPU split GEMM. The
 plumbing is small, but the CPU half computes int4 and the GPU half f32, and a
@@ -127,11 +130,12 @@ crates/
                      WmmaTuner, PlanOptimizer, the N-ring concurrent lane
                      (concurrent.rs), top-level Model
   peregrine-io       io_uring Reactor (registered files, O_DIRECT, fadvise, batched hint),
-                     LRU cache, LFRU tiering, warm cache (Bloom + optional zstd compression),
+                     priority-weighted LRU cache, warm cache (Bloom + optional zstd),
                      mem hints (hugepages, NUMA pinning), topology probe, perf counters,
                      aligned slab pool
   peregrine-cuda     FFI to cuda/backend_cuda.cu (feature = "cuda")
-  peregrine-sched    concurrent MoE scheduler: io_uring streaming ∥ CPU compute
+  peregrine-sched    two-lane streaming ancestor — NOT linked by any crate;
+                     the live 3-lane path is peregrine-model/concurrent.rs
   peregrine-par      persistent scoped worker pool, bit-identical to serial (std-only)
   peregrine-engine   binary `peregrine`: stdio serve protocol, demo, bench, automaton
   peregrine-serve    binary `peregrine-serve`: OpenAI HTTP server + continuous batching
@@ -303,7 +307,7 @@ CPU-streaming decode):
 | Decode, single sequence (steady state) | 0.054 tok/s | **0.077 tok/s** |
 | **Batched decode, B=16 (aggregate)** | **0.280 tok/s** (4.4× over B=1) | — |
 | Warm cache on a repeated forward | **3.58×** (100 % hit, 0 disk) | learned pin |
-| Cross-token expert locality | 0.6 % (measured) | — |
+| Warm-cache hit rate, sustained decode (10 GB cache) | 0.6 % (measured) | — |
 
 Both are **disk-bandwidth-bound** (600 experts ≈ 11 GB/token); colibrì is currently
 ~1.4× faster at raw *single-sequence* streaming (deeper io_uring queue), while

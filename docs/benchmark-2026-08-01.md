@@ -58,7 +58,7 @@ almost nothing here — measured cross-token expert hit rate is 0.6 %.
 | Arm | Knobs on top of defaults |
 |---|---|
 | `baseline` | none — every adaptive knob defaults to historical behavior, so plain defaults *are* the published study's config |
-| `improved` | `COLI_DIRECT` `COLI_REGBUF`¹ `COLI_IO_TUNE` `COLI_LANE_BALANCE` `COLI_SHAPE_SPECIALIZE` `COLI_HYPER_SCHED` `COLI_PREFETCH_TUNE` `COLI_ENTROPY_ADAPT` `COLI_REPLICATE_K=8` |
+| `improved` | `COLI_DIRECT`² `COLI_REGBUF`¹ `COLI_IO_TUNE` `COLI_LANE_BALANCE` `COLI_SHAPE_SPECIALIZE` `COLI_HYPER_SCHED` `COLI_PREFETCH_TUNE` `COLI_ENTROPY_ADAPT` `COLI_REPLICATE_K=8` |
 | `gpu` | `improved` + `COLI_GPU=1` on the `cuda` build |
 
 ¹ **`COLI_REGBUF` turned out to be inert.** Audited after this pass:
@@ -68,6 +68,25 @@ streaming path always takes the plain read. So the `improved` arm was eight live
 knobs and one no-op. It does not change the conclusion (the bundle was already
 1.00×, with byte-identical disk reads), but the arm description would otherwise
 overstate what was exercised. Tracked in [`todo.md`](../todo.md) §4.
+
+² **`COLI_DIRECT` was crippled, which this pass could not have known.**
+Discovered 2026-08-02: `Reactor::read_direct_aligned` — the call the streaming
+lane makes under `COLI_DIRECT=1` — submitted **one region at a time**, so the
+O_DIRECT lane ran at queue depth 1 regardless of `COLI_IO_BATCH` or
+`COLI_IO_RINGS`, while the buffered sibling submitted all 96 regions of an expert
+batch at once. Direct reads were consequently *slower* than buffered ones.
+
+So the nine-knob bundle above was really **eight live knobs, one no-op, and one
+running at a fraction of its intended depth** — and the headline **1.004×** rests
+on that. Unlike footnote ¹ this one *may* change the conclusion, because
+`COLI_DIRECT` is the knob most directly aimed at the disk-bandwidth bound the
+whole §1–§11 program targets. The fix measured 1.2–1.3× on the I/O lane in
+isolation on a LUKS laptop; its effect on end-to-end decode is unmeasured.
+
+**Re-running this pass is the first thing to do on hardware that can load the
+model** — see the [validation runbook](validation-runbook.md#2-re-run-the-2026-08-01-knob-pass--its-conclusion-is-suspect).
+Until then, treat 1.004× as provisional rather than as settled evidence that
+faster byte movement is exhausted.
 
 ## Results — B=16, isolated, 3 repeats
 

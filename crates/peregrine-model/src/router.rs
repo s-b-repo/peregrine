@@ -315,6 +315,48 @@ fn kk_range(kept: usize, k: usize) -> std::ops::Range<usize> {
     kept.min(k)..k
 }
 
+/// Process-global batch-union tallies: total selections, distinct experts, and
+/// calls. Same shape and rationale as the gate-share counters above — `batch_union`
+/// is the one chokepoint both MoE paths reach (`concurrent.rs`, `mlp.rs`), so the
+/// counter lives here rather than being threaded through `ForwardCtx`.
+static UNION_SELECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UNION_DISTINCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UNION_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether to tally batch-union sharing (`COLI_UNION_STATS=1`). Off by default:
+/// three relaxed adds per sparse layer per forward, but it is pure diagnostics.
+fn union_stats_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("COLI_UNION_STATS").as_deref(), Ok("1") | Ok("true")))
+}
+
+/// `(selections, distinct, calls)` accumulated since process start, or `None`
+/// when `COLI_UNION_STATS` is off — so "not measured" cannot read as "no sharing".
+///
+/// **What this settles.** `selections / distinct` is the *expert-read sharing
+/// factor*: how many routed selections each disk read actually serves.
+/// `docs/benchmarks.md` attributes the measured 4.4× aggregate gain at B=16
+/// "entirely" to this sharing, but a union model over GLM-5.2's parameters
+/// (256 experts, top-8) predicts only ~1.26× at B=16. Both cannot be right, and
+/// the same document already retracted a 1.45× that in-process sweeping had
+/// manufactured. This counter reads the number off the live engine instead of
+/// deriving it.
+pub fn union_stats_snapshot() -> Option<(u64, u64, u64)> {
+    if !union_stats_enabled() {
+        return None;
+    }
+    use std::sync::atomic::Ordering;
+    let calls = UNION_CALLS.load(Ordering::Relaxed);
+    if calls == 0 {
+        return None;
+    }
+    Some((
+        UNION_SELECTIONS.load(Ordering::Relaxed),
+        UNION_DISTINCT.load(Ordering::Relaxed),
+        calls,
+    ))
+}
+
 /// Batch-union (Phase B): the set of distinct experts routed by any position, in
 /// first-seen order. Each unique expert is computed once and applied to all its
 /// rows — the invariant the concurrent scheduler (M4) enforces structurally.
@@ -328,6 +370,17 @@ pub fn batch_union(r: &Routed, s_n: usize) -> Vec<i32> {
                 uniq.push(e);
             }
         }
+    }
+    // Tallied after the loop, and the selection count is re-derived from `keff`
+    // rather than incremented inside it — so the hot path carries no counter at
+    // all when the knob is off. Relaxed is right: these are monotonic
+    // diagnostics read once at shutdown, never compared mid-flight.
+    if union_stats_enabled() {
+        use std::sync::atomic::Ordering;
+        let selections: u64 = (0..s_n).map(|s| r.keff[s].max(0) as u64).sum();
+        UNION_SELECTIONS.fetch_add(selections, Ordering::Relaxed);
+        UNION_DISTINCT.fetch_add(uniq.len() as u64, Ordering::Relaxed);
+        UNION_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     uniq
 }
@@ -532,6 +585,37 @@ mod tests {
         let r = Routed { idx: vec![0, 2, 2, 3], w: vec![1.0; 4], keff: vec![2, 2], k: 2 };
         let u = batch_union(&r, 2);
         assert_eq!(u, vec![0, 2, 3]); // first-seen order
+    }
+
+    #[test]
+    fn union_stats_are_silent_unless_asked() {
+        // Default-off is the contract: a caller must not be able to mistake
+        // "the knob is off" for "no sharing was observed". The knob is read
+        // once into a OnceLock, so this asserts the shipped default rather than
+        // trying to toggle it mid-process.
+        let r = Routed { idx: vec![0, 2, 2, 3], w: vec![1.0; 4], keff: vec![2, 2], k: 2 };
+        assert_eq!(batch_union(&r, 2).len(), 3, "the call still has to work with the tally off");
+        if std::env::var("COLI_UNION_STATS").is_err() {
+            assert!(union_stats_snapshot().is_none(), "off by default, and 'off' is not 'zero'");
+        }
+    }
+
+    #[test]
+    fn union_sharing_factor_is_selections_over_distinct() {
+        // The quantity the counter exists to report. 2 positions x top-2 = 4
+        // selections over 3 distinct experts → each read serves 4/3 selections.
+        // This is the arithmetic behind the 4.4x-vs-1.26x disagreement, so it is
+        // worth pinning even though the tally itself is env-gated.
+        let r = Routed { idx: vec![0, 2, 2, 3], w: vec![1.0; 4], keff: vec![2, 2], k: 2 };
+        let distinct = batch_union(&r, 2).len() as u64;
+        let selections: u64 = (0..2).map(|s| r.keff[s].max(0) as u64).sum();
+        assert_eq!((selections, distinct), (4, 3));
+        assert!((selections as f64 / distinct as f64 - 4.0 / 3.0).abs() < 1e-12);
+
+        // Fully disjoint routing shares nothing: the factor is exactly 1.0, the
+        // floor a disk-bound engine gets no amortization from.
+        let d = Routed { idx: vec![0, 1, 2, 3], w: vec![1.0; 4], keff: vec![2, 2], k: 2 };
+        assert_eq!(batch_union(&d, 2).len(), 4);
     }
 
     #[test]

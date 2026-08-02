@@ -15,10 +15,20 @@ sidecar artifact the runtime reads or writes.
 | `*.safetensors` (≥ 1) | yes | every file with the `safetensors` extension, loaded in **lexical filename order**; there is no `model.safetensors.index.json` support |
 | `tokenizer.json` | serve only | required by `peregrine-serve` (gigatoken BPE); the stdio engine works on raw token ids without it |
 
-Optional sidecars are consumed automatically and best-effort (missing,
-malformed, or stale files are silently ignored): `automaton.json`,
+Optional sidecars are consumed automatically and best-effort — none of them can
+change what the engine computes, only how fast: `automaton.json`,
 `macrostates.json`, `route_stats.json`, `tiers.json`, `schedule.json`,
 `plan.json` — see [the artifact table](#runtime--offline-artifacts).
+
+**A missing sidecar is silent; a broken one is not.** An absent file is the
+normal case and says nothing. A file that is present but unreadable or malformed
+is still ignored — correctness never depends on one — but reports through
+`note_advisory_err`, so `COLI_DEBUG=1` names the file and the reason. Until
+2026-08-02 the two were indistinguishable, and a syntax error in `plan.json`
+produced default behavior with nothing anywhere to explain why the artifact had
+no effect. A **stale** file (one that fails its `config_tag` fingerprint) is a
+third case and remains silent by design: it is a correct file for a different
+model, and the guard exists precisely so mixing them is a no-op.
 
 `peregrine build <dir>` writes a minimal valid directory (tiny synthetic
 GLM-5.2-shaped model, fixed seed — the executable spec of the format). Note it
@@ -64,10 +74,57 @@ shape `[O, I]` with `ns` scale floats in `W.qs`:
 | 0 | F32 | no `.qs` sibling — rejected on the quantized expert path | 0 |
 | 1 | Int8 (per-row) | `O·I` | `O` |
 | 2 | Int4 (per-row) | `O·⌈I/2⌉` packed nibbles | `O` |
-| 3 | Int2 | the remaining case (nominally `O·⌈I/4⌉`) | `O` |
+| 3 | Int2 | `O·⌈I/4⌉` | `O` |
 | 4 | Int4 grouped | same payload as fmt 2 but `ns > O` | `O·⌈I/gs⌉` |
+| 5 | Int3 grouped-64 | `O·⌈I/64⌉·24` **and** `ns == O·⌈I/64⌉` | `O·⌈I/64⌉` |
+| 7 | Int2 grouped-64, **affine** | `O·⌈I/64⌉·16` **and** `ns == 2·O·⌈I/64⌉`, requires `⌈I/64⌉ ≥ 2` | `2·O·⌈I/64⌉` (`[scale, zero]` interleaved) |
 
 - Int4 nibbles are biased `+8` into `[0,15]`; even index in the low nibble.
+- **Int2-g64** (fmt 7) is one 16-byte plane per 64-value group — four 2-bit
+  fields per byte, the same packing as int3-g64's low plane — plus **two** f32
+  per group in `.qs`, interleaved `[scale, zero]`. Fields are unsigned `[0,3]`
+  and the bias is the group's own zero-point, so an affine mapping of
+  `[min, max]` onto four levels.
+
+  **3.0 bits/weight effective, not 2.** The two f32 per group are 8 bytes per
+  64 values — a full extra bit/weight on top of the 2-bit payload. It is still
+  the smallest scheme here (int3-g64 is 3.5, per-row int4 ~4.0, so 25% below
+  int4), but "2-bit" describes the payload, not the container, and the
+  distinction is worth 33% of the file. Storing the scale pair as f16 would
+  reach ~2.5 bits/weight; `.qs` is F32 across every format today, so that is a
+  container-wide change rather than a per-format one.
+
+  It exists because per-row **Int2 (fmt 3) is effectively ternary**: its
+  `s = amax / 1` convention with a `[-2, 1]` clamp makes the `-2` level
+  unreachable (it would need `|w| ≥ 1.5·amax`, impossible when `amax` is the
+  row's own maximum), so one of four levels is dead in every row it can write.
+  Affine grouping fixes that by construction and adds finer scales;
+  `int2_g64_reaches_all_four_levels_where_per_row_int2_reaches_three` pins the
+  difference.
+
+  Two f32 per group rather than a third `.qz` sibling tensor is deliberate: a
+  third sibling would take the streamed expert read from 6 regions to 9, and
+  `prefetch_hint_item` returns a fixed `[(RawFd, u64, usize); 6]`. Interleaving
+  keeps the whole streaming path untouched.
+
+  **At least two groups per row are required.** At one group the
+  `(bytes, scales)` pair is identical to grouped int4 (O=2, I=32, gs=16 is also
+  32 bytes and 4 scales), so the format is undetectable and
+  `peregrine-requantize` refuses to write it rather than emit a container that
+  loads as something else. Real routed experts are 1536–5120 wide, so this
+  excludes only fixtures.
+- **Int3-g64** (colibrì's fmt 5) is two planes per 64-value group: a 16-byte low
+  plane holding bits 0-1 in the int2 layout, then an 8-byte high plane holding
+  bit 2 one bit per value. Values are biased `+4` into `[0,7]`, decoding to
+  `[-4, 3]`, with one f32 scale per group — 3.5 bits/weight effective, 12.7%
+  smaller than int4 once the scales are counted. The scale *cardinality* is part
+  of the discriminator, not a consequence of it, because a narrow tensor's int3
+  size can collide with a row format's. `quant_i3_g64` is **byte-identical to
+  colibrì's encoder**, frozen by `int3_g64_bytes_match_colibri_byte_for_byte`
+  against a vector that engine produced — which is how peregrine can read a
+  container colibrì wrote. That test caught a rounding mismatch (`f32::round`
+  rounds halves away from zero; `np.rint` rounds to even) that a round-trip test
+  structurally cannot see, since each encoder decodes its own output correctly.
 - Scales: int8 = `amax/127` per row, int4 = `amax/7`.
 - The group size `gs` is probed from `[16, 32, 48, 64, 96, 128, 192, 256]`
   (finest first); the grouped scale layout `sc[o·ng + g]` matches
@@ -104,6 +161,19 @@ as stop ids), and the DSA fields `index_topk`, `index_n_heads`,
 
 Constraint: **`n_group` must be exactly 1** (GLM-5.2) — anything else is a
 load error.
+
+## Mixed-precision containers
+
+A container may hold **different formats per expert** — `QtInfo::detect` runs
+per tensor and is re-detected per expert per forward, so nothing in the loader
+assumes uniformity. `peregrine-requantize --tier-hot-frac` produces one, keeping
+the hottest experts of each layer at a higher precision.
+
+Read the economics before building one: tiering saves *disk* in proportion to
+expert **count** but *per-token bytes* in proportion to routing **frequency**,
+and frequency is what makes an expert hot. On a skewed trace, keeping the hot
+25% at int4 measured **140% of an all-int2 checkpoint** — the accuracy hedge
+gave back 40% of the byte saving. The tool prints that ratio before converting.
 
 ## Runtime & offline artifacts
 

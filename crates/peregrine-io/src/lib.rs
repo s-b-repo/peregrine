@@ -45,7 +45,7 @@ pub use mem::{
 };
 pub use perf::PerfCounter;
 pub use sensors::{energy_uj, max_temp_c, EnergyMeter};
-pub use ring::{pread_many, probe_direct, read_file, Reactor, ReadReq};
+pub use ring::{pread_many, pread_many_threaded, probe_direct, read_file, Reactor, ReadReq};
 pub use slab::{align_down, align_up, AlignedBuf, Bytes, SlabHandle, SlabPool, ALIGN};
 pub use tier::{decay, lfru_score, pick_lfru, pick_swap, Swap};
 pub use warmcache::{ExpertSlab, WarmCache};

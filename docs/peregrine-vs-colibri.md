@@ -39,8 +39,9 @@ headline findings:
   page cache and parallelizing dm-crypt — implementation gaps, not architectural ones.
 - **peregrine's warm cache delivers a real 3.58× on a *repeated* forward** (16.1 s → 4.5 s, 100 %
   expert-cache hits, zero disk) — proving the mechanism works — **but ~1× on sustained decode**,
-  because GLM‑5.2's expert routing has **near-zero token-to-token locality (0.6 % cache hit rate,
-  measured)**. Consecutive tokens route to almost disjoint expert sets.
+  at a **0.6 % warm-cache hit rate** on a 10 GB cache against a ~180 GB working set. Note this is a
+  *cache-capacity* result; the routing claim it used to carry was never measured (see the correction
+  in §5.2, and `peregrine route-stats`).
 - This independently corroborates two of colibrì's own findings: its **PILOT** cross-layer prefetch
   is "neutral" on a disk-saturated box, and its **MTP** speculative decoding is a *net loss* on MoE
   decode — both symptoms of the same high routing entropy.
@@ -121,7 +122,7 @@ GLM‑5.2 (as shipped in the int4 container both engines consume) is a DeepSeek�
 | Expert intermediate (`moe_intermediate_size`) | 2048 → **18.9 MB/expert at int4** |
 | Shared experts | 1 (always active) |
 | Attention | **MLA** (64 heads, q-LoRA 2048, kv-LoRA 512, partial RoPE 64/192, v-head 256) |
-| Sparse attention | **DSA** lightning indexer, top-2048 keys |
+| Sparse attention | **DSA** lightning indexer, top-2048 keys (peregrine: module present, **not reachable** — see the feature table below) |
 | Speculative head | **MTP** (layer 78, int8) |
 | Vocab | 154,880 |
 | **Experts routed per token** | **75 layers × 8 = 600 ≈ 11.3 GB int4** |
@@ -173,8 +174,8 @@ to the sequential path (guarded by the `streamed_experts_match_resident` test). 
 | Prefetch | **PILOT** cross-layer (router-lookahead, 71.6 % recall); `PILOT_REAL` | **PILOT lane** (prev-token predictor, dedicated ring, background warm) |
 | GPU expert tier | CUDA resident tier, `CUDA_EXPERT_GB`, live LFRU repin (`REPIN`) | `GpuTier` (feature `cuda`); **round-robin placement across all sparse layers** |
 | CPU kernels | int8/int4 IDOT, AVX2 `maddubs`, 119 GFLOP/s; per-shape f32/int routing | `std::arch` int8/int4/int2 IDOT (AVX2 + AVX-VNNI), scalar-exact reference; bit-checked SIMD |
-| Attention | MLA + absorption; DSA lightning indexer | MLA + absorption; DSA (M5) |
-| Speculation | MTP (int8 head) + grammar-forced drafts | MTP head wired (`speculative_sample` rejection-sampling lossless) |
+| Attention | MLA + absorption; DSA lightning indexer | MLA; absorption opt-in via `COLI_MLA_ABSORB` (off by default, unmeasured on a real checkpoint); **DSA implemented but unreachable** — no production path calls it |
+| Speculation | MTP (int8 head) + grammar-forced drafts | **not reachable end to end.** `speculative_sample` is implemented and statistically validated, but `generate_speculative` is called by no binary — there is no `--draft` flag or `DRAFT` knob — so no request can use it. colibrì also measures MTP a net loss on disk-bound MoE decode |
 | Dense on GPU | `CUDA_DENSE=1` (+30.8 %) | (future) |
 | Backends | CPU, CUDA, **Metal** (Apple) | CPU, CUDA |
 | Platforms | Linux, macOS, Windows (MinGW) | Linux + NVIDIA |
@@ -209,8 +210,9 @@ effect on this box*.
   measured "neutral" on the disk-saturated dev box.
 - **peregrine:** a dedicated prefetch reactor + background worker warms the *next token's predicted*
   experts (predictor = previous token's routed set) into the shared cache off the critical path.
-- **Measured:** **ineffective on GLM‑5.2** — cross-token expert locality is **0.6 %**, so the
-  previous-token predictor mostly mis-predicts (499 speculative reads, ~0 useful). This is an honest
+- **Measured:** **ineffective on GLM‑5.2** — the previous-token predictor mostly mis-predicts (499
+  speculative reads, ~0 useful). *That* is a direct measurement of the predictor and stands on its
+  own; it does not depend on the 0.6 % cache figure, which §5.2 corrects. This is an honest
   negative that matches colibrì's PILOT/MTP experience; it is a *predictor*-quality problem, not a
   mechanism bug (the lane, ring, and cache all work).
 
@@ -296,11 +298,38 @@ one. Both decode within colibrì's published dev-box range (~0.05–0.1 tok/s).
 |---|---|---|---|
 | **Repeated identical forward** | 12 GB (holds its 600 experts) | **3.58×** (16.1 s→4.5 s), 600/600 hits, 0 disk | working set fits → 100 % reuse |
 | **Sustained decode, 16 tok** | 10 GB | **0.054 tok/s, 1.05× warm** | 16 tokens touch ~9,600 experts (~180 GB) ≫ cache |
-| **Cross-token locality** | — | **0.6 % hit rate** (58/9,600) | consecutive tokens route to ~disjoint expert sets |
+| **Warm-cache hit rate, sustained decode** | 10 GB | **0.6 % hit rate** (58/9,600) | the cache holds ~5 % of the 16-token working set |
 
-The 0.6 % figure is the key empirical result: **GLM‑5.2's MoE router has very high per-token entropy**,
-so caching only pays off (a) for repeated computation, or (b) once the cache can hold a large fraction
-of the whole model — i.e. the residency regime.
+The 0.6 % figure says caching only pays off (a) for repeated computation, or (b) once the cache can
+hold a large fraction of the whole model — i.e. the residency regime.
+
+> **Correction (2026-08-02): what this figure is, and what it is not.**
+> It is a **warm-cache hit rate at a 10 GB cache** — 58 hits out of 9,600 expert
+> reads. It is *not* a measurement of the router. This table used to label the
+> row "cross-token locality" and explain it as "consecutive tokens route to
+> ~disjoint expert sets", and four other documents repeated that gloss; but a
+> hit rate confounds routing behaviour with cache capacity, and here capacity
+> dominates: 16 tokens touch ~180 GB against a 10 GB cache, so **a cache holding
+> ~5 % of the working set cannot hit much more than ~5 % however the router
+> behaves**. A low number was therefore guaranteed by the setup.
+>
+> The routing quantity was never measured. Under uniform 8-of-256 routing two
+> consecutive tokens would be expected to share **~3.1 %** of their experts by
+> chance alone, and 0.6 % sits *below* that — which, read as a routing
+> statistic, would mean routing is anti-correlated across positions. That is a
+> much stronger and stranger claim than "no locality", and nothing here supports
+> it. The likeliest reading is simply that the two quantities are different.
+>
+> This matters beyond bookkeeping: the routing figure is what decides whether
+> batching genuinely amortizes expert reads (§5.4 credits its 4.4× "entirely" to
+> sharing) and whether speculative verification is byte-neutral. Both were being
+> reasoned about from a cache statistic.
+>
+> **`peregrine route-stats <routes.json> 256`** now measures the routing
+> quantity directly — consecutive-token overlap against its independence null,
+> plus union growth over speculative and batch windows — and `COLI_UNION_STATS=1`
+> reports the live per-step sharing factor as `[union] … share=N.NNNx`. Run both
+> before treating either the entropy claim or the 4.4× attribution as settled.
 
 ### 5.3 Published scaling context (colibrì, cited)
 
@@ -414,11 +443,13 @@ streaming now reads *faster* than colibrì's measured ~870 MB/s on this box.** T
 didn't show this cleanly only because system contention dominates the small-token wall-clock; the
 device-throughput numbers are the trustworthy measurement, and they are unambiguously positive.
 
-**Caching is defeated by routing entropy.** The measured 0.6 % cross-token locality means a warm cache
-helps only when it can hold a large fraction of the 19,200 experts (≈370 GB) — impossible in 46 GB RAM
-or 12 GB VRAM. peregrine's 3.58× on a *repeated* forward proves the cache is correct and effective when
-the working set fits; it simply never fits during ordinary decode on this box. The same entropy is why
-colibrì's PILOT is "neutral" and its MTP speculation *loses* on MoE decode.
+**Caching is defeated by capacity.** A warm cache helps only when it can hold a large fraction of the
+19,200 experts (≈370 GB) — impossible in 46 GB RAM or 12 GB VRAM, which is what the 0.6 % hit rate
+records. peregrine's 3.58× on a *repeated* forward proves the cache is correct and effective when the
+working set fits; it simply never fits during ordinary decode on this box. colibrì's PILOT is
+"neutral" and its MTP speculation *loses* on MoE decode, which is consistent with this — though
+attributing all three to router entropy is an inference, not a measurement: §5.2 explains why the
+0.6 % figure cannot carry it, and `peregrine route-stats` is the instrument that can.
 
 **peregrine's concurrent scheduler is architecturally superior but latent here.** Its advantage is
 eliminating the C engine's phased CPU-then-GPU serialization — which only exists when experts are
@@ -506,9 +537,12 @@ Ordered by leverage on a single box, informed directly by this study:
    `MALLOC_ARENA_MAX` isn't a hard requirement — the last robustness gap vs colibrì on this box.
 3. **Reproduce the residency regime** (multi-GPU or ≥256 GB RAM) to measure the concurrent-vs-phased
    scheduler head-to-head — the one comparison this box cannot make (colibrì hits 6.84 tok/s there).
-4. **Better prefetch predictors.** The 0.6 % previous-token locality means the current PILOT predictor
-   is weak; a learned/transition-graph predictor (todo.txt "expert momentum", "transition automaton")
-   is the only path to prefetch that pays on GLM‑5.2.
+4. **Measure the routing overlap, then decide about predictors.** The previous-token predictor is
+   measurably weak (499 speculative reads, ~0 useful), but *how much* headroom a better predictor has
+   depends on the cross-token routing overlap, which has never been measured — the 0.6 % figure is a
+   cache hit rate (§5.2). Run `peregrine route-stats <routes.json> 256` first: if overlap sits at the
+   ~3.1 % independence null there is nothing for any predictor to learn, and a
+   learned/transition-graph predictor is wasted effort rather than "the only path".
 5. **GPUDirect Storage**, larger VRAM residency, persistent CUDA kernels, NUMA-aware placement — and,
    trivially, **faster storage** (throughput ∝ GB/s: colibrì shows 0.10→1.23 tok/s across 1.5→11.5 GB/s).
 
