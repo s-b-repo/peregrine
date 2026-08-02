@@ -24,7 +24,7 @@ pub use durable::{commit_atomic, temp_sibling, write_atomic};
 /// best-effort failures on stderr) so downstream crates that only depend on
 /// `peregrine-core` reach it through one canonical path.
 pub use peregrine_io::note_advisory_err;
-pub use dtype::{bf16_to_f32, f16_to_f32, Dtype};
+pub use dtype::{bf16_to_f32, f16_to_f32, f32_to_f16, Dtype};
 pub use qt::{detect_group_size, QtFmt, QtInfo};
 pub use safetensors::{SafeTensors, TensorInfo};
 

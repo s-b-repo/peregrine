@@ -208,6 +208,37 @@ backstop — which is exactly the drift colibrì hit (74.4 GB projected, 115.6 G
 actual, three kernel kills). Watch for the guard's `[ram] RSS … over the … budget`
 line; if it fires often, fix the projection rather than leaning on the guard.
 
+### 3a. What does f16 KV actually cost?
+
+The byte saving is exact and needs no measurement: `COLI_KV_DTYPE=f16` halves
+resident KV, asserted as an equality in the suite. The **accuracy** cost is the
+open question, and the synthetic model says something specific enough to be
+worth confirming or refuting on a real checkpoint:
+
+| core | measured relative error, tiny model | mechanism |
+|---|---|---|
+| absorb (`COLI_MLA_ABSORB=1`) | 1.8e-4 | f16's own precision — the latent is dotted in f32 |
+| dense (default) | 1.7e-2 | `kv_b.apply_vec` quantizes activations to int8 at `amax / 127`; a perturbation that moves the row maximum rescales the whole grid |
+
+Two orders of magnitude, and the cause is the int8 activation path, not f16. So
+measure **four** arms, not two — the interaction is the finding:
+
+```bash
+for kv in f32 f16; do for absorb in 0 1; do
+  COLI_KV_DTYPE=$kv COLI_MLA_ABSORB=$absorb \
+    ./target/release/peregrine "$COLI_MODEL" < prompts.txt > out.$kv.$absorb
+done; done
+```
+
+Then `prediction_flip_rate` each against the `f32`/`absorb=0` reference. If the
+gap does not reproduce, the tiny model's 8-wide latent was amplifying and f16 is
+cheaper than it looks; if it does, `COLI_MLA_ABSORB` stops being an independent
+knob and becomes a prerequisite. Either answer changes the recommendation, which
+is why this is measured rather than asserted.
+
+Note `COLI_MLA_ABSORB` is itself listed as unvalidated on a real checkpoint, so
+this run grades both at once.
+
 ### 5a. Does prefix sharing show up in RSS and admission?
 
 Refcounted prefixes and the KV byte budget are the two halves of one change, and
