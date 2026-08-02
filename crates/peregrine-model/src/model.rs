@@ -209,8 +209,13 @@ pub struct Model {
 /// Per-sequence KV cache: one [`LayerKv`] per layer. Owned by the batching
 /// scheduler rather than the [`Model`], so a single resident model can decode
 /// many independent sequences concurrently via [`Model::forward_step_batched`].
-/// (A paged/block-pooled variant that bounds many-sequence RAM is a follow-up;
-/// this per-sequence layout is the correct, bit-identical foundation.)
+///
+/// Sequences seeded from the same prompt prefix **share** its storage by
+/// refcount and own only their own tail, so admitting a request against a
+/// cached system prompt costs a pointer rather than a copy of it. A
+/// block-pooled variant that also reclaims growth fragmentation is a follow-up;
+/// what makes either safe is that readers go through `KvSpan` and cannot tell a
+/// split cache from a contiguous one.
 pub struct SeqKv {
     layers: Vec<LayerKv>,
 }
@@ -224,12 +229,12 @@ impl SeqKv {
 
     /// Positions cached so far (the sequence length); all layers share it.
     pub fn len(&self) -> usize {
-        self.layers.first().map_or(0, |k| k.len)
+        self.layers.first().map_or(0, |k| k.len())
     }
 
     /// Whether no positions are cached yet.
     pub fn is_empty(&self) -> bool {
-        self.layers.first().is_none_or(|k| k.len == 0)
+        self.layers.first().is_none_or(|k| k.is_empty())
     }
 
     /// Rewind every layer to `new_len` (speculative-decode reject cleanup).
@@ -239,9 +244,29 @@ impl SeqKv {
         }
     }
 
-    /// Resident bytes across every layer — what a cache of these must budget by.
+    /// Logical bytes across every layer: what this sequence would cost holding
+    /// every position privately. Sharing a prefix does not shrink it, so a
+    /// budget built on it is never an under-estimate — see
+    /// [`Self::owned_bytes`] + [`Self::shared_prefix`] for the exact split.
     pub fn bytes(&self) -> usize {
         self.layers.iter().map(|k| k.bytes()).sum()
+    }
+
+    /// Bytes held privately by this sequence, excluding any shared prefix.
+    pub fn owned_bytes(&self) -> usize {
+        self.layers.iter().map(|k| k.owned_bytes()).sum()
+    }
+
+    /// The shared prefix this sequence was seeded from: a stable identity and
+    /// the bytes of the whole shared allocation. Sequences seeded from the same
+    /// prefix-cache entry return the same identity, which is what lets a budget
+    /// over many sequences charge one shared prefix once instead of once each.
+    ///
+    /// Layer 0 supplies the identity: a `SeqKv`'s layers are always cloned
+    /// together from one parent, so if layer 0's prefix matches, all of them do.
+    pub fn shared_prefix(&self) -> Option<(usize, usize)> {
+        let id = self.layers.first()?.shared_id()?;
+        Some((id, self.layers.iter().map(|k| k.shared_bytes()).sum()))
     }
 
     /// A copy holding only the first `n` positions of every layer.
@@ -3823,6 +3848,48 @@ mod tests {
         let external = m.forward_prefill_seq(&toks, &mut seq, 0)?;
         assert_eq!(internal, external, "external-KV prefill must equal internal forward_step");
         assert_eq!(seq.len(), toks.len());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sharing_a_prefix_charges_one_allocation_not_one_per_sequence() -> Result<(), peregrine_core::Error> {
+        // What the serving engine's byte budget has to see: two admissions
+        // seeded from one cached prompt hold *one* allocation between them, not
+        // two. Reporting logical `bytes()` twice would refuse admissions over
+        // RAM that was never allocated — cancelling the saving it is measuring.
+        let dir = tmp_model_dir("kv_share_bytes")?;
+        let m = Model::load(&dir)?;
+        let mut src = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&[1, 5, 9, 2, 6, 3], &mut src, 0)?;
+        assert!(src.owned_bytes() > 0, "a prefilled sequence holds KV");
+        assert_eq!(src.shared_prefix(), None, "…and owns all of it privately");
+        assert_eq!(src.bytes(), src.owned_bytes(), "logical == private when nothing is shared");
+
+        let entry = src.clone_prefix(4); // what the prefix cache stores
+        let a = entry.clone_prefix(4); // two admissions matching it, to different depths
+        let b = entry.clone_prefix(3);
+        let missing = || Error::Format("a seeded sequence must report its shared prefix".into());
+        let (id_a, bytes_a) = a.shared_prefix().ok_or_else(missing)?;
+        let (id_b, bytes_b) = b.shared_prefix().ok_or_else(missing)?;
+        assert_eq!(id_a, id_b, "both admissions view the same allocation");
+        assert_eq!(bytes_a, bytes_b, "…so both report its full size, not their view of it");
+        assert_eq!(bytes_a, entry.bytes(), "which is what the snapshot itself costs");
+        assert_eq!((a.owned_bytes(), b.owned_bytes()), (0, 0), "neither owns a row yet");
+        assert!(b.bytes() < a.bytes(), "the shallower view is still logically smaller");
+
+        // The accounting identity the engine's `resident_kv` relies on: the pair
+        // costs one prefix, where summing `bytes()` would have charged two.
+        let deduped = a.owned_bytes() + b.owned_bytes() + bytes_a;
+        assert_eq!(deduped, entry.bytes());
+        assert!(deduped < a.bytes() + b.bytes(), "sharing must show up as a saving, not a wash");
+
+        // Decoding on top adds private bytes only, leaving the shared charge fixed.
+        let mut a = a;
+        let mut one: [&mut SeqKv; 1] = [&mut a];
+        m.forward_step_batched(&[7], &mut one, &[4], None)?;
+        assert!(a.owned_bytes() > 0, "the new position went into the private tail");
+        assert_eq!(a.shared_prefix().ok_or_else(missing)?.1, bytes_a, "the shared charge is unchanged");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

@@ -15,22 +15,63 @@
 use crate::math::{rmsnorm_inplace, rope_interleave, softmax};
 use crate::weight::QtWeight;
 use peregrine_core::{Cfg, Error};
+use std::sync::Arc;
+
+/// An immutable, refcounted run of cached positions, shared by every sequence
+/// seeded from the same prompt prefix.
+///
+/// Sound for the same reason the prefix cache above it is: each position
+/// attends only its causal prefix, so two prompts agreeing on their first `n`
+/// tokens produce bit-identical KV for those positions. Once built it is never
+/// written again — a sequence's own new positions go in its private tail — so
+/// sharing needs nothing beyond the refcount.
+struct KvPrefix {
+    lc: Vec<f32>,
+    rc: Vec<f32>,
+}
 
 /// Per-layer KV cache holding the compressed latents and roped keys. Positions
 /// are appended in order (`pos == len`), matching sequential prefill/decode.
+///
+/// Storage is a shared immutable prefix plus this sequence's private tail. The
+/// prefix is what an admission from the cross-request prefix cache used to
+/// **deep-copy** — ~350 MB per request for a 2 k-token shared system prompt at
+/// GLM-5.2's 175.5 KiB/token — and is now a refcount bump. Readers never see
+/// the seam: they go through [`KvSpan`], and
+/// `kv_span_split_attention_is_bit_identical_to_contiguous` pins that a split
+/// cache produces the same bits as a contiguous one.
 #[derive(Clone)]
 pub struct LayerKv {
-    pub lc: Vec<f32>, // [len, kv_lora]
-    pub rc: Vec<f32>, // [len, qk_rope]
-    pub len: usize,
+    /// Shared immutable prefix, if this cache was seeded from one.
+    shared: Option<Arc<KvPrefix>>,
+    /// How many of `shared`'s rows this sequence uses. Always `<=` the rows the
+    /// prefix holds, and may be *fewer*: that is what lets one frozen prefix
+    /// serve requests matching it to different depths without a copy each.
+    shared_rows: usize,
+    /// This sequence's own positions, appended after the shared prefix.
+    lc: Vec<f32>, // [len - shared_rows, kv_lora]
+    rc: Vec<f32>, // [len - shared_rows, qk_rope]
+    len: usize,
     kv_lora: usize,
     qk_rope: usize,
 }
 
 impl LayerKv {
     pub fn new(kv_lora: usize, qk_rope: usize) -> LayerKv {
-        LayerKv { lc: Vec::new(), rc: Vec::new(), len: 0, kv_lora, qk_rope }
+        LayerKv { shared: None, shared_rows: 0, lc: Vec::new(), rc: Vec::new(), len: 0, kv_lora, qk_rope }
     }
+
+    /// Positions cached so far — the shared prefix this sequence uses plus its
+    /// own tail.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no positions are cached yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Append one position's latents. Positions must arrive in order: an
     /// out-of-order append would silently corrupt attention for the rest of the
     /// sequence, so the invariant is checked on every call. The failure is
@@ -63,30 +104,141 @@ impl LayerKv {
     /// Drop cached positions back to `new_len` — the speculative-decode rewind
     /// after rejected draft tokens. A no-op when `new_len >= len`.
     pub fn truncate(&mut self, new_len: usize) {
-        if new_len < self.len {
-            self.lc.truncate(new_len * self.kv_lora);
-            self.rc.truncate(new_len * self.qk_rope);
-            self.len = new_len;
+        if new_len >= self.len {
+            return;
         }
+        if new_len >= self.shared_rows {
+            let own = new_len - self.shared_rows;
+            self.lc.truncate(own * self.kv_lora);
+            self.rc.truncate(own * self.qk_rope);
+        } else {
+            // Rewinding into the shared prefix. It is immutable and other
+            // sequences may still be reading it, so narrow this cache's *view*
+            // instead of the buffer. The dropped rows stay allocated until the
+            // last holder goes — exactly the lifetime they had before sharing.
+            self.shared_rows = new_len;
+            self.lc.clear();
+            self.rc.clear();
+        }
+        self.len = new_len;
     }
 
-    /// Resident bytes of the cached latents (excludes the fixed struct fields).
+    /// Logical bytes of the cached latents: what this sequence would cost if it
+    /// held every position privately. Unchanged by sharing, so a budget built on
+    /// it stays correct (conservatively) however prefixes are shared — see
+    /// [`Self::owned_bytes`] and [`Self::shared_bytes`] for the exact split.
     pub fn bytes(&self) -> usize {
+        (self.shared_rows * (self.kv_lora + self.qk_rope) + self.lc.len() + self.rc.len()) * std::mem::size_of::<f32>()
+    }
+
+    /// Bytes this cache holds *by itself*, excluding any shared prefix.
+    pub fn owned_bytes(&self) -> usize {
         (self.lc.len() + self.rc.len()) * std::mem::size_of::<f32>()
     }
 
-    /// A copy holding only the first `n` positions. Copies just that prefix
-    /// rather than cloning and truncating, so sharing a short prefix of a long
-    /// cached prompt does not first duplicate the whole thing.
+    /// Bytes of the whole shared prefix allocation — not just this cache's view
+    /// of it, because the allocation is what actually occupies RAM while any
+    /// sequence holds it.
+    pub fn shared_bytes(&self) -> usize {
+        self.shared.as_ref().map_or(0, |p| (p.lc.len() + p.rc.len()) * std::mem::size_of::<f32>())
+    }
+
+    /// Identity of the shared prefix allocation, if any. A budget summing many
+    /// sequences uses it to count one shared prefix once rather than once per
+    /// viewer. Pointer-derived and never dereferenced; two caches seeded from
+    /// the same entry compare equal.
+    pub fn shared_id(&self) -> Option<usize> {
+        self.shared.as_ref().map(|p| Arc::as_ptr(p) as usize)
+    }
+
+    /// A cache holding only the first `n` positions, sharing storage with this
+    /// one wherever it can.
+    ///
+    /// **This is the admission path's hot copy.** Every request matching a
+    /// cached prompt prefix deep-copied the whole thing. When `n` falls inside
+    /// an already-frozen prefix — the prefix cache's steady state, since its
+    /// entries are themselves produced by this function — the result is a
+    /// refcount bump and nothing is copied at all.
+    ///
+    /// Bit-identical by construction: the child sees the same bytes in the same
+    /// order and never writes them.
     pub fn clone_prefix(&self, n: usize) -> LayerKv {
         let n = n.min(self.len);
+        if n <= self.shared_rows {
+            if let Some(pre) = &self.shared {
+                return LayerKv {
+                    shared: Some(Arc::clone(pre)),
+                    shared_rows: n,
+                    lc: Vec::new(),
+                    rc: Vec::new(),
+                    len: n,
+                    kv_lora: self.kv_lora,
+                    qk_rope: self.qk_rope,
+                };
+            }
+        }
+        // Freeze the first `n` positions into a new shared prefix. This copies
+        // once, so that every later `clone_prefix` of the result takes the
+        // refcount path above.
+        let mut lc = Vec::with_capacity(n * self.kv_lora);
+        let mut rc = Vec::with_capacity(n * self.qk_rope);
+        for run in self.lc_span(n).runs() {
+            lc.extend_from_slice(run);
+        }
+        for run in self.rc_span(n).runs() {
+            rc.extend_from_slice(run);
+        }
         LayerKv {
-            lc: self.lc[..n * self.kv_lora].to_vec(),
-            rc: self.rc[..n * self.qk_rope].to_vec(),
+            shared: Some(Arc::new(KvPrefix { lc, rc })),
+            shared_rows: n,
+            lc: Vec::new(),
+            rc: Vec::new(),
             len: n,
             kv_lora: self.kv_lora,
             qk_rope: self.qk_rope,
         }
+    }
+
+    /// The compressed latents of the first `n` positions, in causal order.
+    pub fn lc_span(&self, n: usize) -> KvSpan<'_> {
+        let shared = self.shared.as_ref().map_or(&[][..], |p| &p.lc);
+        span_of(shared, &self.lc, self.shared_rows, n, self.kv_lora)
+    }
+
+    /// The roped keys of the first `n` positions, in causal order.
+    pub fn rc_span(&self, n: usize) -> KvSpan<'_> {
+        let shared = self.shared.as_ref().map_or(&[][..], |p| &p.rc);
+        span_of(shared, &self.rc, self.shared_rows, n, self.qk_rope)
+    }
+
+    /// The whole cache as an attention view.
+    pub fn view(&self) -> RowAttn<'_> {
+        self.view_prefix(self.len)
+    }
+
+    /// The first `n` positions as an attention view — one row's causal prefix.
+    pub fn view_prefix(&self, n: usize) -> RowAttn<'_> {
+        let n = n.min(self.len);
+        RowAttn { len: n, lc: self.lc_span(n), rc: self.rc_span(n) }
+    }
+}
+
+/// The first `n` rows of `shared ++ own` as a span, where `shared_rows` of the
+/// shared buffer belong to this cache.
+///
+/// Total by construction — every bound is clamped to what the buffers actually
+/// hold. A slicing panic here would abort the process under the release
+/// profile's `panic = "abort"`, taking every concurrent sequence with it, which
+/// is the same reason [`LayerKv::append`] reports its errors instead of
+/// asserting.
+fn span_of<'a>(shared: &'a [f32], own: &'a [f32], shared_rows: usize, n: usize, width: usize) -> KvSpan<'a> {
+    let head_rows = shared_rows.min(n).min(shared.len().checked_div(width).unwrap_or(0));
+    let tail_rows = (n - head_rows).min(own.len().checked_div(width).unwrap_or(0));
+    let head = &shared[..head_rows * width];
+    if tail_rows == 0 {
+        KvSpan::contiguous(head)
+    } else {
+        KvSpan::split(head, &own[..tail_rows * width])
     }
 }
 
@@ -241,7 +393,7 @@ fn project(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut 
 /// `sel`, when `Some`, restricts each query `s` to attend only the cached key
 /// indices in `sel[s]` (the DSA lightning-indexer selection); `None` attends all
 /// causal keys (dense). Selecting every causal key is identical to dense.
-fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: &LayerKv, c: &Cfg, sel: Option<&[Vec<usize>]>) -> Vec<f32> {
+fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, kv: &RowAttn, c: &Cfg, sel: Option<&[Vec<usize>]>) -> Vec<f32> {
     let h_n = c.n_heads as usize;
     let qk_nope = c.qk_nope as usize;
     let qk_rope = c.qk_rope as usize;
@@ -250,8 +402,23 @@ fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: 
     let kvl = c.kv_lora as usize;
     let kvb_head = qk_nope + vh;
 
-    let tk = cache.len;
-    let kvb_all = w.kv_b.apply_vec(&cache.lc[..tk * kvl], tk);
+    let tk = kv.len;
+    // Reconstruct `[k_nope|v]` for every cached position. When the cache is
+    // split across a shared prefix and an owned tail, the matmul runs once per
+    // run and the *outputs* concatenate — bit-identically, because `apply_vec`
+    // is row-independent: it already splits rows into chunks across the pool,
+    // and `apply_vec_parallel_matches_serial` pins that as equal to one whole
+    // serial call. Splitting the input on a row boundary is the same split.
+    let mut kvb_all: Vec<f32> = Vec::new();
+    for run in kv.lc.runs() {
+        let rows = run.len().checked_div(kvl).unwrap_or(0);
+        let part = w.kv_b.apply_vec(run, rows);
+        if kvb_all.is_empty() {
+            kvb_all = part; // the contiguous case: no extra copy
+        } else {
+            kvb_all.extend_from_slice(&part);
+        }
+    }
 
     let mut ctx = vec![0f32; s_n * h_n * vh];
     for s in 0..s_n {
@@ -272,7 +439,7 @@ fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: 
         // beyond `pos`) would otherwise softmax an empty score row and leave the
         // context vector identically zero — silently blanking attention.
         if keys.is_empty() {
-            keys.push(pos.min(cache.len.saturating_sub(1)));
+            keys.push(pos.min(tk.saturating_sub(1)));
         }
         for h in 0..h_n {
             let qp = &q[s * h_n * qh + h * qh..s * h_n * qh + h * qh + qh];
@@ -281,7 +448,7 @@ fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: 
             for (i, &t) in keys.iter().enumerate() {
                 let base = t * h_n * kvb_head + h * kvb_head;
                 let kn = &kvb_all[base..base + qk_nope];
-                let kr = &cache.rc[t * qk_rope..t * qk_rope + qk_rope];
+                let kr = kv.rc.row(t, qk_rope);
                 sc[i] = (dot(q_nope, kn) + dot(q_rope, kr)) * c.attn_scale;
             }
             softmax(&mut sc);
@@ -375,18 +542,7 @@ fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg, 
 /// [`attend_absorb_batched`] with per-row prefix views — bit-identical to the
 /// pre-batching core (same `nt`, same slices, same arithmetic).
 fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: &LayerKv, c: &Cfg) -> Vec<f32> {
-    let kvl = c.kv_lora as usize;
-    let qk_rope = c.qk_rope as usize;
-    let rows: Vec<RowAttn> = (0..s_n)
-        .map(|s| {
-            let nt = pos_base + s + 1;
-            RowAttn {
-                len: nt,
-                lc: KvSpan::contiguous(&cache.lc[..nt * kvl]),
-                rc: KvSpan::contiguous(&cache.rc[..nt * qk_rope]),
-            }
-        })
-        .collect();
+    let rows: Vec<RowAttn> = (0..s_n).map(|s| cache.view_prefix(pos_base + s + 1)).collect();
     attend_absorb_batched(w, q, &rows, c, peregrine_par::PAR_ATTN_MIN)
 }
 
@@ -394,7 +550,7 @@ fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache:
 /// appended to `cache`; returns `out[s_n, hidden]`.
 pub fn mla_attention(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut LayerKv, c: &Cfg) -> Result<Vec<f32>, Error> {
     let q = project(w, x, s_n, pos_base, cache, c)?;
-    let ctx = attend_dense(w, &q, s_n, pos_base, cache, c, None);
+    let ctx = attend_dense(w, &q, s_n, pos_base, &cache.view(), c, None);
     Ok(w.o.apply_vec(&ctx, s_n))
 }
 
@@ -417,7 +573,7 @@ pub fn mla_attention_dsa(
         )));
     }
     let q = project(w, x, s_n, pos_base, cache, c)?;
-    let ctx = attend_dense(w, &q, s_n, pos_base, cache, c, Some(sel));
+    let ctx = attend_dense(w, &q, s_n, pos_base, &cache.view(), c, Some(sel));
     Ok(w.o.apply_vec(&ctx, s_n))
 }
 
@@ -467,13 +623,7 @@ pub fn mla_attention_batched(
     for s in 0..s_n {
         caches[s].append(pos_of[s], &lc_rows[s * kvl..s * kvl + kvl], &rc_rows[s * qk_rope..s * qk_rope + qk_rope])?;
     }
-    let rows: Vec<RowAttn> = (0..s_n)
-        .map(|s| RowAttn {
-            len: caches[s].len,
-            lc: KvSpan::contiguous(caches[s].lc.as_slice()),
-            rc: KvSpan::contiguous(caches[s].rc.as_slice()),
-        })
-        .collect();
+    let rows: Vec<RowAttn> = caches.iter().map(|k| k.view()).collect();
     let ctx = attend_absorb_batched(w, &q, &rows, c, peregrine_par::PAR_ATTN_MIN);
     Ok(w.o.apply_vec(&ctx, s_n))
 }
@@ -546,6 +696,23 @@ mod tests {
         LayerKv::new(c.kv_lora as usize, c.qk_rope as usize)
     }
 
+    /// Both cores behind one signature, so a property can be asserted for each.
+    fn attend_either(
+        dense: bool,
+        w: &AttnWeights,
+        x: &[f32],
+        s_n: usize,
+        pos: usize,
+        cache: &mut LayerKv,
+        c: &Cfg,
+    ) -> Result<Vec<f32>, Error> {
+        if dense {
+            mla_attention(w, x, s_n, pos, cache, c)
+        } else {
+            mla_attention_absorb(w, x, s_n, pos, cache, c)
+        }
+    }
+
     #[test]
     fn single_token_is_value_projection() -> Result<(), peregrine_core::Error> {
         let c = cfg()?;
@@ -555,7 +722,7 @@ mod tests {
         let x: Vec<f32> = (0..c.hidden as usize).map(|_| r.f()).collect();
         let mut cache = new_cache(&c);
         let out = mla_attention(&w.view(), &x, 1, 0, &mut cache, &c)?;
-        let kvb = w.kv_b.apply_vec(&cache.lc[..kvl], 1);
+        let kvb = w.kv_b.apply_vec(cache.lc_span(1).row(0, kvl), 1);
         let kvb_head = qkn + vh;
         let mut v = vec![0f32; h * vh];
         for hh in 0..h {
@@ -750,10 +917,7 @@ mod tests {
         // sequential reference: decode each sequence on a clone of its cache
         let mut seq_out = vec![0f32; b * hidden];
         for s in 0..b {
-            let mut refc = new_cache(&c);
-            refc.lc = seq_caches[s].lc.clone();
-            refc.rc = seq_caches[s].rc.clone();
-            refc.len = seq_caches[s].len;
+            let mut refc = seq_caches[s].clone();
             let o = mla_attention_absorb(&w.view(), &newtok[s], 1, lens[s], &mut refc, &c)?;
             seq_out[s * hidden..s * hidden + hidden].copy_from_slice(&o);
         }
@@ -837,6 +1001,116 @@ mod tests {
                 assert_eq!(a.to_bits(), b.to_bits(), "split at row {cut}, output {k}: not bit-identical");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_shared_prefix_produces_the_same_bits_as_a_private_copy() -> Result<(), peregrine_core::Error> {
+        // Prefix sharing's whole claim: `clone_prefix` hands out a refcounted
+        // view instead of the deep copy every admission used to pay (~350 MB for
+        // a 2 k-token system prompt at GLM-5.2's 175.5 KiB/token), and nothing
+        // downstream can tell. Both cores are checked — the dense one because
+        // its `kv_b` reconstruction now runs once per run and concatenates, the
+        // absorb one because it reads every row through the span.
+        let c = cfg()?;
+        let w = make_weights(&c, 23);
+        let hidden = c.hidden as usize;
+        let (n, m) = (5usize, 3usize); // shared prefix, then this sequence's own tail
+        let mut r = Lcg(0xC0FFEE);
+        let x: Vec<f32> = (0..(n + m) * hidden).map(|_| r.f()).collect();
+
+        for dense in [true, false] {
+            // Private: one cache owning every position, as before this change.
+            let mut owned = new_cache(&c);
+            attend_either(dense, &w.view(), &x[..n * hidden], n, 0, &mut owned, &c)?;
+            let want = attend_either(dense, &w.view(), &x[n * hidden..], m, n, &mut owned, &c)?;
+
+            // Shared: freeze the prefix, then continue into a private tail.
+            let mut src = new_cache(&c);
+            attend_either(dense, &w.view(), &x[..n * hidden], n, 0, &mut src, &c)?;
+            let mut shared = src.clone_prefix(n);
+            assert!(shared.shared_id().is_some(), "clone_prefix must freeze into a shared prefix");
+            assert_eq!(shared.owned_bytes(), 0, "a freshly seeded cache owns no rows of its own");
+            assert_eq!(shared.len(), n);
+            let got = attend_either(dense, &w.view(), &x[n * hidden..], m, n, &mut shared, &c)?;
+
+            assert_eq!(shared.len(), n + m);
+            assert!(shared.owned_bytes() > 0, "the tail must be private, not written into the prefix");
+            for (k, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "dense={dense}, output {k}: sharing moved a bit");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cloning_an_already_frozen_prefix_is_a_refcount_bump() -> Result<(), peregrine_core::Error> {
+        // The steady state that makes 3a worth anything: the prefix cache's
+        // entries are themselves `clone_prefix` results, so every admission
+        // matching one takes the shared path. Identical allocation identity is
+        // the direct evidence that nothing was copied.
+        let c = cfg()?;
+        let w = make_weights(&c, 29);
+        let hidden = c.hidden as usize;
+        let n = 6usize;
+        let mut r = Lcg(0x51A7ED);
+        let x: Vec<f32> = (0..n * hidden).map(|_| r.f()).collect();
+        let mut src = new_cache(&c);
+        mla_attention_absorb(&w.view(), &x, n, 0, &mut src, &c)?;
+
+        let entry = src.clone_prefix(n); // the one copy: freezes the prefix
+        assert!(src.shared_id().is_none(), "the source owned its rows privately");
+        let full = entry.clone_prefix(n);
+        let partial = entry.clone_prefix(n - 2); // a shallower match reuses the same buffer
+        assert_eq!(entry.shared_id(), full.shared_id(), "a full re-clone must not copy");
+        assert_eq!(entry.shared_id(), partial.shared_id(), "a shallower match must not copy either");
+        assert_eq!(partial.len(), n - 2);
+        assert_eq!(partial.owned_bytes(), 0);
+        // The shallower view charges its own logical size but shares the whole
+        // allocation — the distinction `resident_kv` budgets on.
+        assert!(partial.bytes() < entry.bytes(), "a shallower view is logically smaller");
+        assert_eq!(partial.shared_bytes(), entry.shared_bytes(), "…but the allocation is the same one");
+
+        // Rows read through the shallower view are the same rows.
+        let kvl = c.kv_lora as usize;
+        for t in 0..n - 2 {
+            assert_eq!(partial.lc_span(n - 2).row(t, kvl), entry.lc_span(n).row(t, kvl), "row {t}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rewinding_into_a_shared_prefix_leaves_other_holders_intact() -> Result<(), peregrine_core::Error> {
+        // Speculative decode rewinds the cache on a rejected draft, and the
+        // rewind can land *inside* a prefix other sequences are still reading.
+        // It must narrow this cache's view, never the shared buffer — truncating
+        // the buffer would silently shorten every concurrent sequence seeded
+        // from it, which is corruption no test downstream would catch.
+        let c = cfg()?;
+        let w = make_weights(&c, 31);
+        let (hidden, kvl) = (c.hidden as usize, c.kv_lora as usize);
+        let n = 6usize;
+        let mut r = Lcg(0x2E17);
+        let x: Vec<f32> = (0..n * hidden).map(|_| r.f()).collect();
+        let mut src = new_cache(&c);
+        mla_attention_absorb(&w.view(), &x, n, 0, &mut src, &c)?;
+
+        let entry = src.clone_prefix(n);
+        let mut a = entry.clone_prefix(n);
+        let b = entry.clone_prefix(n);
+        a.truncate(n - 3);
+        assert_eq!(a.len(), n - 3);
+        assert_eq!(b.len(), n, "the other holder must be untouched by a's rewind");
+        for t in 0..n {
+            assert_eq!(b.lc_span(n).row(t, kvl), entry.lc_span(n).row(t, kvl), "row {t} of the untouched holder");
+        }
+        for t in 0..n - 3 {
+            assert_eq!(a.lc_span(n - 3).row(t, kvl), entry.lc_span(n).row(t, kvl), "surviving row {t}");
+        }
+        // The rewound cache still accepts the replacement tokens, in order.
+        mla_attention_absorb(&w.view(), &x[..2 * hidden], 2, n - 3, &mut a, &c)?;
+        assert_eq!(a.len(), n - 1);
+        assert_eq!(b.len(), n, "…and appending to a still does not touch b");
         Ok(())
     }
 

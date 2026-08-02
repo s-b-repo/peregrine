@@ -142,10 +142,11 @@ fixed prompt set, via `Model::prediction_flip_rate`.
 ./target/release/peregrine-requantize "$COLI_MODEL" /path/glm52_i2 --target int2
 # int3-g64: 12.7% fewer bytes, better-conditioned than per-row int4
 ./target/release/peregrine-requantize "$COLI_MODEL" /path/glm52_i3 --target int3-g64
-# int2-g64: affine 2-bit, ~2.06 bits/weight — the biggest byte cut available, and
-# the one whose accuracy cost is least known. Unlike per-row int2 it uses all four
-# levels and scales per 64 values, so it should land well ahead of `--target int2`;
-# measure both rather than assuming.
+# int2-g64: affine 2-bit, 3.0 bits/weight once the two f32 per group are counted
+# (~25% under int4, not the ~50% the payload width implies), and the format whose
+# accuracy cost is least known. Unlike per-row int2 it uses all four levels and
+# scales per 64 values, so it should land well ahead of `--target int2`; measure
+# both rather than assuming.
 ./target/release/peregrine-requantize "$COLI_MODEL" /path/glm52_i2g --target int2-g64
 ```
 
@@ -206,6 +207,38 @@ the projection's slack model is wrong and the **runtime RSS guard**
 backstop — which is exactly the drift colibrì hit (74.4 GB projected, 115.6 GB
 actual, three kernel kills). Watch for the guard's `[ram] RSS … over the … budget`
 line; if it fires often, fix the projection rather than leaning on the guard.
+
+### 5a. Does prefix sharing show up in RSS and admission?
+
+Refcounted prefixes and the KV byte budget are the two halves of one change, and
+only a real checkpoint can show whether they add up. The synthetic tests prove
+the bytes are identical and the allocation is counted once; what they cannot
+show is the size of the win, because it scales with the *shared prompt*.
+
+Drive N concurrent requests that share a long system prompt, with the prefix
+cache on and the byte budget set below what N private copies would need:
+
+```bash
+COLI_PREFIX_CACHE_MB=8192 COLI_KV_BUDGET_MB=16384 \
+  ./target/release/peregrine-serve --max-batch 16 &
+# then N clients, same system prompt, different user turns
+```
+
+Two numbers, both from one run:
+
+- **Peak RSS** against `N × prompt_tokens × 175.5 KiB`. Before sharing, the
+  admission path copied the whole prefix per request; after, the prefix appears
+  once, so RSS should track `1 ×` the prompt plus each sequence's generated
+  tail. A peak still scaling with `N` means the requests are not matching the
+  cache — check the prefix-cache hit counter before concluding sharing failed.
+- **Admitted concurrency** at a budget that would have refused most of the
+  batch. This is the half that is easy to get wrong in the *other* direction: if
+  concurrency does not rise, confirm `resident_kv` is deduping rather than that
+  the budget is simply large enough to be inert.
+
+Also worth one run with `--draft 4`: speculative rewind is the path that
+truncates *into* a shared prefix, and `rewinding_into_a_shared_prefix_leaves_other_holders_intact`
+covers it only at synthetic scale.
 
 ## What to do with the results
 
