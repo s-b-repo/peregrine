@@ -296,6 +296,69 @@ fn adaptive_window_ratio() -> u64 {
     })
 }
 
+/// Resident KV budget in bytes (`COLI_KV_BUDGET_MB`); 0 = off, the historical
+/// count-only admission.
+///
+/// **Why this exists.** Admission is capped by a *count* (`--max-batch`,
+/// default 32) and nothing ever reads bytes, so at GLM-5.2 shapes
+/// (175.5 KiB/token of MLA KV) the default flags admit a worst case of ~53 GB
+/// of KV with no accounting — `todo.md` §12 flags the unbounded case and tracks
+/// it nowhere else. It is also the link that breaks the whole KV-saving chain:
+/// halving KV bytes cannot raise concurrency while concurrency is a count, so
+/// every downstream KV optimization is worth exactly zero extra batch slots
+/// until this exists.
+fn kv_budget_bytes() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_KV_BUDGET_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|mb| mb.saturating_mul(1 << 20))
+            .unwrap_or(0)
+    })
+}
+
+/// Whether the engine may admit another sequence given the KV already resident.
+///
+/// Pure so the policy is testable without a model, following `ram.rs`'s
+/// precedent (`project_load` / `ram_verdict`) of keeping sizing decisions out of
+/// the machine they size.
+///
+/// This is a **high-water gate, not a predictive one**: it stops admitting once
+/// resident KV crosses the budget, so the true peak overshoots by at most one
+/// sequence's KV. Predicting the next request's cost would need its prompt
+/// length, which is not known until after `try_recv` has already consumed it —
+/// and dropping a consumed request is worse than a bounded overshoot.
+///
+/// `in_flight == 0` always admits. Without that, a single request whose KV
+/// exceeds the budget would be refused forever and the engine would hang
+/// instead of running it — the same "keep at least one" guard the warm cache's
+/// eviction uses.
+fn kv_admits(resident: usize, budget: usize, in_flight: usize) -> bool {
+    budget == 0 || in_flight == 0 || resident < budget
+}
+
+/// Bytes of KV currently held by every in-flight sequence, decoding and
+/// prefilling alike. Exact, not projected: `SeqKv::bytes()` sums the real
+/// per-layer allocations.
+fn resident_kv(active: &[SeqState], pending: &VecDeque<Prefilling>) -> usize {
+    active.iter().map(|s| s.seq.bytes()).sum::<usize>()
+        + pending.iter().map(|p| p.seq.bytes()).sum::<usize>()
+}
+
+/// The admission-loop form of [`kv_admits`]. Ordered so that the default-off
+/// path returns before walking every sequence's layer list — the sum is
+/// re-evaluated on each admission attempt, so it must cost nothing when the
+/// budget is unset.
+fn kv_headroom(active: &[SeqState], pending: &VecDeque<Prefilling>, budget: usize) -> bool {
+    if budget == 0 {
+        return true;
+    }
+    let in_flight = active.len() + pending.len();
+    in_flight == 0 || kv_admits(resident_kv(active, pending), budget, in_flight)
+}
+
 /// One in-flight sequence. Invariant at the top of a decode step: `seq.len() ==
 /// pos`, and `next_tok` is an already-emitted token to be fed at `pos` next.
 struct SeqState {
@@ -333,6 +396,8 @@ fn run(
     // Resolved once: prefill chunking is a latency/work trade, not a per-tick decision.
     let chunk_div = prefill_chunk_div();
     let mut prefix = PrefixCache::new(prefix_cache_budget());
+    // Resolved once: the KV byte ceiling admission respects alongside the count.
+    let kv_budget = kv_budget_bytes();
     let mut working_cap = max_batch;
     let mut ewma_decode_us: u64 = 0;
     // Small current-thread runtime just for the priority-aware blocking recv.
@@ -350,15 +415,18 @@ fn run(
     loop {
         // Drain queued requests into the prefill queue: HIGH first (so they
         // beat normal admissions to the batch), NORMAL second — both capped by
-        // the *working* cap so an SLA-shrunk engine backpressures both queues.
-        while active.len() + pending.len() < working_cap {
+        // the *working* cap so an SLA-shrunk engine backpressures both queues,
+        // and by the KV byte budget so a long-context workload backpressures on
+        // memory rather than only on sequence count. Re-evaluated each iteration
+        // because every admission grows the resident set.
+        while active.len() + pending.len() < working_cap && kv_headroom(&active, &pending, kv_budget) {
             match rx_high.try_recv() {
                 Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
-        while active.len() + pending.len() < working_cap {
+        while active.len() + pending.len() < working_cap && kv_headroom(&active, &pending, kv_budget) {
             match rx_normal.try_recv() {
                 Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -672,6 +740,35 @@ fn prefill_step(
 mod tests {
     use super::*;
     use peregrine_model::argmax;
+
+    #[test]
+    fn kv_budget_off_is_exactly_the_historical_admission() {
+        // The default must be indistinguishable from the count-only engine that
+        // shipped: no byte can refuse an admission when the budget is 0.
+        for resident in [0usize, 1, usize::MAX] {
+            for in_flight in [0usize, 1, 32] {
+                assert!(kv_admits(resident, 0, in_flight), "budget 0 must never refuse");
+            }
+        }
+    }
+
+    #[test]
+    fn kv_budget_refuses_once_resident_crosses_it() {
+        let budget = 1000;
+        assert!(kv_admits(999, budget, 4), "under budget admits");
+        assert!(!kv_admits(1000, budget, 4), "at budget refuses — this is a high-water gate");
+        assert!(!kv_admits(5000, budget, 4), "over budget refuses");
+    }
+
+    #[test]
+    fn an_empty_engine_always_admits_even_over_budget() {
+        // Without this the engine hangs instead of running a request whose KV
+        // exceeds the whole budget: it would be refused forever, and refusing
+        // forever is a worse failure than overshooting once. Same "keep at least
+        // one" shape as the warm cache's eviction guard.
+        assert!(kv_admits(usize::MAX, 1, 0), "nothing in flight must still admit");
+        assert!(!kv_admits(usize::MAX, 1, 1), "…but only while nothing is in flight");
+    }
 
     fn tiny_dir(tag: &str) -> Result<std::path::PathBuf, Error> {
         let d = std::env::temp_dir().join(format!("peregrine_batch_{}_{}", std::process::id(), tag));

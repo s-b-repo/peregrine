@@ -210,6 +210,32 @@ pub fn solve_residency_sized(
     out
 }
 
+/// Bytes one resident expert actually occupies in VRAM.
+///
+/// `raw_int4` must reflect what the *container* holds, not what the operator
+/// asked for. Raw int4 residency requires all three projections to be per-row
+/// int4 (`upload_int4`); every other source format — grouped int4, int8,
+/// int3-g64, int2-g64 — is uploaded **dequantized to f32**, which is 8× the
+/// int4 figure.
+///
+/// Planning with the int4 number on a container that cannot use it budgets `N`
+/// experts and then uploads `8N` worth. The runtime byte tracker in
+/// `build_with` stops the upload before VRAM overruns, so this does not crash —
+/// it silently delivers a tier roughly 8× smaller than the operator asked for,
+/// which is worse than crashing because nothing reports it. `validation-runbook`
+/// §4 flags exactly this for an int3 container; every sub-4-bit format added
+/// since makes it likelier.
+pub fn resident_bytes_per_expert(hidden: usize, inter: usize, raw_int4: bool) -> usize {
+    // gate + up ([inter,hidden]) + down ([hidden,inter])
+    let weights = 2 * inter * hidden + hidden * inter;
+    if raw_int4 {
+        // packed nibbles + f32 row scales
+        weights / 2 + (2 * inter + hidden) * 4
+    } else {
+        weights * 4
+    }
+}
+
 /// Per-expert VRAM residency precision. The hottest experts earn the
 /// high-precision f32 residency (better numerics on the most-used weights);
 /// the long tail stays per-row int4 (8× denser → more experts resident).
@@ -452,7 +478,28 @@ pub fn rank_by_heat(counts: &[u32], n_layers: usize, first_dense: usize, n_exper
 
 #[cfg(test)]
 mod residency_tests {
-    use super::{solve_residency_sized, HeatTable};
+    use super::{resident_bytes_per_expert, solve_residency_sized, HeatTable};
+
+    #[test]
+    fn resident_bytes_track_the_format_the_container_can_actually_upload() {
+        // GLM-5.2 shapes. Raw int4 residency is ~8x denser than the dequantized
+        // f32 fallback, and *only* per-row int4 sources can take the raw path.
+        let (hidden, inter) = (5120usize, 1536usize);
+        let i4 = resident_bytes_per_expert(hidden, inter, true);
+        let f32b = resident_bytes_per_expert(hidden, inter, false);
+        let ratio = f32b as f64 / i4 as f64;
+        assert!((7.0..8.1).contains(&ratio), "f32 residency should cost ~8x int4, got {ratio:.2}x");
+
+        // The bug this helper exists to prevent: planning with the int4 figure
+        // on a container that must fall back to f32 budgets N experts and
+        // uploads ~8N worth. Expressed as the capacity the planner would hand
+        // out for a fixed budget.
+        let budget = 10usize << 30;
+        assert!(
+            budget / i4 > 7 * (budget / f32b),
+            "an int4-sized plan hands out ~8x the experts an f32 upload can hold"
+        );
+    }
 
     #[test]
     fn sized_solver_respects_a_byte_budget_with_mixed_formats() {
@@ -884,7 +931,7 @@ mod real {
     /// same-size hottest set as heat accumulates. `int4` picks the residency format:
     /// per-row int4 (8× denser) vs dequantized f32. When `adaptive_f32_frac` is
     /// set (`COLI_GPU_F32_FRAC`, int4 tiers only), `reheat` promotes that fraction
-    /// of the hottest residents to f32 per [`super::plan_precision`], tracking each
+    /// of the hottest residents to f32 per [`super::plan_precision_fitted`], tracking each
     /// expert's current format in `precision` and re-uploading on a change.
     pub struct GpuTier {
         device: i32,
@@ -952,6 +999,24 @@ mod real {
         }
     }
 
+    /// Whether the first sparse layer's expert 0 stores all three projections as
+    /// per-row int4 — the only source shape `upload_int4` can take raw.
+    ///
+    /// One expert is a sound probe because a container is written by one
+    /// converter run at one target; a *tiered* container mixes formats, and this
+    /// deliberately answers "no" for it rather than planning as if the whole tier
+    /// were int4. Under-planning wastes VRAM; over-planning silently truncates
+    /// the tier, so the conservative answer is the right one.
+    fn experts_are_per_row_int4(st: &SafeTensors, cfg: &Cfg) -> bool {
+        use peregrine_core::QtInfo;
+        let (hidden, inter) = (cfg.hidden as i64, cfg.moe_inter as i64);
+        let l = cfg.first_dense as usize;
+        let pe = |t: &str| format!("model.layers.{l}.mlp.experts.0.{t}");
+        [(pe("gate_proj.weight"), inter, hidden), (pe("up_proj.weight"), inter, hidden), (pe("down_proj.weight"), hidden, inter)]
+            .iter()
+            .all(|(name, o, i)| QtInfo::detect(st, name, *o, *i).fmt == peregrine_core::QtFmt::Int4)
+    }
+
     impl GpuTier {
         /// Build the tier by uploading as many routed experts as fit within
         /// `free VRAM - headroom`, choosing int4-resident (8× denser) vs f32
@@ -987,12 +1052,23 @@ mod real {
             let (free, _total) = peregrine_cuda::mem_info(device)?;
             let hidden = cfg.hidden as usize;
             let inter = cfg.moe_inter as usize;
-            // gate + up ([inter,hidden]) + down ([hidden,inter]); int4 = packed
-            // nibbles + f32 row scales (~8× smaller than the f32 residency).
-            let weights = 2 * inter * hidden + hidden * inter;
-            let int4_bytes = weights / 2 + (2 * inter + hidden) * 4;
-            let f32_bytes = weights * 4;
-            let bytes_per_expert = if int4 { int4_bytes } else { f32_bytes };
+            // The two possible per-expert costs; which one an expert actually
+            // pays is decided per upload, below.
+            let int4_bytes = super::resident_bytes_per_expert(hidden, inter, true);
+            let f32_bytes = super::resident_bytes_per_expert(hidden, inter, false);
+            // `int4` is what the operator asked for; `raw_int4` is what this
+            // container can actually deliver. Sizing the *plan* from the request
+            // rather than the container is how an int3/int2-g64 checkpoint plans
+            // N experts and uploads 8N worth — the per-expert tracking below then
+            // truncates the tier, silently, to ~1/8 of what was asked for.
+            let raw_int4 = int4 && experts_are_per_row_int4(st, cfg);
+            if int4 && !raw_int4 {
+                eprintln!(
+                    "peregrine: COLI_GPU_INT4 set, but this container's experts are not per-row \
+                     int4 — they upload dequantized to f32 (8x), so the VRAM plan is sized for f32"
+                );
+            }
+            let bytes_per_expert = if raw_int4 { int4_bytes } else { f32_bytes };
             let budget = free.saturating_sub(headroom_bytes);
 
             // Heat-density knapsack over the persisted routing counts. On a cold

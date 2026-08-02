@@ -22,10 +22,28 @@ pub enum QtFmt {
     Int2 = 3,
     /// grouped packed int4 (`gs` weights share one scale)
     Int4Grouped = 4,
+    /// int3 with per-group scales, group = 64 (colibrì's fmt 5). Each group is
+    /// 24 bytes — a 16-byte low plane (2 bits/value, the int2 layout) plus an
+    /// 8-byte high plane (1 bit/value) — and carries one f32 scale, so 3.5
+    /// bits/weight effective. Values are `[-4, 3]`, stored biased `+4`.
+    Int3G64 = 5,
+    /// **affine** int2 with a scale *and* zero-point per 64-value group. 16
+    /// bytes per group (the int2 packing, four 2-bit fields per byte) plus two
+    /// f32 per group in `.qs`, interleaved `[scale, zero]`. Fields are unsigned
+    /// `[0, 3]` and the bias is the per-group zero-point, so all four levels
+    /// carry weight — unlike per-row [`QtFmt::Int2`], whose `amax / 1`
+    /// convention leaves the `-2` level unreachable.
+    ///
+    /// **3.0 bits/weight effective**, not 2 — the two f32 per group are 8 bytes
+    /// per 64 values, a full extra bit/weight on top of the 2-bit payload. Still
+    /// the smallest format in this container family (int3-g64 is 3.5, per-row
+    /// int4 is ~4.0), but the headline "2-bit" describes the payload, not the
+    /// container. Narrowing the scales to f16 would reach ~2.5.
+    Int2G64 = 7,
     /// the payload size matches no known container for the requested `[O, I]`
     /// — a truncated tensor, or a caller/file shape disagreement. Loading one
     /// is an error rather than a guess.
-    Unknown = 5,
+    Unknown = 6,
 }
 
 /// Resolved format for one weight `[O, I]`.
@@ -85,12 +103,41 @@ impl QtInfo {
         // both compression and the scale dtype's byte width.
         let ns = st.numel(&scale_name).unwrap_or(0);
 
-        let mut fmt = if nb == o * i {
+        // Row-major formats are tested before int3-g64 so a narrow tensor whose
+        // int3 size coincides with an int8/int4/int2 row size still resolves to
+        // the row format — the precedence colibrì documents at `colibri.c:1059`.
+        let i3_groups = (i + 63) / 64;
+        let i2g_scales = o * i3_groups * 2;
+        // int2-g64 is tested **before** the row formats, which is the opposite of
+        // int3-g64's precedence below. Its payload `o·ng·16` collides with a row
+        // format at several widths — int8 at I=16, per-row int2 at every I that
+        // is a multiple of 64 — so byte count alone can never place it, and the
+        // `2·o·ng` scale cardinality is what separates it.
+        //
+        // **Requiring at least two groups is what makes the pair unique.** At
+        // `ng == 1` the format is degenerate (one scale+zero per row) and
+        // genuinely indistinguishable: O=2, I=32 grouped int4 with gs=16 is also
+        // 32 bytes with 4 scales. Above one group no other format produces this
+        // (bytes, scales) combination, so first place is safe. Real routed
+        // experts are 1536–5120 wide, so this excludes only fixtures — and
+        // `peregrine-requantize` refuses to *write* a single-group int2-g64
+        // tensor rather than emit a container that would land here as int8.
+        //
+        // int3-g64 cannot take the same precedence: its `o·ng` scales *equal*
+        // `o` when I ≤ 64, so it stays ambiguous with per-row and has to yield.
+        let mut fmt = if i3_groups >= 2 && nb == o * i3_groups * 16 && ns == i2g_scales {
+            QtFmt::Int2G64
+        } else if nb == o * i {
             QtFmt::Int8
         } else if nb == o * ((i + 1) / 2) {
             QtFmt::Int4
         } else if nb == o * ((i + 3) / 4) {
             QtFmt::Int2
+        } else if nb == o * i3_groups * 24 && ns == o * i3_groups {
+            // The scale cardinality is part of the discriminator, not a
+            // consequence of it: colibrì records fmt 5 regressing precisely when
+            // a per-row scale bound was applied to a per-group format.
+            QtFmt::Int3G64
         } else {
             // Deliberately not "assume int2": an unrecognized size means the
             // caller's (o, i) disagrees with the file, or the tensor is
@@ -104,12 +151,16 @@ impl QtInfo {
                 fmt = QtFmt::Int4Grouped;
             }
         }
-        let scale_count = if fmt == QtFmt::Int4Grouped {
-            let ng = (i + gs as i64 - 1) / gs as i64;
-            o * ng
-        } else {
-            o
+        let scale_count = match fmt {
+            QtFmt::Int4Grouped => o * ((i + gs as i64 - 1) / gs as i64),
+            QtFmt::Int3G64 => o * i3_groups,
+            // Two f32 per group: scale and zero-point, interleaved.
+            QtFmt::Int2G64 => i2g_scales,
+            _ => o,
         };
+        if matches!(fmt, QtFmt::Int3G64 | QtFmt::Int2G64) {
+            gs = 64;
+        }
         QtInfo { fmt, o, i, gs, scale_count }
     }
 }
@@ -176,6 +227,78 @@ mod tests {
         assert_eq!(QtInfo::detect(&st, "w8", o, i).fmt, QtFmt::Int8);
         assert_eq!(QtInfo::detect(&st, "wf", o, i).fmt, QtFmt::F32);
 
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn int2_and_int2_g64_have_identical_byte_counts_and_are_told_apart_by_scales() -> Result<(), Error> {
+        // The hazard this format introduces. At I=128 a grouped-2-bit tensor is
+        // o*ceil(128/64)*16 = 32*o bytes and per-row int2 is o*ceil(128/4) =
+        // 32*o bytes — the *same*. Byte count cannot discriminate, and reading a
+        // 2*ng-entry interleaved [scale, zero] array as one scale per row would
+        // decode garbage that loads cleanly, which is exactly the failure mode
+        // the "deliberately not assume int2" comment above guards against.
+        // Scale cardinality is the only thing that separates them.
+        let (o, i) = (4i64, 128i64);
+        let ng = (i + 63) / 64;
+        let payload = (o * (i / 4)) as usize;
+        assert_eq!(payload, (o * ng * 16) as usize, "the collision this test exists for");
+        let dir = tmpdir("i2g");
+        write_safetensors(
+            &dir,
+            &[
+                // per-row int2: exactly O scales
+                Blob { name: "wr", dtype: "U8", shape: vec![o, i / 4], bytes: vec![0u8; payload] },
+                Blob { name: "wr.qs", dtype: "F32", shape: vec![o], bytes: vec![0u8; (o * 4) as usize] },
+                // int2-g64: 2 f32 per group per row, interleaved [scale, zero]
+                Blob { name: "wg", dtype: "U8", shape: vec![o, i / 4], bytes: vec![0u8; payload] },
+                Blob {
+                    name: "wg.qs",
+                    dtype: "F32",
+                    shape: vec![o * ng * 2],
+                    bytes: vec![0u8; (o * ng * 2 * 4) as usize],
+                },
+            ],
+        )?;
+        let st = SafeTensors::open(&dir)?;
+
+        assert_eq!(QtInfo::detect(&st, "wr", o, i).fmt, QtFmt::Int2, "O scales => per-row");
+        let g = QtInfo::detect(&st, "wg", o, i);
+        assert_eq!(g.fmt, QtFmt::Int2G64, "2*O*ng scales => grouped affine");
+        assert_eq!(g.gs, 64);
+        assert_eq!(g.scale_count, o * ng * 2);
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn int2_g64_with_a_ragged_width_gets_its_own_branch() -> Result<(), Error> {
+        // When I is not a multiple of 64 the two byte counts differ (I=100:
+        // 2*16=32 bytes/row grouped vs ceil(100/4)=25 per-row), so the int2
+        // branch never fires and detection must reach the dedicated one.
+        let (o, i) = (3i64, 100i64);
+        let ng = (i + 63) / 64; // 2
+        let payload = (o * ng * 16) as usize;
+        assert_ne!(payload, (o * ((i + 3) / 4)) as usize, "ragged widths must not collide");
+        let dir = tmpdir("i2g_ragged");
+        write_safetensors(
+            &dir,
+            &[
+                Blob { name: "w", dtype: "U8", shape: vec![o, ng * 16], bytes: vec![0u8; payload] },
+                Blob {
+                    name: "w.qs",
+                    dtype: "F32",
+                    shape: vec![o * ng * 2],
+                    bytes: vec![0u8; (o * ng * 2 * 4) as usize],
+                },
+            ],
+        )?;
+        let st = SafeTensors::open(&dir)?;
+        let d = QtInfo::detect(&st, "w", o, i);
+        assert_eq!(d.fmt, QtFmt::Int2G64);
+        assert_eq!(d.scale_count, o * ng * 2);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "peregrine-layout-reorg"
 path = "src/reorg.rs"
 
+[[bin]]
+name = "peregrine-requantize"
+path = "src/requant_main.rs"
+
 [dependencies]
 serde_json.workspace = true
 peregrine-core = { path = "../peregrine-core" }

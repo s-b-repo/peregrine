@@ -1,0 +1,192 @@
+//! `peregrine-requantize` — rewrite a container at a different on-disk precision.
+//!
+//! Separate from `peregrine build` on purpose: that name already means "write a
+//! tiny synthetic model", and a multi-hour batch job has no business living in
+//! the inference binary's dependency surface. This links `peregrine-core` only.
+//!
+//! ```text
+//! peregrine-requantize <indir> <outdir> [--target int2] [--include .mlp.experts.]
+//!                                       [--shard-bytes N] [--dry-run]
+//! ```
+
+use peregrine_tools::requant::{plan_sizes, requantize, HeatTier, Plan, Target};
+use std::path::Path;
+
+fn usage() -> i32 {
+    eprintln!(
+        "usage: peregrine-requantize <indir> <outdir> [options]\n\
+         \n\
+         options:\n\
+         \x20 --target <scheme>    int8 | int4 | int4-g<N> | int2   (default int2)\n\
+         \x20 --include <substr>   only tensors containing this      (default .mlp.experts.)\n\
+         \x20 --shard-bytes <N>    roll output shards at N bytes     (default 5000000000)\n\
+         \x20 --dry-run            report the size plan from headers, write nothing\n\
+         \x20 --tier-hot-frac <f>  heat-tiered precision: keep this fraction of each\n\
+         \x20                      layer's experts (by routing heat from the source's\n\
+         \x20                      route_stats.json) at --tier-hot, rest at --target\n\
+         \x20 --tier-hot <scheme>  precision for the hot fraction (default int4)\n\
+         \n\
+         Requantizing is lossy: it changes token values. Measure the cost with\n\
+         Model::prediction_flip_rate against the source container before relying\n\
+         on the output."
+    );
+    2
+}
+
+fn main() -> std::process::ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut positional: Vec<&str> = Vec::new();
+    let mut plan = Plan::default();
+    let mut dry_run = false;
+    let mut tier_frac: Option<f64> = None;
+    let mut tier_hot = Target::Int4;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => dry_run = true,
+            "--target" => {
+                i += 1;
+                match args.get(i).and_then(|s| Target::parse(s)) {
+                    Some(t) => plan.target = t,
+                    None => {
+                        eprintln!("peregrine-requantize: unknown --target (int8|int4|int4-g<N>|int2)");
+                        return std::process::ExitCode::from(2);
+                    }
+                }
+            }
+            "--include" => {
+                i += 1;
+                match args.get(i) {
+                    Some(s) => plan.include = s.clone(),
+                    None => return std::process::ExitCode::from(usage() as u8),
+                }
+            }
+            "--shard-bytes" => {
+                i += 1;
+                match args.get(i).and_then(|s| s.parse::<u64>().ok()) {
+                    Some(n) if n > 0 => plan.shard_bytes = n,
+                    _ => {
+                        eprintln!("peregrine-requantize: --shard-bytes needs a positive integer");
+                        return std::process::ExitCode::from(2);
+                    }
+                }
+            }
+            "--tier-hot-frac" => {
+                i += 1;
+                match args.get(i).and_then(|s| s.parse::<f64>().ok()) {
+                    Some(f) if (0.0..=1.0).contains(&f) => tier_frac = Some(f),
+                    _ => {
+                        eprintln!("peregrine-requantize: --tier-hot-frac needs a fraction in [0,1]");
+                        return std::process::ExitCode::from(2);
+                    }
+                }
+            }
+            "--tier-hot" => {
+                i += 1;
+                match args.get(i).and_then(|s| Target::parse(s)) {
+                    Some(t) => tier_hot = t,
+                    None => {
+                        eprintln!("peregrine-requantize: unknown --tier-hot scheme");
+                        return std::process::ExitCode::from(2);
+                    }
+                }
+            }
+            "-h" | "--help" => return std::process::ExitCode::from(usage() as u8),
+            other => positional.push(other),
+        }
+        i += 1;
+    }
+    let (indir, outdir) = match positional.as_slice() {
+        [a, b] => (Path::new(*a), Path::new(*b)),
+        _ => return std::process::ExitCode::from(usage() as u8),
+    };
+    if let Some(frac) = tier_frac {
+        let cfg = match peregrine_core::config::Cfg::load(indir) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("peregrine-requantize: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let (nl, ne) = (cfg.n_layers as usize, cfg.n_experts as usize);
+        let heat = match HeatTier::from_route_stats(indir, nl, ne) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!(
+                    "peregrine-requantize: heat tiering needs routing data — {e}\n\
+                     Produce it by running the model with COLI_ROUTE_STATS_PERSIST=1, or with \
+                     `peregrine dump-routes`. Refusing rather than tiering everything cold, \
+                     which would look like it worked."
+                );
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let tier = HeatTier { hot_frac: frac, hot: tier_hot, cold: plan.target, heat, n_experts: ne };
+        // The number that decides whether this is worth doing at all.
+        let ratio = tier.weighted_ratio(cfg.moe_inter as usize, cfg.hidden as usize);
+        eprintln!(
+            "peregrine-requantize: heat-tiered — hottest {:.0}% at {} / rest at {}; \
+             per-token bytes {:.0}% of an all-{} checkpoint",
+            frac * 100.0,
+            tier_hot.label(),
+            plan.target.label(),
+            ratio * 100.0,
+            plan.target.label(),
+        );
+        plan.tier = Some(tier);
+    }
+
+    if dry_run {
+        return match plan_sizes(indir, &plan) {
+            Ok(rep) => {
+                eprintln!(
+                    "peregrine-requantize --dry-run: {} tensors ({} would requantize to {}) | \
+                     {:.2} GB -> {:.2} GB ({:.1}% of source), about {} shard(s) at {:.1} GB each\n\
+                     both containers must fit at once: plan for {:.2} GB of free space.",
+                    rep.tensors_total,
+                    rep.tensors_requantized,
+                    plan.target.label(),
+                    rep.bytes_in as f64 / 1e9,
+                    rep.bytes_out as f64 / 1e9,
+                    rep.ratio() * 100.0,
+                    rep.shards,
+                    plan.shard_bytes as f64 / 1e9,
+                    rep.bytes_out as f64 / 1e9,
+                );
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("peregrine-requantize: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    eprintln!(
+        "peregrine-requantize: {} -> {} | target {} | include '{}'",
+        indir.display(),
+        outdir.display(),
+        plan.target.label(),
+        plan.include
+    );
+    match requantize(indir, outdir, &plan) {
+        Ok(rep) => {
+            eprintln!(
+                "peregrine-requantize: {} tensors ({} requantized) -> {} shards | {:.2} GB -> {:.2} GB ({:.1}% of source)",
+                rep.tensors_total,
+                rep.tensors_requantized,
+                rep.shards,
+                rep.bytes_in as f64 / 1e9,
+                rep.bytes_out as f64 / 1e9,
+                rep.ratio() * 100.0,
+            );
+            for n in rep.skipped_unsupported.iter().take(8) {
+                eprintln!("peregrine-requantize: copied through (no packed form): {n}");
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("peregrine-requantize: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}

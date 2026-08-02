@@ -59,22 +59,27 @@ argument order so the two are directly comparable:
 cargo run --release -p peregrine-io --example iobench -- FILE BLK_MB ITERS RINGS DIRECT
 ```
 
-Each ring submits its whole batch in one `read_direct_many`/`read_many` call, so
-queue depth = `ITERS` — a depth-1 loop measures per-request latency, not the
-device's parallel read rate, and reads ~40 % low.
+Each ring submits its whole batch in one call, so queue depth = `ITERS` — a
+depth-1 loop measures per-request latency, not the device's parallel read rate,
+and reads ~40 % low.
 
-**Known gap (measured 2026-08-01, i5-1235U laptop, LUKS NVMe):** this lane
-sustains 0.84 GB/s at 8 rings where colibrì's threaded `pread` + O_DIRECT
-harness reaches 2.02 GB/s — a 2.4× deficit, direction-consistent with the
-reference box's 710 vs 870 MB/s. On a dm-crypt volume reads are CPU-bound on
-decryption, so *N* blocking `pread`s keep *N* cores decrypting while the ring's
-completion model can leave cores idle. The example does not enable `COLI_REGBUF`
-or multi-ring tuning, so its number is a floor. See
-[Benchmarks](benchmarks.md#second-box-glm-52-on-a-7-gb-laptop).
+**Fixed 2026-08-02: the O_DIRECT lane itself ran at queue depth 1.**
+`read_direct_aligned` looped one region at a time, each calling `read_many` with
+a single-element slice, so a 96-region expert batch became 96 sequential ring
+round-trips — the "batched reads" win never reached the direct path, and direct
+reads measured *slower* than buffered ones. It now allocates every region's
+landing buffer up front, submits them in one `read_many` (which chunks
+internally to the ring's entry count), and completes short reads per region.
+Peak memory is unchanged, since each region already owned its buffer for the
+returned `Bytes`. Worth 1.2–1.3× on a LUKS NVMe; the residual gap to colibrì's
+threaded-pread harness is still open, with dm-crypt CPU-boundness as the
+hypothesis. See [Benchmarks](benchmarks.md#second-box-glm-52-on-a-7-gb-laptop).
 
 ## Slab pool (`slab.rs`)
 
-A lock-free pool of aligned slabs for expert landing buffers.
+A pool of aligned slabs for expert landing buffers. (Not lock-free, despite
+older prose: `slab.rs` states outright that the outer `Mutex<Reactor>` already
+serializes access, so a lock-free swap here would be dead weight.)
 `checkout_tagged` / `checkin_tagged` return and verify a generation-tagged
 `SlabHandle { gen }` so a straggler speculative load cannot write into a recycled
 slab — **but nothing calls them**. The live path is the untagged
@@ -86,16 +91,21 @@ streamed `QtWeight` moves in, and kernels read it via `Deref<[u8]>`.
 
 Covered in depth in [Prefetch & caching](prefetch-and-caching.md): the
 budgeted warm RAM cache (`COLI_ECACHE_GB`) with Bloom-filter miss shortcut,
-transparent zstd, negative TTL, heat-gated admission and idle recompression;
-plus the LFRU tier scoring (`(heat << 8) | recency`) used for
-eviction/promotion decisions.
+transparent zstd, negative TTL, heat-gated admission and idle recompression.
+
+Eviction picks the lowest `(priority, recency)` — priority-weighted LRU
+(`warmcache.rs::evict_to_budget`). The LFRU scoring in `tier.rs`
+(`(heat << 8) | recency`) is **not** wired to it; see
+[prefetch & caching](prefetch-and-caching.md#tiering--gpu-residency).
 
 ## Compression (`peregrine-core/src/compress.rs`)
 
 One shared zstd codec threads through both storage levels:
 
-- **On disk** — `pack::Blob::with_compression(Compression::Zstd)` writes
-  tensors compressed; the safetensors header carries
+- **On disk** — read support only. `SafeTensors` decodes compressed containers
+  produced elsewhere, but no first-party path *writes* one:
+  `pack::Blob::with_compression` has test-only callers, and
+  `peregrine-requantize` writes uncompressed. The header carries
   `"compression": "zstd"` + `"uncompressed_nbytes"` and reads decompress
   transparently. See [Model format](model-format.md#safetensors-header-extensions).
 - **In RAM** — `COLI_CACHE_COMPRESS` zstd-compresses warm-cache slabs on

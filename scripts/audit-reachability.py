@@ -61,32 +61,61 @@ def main() -> int:
     files = sorted(
         p for p in root.glob("crates/*/src/**/*.rs") if "peregrine-token" not in str(p)
     )
-    defs: dict[str, tuple[Path, int]] = {}
+    # Every definition site per name, not just the first. A symbol declared twice
+    # — the `#[cfg(target_os = "linux")]` implementation and its
+    # `#[cfg(not(...))]` stub — used to have its second declaration counted as a
+    # caller of the first, so the pair vouched for each other and the symbol
+    # looked reachable. That hid `register_read_buffers`/`read_fixed`, i.e. this
+    # script's own headline example (`COLI_REGBUF`), from this script.
+    defs: dict[str, list[tuple[Path, int]]] = {}
     prod: list[tuple[Path, int, str]] = []
     for f in files:
         lines = f.read_text(errors="replace").splitlines()
         mask = test_mask(lines)
+        in_block = False
         for i, ln in enumerate(lines):
-            if ln.strip().startswith(("//", "///", "*", "#!")):
+            stripped = ln.strip()
+            # Track block comments properly instead of treating every line that
+            # starts with `*` as a comment continuation. That shortcut also ate
+            # dereference assignments, and `*o = f16_to_f32(...)`
+            # (safetensors.rs) was this scan's only reference to a live
+            # production function — so a reachable symbol was reported dead.
+            was_in_block = in_block
+            if "/*" in stripped and "*/" not in stripped:
+                in_block = True
+            elif "*/" in stripped:
+                in_block = False
+            if was_in_block or stripped.startswith(("//", "///", "#!")):
                 continue
             if not mask[i]:
                 prod.append((f, i + 1, ln))
                 m = DEF_RE.match(ln)
                 if m:
-                    defs.setdefault(m.group(1), (f, i + 1))
+                    defs.setdefault(m.group(1), []).append((f, i + 1))
 
     suspect = []
-    for name, (dfile, dline) in sorted(defs.items()):
+    for name, sites in sorted(defs.items()):
         word = re.compile(r"\b" + re.escape(name) + r"\b")
+        declared_at = set(sites)
         if not any(
             word.search(ln)
             for f, lineno, ln in prod
-            if not (f == dfile and lineno == dline)
-            and not ln.strip().startswith(("use ", "pub use"))
+            if (f, lineno) not in declared_at and not ln.strip().startswith(("use ", "pub use"))
         ):
+            dfile, dline = sites[0]
             suspect.append((name, dfile.relative_to(root), dline))
 
     print(f"[R] pub fns with no production caller (INFO): {len(suspect)}")
+    # Known blind spot, stated so absence of a symbol here is not read as proof.
+    # References are matched by BARE NAME across the workspace, with no type
+    # resolution, so a method whose name collides with any called function
+    # anywhere scores as reached. `Indexer::{load,select,reset}` (dsa.rs) are
+    # invisible for exactly this reason — `load`, `select` and `reset` are called
+    # constantly on other types — which is why the whole DSA module went
+    # unreported while being entirely unreachable. Treat common method names
+    # (`new`, `load`, `get`, `push`, `len`, `clear`, `reset`, `select`) as
+    # unchecked, not as clean.
+    print("      note: bare-name matching — common method names are unchecked, not clean")
     if "--list" in sys.argv:
         for name, f, ln in suspect:
             print(f"      {f}:{ln}: {name}")

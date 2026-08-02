@@ -147,7 +147,7 @@ pub mod x86 {
 
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn hsum256(v: __m256i) -> i32 {
+    pub(super) unsafe fn hsum256(v: __m256i) -> i32 {
         let lo = _mm256_castsi256_si128(v);
         let hi = _mm256_extracti128_si256::<1>(v);
         let mut s = _mm_add_epi32(lo, hi);
@@ -279,8 +279,279 @@ pub mod x86 {
     }
 }
 
+/// **affine** int2-g64·int8 dot → f32. Reference implementation.
+///
+/// Each 64-value group is 16 bytes (four 2-bit fields per byte, the int2
+/// layout) and carries **two** f32 in `scales`, interleaved `[s, z]`. Fields are
+/// unsigned `[0, 3]`; the bias is the group's own zero-point, not a constant.
+///
+/// The affine form decomposes so the integer dot survives intact:
+///
+/// ```text
+///   Σ (q·s + z)·x  =  s·Σ(q·x)  +  z·Σ(x)
+/// ```
+///
+/// so a group needs the usual integer dot *plus* a plain sum of that group's
+/// activations. That second accumulator is the whole cost of the zero-point —
+/// no float enters until the per-group scale multiply, exactly as in
+/// [`dot_i3i8_g64_scalar`].
+pub fn dot_i2i8_g64_scalar(w2: &[u8], x: &[i8], scales: &[f32], n: usize) -> f32 {
+    const GROUP: usize = 64;
+    const GROUP_BYTES: usize = 16;
+    let mut acc = 0f32;
+    let mut start = 0usize;
+    let mut g = 0usize;
+    while start < n {
+        let len = GROUP.min(n - start);
+        let base = g * GROUP_BYTES;
+        let mut d = 0i32; // Σ q·x
+        let mut sx = 0i32; // Σ x
+        for k in 0..len {
+            let field = ((w2[base + (k >> 2)] >> (2 * (k & 3))) & 0x03) as i32;
+            let xv = x[start + k] as i32;
+            d += field * xv;
+            sx += xv;
+        }
+        acc += scales[2 * g] * d as f32 + scales[2 * g + 1] * sx as f32;
+        start += GROUP;
+        g += 1;
+    }
+    acc
+}
+
+/// affine int2-g64·int8 dot → f32, using the best available inner kernel.
+///
+/// Bit-identical to [`dot_i2i8_g64_scalar`]: both accumulate the group's two
+/// integer sums exactly and apply the same two float multiplies in the same
+/// order. Gated by `int2_g64_avx2_matches_scalar`.
+pub fn dot_i2i8_g64(w2: &[u8], x: &[i8], scales: &[f32], n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the avx2 kernel is only called after detecting avx2 at runtime.
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { x86_i2g::dot_i2i8_g64_avx2(w2, x, scales, n) };
+        }
+    }
+    dot_i2i8_g64_scalar(w2, x, scales, n)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86_i2g {
+    use super::x86::hsum256;
+    use std::arch::x86_64::*;
+
+    const GROUP: usize = 64;
+    const GROUP_BYTES: usize = 16;
+
+    /// `(Σ q·x, Σ x)` over 32 consecutive elements starting at packed byte
+    /// `wp` and activation pointer `xp`.
+    ///
+    /// The unsigned field layout is what makes this simpler than the biased
+    /// per-row int2 kernel: `q ∈ [0,3]` is already a valid unsigned operand for
+    /// `maddubs`, so the sign-shuffle dance that kernel needs is unnecessary
+    /// here. Products stay in `[-384, 381]` and pairwise sums in `[-768, 762]`,
+    /// well inside i16.
+    ///
+    /// # Safety
+    /// AVX2 required; `wp` must have 8 readable bytes and `xp` 32.
+    #[target_feature(enable = "avx2")]
+    unsafe fn block32(wp: *const u8, xp: *const i8) -> (__m256i, __m256i) {
+        let m2 = _mm_set1_epi8(0x03);
+        let ones16 = _mm256_set1_epi16(1);
+        let by = _mm_loadl_epi64(wp as *const __m128i); // 8 B = 32 fields
+        let f0 = _mm_and_si128(by, m2);
+        let f1 = _mm_and_si128(_mm_srli_epi16::<2>(by), m2);
+        let f2 = _mm_and_si128(_mm_srli_epi16::<4>(by), m2);
+        let f3 = _mm_and_si128(_mm_srli_epi16::<6>(by), m2);
+        let lo01 = _mm_unpacklo_epi8(f0, f1);
+        let lo23 = _mm_unpacklo_epi8(f2, f3);
+        let r_lo = _mm_unpacklo_epi16(lo01, lo23); // elements 0..15
+        let r_hi = _mm_unpackhi_epi16(lo01, lo23); // elements 16..31
+        let wv = _mm256_set_m128i(r_hi, r_lo); // unsigned [0,3], in order
+        let xv = _mm256_loadu_si256(xp as *const __m256i);
+        // Σ q·x — q is the unsigned operand, x the signed one.
+        let d = _mm256_madd_epi16(_mm256_maddubs_epi16(wv, xv), ones16);
+        // Σ x — same shape with every weight forced to 1.
+        let sx = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), xv), ones16);
+        (d, sx)
+    }
+
+    /// # Safety
+    /// AVX2 required. [`super::dot_i2i8_g64`] verifies this before calling.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn dot_i2i8_g64_avx2(w2: &[u8], x: &[i8], scales: &[f32], n: usize) -> f32 {
+        let mut acc = 0f32;
+        let mut start = 0usize;
+        let mut g = 0usize;
+        while start < n {
+            let len = GROUP.min(n - start);
+            let base = g * GROUP_BYTES;
+            let (d, sx) = if len == GROUP {
+                // A group is exactly two 32-element blocks, so the vector loop
+                // never straddles a group boundary and the per-group scale stays
+                // exact.
+                let (d0, s0) = block32(w2.as_ptr().add(base), x.as_ptr().add(start));
+                let (d1, s1) = block32(w2.as_ptr().add(base + 8), x.as_ptr().add(start + 32));
+                (hsum256(_mm256_add_epi32(d0, d1)), hsum256(_mm256_add_epi32(s0, s1)))
+            } else {
+                // Ragged final group: fall back rather than masking. Integer
+                // sums are order-independent, so this is still bit-identical.
+                let mut d = 0i32;
+                let mut sxs = 0i32;
+                for k in 0..len {
+                    let field = ((w2[base + (k >> 2)] >> (2 * (k & 3))) & 0x03) as i32;
+                    let xv = x[start + k] as i32;
+                    d += field * xv;
+                    sxs += xv;
+                }
+                (d, sxs)
+            };
+            acc += scales[2 * g] * d as f32 + scales[2 * g + 1] * sx as f32;
+            start += GROUP;
+            g += 1;
+        }
+        acc
+    }
+}
+
+/// int3-g64·int8 dot → f32 (colibrì's fmt 5).
+///
+/// Each 64-value group is 24 bytes — a 16-byte low plane holding bits 0-1 in the
+/// int2 layout, then an 8-byte high plane holding bit 2 one bit per value — plus
+/// one f32 scale. Values are stored biased `+4`, so they decode to `[-4, 3]`.
+///
+/// The integer dot is accumulated per group and scaled once, the same shape as
+/// [`dot_i4i8_grouped`]: per-group scales cannot be factored out of a single
+/// integer accumulator. colibrì has no int8-activation path for this format
+/// ("int3 has no IDOT in v1: int8 activations don't compose with per-group
+/// accumulation without a kernel restructure") — that restructure is what
+/// `dot_i4i8_grouped` already is here, so int3 composes with it for free.
+pub fn dot_i3i8_g64_scalar(w3: &[u8], x: &[i8], scales: &[f32], n: usize) -> f32 {
+    const GROUP: usize = 64;
+    const LOW_BYTES: usize = 16;
+    const GROUP_BYTES: usize = 24;
+    let mut acc = 0f32;
+    let mut start = 0usize;
+    let mut g = 0usize;
+    while start < n {
+        let len = GROUP.min(n - start);
+        let base = g * GROUP_BYTES;
+        let mut d = 0i32;
+        for k in 0..len {
+            let lo = w3[base + (k >> 2)];
+            let hi = w3[base + LOW_BYTES + (k >> 3)];
+            let low = ((lo >> (2 * (k & 3))) & 0x03) as i32;
+            let high = ((hi >> (k & 7)) & 0x01) as i32;
+            d += ((low | (high << 2)) - 4) * x[start + k] as i32;
+        }
+        acc += scales[g] * d as f32;
+        start += GROUP;
+        g += 1;
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn int2_g64_avx2_matches_scalar() {
+        // Same contract as int3-g64 below: the scalar kernel is the reference
+        // and the SIMD variant must equal it bit-for-bit, not within a
+        // tolerance. Both integer accumulators are exact and the two float
+        // multiplies happen in the same order, so equality is achievable.
+        //
+        // Packing is done here rather than through `quant_i2_g64`, so this pits
+        // the two kernels against each other rather than against a shared
+        // producer bug.
+        fn pack(codes: &[u8]) -> Vec<u8> {
+            let ng = codes.len().div_ceil(64);
+            let mut q = vec![0u8; ng * 16];
+            for (k, &u) in codes.iter().enumerate() {
+                let (g, j) = (k / 64, k % 64);
+                q[g * 16 + (j >> 2)] |= (u & 0x03) << (2 * (j & 3));
+            }
+            q
+        }
+        // Widths that exercise a whole group, several groups, and every ragged
+        // remainder class around the 32-element vector block.
+        for n in [64usize, 128, 192, 200, 63, 65, 32, 31, 1] {
+            let codes: Vec<u8> = (0..n).map(|k| (k * 7 % 4) as u8).collect();
+            let q = pack(&codes);
+            let ng = n.div_ceil(64);
+            // Interleaved [scale, zero]; zeros deliberately non-zero and signed,
+            // since a zero-point of 0 would hide the whole Σx term.
+            let sc: Vec<f32> = (0..ng)
+                .flat_map(|g| [0.125 + g as f32 * 0.5, -0.75 + g as f32 * 0.25])
+                .collect();
+            // Activations spanning the i8 extremes: the Σx accumulator is where
+            // a saturating or unsigned mistake would show up.
+            let x: Vec<i8> = (0..n).map(|k| ((((k * 37) % 255) as i32) - 128) as i8).collect();
+            let want = dot_i2i8_g64_scalar(&q, &x, &sc, n);
+            let got = dot_i2i8_g64(&q, &x, &sc, n);
+            assert_eq!(want.to_bits(), got.to_bits(), "n={n}: avx2 must be bit-identical to scalar");
+        }
+    }
+
+    #[test]
+    fn int2_g64_dot_matches_dequantized_reference() {
+        // The kernel and the container decoder must agree: quantize, then check
+        // the kernel against a plain f32 dot over what `QtView` says the bytes
+        // mean. This is the pairing that would catch a bias or ordering mismatch
+        // between producer and consumer, which no kernel-vs-kernel test can see.
+        let n = 128usize;
+        let codes: Vec<u8> = (0..n).map(|k| (k * 3 % 4) as u8).collect();
+        let ng = n.div_ceil(64);
+        let mut q = vec![0u8; ng * 16];
+        for (k, &u) in codes.iter().enumerate() {
+            q[(k / 64) * 16 + ((k % 64) >> 2)] |= (u & 0x03) << (2 * ((k % 64) & 3));
+        }
+        let sc: Vec<f32> = (0..ng).flat_map(|g| [0.5 + g as f32, -1.25 * (g + 1) as f32]).collect();
+        let x: Vec<i8> = (0..n).map(|k| ((k % 17) as i32 - 8) as i8).collect();
+
+        let mut want = 0f64;
+        for k in 0..n {
+            let g = k / 64;
+            let w = codes[k] as f64 * sc[2 * g] as f64 + sc[2 * g + 1] as f64;
+            want += w * x[k] as f64;
+        }
+        let got = dot_i2i8_g64(&q, &x, &sc, n) as f64;
+        assert!((got - want).abs() < 1e-3, "kernel {got} vs dequantized reference {want}");
+    }
+
+    #[test]
+    fn int3_g64_avx2_matches_scalar() {
+        // Every format here ships a scalar reference and a SIMD variant checked
+        // bit-for-bit against it (docs/testing-and-quality.md). int3 shipped with
+        // only the scalar half, so an int3 checkpoint computed slower than the
+        // int4 it replaced. The per-group integer dot is exact in both paths, so
+        // equality here is bit-equality, not a tolerance.
+        //
+        // The packing is done here rather than via the encoder, so this tests the
+        // two kernels against each other and not against a shared producer bug.
+        fn pack(codes: &[u8]) -> Vec<u8> {
+            let ng = codes.len().div_ceil(64);
+            let mut q = vec![0u8; ng * 24];
+            for (k, &u) in codes.iter().enumerate() {
+                let (g, j) = (k / 64, k % 64);
+                let base = g * 24;
+                q[base + (j >> 2)] |= (u & 0x03) << (2 * (j & 3));
+                q[base + 16 + (j >> 3)] |= ((u >> 2) & 0x01) << (j & 7);
+            }
+            q
+        }
+        for n in [64usize, 128, 200, 63, 65, 32] {
+            // every code in [0,7] appears, so both planes vary
+            let codes: Vec<u8> = (0..n).map(|k| (k * 5 % 8) as u8).collect();
+            let q = pack(&codes);
+            let ng = n.div_ceil(64);
+            let sc: Vec<f32> = (0..ng).map(|g| 0.125 + g as f32 * 0.5).collect();
+            let x: Vec<i8> = (0..n).map(|k| ((k * 53 % 255) as i32 - 127) as i8).collect();
+            let want = dot_i3i8_g64_scalar(&q, &x, &sc, n);
+            let got = dot_i3i8_g64(&q, &x, &sc, n);
+            assert_eq!(want.to_bits(), got.to_bits(), "n={n}: SIMD path diverged from the reference");
+        }
+    }
+
     use super::*;
 
     // Deterministic LCG so tests need no rng crate and no Date/random.
@@ -419,5 +690,118 @@ mod tests {
             }
             assert_eq!(dot_i4i8(&w4, &x, n), reference, "dispatch i4 n={n}");
         }
+    }
+}
+
+/// int3-g64·int8 dot → f32, using the best available inner kernel.
+///
+/// Bit-identical to [`dot_i3i8_g64_scalar`]: the per-group integer dot is exact
+/// in both paths (no float rounding until the per-group scale multiply, which is
+/// applied in the same order), so the SIMD path is a speed change only. Gated by
+/// `int3_g64_avx2_matches_scalar`.
+pub fn dot_i3i8_g64(w3: &[u8], x: &[i8], scales: &[f32], n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the avx2 kernel is only called after detecting avx2 at runtime.
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { x86_i3::dot_i3i8_g64_avx2(w3, x, scales, n) };
+        }
+    }
+    dot_i3i8_g64_scalar(w3, x, scales, n)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86_i3 {
+    use super::dot_i3i8_g64_scalar;
+    use super::x86::hsum256;
+    use std::arch::x86_64::*;
+
+    const GROUP: usize = 64;
+    const LOW_BYTES: usize = 16;
+    const GROUP_BYTES: usize = 24;
+
+    /// One full 64-value group as two 32-value halves.
+    ///
+    /// The low plane is byte-for-byte the int2 layout, so its unpack is the same
+    /// shuffle `dot_i2i8_avx2` uses. The high plane is one bit per value: four
+    /// bytes cover 32 values, so each source byte is broadcast across eight lanes
+    /// and tested against a per-lane bit mask, yielding 4 where the bit is set.
+    /// `low | high` reproduces the biased `[0,7]` code, and subtracting 4 gives
+    /// the stored `[-4,3]`.
+    ///
+    /// # Safety
+    /// Caller has verified AVX2. `w3` must hold a whole 24-byte group at `base`
+    /// and `x` 64 readable elements at `xoff`.
+    #[target_feature(enable = "avx2")]
+    unsafe fn group_dot(w3: &[u8], base: usize, x: &[i8], xoff: usize) -> i32 {
+        let m2 = _mm_set1_epi8(0x03);
+        let b4 = _mm256_set1_epi8(4);
+        let ones = _mm256_set1_epi16(1);
+        let bitmask = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128i8, 1, 2, 4, 8, 16, 32, 64, -128i8, 1, 2, 4, 8, 16, 32, 64,
+            -128i8, 1, 2, 4, 8, 16, 32, 64, -128i8,
+        );
+        // byte k of the shuffle result takes source byte k/8, per 128-bit lane
+        let spread = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let mut acc = _mm256_setzero_si256();
+        for half in 0..2 {
+            let k = half * 32; // first value of this half within the group
+            // low plane: 8 bytes = 32 two-bit fields, identical to int2
+            let by = _mm_loadl_epi64(w3.as_ptr().add(base + (k >> 2)) as *const __m128i);
+            let f0 = _mm_and_si128(by, m2);
+            let f1 = _mm_and_si128(_mm_srli_epi16::<2>(by), m2);
+            let f2 = _mm_and_si128(_mm_srli_epi16::<4>(by), m2);
+            let f3 = _mm_and_si128(_mm_srli_epi16::<6>(by), m2);
+            let lo01 = _mm_unpacklo_epi8(f0, f1);
+            let lo23 = _mm_unpacklo_epi8(f2, f3);
+            let r_lo = _mm_unpacklo_epi16(lo01, lo23);
+            let r_hi = _mm_unpackhi_epi16(lo01, lo23);
+            let low = _mm256_set_m128i(r_hi, r_lo);
+
+            // high plane: 4 bytes = 32 single bits
+            let hp = w3.as_ptr().add(base + LOW_BYTES + (k >> 3)) as *const i32;
+            let bcast = _mm256_shuffle_epi8(_mm256_set1_epi32(hp.read_unaligned()), spread);
+            let isset = _mm256_cmpeq_epi8(_mm256_and_si256(bcast, bitmask), bitmask);
+            let high = _mm256_and_si256(isset, b4);
+
+            let wv = _mm256_sub_epi8(_mm256_or_si256(low, high), b4); // → [-4,3]
+            let xv = _mm256_loadu_si256(x.as_ptr().add(xoff + k) as *const __m256i);
+            let p = _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(xv, wv));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, ones));
+        }
+        hsum256(acc)
+    }
+
+    /// # Safety
+    /// Caller has verified AVX2.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn dot_i3i8_g64_avx2(w3: &[u8], x: &[i8], scales: &[f32], n: usize) -> f32 {
+        let mut acc = 0f32;
+        let mut start = 0usize;
+        let mut g = 0usize;
+        while start < n {
+            let len = GROUP.min(n - start);
+            let base = g * GROUP_BYTES;
+            // Only whole groups vectorize; a ragged final group falls back to the
+            // reference, which is the same arithmetic.
+            let d = if len == GROUP {
+                group_dot(w3, base, x, start)
+            } else {
+                let tail = dot_i3i8_g64_scalar(&w3[base..], &x[start..], &scales[g..g + 1], len);
+                // `dot_i3i8_g64_scalar` already applied the scale; undo the double-apply
+                // by accumulating it directly and skipping the multiply below.
+                acc += tail;
+                start += GROUP;
+                g += 1;
+                continue;
+            };
+            acc += scales[g] * d as f32;
+            start += GROUP;
+            g += 1;
+        }
+        acc
     }
 }

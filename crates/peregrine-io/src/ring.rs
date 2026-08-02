@@ -38,6 +38,69 @@ pub fn pread_many(reqs: &mut [ReadReq]) -> Vec<i64> {
         .collect()
 }
 
+/// [`pread_many`] spread across `threads` OS threads, each taking a contiguous
+/// chunk of `reqs`. Returns per-request byte counts in the caller's order.
+///
+/// **Why a blocking-`pread` engine exists next to a working io_uring lane.**
+/// On the 7 GB laptop in `docs/benchmarks.md` §Second box, peregrine's io_uring
+/// O_DIRECT lane measured **0.84 GB/s against colibrì's 2.02 GB/s** from eight
+/// OpenMP threads of blocking `pread` — on the same drive, same shard sizes.
+/// Batching the O_DIRECT submission (2026-08-02) recovered 1.2–1.3× and left a
+/// large gap. The standing hypothesis is dm-crypt: on a LUKS volume reads are
+/// CPU-bound on decryption, so *N* blocking preads keep *N* cores decrypting
+/// where the ring's completion model can leave cores idle. Independently, the
+/// CHEOPS storage-stack study measures plain io_uring at queue depth 1 as
+/// *slower* than synchronous pread (81.3 vs 94.6 KIOPS), and puts the Linux
+/// block layer at an irreducible ~35% of the CPU budget for every in-kernel
+/// stack.
+///
+/// This makes the hypothesis testable end to end instead of only in a
+/// microbenchmark: `read_regions` can pick this engine for the real streaming
+/// path. It is deliberately the dumbest possible implementation — a static
+/// split, no work stealing — because its whole purpose is to be the same shape
+/// as the C harness it is being compared against.
+///
+/// Threads are capped at the request count (no empty workers) and at 64 (a
+/// spawn per region on a large batch would cost more than it saves). One thread
+/// runs inline, with no spawn at all.
+pub fn pread_many_threaded(reqs: &mut [ReadReq], threads: usize) -> Vec<i64> {
+    let n = reqs.len();
+    let t = threads.clamp(1, n.max(1)).min(64);
+    if t <= 1 || n <= 1 {
+        return pread_many(reqs);
+    }
+    let chunk = n.div_ceil(t);
+    let mut out: Vec<i64> = vec![0; n];
+    // Scoped threads so `reqs`' borrowed buffers need no 'static bound and no
+    // Arc/Mutex: each worker owns a disjoint sub-slice for the scope's lifetime.
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(t);
+        for (i, part) in reqs.chunks_mut(chunk).enumerate() {
+            handles.push((i, s.spawn(move || pread_many(part))));
+        }
+        for (i, h) in handles {
+            // A worker panic must not poison the whole batch silently: report
+            // its chunk as a hard error (EIO) so the caller's existing
+            // negative-result handling retries or fails loudly — *and* say so,
+            // because a bare -5 is indistinguishable from a real device error.
+            let res = match h.join() {
+                Ok(v) => v,
+                Err(panic) => {
+                    crate::note_advisory_err("pread worker panicked; chunk reported as EIO", &format!("{panic:?}"));
+                    vec![-5i64; chunk]
+                }
+            };
+            let base = i * chunk;
+            for (k, v) in res.into_iter().enumerate() {
+                if let Some(slot) = out.get_mut(base + k) {
+                    *slot = v;
+                }
+            }
+        }
+    });
+    out
+}
+
 #[cfg(target_os = "linux")]
 mod uring {
     use super::ReadReq;
@@ -255,6 +318,14 @@ mod uring {
             self.registered_bufs.len()
         }
 
+        /// Bytes in the *smallest* registered buffer — the largest read
+        /// `read_fixed_many` can serve. The minimum, not the maximum: one
+        /// undersized slot in the pool caps every request, so reporting the max
+        /// would let a caller size a batch that then fails mid-wave.
+        pub fn fixed_buffer_capacity(&self) -> usize {
+            self.registered_bufs.iter().map(|b| b.len()).min().unwrap_or(0)
+        }
+
         /// Read exactly `out.len()` bytes at `off` from `fd` **through the
         /// registered fixed buffer** `buf_index` (C2), then copy them into `out`.
         /// Loops to complete a short read. Byte-identical to [`Reactor::read_exact`];
@@ -302,6 +373,113 @@ mod uring {
             }
             out.copy_from_slice(&self.registered_bufs[bi][..total]);
             Ok(())
+        }
+
+        /// Batched [`Reactor::read_fixed`]: submit up to one op per registered
+        /// buffer in a single `submit_and_wait`, then copy each landing buffer
+        /// out to its request. Returns per-request byte counts in caller order.
+        ///
+        /// **This exists because `read_fixed` is depth-1.** It loops
+        /// `submit_and_wait(1)` per region — the exact defect that crippled the
+        /// O_DIRECT lane until 2026-08-02, where `read_direct_aligned` submitted
+        /// one region at a time and consequently measured *slower* than buffered
+        /// reads. Wiring `COLI_REGBUF` to the single-region call would have
+        /// reintroduced it, so the batched form has to land first.
+        ///
+        /// **Read the trade before enabling it on the streaming path.** Fixed
+        /// buffers remove the per-I/O page-locking and DMA-mapping that scales
+        /// with transfer size (FAST '24), but this path *copies out* of the
+        /// registered buffer, where `read_many` has the kernel write the
+        /// caller's buffer directly. At the ~6 MB regions peregrine streams, that
+        /// memcpy plausibly costs more than the pinning it saves — the published
+        /// gains are at 4–64 KB. It is offered as a measurable engine, not as a
+        /// recommended default, and `COLI_IO_ENGINE=regbuf` is how you find out
+        /// on your own hardware.
+        ///
+        /// Requests longer than a registered buffer are an error rather than a
+        /// silent short read.
+        pub fn read_fixed_many(&mut self, reqs: &mut [ReadReq]) -> io::Result<Vec<i64>> {
+            let nbufs = self.registered_bufs.len();
+            if nbufs == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "read_fixed_many: no registered buffers (call register_read_buffers first)",
+                ));
+            }
+            let cap = self.registered_bufs.iter().map(|b| b.len()).min().unwrap_or(0);
+            if let Some(bad) = reqs.iter().position(|r| r.buf.len() > cap) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "read_fixed_many: request {bad} is {} bytes, larger than the {cap}-byte registered buffer",
+                        reqs[bad].buf.len()
+                    ),
+                ));
+            }
+            let mut results: Vec<Option<i64>> = vec![None; reqs.len()];
+            // One in-flight op per registered buffer: two ops sharing a buffer
+            // would interleave their writes into it.
+            let width = self.cap.min(nbufs);
+            let mut i = 0usize;
+            while i < reqs.len() {
+                let end = (i + width).min(reqs.len());
+                let mut pushed = 0usize;
+                let mut push_err = None;
+                for (bi, req) in reqs[i..end].iter().enumerate() {
+                    let j = i + bi; // absolute request index; `bi` is the buffer slot
+                    let Ok(len32) = u32::try_from(req.buf.len()) else {
+                        push_err = Some(io::Error::other(format!("read request {j} exceeds u32 bytes")));
+                        break;
+                    };
+                    let base = self.registered_bufs[bi].as_mut_ptr();
+                    let e = opcode::ReadFixed::new(types::Fd(req.fd), base, len32, bi as u16)
+                        .offset(req.offset)
+                        .build()
+                        .user_data(j as u64);
+                    // SAFETY: `base` is registered buffer `bi`, owned by `self`
+                    // and not reallocated while registered; the op is reaped
+                    // below (including on the error paths) before it is reused.
+                    match unsafe { self.push_counted(&e) } {
+                        Ok(()) => pushed += 1,
+                        Err(e) => {
+                            push_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(err) = push_err {
+                    if let Err(drain_err) = self.drain_pushed(pushed) {
+                        crate::note_advisory_err("io_uring drain after failed fixed submit", &drain_err);
+                    }
+                    return Err(err);
+                }
+                self.ring.submit_and_wait(pushed)?;
+                let mut got = 0usize;
+                for cqe in self.ring.completion() {
+                    let ud = cqe.user_data();
+                    if ud & Self::ADVISORY_TAG != 0 {
+                        continue;
+                    }
+                    if let Some(slot) = results.get_mut(ud as usize) {
+                        *slot = Some(cqe.result() as i64);
+                    }
+                    got += 1;
+                }
+                if got < pushed {
+                    return Err(io::Error::other("io_uring read_fixed_many: missing completions"));
+                }
+                // Copy out only after every op in the wave has completed — a
+                // buffer read while its op is still in flight is a torn read.
+                for (bi, req) in reqs[i..end].iter_mut().enumerate() {
+                    let n = results.get(i + bi).copied().flatten().unwrap_or(-5);
+                    if n > 0 {
+                        let n = (n as usize).min(req.buf.len());
+                        req.buf[..n].copy_from_slice(&self.registered_bufs[bi][..n]);
+                    }
+                }
+                i = end;
+            }
+            Ok(results.into_iter().map(|r| r.unwrap_or(-5)).collect())
         }
 
         /// Advise the kernel to read `[off, off+len)` of `fd` into the page cache
@@ -647,29 +825,67 @@ mod uring {
         /// is owned by its returned `Bytes` (it outlives the read into the weight), so
         /// this path allocates per region rather than using the reusable slab pool.
         pub fn read_direct_aligned(&mut self, reqs: &[(RawFd, u64, usize)]) -> io::Result<Vec<Bytes>> {
-            let mut out: Vec<Bytes> = Vec::with_capacity(reqs.len());
-            for &(fd, off, want) in reqs {
+            // Every region's aligned window is submitted in ONE `read_many` call, so
+            // the ring runs at the caller's batch depth (a 16-expert batch is 96
+            // regions) instead of one region per `submit_and_wait`. The per-region
+            // loop this replaced left the whole O_DIRECT lane at queue depth 1 no
+            // matter what `COLI_IO_BATCH`/`COLI_IO_RINGS` said, which is why direct
+            // reads measured *slower* than buffered ones. Peak memory is unchanged:
+            // each region already owns its landing buffer for the returned `Bytes`.
+            struct Span {
+                orig: usize,
+                fd: RawFd,
+                a_off: u64,
+                a_len: usize,
+                head: usize,
+                need: usize,
+                want: usize,
+                done: usize,
+            }
+            let mut slots: Vec<Option<Bytes>> = (0..reqs.len()).map(|_| None).collect();
+            let mut spans: Vec<Span> = Vec::with_capacity(reqs.len());
+            let mut bufs: Vec<AlignedBuf> = Vec::with_capacity(reqs.len());
+            for (orig, &(fd, off, want)) in reqs.iter().enumerate() {
                 if want == 0 {
-                    out.push(Bytes::Vec(Vec::new()));
+                    slots[orig] = Some(Bytes::Vec(Vec::new()));
                     continue;
                 }
                 let a = ALIGN as u64;
                 let a_off = align_down(off, a);
                 let head = (off - a_off) as usize;
                 let a_len = (align_up(off + want as u64, a) - a_off) as usize;
-                let need = head + want; // bytes present before the region is complete
-                let mut buf =
-                    AlignedBuf::with_capacity(a_len).ok_or_else(|| io::Error::other("aligned alloc failed"))?;
-                // Read the aligned window to completion. A positioned read may return
-                // short; the final aligned read of a shard may legally EOF-short once
-                // `need` is covered (the tail padding past the file end is never read).
-                let mut done = 0usize;
-                while done < need {
-                    let n = {
-                        let mut sub =
-                            [ReadReq { fd, offset: a_off + done as u64, buf: &mut buf.as_mut_slice()[done..a_len], tag: 0 }];
-                        self.read_many(&mut sub)?[0]
-                    };
+                bufs.push(
+                    AlignedBuf::with_capacity(a_len).ok_or_else(|| io::Error::other("aligned alloc failed"))?,
+                );
+                // `need` is what must land before the region is complete; the tail
+                // padding past it may legally EOF-short and is never read.
+                spans.push(Span { orig, fd, a_off, a_len, head, need: head + want, want, done: 0 });
+            }
+            // Re-submit only the regions still short. A positioned read may return
+            // short, so this converges rather than assuming one pass suffices.
+            while spans.iter().any(|s| s.done < s.need) {
+                let mut idx: Vec<usize> = Vec::new();
+                let results = {
+                    let mut batch: Vec<ReadReq> = Vec::new();
+                    for (i, buf) in bufs.iter_mut().enumerate() {
+                        let s = &spans[i];
+                        if s.done >= s.need {
+                            continue;
+                        }
+                        idx.push(i);
+                        batch.push(ReadReq {
+                            fd: s.fd,
+                            offset: s.a_off + s.done as u64,
+                            buf: &mut buf.as_mut_slice()[s.done..s.a_len],
+                            tag: 0,
+                        });
+                    }
+                    self.read_many(&mut batch)?
+                };
+                for (k, &i) in idx.iter().enumerate() {
+                    let n = results.get(k).copied().ok_or_else(|| {
+                        io::Error::other("io_uring returned fewer results than submitted direct reads")
+                    })?;
                     if n < 0 {
                         return Err(Self::errno_from_result(n));
                     }
@@ -679,11 +895,16 @@ mod uring {
                             "O_DIRECT read hit EOF before covering the region",
                         ));
                     }
-                    done += n as usize;
+                    spans[i].done += n as usize;
                 }
-                out.push(Bytes::Aligned { buf, head, len: want });
             }
-            Ok(out)
+            for (s, buf) in spans.into_iter().zip(bufs) {
+                slots[s.orig] = Some(Bytes::Aligned { buf, head: s.head, len: s.want });
+            }
+            slots
+                .into_iter()
+                .map(|b| b.ok_or_else(|| io::Error::other("direct read left a region unfilled")))
+                .collect()
         }
     }
 }
@@ -748,8 +969,14 @@ impl Reactor {
     pub fn fixed_buffer_count(&self) -> usize {
         0
     }
+    pub fn fixed_buffer_capacity(&self) -> usize {
+        0
+    }
     pub fn read_fixed(&mut self, _fd: RawFd, _off: u64, _buf_index: u16, _out: &mut [u8]) -> std::io::Result<()> {
         Self::unsupported()
+    }
+    pub fn read_fixed_many(&mut self, _reqs: &mut [ReadReq]) -> std::io::Result<Vec<i64>> {
+        Self::unsupported().map(|_| Vec::new())
     }
     pub fn fadvise_willneed(&mut self, _fd: RawFd, _off: u64, _len: usize) -> std::io::Result<()> {
         Self::unsupported()
@@ -834,6 +1061,49 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn threaded_pread_matches_serial_byte_for_byte() -> std::io::Result<()> {
+        // The engine choice must be a performance decision and nothing else, so
+        // the threaded split has to return exactly what the serial reader does —
+        // same bytes, same per-request counts, same order — for any thread count
+        // and any request count, including the awkward ones where the chunking
+        // does not divide evenly.
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"abcdefghij", 2000)?;
+        let fd = f.as_raw_fd();
+        for n_reqs in [1usize, 2, 3, 7, 16] {
+            for threads in [1usize, 2, 3, 8, 64, 1000] {
+                let mut want: Vec<Vec<u8>> = (0..n_reqs).map(|k| vec![0u8; 32 + k]).collect();
+                let mut got: Vec<Vec<u8>> = (0..n_reqs).map(|k| vec![0u8; 32 + k]).collect();
+                let off = |k: usize| (k * 101) as u64;
+
+                let mut wr: Vec<ReadReq> = want
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(k, b)| ReadReq { fd, offset: off(k), buf: b.as_mut_slice(), tag: k as u64 })
+                    .collect();
+                let rs = pread_many(&mut wr);
+
+                let mut gr: Vec<ReadReq> = got
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(k, b)| ReadReq { fd, offset: off(k), buf: b.as_mut_slice(), tag: k as u64 })
+                    .collect();
+                let rt = pread_many_threaded(&mut gr, threads);
+
+                assert_eq!(rs, rt, "n={n_reqs} t={threads}: byte counts must match the serial reader");
+                assert_eq!(want, got, "n={n_reqs} t={threads}: contents must match the serial reader");
+                // …and match the file, so a shared bug in both readers still fails.
+                for (k, b) in got.iter().enumerate() {
+                    let s = off(k) as usize;
+                    assert_eq!(&b[..], &data[s..s + b.len()], "n={n_reqs} t={threads} req {k}");
+                }
+            }
+        }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn uring_matches_pread() -> std::io::Result<()> {
@@ -904,6 +1174,58 @@ mod tests {
         assert_eq!(res, vec![32, 40]);
         assert_eq!(&b0[..], &data[10..42]);
         assert_eq!(&b1[..], &data[100..140]);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_fixed_many_matches_pread_and_batches() -> std::io::Result<()> {
+        // The batched fixed-buffer reader must agree with the pread oracle for
+        // every region, across waves — the interesting case is more requests
+        // than registered buffers, where the reader has to complete one wave
+        // fully before reusing a buffer. Copying out mid-flight would tear.
+        use std::os::unix::io::AsRawFd;
+        // Size must be unique across this module: `temp_file_with` keys the
+        // temp path on it, so a duplicate races another test's file.
+        let (f, path, data) = temp_file_with(b"fixed-many-payload", 7000)?;
+        let fd = f.as_raw_fd();
+        let mut reactor = match Reactor::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        // 3 buffers, 7 requests → 3 waves, the last one partial.
+        if reactor.register_read_buffers(vec![vec![0u8; 512]; 3]).is_err() {
+            std::fs::remove_file(&path)?; // kernel without buffer registration → skip
+            return Ok(());
+        }
+        let n = 7usize;
+        let off = |k: usize| (k * 313) as u64;
+        let mut bufs: Vec<Vec<u8>> = (0..n).map(|k| vec![0u8; 64 + k * 10]).collect();
+        let counts = {
+            let mut reqs: Vec<ReadReq> = bufs
+                .iter_mut()
+                .enumerate()
+                .map(|(k, b)| ReadReq { fd, offset: off(k), buf: b.as_mut_slice(), tag: k as u64 })
+                .collect();
+            reactor.read_fixed_many(&mut reqs)?
+        };
+        for (k, b) in bufs.iter().enumerate() {
+            assert_eq!(counts[k], b.len() as i64, "request {k} must read fully");
+            let s = off(k) as usize;
+            assert_eq!(&b[..], &data[s..s + b.len()], "request {k} bytes must match the file");
+        }
+
+        // A request larger than the registered buffer is refused, not silently
+        // truncated — a short read here would be indistinguishable from EOF.
+        let mut big = vec![0u8; 513];
+        let mut one = vec![ReadReq { fd, offset: 0, buf: big.as_mut_slice(), tag: 0 }];
+        assert!(reactor.read_fixed_many(&mut one).is_err(), "oversized request must be refused");
+
         std::fs::remove_file(&path)?;
         Ok(())
     }
@@ -1070,6 +1392,61 @@ mod tests {
             assert_eq!(got[k].len(), len, "region {k} wrong len");
             let o = off as usize;
             assert_eq!(&got[k][..], &data[o..o + len], "aligned off={off} len={len} bytes mismatch");
+        }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_aligned_batch_exceeding_ring_capacity_matches_serial() -> std::io::Result<()> {
+        // `read_direct_aligned` submits every region in one `read_many`, which
+        // chunks internally to the ring's entry count. Submitting more regions
+        // than the ring holds must therefore still deliver each region's exact
+        // bytes, in order — the case a per-region loop could never get wrong and
+        // batched submission can. Serial single-region calls are the oracle.
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"batched-direct-submission-oracle", 43000)?;
+        drop(f);
+        let df = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&path) {
+            Ok(df) => df,
+            Err(e) => {
+                eprintln!("skipping: filesystem rejects O_DIRECT open: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let dfd = df.as_raw_fd();
+        if !super::probe_direct(dfd) {
+            std::fs::remove_file(&path)?;
+            return Ok(());
+        }
+        // 40 regions through an 8-entry ring: 5 submission chunks.
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let cases: Vec<(RawFd, u64, usize)> =
+            (0..40u64).map(|i| (dfd, i * 1013 + 7, 100 + (i as usize % 37))).collect();
+        let batched = match reactor.read_direct_aligned(&cases) {
+            Ok(g) => g,
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        assert_eq!(batched.len(), cases.len(), "one result per region, in order");
+        for (k, &(_, off, len)) in cases.iter().enumerate() {
+            let serial = reactor.read_direct_aligned(&[(dfd, off, len)])?;
+            let o = off as usize;
+            assert_eq!(&batched[k][..], &data[o..o + len], "batched region {k} bytes mismatch");
+            assert_eq!(&batched[k][..], &serial[0][..], "batched region {k} differs from serial read");
         }
         std::fs::remove_file(&path)?;
         Ok(())

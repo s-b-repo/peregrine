@@ -18,7 +18,7 @@ CPU-streaming decode.
 | **Batched decode, B=16 (aggregate)** | **0.280 tok/s** (4.4× over B=1) | — |
 | Warm cache on a repeated forward | **3.58×** (100 % hit, 0 disk) | learned pin |
 | Raw device read rate (after I/O ports) | **~980 MB/s** | ~870 MB/s — but see [the laptop re-measurement](#second-box-glm-52-on-a-7-gb-laptop), which inverts this |
-| Cross-token expert locality | 0.6 % (measured) | — |
+| Warm-cache hit rate, sustained decode (10 GB cache) | 0.6 % (measured) | — |
 | Tokenizer throughput | **204 MB/s** (gigatoken) | — (HF: 6 MB/s) |
 
 ## How to read them
@@ -34,11 +34,16 @@ CPU-streaming decode.
   shares it across the batch**, so step time grows only 3.6× for 16× the
   tokens — a measured **4.4× aggregate gain at B=16** (0.064 → 0.280 tok/s).
   The win is amortization of the byte budget, not a faster drive.
-- **The warm cache works but locality doesn't**: 3.58× on a repeated forward
-  proves the mechanism; 0.6 % measured cross-token hit rate explains why it's
-  ~1× on sustained decode. This independently corroborates colibrì's own
-  findings that its PILOT prefetch is neutral and MTP is a net loss on
-  disk-saturated MoE decode — all symptoms of high routing entropy.
+- **The warm cache works but never fits**: 3.58× on a repeated forward proves
+  the mechanism; the 0.6 % hit rate on sustained decode is a *capacity*
+  result — a 10 GB cache against a ~180 GB 16-token working set can hit ~5 %
+  at best, however the router behaves. colibrì independently finds its PILOT
+  prefetch neutral and MTP a net loss on disk-saturated MoE decode.
+  **Attributing all three to routing entropy is an inference, not a
+  measurement** — the routing overlap has never been measured. Run
+  `peregrine route-stats <routes.json> 256` (and `COLI_UNION_STATS=1` for the
+  live per-step sharing factor) before relying on the entropy story; see the
+  correction in [the study](peregrine-vs-colibri.md#52-cache--locality-analysis-peregrine-measured).
 - **The 3-lane scheduler's full advantage is latent** without expert
   residency: colibrì reaches **6.84 tok/s on 6× RTX 5090** (full residency),
   which is exactly the regime peregrine's concurrent design targets.
@@ -102,21 +107,39 @@ through load. That is a hardware-envelope result, not an engine defect, and it
 hits both sides identically — the box needs ≥ 16 GB of RAM+swap to produce
 decode rows at all.
 
-**The I/O rows invert the headline table above.** On this machine colibrì's
-threaded-pread `O_DIRECT` harness sustains **2.4× peregrine's io_uring lane**.
-The likely mechanism is dm-crypt: on a LUKS volume, reads are CPU-bound on
-decryption, and *N* blocking `pread`s keep *N* cores busy decrypting, whereas
-the ring's completion model can leave cores idle. This independently corroborates
-the direction of [the full study's](peregrine-vs-colibri.md) §5.1 finding
-(colibrì ~870 MB/s vs peregrine ~710 MB/s effective, also on LUKS) and is the
-most actionable gap on the list: both engines are disk-bandwidth-bound during
-MoE decode.
+**The I/O rows invert the headline table above**, and the first cause turned out
+to be a defect rather than the hardware. `Reactor::read_direct_aligned` — the
+call the streaming lane makes under `COLI_DIRECT=1` — looped **one region at a
+time**, each its own `submit_and_wait`. The O_DIRECT lane therefore ran at queue
+depth 1 no matter what `COLI_IO_BATCH`/`COLI_IO_RINGS` said, while the buffered
+sibling submitted all 96 regions of a 16-expert batch in one call. That is why
+direct reads measured *slower* than buffered ones, which is backwards.
 
-*Caveat on the peregrine number:* it comes from
+Batching the submission (2026-08-02) is worth a consistent **1.2–1.3×** across
+four configurations, controlled A/B on the same shard sizes, run-to-run spread
+±0.01 GB/s:
+
+| config | before | after |
+|---|---|---|
+| 6 MB × 24 regions, 8 rings | 0.60 GB/s | **0.73** |
+| 6 MB × 24 regions, 4 rings | 0.53 | **0.66** |
+| 64 MB × 4, 8 rings | 0.67 | **0.86** |
+| 64 MB × 4, 4 rings | 0.53 | **0.64** |
+
+A gap to colibrì remains, and dm-crypt is the standing hypothesis for it: on a
+LUKS volume reads are CPU-bound on decryption, so *N* blocking `pread`s keep *N*
+cores decrypting where the ring's completion model can leave cores idle. Testing
+that means adding a pread engine behind the same `read_regions` choke point and
+measuring — not asserting.
+
+*Provenance of the numbers:* peregrine's come from
 [`crates/peregrine-io/examples/iobench.rs`](../crates/peregrine-io/examples/iobench.rs),
-which drives the `Reactor` directly with batched submissions but does **not**
-enable registered fixed buffers (`COLI_REGBUF`) or the engine's multi-ring
-tuning. Treat 0.84 GB/s as a floor for the lane, not a verdict on io_uring.
+which now drives `read_direct_aligned` — the production path — rather than a
+sibling with its own batching. colibrì's 2.02 GB/s comes from its `c/iobench.c`,
+which is **not** io_uring at all but 8 OpenMP threads issuing blocking `pread`s;
+its production decode path is a 512-deep io_uring queue. The two harnesses
+measure different things, so read the ratio as "this box's best threaded reader
+vs this lane", not as "C beats Rust".
 
 Reproducing the two engine-comparable rows:
 

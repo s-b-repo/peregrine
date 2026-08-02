@@ -38,14 +38,15 @@ depend on machine timing, so the same prompt would give different logits run to
 run.
 
 **Pure CPU work, blocked only by size (8)** — and this is where the remaining
-throughput is, since cross-token expert locality measures 0.6% and §1–§11 all
-optimize how fast bytes move rather than how many:
+throughput is, since caching plateaus at this capacity ratio (0.6% warm-cache
+hit rate on a 10 GB cache; see the §5.2 correction) and §1–§11 all optimize how
+fast bytes move rather than how many:
 
 - Fuse prefill rows into the decode batch (two disjoint forwards today, each
   streaming its own expert union)
 - KV cache quantization (the KV is f32; ~180 MB per 1k tokens)
 - Paged / block-pooled KV (per-sequence contiguous `Vec`s, capped by count not bytes)
-- int2 checkpoint conversion (the quantizer shipped; the converter has not)
+- int2 checkpoint conversion — **the converter shipped** (`peregrine-requantize`, measured 2.69 GB → 1.35 GB on a real GLM-5.2 shard); what remains is a full-checkpoint run and a flip-rate measurement
 - Heat-tiered on-disk precision (hot int4 / cold int2 — needs no loader change)
 - Wire three features that ship tested but unreachable, found by the [R]
   reachability pass: the registered-buffer read path (`COLI_REGBUF` is read by no
