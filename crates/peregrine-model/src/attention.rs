@@ -14,8 +14,190 @@
 
 use crate::math::{rmsnorm_inplace, rope_interleave, softmax};
 use crate::weight::QtWeight;
-use peregrine_core::{Cfg, Error};
+use peregrine_core::{f16_to_f32, f32_to_f16, Cfg, Error};
 use std::sync::Arc;
+
+/// Element type of the stored KV latents (`COLI_KV_DTYPE`).
+///
+/// **`F32` is the default and reproduces what shipped, bit for bit.** `F16`
+/// halves resident KV — `(512 + 64) × 78` latents per token is 175.5 KiB at f32
+/// and 87.8 KiB at f16 — which under `COLI_KV_BUDGET_MB` converts directly into
+/// batch slots. Worth doing before any cleverer scheme, because every published
+/// KV-quantization result is measured against an fp16 baseline: at f32 the
+/// engine starts a full 2× behind the number it would be compared to.
+///
+/// **It changes token values.** The latents are stored rounded, so this is not
+/// an output-neutral knob; size it with `Model::prediction_flip_rate`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum KvDtype {
+    #[default]
+    F32,
+    F16,
+}
+
+impl KvDtype {
+    /// Parse a `COLI_KV_DTYPE` value. `None` for anything unrecognised, so the
+    /// caller can report a typo rather than silently picking a dtype — a
+    /// mis-spelled value must not quietly change token values.
+    pub fn parse(s: &str) -> Option<KvDtype> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "f32" | "fp32" | "" => Some(KvDtype::F32),
+            "f16" | "fp16" | "half" => Some(KvDtype::F16),
+            _ => None,
+        }
+    }
+
+    fn elem_size(self) -> usize {
+        match self {
+            KvDtype::F32 => 4,
+            KvDtype::F16 => 2,
+        }
+    }
+}
+
+/// Stored latents in whichever element type the cache was created with.
+#[derive(Clone)]
+enum KvBuf {
+    F32(Vec<f32>),
+    F16(Vec<u16>),
+}
+
+impl KvBuf {
+    fn new(dt: KvDtype) -> KvBuf {
+        match dt {
+            KvDtype::F32 => KvBuf::F32(Vec::new()),
+            KvDtype::F16 => KvBuf::F16(Vec::new()),
+        }
+    }
+
+    fn dtype(&self) -> KvDtype {
+        match self {
+            KvBuf::F32(_) => KvDtype::F32,
+            KvBuf::F16(_) => KvDtype::F16,
+        }
+    }
+
+    fn elems(&self) -> usize {
+        match self {
+            KvBuf::F32(v) => v.len(),
+            KvBuf::F16(v) => v.len(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.elems() * self.dtype().elem_size()
+    }
+
+    fn push(&mut self, row: &[f32]) {
+        match self {
+            KvBuf::F32(v) => v.extend_from_slice(row),
+            KvBuf::F16(v) => v.extend(row.iter().map(|&x| f32_to_f16(x))),
+        }
+    }
+
+    fn truncate(&mut self, elems: usize) {
+        match self {
+            KvBuf::F32(v) => v.truncate(elems),
+            KvBuf::F16(v) => v.truncate(elems),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.truncate(0);
+    }
+
+    fn run(&self) -> KvRun<'_> {
+        match self {
+            KvBuf::F32(v) => KvRun::F32(v),
+            KvBuf::F16(v) => KvRun::F16(v),
+        }
+    }
+
+    /// Append a run verbatim. The mixed arms cannot arise — a run always comes
+    /// from a buffer of the same cache — but converting beats dropping data if
+    /// a future caller ever mixes them.
+    fn extend_run(&mut self, r: KvRun) {
+        match (self, r) {
+            (KvBuf::F32(v), KvRun::F32(s)) => v.extend_from_slice(s),
+            (KvBuf::F16(v), KvRun::F16(s)) => v.extend_from_slice(s),
+            (KvBuf::F32(v), KvRun::F16(s)) => v.extend(s.iter().map(|&x| f16_to_f32(x))),
+            (KvBuf::F16(v), KvRun::F32(s)) => v.extend(s.iter().map(|&x| f32_to_f16(x))),
+        }
+    }
+}
+
+/// One contiguous run of stored latents, as read.
+#[derive(Clone, Copy)]
+enum KvRun<'a> {
+    F32(&'a [f32]),
+    F16(&'a [u16]),
+}
+
+impl<'a> KvRun<'a> {
+    fn empty_like(b: &KvBuf) -> KvRun<'static> {
+        match b {
+            KvBuf::F32(_) => KvRun::F32(&[]),
+            KvBuf::F16(_) => KvRun::F16(&[]),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            KvRun::F32(v) => v.len(),
+            KvRun::F16(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn head(&self, elems: usize) -> KvRun<'a> {
+        let n = elems.min(self.len());
+        match self {
+            KvRun::F32(v) => KvRun::F32(&v[..n]),
+            KvRun::F16(v) => KvRun::F16(&v[..n]),
+        }
+    }
+
+    /// `Σ v[i] · self[off + i]`. The `F32` arm is the historical `dot`, term for
+    /// term and in the same order — this must stay bit-identical, since it is
+    /// the default path.
+    #[inline]
+    fn dot(&self, off: usize, width: usize, v: &[f32]) -> f32 {
+        match self {
+            KvRun::F32(s) => s[off..off + width].iter().zip(v).map(|(&x, &y)| x * y).sum(),
+            KvRun::F16(s) => s[off..off + width].iter().zip(v).map(|(&x, &y)| f16_to_f32(x) * y).sum(),
+        }
+    }
+
+    /// `acc[i] += a · self[off + i]`.
+    #[inline]
+    fn axpy(&self, off: usize, width: usize, a: f32, acc: &mut [f32]) {
+        match self {
+            KvRun::F32(s) => {
+                for (o, &x) in acc.iter_mut().zip(&s[off..off + width]) {
+                    *o += a * x;
+                }
+            }
+            KvRun::F16(s) => {
+                for (o, &x) in acc.iter_mut().zip(&s[off..off + width]) {
+                    *o += a * f16_to_f32(x);
+                }
+            }
+        }
+    }
+
+    fn extend_f32(&self, out: &mut Vec<f32>) {
+        match self {
+            KvRun::F32(s) => out.extend_from_slice(s),
+            KvRun::F16(s) => out.extend(s.iter().map(|&x| f16_to_f32(x))),
+        }
+    }
+}
 
 /// An immutable, refcounted run of cached positions, shared by every sequence
 /// seeded from the same prompt prefix.
@@ -26,8 +208,8 @@ use std::sync::Arc;
 /// written again — a sequence's own new positions go in its private tail — so
 /// sharing needs nothing beyond the refcount.
 struct KvPrefix {
-    lc: Vec<f32>,
-    rc: Vec<f32>,
+    lc: KvBuf,
+    rc: KvBuf,
 }
 
 /// Per-layer KV cache holding the compressed latents and roped keys. Positions
@@ -49,16 +231,38 @@ pub struct LayerKv {
     /// serve requests matching it to different depths without a copy each.
     shared_rows: usize,
     /// This sequence's own positions, appended after the shared prefix.
-    lc: Vec<f32>, // [len - shared_rows, kv_lora]
-    rc: Vec<f32>, // [len - shared_rows, qk_rope]
+    lc: KvBuf, // [len - shared_rows, kv_lora]
+    rc: KvBuf, // [len - shared_rows, qk_rope]
     len: usize,
     kv_lora: usize,
     qk_rope: usize,
 }
 
 impl LayerKv {
+    /// A cache storing f32 latents — the historical, output-neutral layout.
     pub fn new(kv_lora: usize, qk_rope: usize) -> LayerKv {
-        LayerKv { shared: None, shared_rows: 0, lc: Vec::new(), rc: Vec::new(), len: 0, kv_lora, qk_rope }
+        LayerKv::with_dtype(kv_lora, qk_rope, KvDtype::F32)
+    }
+
+    /// A cache storing latents as `dt`. Separate from [`Self::new`] rather than
+    /// reading the environment here, so the narrow path is reachable from a test
+    /// — `iotune.rs` documents why a process-wide `OnceLock` enable flag makes a
+    /// feature untestable.
+    pub fn with_dtype(kv_lora: usize, qk_rope: usize, dt: KvDtype) -> LayerKv {
+        LayerKv {
+            shared: None,
+            shared_rows: 0,
+            lc: KvBuf::new(dt),
+            rc: KvBuf::new(dt),
+            len: 0,
+            kv_lora,
+            qk_rope,
+        }
+    }
+
+    /// Element type of the stored latents.
+    pub fn dtype(&self) -> KvDtype {
+        self.lc.dtype()
     }
 
     /// Positions cached so far — the shared prefix this sequence uses plus its
@@ -95,8 +299,8 @@ impl LayerKv {
                 self.qk_rope
             )));
         }
-        self.lc.extend_from_slice(lc_row);
-        self.rc.extend_from_slice(rc_row);
+        self.lc.push(lc_row);
+        self.rc.push(rc_row);
         self.len += 1;
         Ok(())
     }
@@ -128,19 +332,19 @@ impl LayerKv {
     /// it stays correct (conservatively) however prefixes are shared — see
     /// [`Self::owned_bytes`] and [`Self::shared_bytes`] for the exact split.
     pub fn bytes(&self) -> usize {
-        (self.shared_rows * (self.kv_lora + self.qk_rope) + self.lc.len() + self.rc.len()) * std::mem::size_of::<f32>()
+        self.shared_rows * (self.kv_lora + self.qk_rope) * self.dtype().elem_size() + self.owned_bytes()
     }
 
     /// Bytes this cache holds *by itself*, excluding any shared prefix.
     pub fn owned_bytes(&self) -> usize {
-        (self.lc.len() + self.rc.len()) * std::mem::size_of::<f32>()
+        self.lc.bytes() + self.rc.bytes()
     }
 
     /// Bytes of the whole shared prefix allocation — not just this cache's view
     /// of it, because the allocation is what actually occupies RAM while any
     /// sequence holds it.
     pub fn shared_bytes(&self) -> usize {
-        self.shared.as_ref().map_or(0, |p| (p.lc.len() + p.rc.len()) * std::mem::size_of::<f32>())
+        self.shared.as_ref().map_or(0, |p| p.lc.bytes() + p.rc.bytes())
     }
 
     /// Identity of the shared prefix allocation, if any. A budget summing many
@@ -164,13 +368,14 @@ impl LayerKv {
     /// order and never writes them.
     pub fn clone_prefix(&self, n: usize) -> LayerKv {
         let n = n.min(self.len);
+        let dt = self.dtype();
         if n <= self.shared_rows {
             if let Some(pre) = &self.shared {
                 return LayerKv {
                     shared: Some(Arc::clone(pre)),
                     shared_rows: n,
-                    lc: Vec::new(),
-                    rc: Vec::new(),
+                    lc: KvBuf::new(dt),
+                    rc: KvBuf::new(dt),
                     len: n,
                     kv_lora: self.kv_lora,
                     qk_rope: self.qk_rope,
@@ -179,20 +384,21 @@ impl LayerKv {
         }
         // Freeze the first `n` positions into a new shared prefix. This copies
         // once, so that every later `clone_prefix` of the result takes the
-        // refcount path above.
-        let mut lc = Vec::with_capacity(n * self.kv_lora);
-        let mut rc = Vec::with_capacity(n * self.qk_rope);
+        // refcount path above. Runs are copied verbatim, never converted: a
+        // narrowed cache must not be re-rounded on every admission.
+        let mut lc = KvBuf::new(dt);
+        let mut rc = KvBuf::new(dt);
         for run in self.lc_span(n).runs() {
-            lc.extend_from_slice(run);
+            lc.extend_run(run);
         }
         for run in self.rc_span(n).runs() {
-            rc.extend_from_slice(run);
+            rc.extend_run(run);
         }
         LayerKv {
             shared: Some(Arc::new(KvPrefix { lc, rc })),
             shared_rows: n,
-            lc: Vec::new(),
-            rc: Vec::new(),
+            lc: KvBuf::new(dt),
+            rc: KvBuf::new(dt),
             len: n,
             kv_lora: self.kv_lora,
             qk_rope: self.qk_rope,
@@ -201,14 +407,14 @@ impl LayerKv {
 
     /// The compressed latents of the first `n` positions, in causal order.
     pub fn lc_span(&self, n: usize) -> KvSpan<'_> {
-        let shared = self.shared.as_ref().map_or(&[][..], |p| &p.lc);
-        span_of(shared, &self.lc, self.shared_rows, n, self.kv_lora)
+        let shared = self.shared.as_ref().map_or_else(|| KvRun::empty_like(&self.lc), |p| p.lc.run());
+        span_of(shared, self.lc.run(), self.shared_rows, n, self.kv_lora)
     }
 
     /// The roped keys of the first `n` positions, in causal order.
     pub fn rc_span(&self, n: usize) -> KvSpan<'_> {
-        let shared = self.shared.as_ref().map_or(&[][..], |p| &p.rc);
-        span_of(shared, &self.rc, self.shared_rows, n, self.qk_rope)
+        let shared = self.shared.as_ref().map_or_else(|| KvRun::empty_like(&self.rc), |p| p.rc.run());
+        span_of(shared, self.rc.run(), self.shared_rows, n, self.qk_rope)
     }
 
     /// The whole cache as an attention view.
@@ -231,15 +437,10 @@ impl LayerKv {
 /// profile's `panic = "abort"`, taking every concurrent sequence with it, which
 /// is the same reason [`LayerKv::append`] reports its errors instead of
 /// asserting.
-fn span_of<'a>(shared: &'a [f32], own: &'a [f32], shared_rows: usize, n: usize, width: usize) -> KvSpan<'a> {
+fn span_of<'a>(shared: KvRun<'a>, own: KvRun<'a>, shared_rows: usize, n: usize, width: usize) -> KvSpan<'a> {
     let head_rows = shared_rows.min(n).min(shared.len().checked_div(width).unwrap_or(0));
     let tail_rows = (n - head_rows).min(own.len().checked_div(width).unwrap_or(0));
-    let head = &shared[..head_rows * width];
-    if tail_rows == 0 {
-        KvSpan::contiguous(head)
-    } else {
-        KvSpan::split(head, &own[..tail_rows * width])
-    }
+    KvSpan { head: shared.head(head_rows * width), tail: own.head(tail_rows * width) }
 }
 
 /// An ordered view of cached KV that may be split across **two** contiguous
@@ -260,32 +461,57 @@ fn span_of<'a>(shared: &'a [f32], own: &'a [f32], shared_rows: usize, n: usize, 
 /// **Rows never straddle the boundary.** `head` always holds a whole number of
 /// rows, so `row` is a bounds check and an offset, never a stitch across two
 /// allocations. Callers construct spans from row-aligned prefixes only.
+/// **The readers take operations, not rows.** `row(t) -> &[f32]` would force
+/// the store to be f32, so the three things the cores actually do with a cached
+/// row are the interface instead: score against it, accumulate it, or hand a
+/// whole prefix to a bulk matmul. Every f32 arm below is the historical code
+/// term for term, in the same order, so the default path is bit-identical.
 #[derive(Clone, Copy)]
 pub struct KvSpan<'a> {
-    head: &'a [f32],
-    tail: &'a [f32],
+    head: KvRun<'a>,
+    tail: KvRun<'a>,
 }
 
 impl<'a> KvSpan<'a> {
-    /// The whole cache in one run — what every caller had before.
-    pub fn contiguous(all: &'a [f32]) -> KvSpan<'a> {
-        KvSpan { head: all, tail: &[] }
+    // The four slice constructors are `cfg(test)`. Production builds a span
+    // from a `LayerKv`, which knows its own element type and split point; only
+    // the tests need to construct one at an *arbitrary* cut, which is exactly
+    // what the bit-identity proofs do. Shipping them as public API would put
+    // four internals on the reachability audit's list, which exists to catch
+    // shipped-but-unreachable *features* — and the f16 store is wired end to
+    // end through `COLI_KV_DTYPE`.
+    /// The whole cache in one run.
+    #[cfg(test)]
+    fn contiguous(all: &'a [f32]) -> KvSpan<'a> {
+        KvSpan { head: KvRun::F32(all), tail: KvRun::F32(&[]) }
     }
 
     /// A shared prefix followed by an owned tail.
-    pub fn split(head: &'a [f32], tail: &'a [f32]) -> KvSpan<'a> {
-        KvSpan { head, tail }
+    #[cfg(test)]
+    fn split(head: &'a [f32], tail: &'a [f32]) -> KvSpan<'a> {
+        KvSpan { head: KvRun::F32(head), tail: KvRun::F32(tail) }
     }
 
-    /// Row `t` of `width` floats, in causal order across both runs.
+    /// [`Self::contiguous`] over half-precision storage.
+    #[cfg(test)]
+    fn contiguous_f16(all: &'a [u16]) -> KvSpan<'a> {
+        KvSpan { head: KvRun::F16(all), tail: KvRun::F16(&[]) }
+    }
+
+    /// [`Self::split`] over half-precision storage.
+    #[cfg(test)]
+    fn split_f16(head: &'a [u16], tail: &'a [u16]) -> KvSpan<'a> {
+        KvSpan { head: KvRun::F16(head), tail: KvRun::F16(tail) }
+    }
+
+    /// Which run holds row `t`, and its element offset within that run.
     #[inline]
-    pub fn row(&self, t: usize, width: usize) -> &'a [f32] {
+    fn locate(&self, t: usize, width: usize) -> (KvRun<'a>, usize) {
         let hrows = self.head.len().checked_div(width).unwrap_or(0);
         if t < hrows {
-            &self.head[t * width..t * width + width]
+            (self.head, t * width)
         } else {
-            let k = t - hrows;
-            &self.tail[k * width..k * width + width]
+            (self.tail, (t - hrows) * width)
         }
     }
 
@@ -294,9 +520,45 @@ impl<'a> KvSpan<'a> {
         (self.head.len() + self.tail.len()).checked_div(width).unwrap_or(0)
     }
 
-    /// The runs in causal order, skipping empties — for bulk operations that
-    /// work per row and can be applied run-by-run, then concatenated.
-    pub fn runs(&self) -> impl Iterator<Item = &'a [f32]> {
+    /// `Σ v[i] · row(t)[i]` — one cached position's score contribution.
+    #[inline]
+    pub fn dot_row(&self, t: usize, width: usize, v: &[f32]) -> f32 {
+        let (run, off) = self.locate(t, width);
+        run.dot(off, width, v)
+    }
+
+    /// `acc[i] += a · row(t)[i]` — the attention-weighted latent accumulation.
+    #[inline]
+    pub fn axpy_row(&self, t: usize, width: usize, a: f32, acc: &mut [f32]) {
+        let (run, off) = self.locate(t, width);
+        run.axpy(off, width, a, acc);
+    }
+
+    /// Rows `[0, n)` appended to `out` as f32 — the bulk-matmul input, for the
+    /// dense core's `kv_b` reconstruction which consumes a whole prefix at once.
+    pub fn extend_f32(&self, n: usize, width: usize, out: &mut Vec<f32>) {
+        let hrows = self.head.len().checked_div(width).unwrap_or(0);
+        let h = n.min(hrows);
+        self.head.head(h * width).extend_f32(out);
+        if n > h {
+            let t = (n - h).min(self.tail.len().checked_div(width).unwrap_or(0));
+            self.tail.head(t * width).extend_f32(out);
+        }
+    }
+
+    /// The backing f32 slice when there is exactly one and it is wide enough —
+    /// so a bulk consumer skips materialization on the default path, which is
+    /// both the common case and the one that must not regress.
+    pub fn as_contiguous_f32(&self, n: usize, width: usize) -> Option<&'a [f32]> {
+        match (self.head, self.tail.is_empty()) {
+            (KvRun::F32(h), true) if n * width <= h.len() => Some(&h[..n * width]),
+            _ => None,
+        }
+    }
+
+    /// The runs in causal order, skipping empties — for verbatim copies that
+    /// must not convert between element types.
+    fn runs(&self) -> impl Iterator<Item = KvRun<'a>> {
         [self.head, self.tail].into_iter().filter(|r| !r.is_empty())
     }
 }
@@ -403,22 +665,20 @@ fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, kv: &Ro
     let kvb_head = qk_nope + vh;
 
     let tk = kv.len;
-    // Reconstruct `[k_nope|v]` for every cached position. When the cache is
-    // split across a shared prefix and an owned tail, the matmul runs once per
-    // run and the *outputs* concatenate — bit-identically, because `apply_vec`
-    // is row-independent: it already splits rows into chunks across the pool,
-    // and `apply_vec_parallel_matches_serial` pins that as equal to one whole
-    // serial call. Splitting the input on a row boundary is the same split.
-    let mut kvb_all: Vec<f32> = Vec::new();
-    for run in kv.lc.runs() {
-        let rows = run.len().checked_div(kvl).unwrap_or(0);
-        let part = w.kv_b.apply_vec(run, rows);
-        if kvb_all.is_empty() {
-            kvb_all = part; // the contiguous case: no extra copy
-        } else {
-            kvb_all.extend_from_slice(&part);
+    // Reconstruct `[k_nope|v]` for every cached position. `kv_b` wants one f32
+    // block, which a contiguous f32 cache already is — the default path hands
+    // it the backing slice and copies nothing. A split or narrowed cache is
+    // gathered into scratch first, which costs `tk × kv_lora` floats against
+    // the `tk × H × (qk_nope + v_head)` this call is about to produce anyway.
+    let mut scratch: Vec<f32> = Vec::new();
+    let lc_all: &[f32] = match kv.lc.as_contiguous_f32(tk, kvl) {
+        Some(s) => s,
+        None => {
+            kv.lc.extend_f32(tk, kvl, &mut scratch);
+            &scratch
         }
-    }
+    };
+    let kvb_all = w.kv_b.apply_vec(lc_all, tk);
 
     let mut ctx = vec![0f32; s_n * h_n * vh];
     for s in 0..s_n {
@@ -448,8 +708,7 @@ fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, kv: &Ro
             for (i, &t) in keys.iter().enumerate() {
                 let base = t * h_n * kvb_head + h * kvb_head;
                 let kn = &kvb_all[base..base + qk_nope];
-                let kr = kv.rc.row(t, qk_rope);
-                sc[i] = (dot(q_nope, kn) + dot(q_rope, kr)) * c.attn_scale;
+                sc[i] = (dot(q_nope, kn) + kv.rc.dot_row(t, qk_rope, q_rope)) * c.attn_scale;
             }
             softmax(&mut sc);
             let cx = &mut ctx[(s * h_n + h) * vh..(s * h_n + h) * vh + vh];
@@ -513,19 +772,15 @@ fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg, 
             sc.clear();
             sc.resize(nt, 0.0);
             for (t, sct) in sc.iter_mut().enumerate().take(nt) {
-                let lt = cache_lc.row(t, kvl);
-                let kr = cache_rc.row(t, qk_rope);
-                *sct = (dot(&qabs, lt) + dot(q_rope, kr)) * c.attn_scale;
+                let raw = cache_lc.dot_row(t, kvl, &qabs) + cache_rc.dot_row(t, qk_rope, q_rope);
+                *sct = raw * c.attn_scale;
             }
             softmax(&mut sc);
 
             // clat = Σ_t sc[t] · Lc[t]; ctx = kv_b value rows · clat
             clat.fill(0.0);
             for (t, &a) in sc.iter().enumerate().take(nt) {
-                let lt = cache_lc.row(t, kvl);
-                for i in 0..kvl {
-                    clat[i] += a * lt[i];
-                }
+                cache_lc.axpy_row(t, kvl, a, &mut clat);
             }
             let cx = &mut ctx_row[h * vh..h * vh + vh];
             for (j, out) in cx.iter_mut().enumerate() {
@@ -696,6 +951,13 @@ mod tests {
         LayerKv::new(c.kv_lora as usize, c.qk_rope as usize)
     }
 
+    /// Rows `[0, n)` of a span as f32, for comparing two caches' contents.
+    fn span_rows(s: KvSpan, n: usize, width: usize) -> Vec<u32> {
+        let mut v = Vec::new();
+        s.extend_f32(n, width, &mut v);
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
     /// Both cores behind one signature, so a property can be asserted for each.
     fn attend_either(
         dense: bool,
@@ -722,7 +984,9 @@ mod tests {
         let x: Vec<f32> = (0..c.hidden as usize).map(|_| r.f()).collect();
         let mut cache = new_cache(&c);
         let out = mla_attention(&w.view(), &x, 1, 0, &mut cache, &c)?;
-        let kvb = w.kv_b.apply_vec(cache.lc_span(1).row(0, kvl), 1);
+        let mut lc0 = Vec::new();
+        cache.lc_span(1).extend_f32(1, kvl, &mut lc0);
+        let kvb = w.kv_b.apply_vec(&lc0, 1);
         let kvb_head = qkn + vh;
         let mut v = vec![0f32; h * vh];
         for hh in 0..h {
@@ -946,16 +1210,135 @@ mod tests {
         let contig = KvSpan::contiguous(&all);
         assert_eq!(split.rows(2), 6);
         assert_eq!(contig.rows(2), 6);
+        let probe = [1.0f32, 10.0];
         for t in 0..6 {
-            assert_eq!(split.row(t, 2), contig.row(t, 2), "row {t} must be the same either way");
+            assert_eq!(split.dot_row(t, 2, &probe), contig.dot_row(t, 2, &probe), "row {t} scores the same either way");
+            let (mut a, mut b) = (vec![0f32; 2], vec![0f32; 2]);
+            split.axpy_row(t, 2, 2.0, &mut a);
+            contig.axpy_row(t, 2, 2.0, &mut b);
+            assert_eq!(a, b, "row {t} accumulates the same either way");
         }
+        assert_eq!(span_rows(split, 6, 2), span_rows(contig, 6, 2));
         // Degenerate shapes return empty rather than dividing by zero.
         assert_eq!(KvSpan::contiguous(&[]).rows(2), 0);
         assert_eq!(contig.rows(0), 0);
-        // `runs` skips empties, so a contiguous span is one run, not two.
-        assert_eq!(contig.runs().count(), 1);
-        assert_eq!(split.runs().count(), 2);
-        assert_eq!(KvSpan::split(&head, &[]).runs().count(), 1);
+        // Only a single-run f32 span can hand out its backing slice.
+        assert_eq!(contig.as_contiguous_f32(6, 2), Some(&all[..]));
+        assert_eq!(contig.as_contiguous_f32(4, 2), Some(&all[..8]), "a shorter prefix is still contiguous");
+        assert_eq!(contig.as_contiguous_f32(7, 2), None, "asking past the end is not contiguous");
+        assert!(split.as_contiguous_f32(6, 2).is_none(), "a split span has no single slice");
+        assert!(KvSpan::split(&head, &[]).as_contiguous_f32(3, 2).is_some(), "an empty tail is still one run");
+    }
+
+    #[test]
+    fn an_f16_span_reads_back_exactly_what_f16_stored() {
+        // `dot_row`, `axpy_row` and `extend_f32` are three views of the same
+        // stored row and the cores mix them freely, so they must agree — and at
+        // f16 each must decode the *stored* value, not an approximation of it.
+        let vals: Vec<f32> = (0..12).map(|k| (k as f32) * 0.37 - 2.0).collect();
+        let enc: Vec<u16> = vals.iter().map(|&v| f32_to_f16(v)).collect();
+        let dec: Vec<f32> = enc.iter().map(|&h| f16_to_f32(h)).collect();
+        let narrow = KvSpan::contiguous_f16(&enc);
+        let wide = KvSpan::contiguous(&dec); // the same values, stored at full width
+        let (w, v) = (4usize, [1.0f32, -0.5, 0.25, 2.0]);
+
+        assert_eq!(narrow.rows(w), 3);
+        assert!(narrow.as_contiguous_f32(3, w).is_none(), "a narrow store has no f32 slice to hand out");
+        for t in 0..3 {
+            assert_eq!(narrow.dot_row(t, w, &v).to_bits(), wide.dot_row(t, w, &v).to_bits(), "score of row {t}");
+            let (mut a, mut b) = (vec![0f32; w], vec![0f32; w]);
+            narrow.axpy_row(t, w, 0.75, &mut a);
+            wide.axpy_row(t, w, 0.75, &mut b);
+            assert_eq!(a, b, "accumulation of row {t}");
+        }
+        assert_eq!(span_rows(narrow, 3, w), span_rows(wide, 3, w));
+        // …and across a seam, at every cut.
+        for cut in 0..=3 {
+            let (h, t) = enc.split_at(cut * w);
+            let sp = KvSpan::split_f16(h, t);
+            assert_eq!(span_rows(sp, 3, w), span_rows(narrow, 3, w), "split at row {cut}");
+            for r in 0..3 {
+                assert_eq!(sp.dot_row(r, w, &v).to_bits(), narrow.dot_row(r, w, &v).to_bits(), "cut {cut}, row {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn f16_kv_halves_the_bytes_and_tracks_f32_closely() -> Result<(), peregrine_core::Error> {
+        // What `COLI_KV_DTYPE=f16` buys and what it costs, in one place. The
+        // saving is exact and checked as such; the cost is that this is **not**
+        // an output-neutral knob, which the test asserts rather than tolerates —
+        // if the two ever agreed bit for bit, nothing here would be measuring.
+        let c = cfg()?;
+        let w = make_weights(&c, 37);
+        let (hidden, kvl, qkr) = (c.hidden as usize, c.kv_lora as usize, c.qk_rope as usize);
+        let n = 6usize;
+        let mut r = Lcg(0xF16CA);
+        let x: Vec<f32> = (0..n * hidden).map(|_| r.f()).collect();
+
+        for dense in [true, false] {
+            let mut wide = LayerKv::new(kvl, qkr);
+            let want = attend_either(dense, &w.view(), &x, n, 0, &mut wide, &c)?;
+            let mut narrow = LayerKv::with_dtype(kvl, qkr, KvDtype::F16);
+            let got = attend_either(dense, &w.view(), &x, n, 0, &mut narrow, &c)?;
+
+            assert_eq!(wide.dtype(), KvDtype::F32, "the default must stay f32");
+            assert_eq!(narrow.dtype(), KvDtype::F16);
+            assert_eq!(narrow.bytes() * 2, wide.bytes(), "f16 must be exactly half the bytes");
+            assert_eq!(narrow.len(), wide.len());
+
+            // **The two cores do not pay the same price, and the gap is the
+            // point.** Absorb dots the stored latent in f32, so its error sits
+            // at f16's own relative precision (2^-11 ~ 4.9e-4; measured 1.8e-4
+            // here). Dense pushes the latent back through `kv_b.apply_vec`,
+            // which quantizes activations to int8 per row at `amax / 127` — so
+            // a perturbation that moves the row maximum rescales the entire
+            // quantization grid, turning a 1e-4 input error into ~1e-2 out.
+            // Two orders of magnitude, from int8 activations rather than from
+            // f16 storage. Anyone enabling `COLI_KV_DTYPE=f16` wants
+            // `COLI_MLA_ABSORB` with it.
+            let tol = if dense { 3e-2 } else { 2e-3 };
+            let mut differs = false;
+            for (k, (p, q)) in want.iter().zip(&got).enumerate() {
+                let scale = p.abs().max(1.0);
+                assert!((p - q).abs() < tol * scale, "dense={dense}, output {k}: {p} vs {q} exceeds {tol}");
+                differs |= p.to_bits() != q.to_bits();
+            }
+            assert!(differs, "dense={dense}: f16 storage must actually round, or this proves nothing");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_narrowed_prefix_is_shared_verbatim_not_re_rounded() -> Result<(), peregrine_core::Error> {
+        // Freezing a prefix copies the *stored* elements. Decoding and
+        // re-encoding would be idempotent for f16 today, but it would make the
+        // cache's contents a function of how many times it had been shared —
+        // a property no future narrower element type would survive.
+        let c = cfg()?;
+        let w = make_weights(&c, 41);
+        let (hidden, kvl, qkr) = (c.hidden as usize, c.kv_lora as usize, c.qk_rope as usize);
+        let (n, m) = (5usize, 3usize);
+        let mut r = Lcg(0x5EED16);
+        let x: Vec<f32> = (0..(n + m) * hidden).map(|_| r.f()).collect();
+
+        let mut src = LayerKv::with_dtype(kvl, qkr, KvDtype::F16);
+        mla_attention_absorb(&w.view(), &x[..n * hidden], n, 0, &mut src, &c)?;
+        let entry = src.clone_prefix(n);
+        assert_eq!(entry.dtype(), KvDtype::F16, "the shared prefix keeps the element type");
+        assert_eq!(entry.bytes(), src.bytes());
+        assert_eq!(span_rows(entry.lc_span(n), n, kvl), span_rows(src.lc_span(n), n, kvl), "lc copied verbatim");
+        assert_eq!(span_rows(entry.rc_span(n), n, qkr), span_rows(src.rc_span(n), n, qkr), "rc copied verbatim");
+
+        // Continuing on the shared prefix is bit-identical to continuing on the
+        // original — sharing is orthogonal to the element type.
+        let mut shared = entry.clone_prefix(n);
+        let via_shared = mla_attention_absorb(&w.view(), &x[n * hidden..], m, n, &mut shared, &c)?;
+        let via_own = mla_attention_absorb(&w.view(), &x[n * hidden..], m, n, &mut src, &c)?;
+        for (k, (a, b)) in via_own.iter().zip(&via_shared).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "output {k}: sharing a narrowed prefix moved a bit");
+        }
+        Ok(())
     }
 
     #[test]
@@ -1073,9 +1456,11 @@ mod tests {
 
         // Rows read through the shallower view are the same rows.
         let kvl = c.kv_lora as usize;
-        for t in 0..n - 2 {
-            assert_eq!(partial.lc_span(n - 2).row(t, kvl), entry.lc_span(n).row(t, kvl), "row {t}");
-        }
+        assert_eq!(
+            span_rows(partial.lc_span(n - 2), n - 2, kvl),
+            span_rows(entry.lc_span(n), n - 2, kvl),
+            "the shallower view must read the same rows"
+        );
         Ok(())
     }
 
@@ -1101,12 +1486,8 @@ mod tests {
         a.truncate(n - 3);
         assert_eq!(a.len(), n - 3);
         assert_eq!(b.len(), n, "the other holder must be untouched by a's rewind");
-        for t in 0..n {
-            assert_eq!(b.lc_span(n).row(t, kvl), entry.lc_span(n).row(t, kvl), "row {t} of the untouched holder");
-        }
-        for t in 0..n - 3 {
-            assert_eq!(a.lc_span(n - 3).row(t, kvl), entry.lc_span(n).row(t, kvl), "surviving row {t}");
-        }
+        assert_eq!(span_rows(b.lc_span(n), n, kvl), span_rows(entry.lc_span(n), n, kvl), "the untouched holder");
+        assert_eq!(span_rows(a.lc_span(n - 3), n - 3, kvl), span_rows(entry.lc_span(n), n - 3, kvl), "surviving rows");
         // The rewound cache still accepts the replacement tokens, in order.
         mla_attention_absorb(&w.view(), &x[..2 * hidden], 2, n - 3, &mut a, &c)?;
         assert_eq!(a.len(), n - 1);
