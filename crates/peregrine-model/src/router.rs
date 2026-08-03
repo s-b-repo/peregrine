@@ -322,6 +322,14 @@ fn kk_range(kept: usize, k: usize) -> std::ops::Range<usize> {
 static UNION_SELECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UNION_DISTINCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UNION_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Distinct experts in the union whose **every** routing row carried a gate
+/// share below [`LOW_GATE_SHARE`]. See [`union_low_gate_snapshot`].
+static UNION_ALL_LOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Gate share below which an expert's contribution is a candidate for being
+/// read at lower precision (or dropped, which is what `COLI_ROUTE_MIN_SHARE`
+/// does today). 1% of a position's kept gate mass.
+pub const LOW_GATE_SHARE: f32 = 0.01;
 
 /// Whether to tally batch-union sharing (`COLI_UNION_STATS=1`). Off by default:
 /// three relaxed adds per sparse layer per forward, but it is pure diagnostics.
@@ -341,6 +349,55 @@ fn union_stats_enabled() -> bool {
 /// the same document already retracted a 1.45× that in-process sweeping had
 /// manufactured. This counter reads the number off the live engine instead of
 /// deriving it.
+/// Distinct experts whose every routing row was low-gate, out of all distinct
+/// experts read. `None` when `COLI_UNION_STATS` is off.
+///
+/// **This is the number that decides gate-mass mixed-precision loading.** The
+/// idea is to read a low-gate expert at lower precision instead of at full
+/// width. But the read is issued once per *union* entry, not once per row: an
+/// expert routed by one row at 40% of its gate mass and another at 0.5% must be
+/// read at the higher precision, because one of its consumers needs it. So the
+/// saving materialises only for experts where **every** routing row is
+/// low-gate, and that gets rarer as the batch grows — the per-token precision
+/// idea is in direct tension with the batch-union amortization the engine
+/// already relies on.
+///
+/// `COLI_GATE_STATS` counts low-gate *selections*; this counts low-gate
+/// *reads*, which is what a precision decision can actually act on. The two
+/// diverging is the whole point.
+pub fn union_low_gate_snapshot() -> Option<(u64, u64)> {
+    if !union_stats_enabled() {
+        return None;
+    }
+    use std::sync::atomic::Ordering;
+    Some((UNION_ALL_LOW.load(Ordering::Relaxed), UNION_DISTINCT.load(Ordering::Relaxed)))
+}
+
+/// Of the distinct experts in one routed batch, how many had every routing row
+/// below `thr` of its position's kept gate mass.
+///
+/// Pure so the tension it measures is testable without an engine — the same
+/// reason `kv_admits` and `prefill_chunk` are pure.
+pub fn union_all_low_gate(r: &Routed, s_n: usize, thr: f32) -> (usize, usize) {
+    let mut any_high: std::collections::HashMap<i32, bool> = std::collections::HashMap::new();
+    for s in 0..s_n {
+        let keff = r.keff.get(s).copied().unwrap_or(0).max(0) as usize;
+        let base = s * r.k;
+        // Shares are relative to this position's kept mass, so the figure is
+        // invariant to `norm_topk` and `routed_scale` — the same normalisation
+        // `gate_share_below` uses.
+        let total: f32 = (0..keff).filter_map(|kk| r.w.get(base + kk)).map(|w| w.abs()).sum();
+        for kk in 0..keff {
+            let (Some(&e), Some(&w)) = (r.idx.get(base + kk), r.w.get(base + kk)) else { continue };
+            let share = if total > 0.0 { w.abs() / total } else { 0.0 };
+            let slot = any_high.entry(e).or_insert(false);
+            *slot |= share >= thr;
+        }
+    }
+    let distinct = any_high.len();
+    (any_high.values().filter(|high| !**high).count(), distinct)
+}
+
 pub fn union_stats_snapshot() -> Option<(u64, u64, u64)> {
     if !union_stats_enabled() {
         return None;
@@ -380,6 +437,8 @@ pub fn batch_union(r: &Routed, s_n: usize) -> Vec<i32> {
         let selections: u64 = (0..s_n).map(|s| r.keff[s].max(0) as u64).sum();
         UNION_SELECTIONS.fetch_add(selections, Ordering::Relaxed);
         UNION_DISTINCT.fetch_add(uniq.len() as u64, Ordering::Relaxed);
+        let (all_low, _) = union_all_low_gate(r, s_n, LOW_GATE_SHARE);
+        UNION_ALL_LOW.fetch_add(all_low as u64, Ordering::Relaxed);
         UNION_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     uniq
@@ -683,6 +742,54 @@ mod tests {
         let r = route(&x, &router_w, &bias, RouterCfg { s_n: 1, d_n: 1, e_n: 2, k: 2, norm_topk: true, routed_scale: 2.5, min_share: 0.0 });
         // normalized weights sum to 1, then ×2.5
         assert!((r.w[0] + r.w[1] - 2.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn batching_erases_the_per_token_precision_decision() -> Result<(), peregrine_core::Error> {
+        // **The tension gate-mass mixed-precision loading has to face.** The
+        // read is issued once per *union* entry, not once per row. An expert
+        // that one row barely wants and another leans on must be read at the
+        // higher precision — so the saving exists only where *every* routing
+        // row is low-gate, and that gets rarer as the batch grows.
+        //
+        // Two rows, both routing expert 0. Row 0 leans on it, row 1 barely uses
+        // it. `gate_share_below` would count one low-gate selection; the read
+        // cannot act on that, and this is the number that says so.
+        let r = Routed {
+            idx: vec![0, 1, 0, 2],
+            // Expert 1's share is 0.005, strictly under the 1% threshold —
+            // exactly 0.01 would sit on the boundary and prove nothing.
+            w: vec![0.995, 0.005, 0.001, 0.999],
+            keff: vec![2, 2],
+            k: 2,
+        };
+        let (all_low, distinct) = union_all_low_gate(&r, 2, LOW_GATE_SHARE);
+        assert_eq!(distinct, 3, "experts 0, 1 and 2 are read");
+        assert_eq!(all_low, 1, "only expert 1 is low-gate for every row that wants it");
+
+        // Alone, row 1 would license reading expert 0 at low precision. Batched
+        // with row 0, it does not — the same expert, the same gate weights, a
+        // different answer purely because of who it shares a read with.
+        let solo = Routed { idx: vec![0, 2], w: vec![0.001, 0.999], keff: vec![2], k: 2 };
+        let (alone, _) = union_all_low_gate(&solo, 1, LOW_GATE_SHARE);
+        assert_eq!(alone, 1, "expert 0 is low-gate when it is read for one row only");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unfilled_slot_does_not_dilute_the_gate_share() -> Result<(), peregrine_core::Error> {
+        // `keff < k` after `COLI_ROUTE_MIN_SHARE` truncation. Shares must be
+        // taken over the *kept* mass, or a truncated position would report
+        // every survivor as more dominant than it is and hide the low-gate
+        // tail this measurement exists to find.
+        let r = Routed { idx: vec![0, 1, -1, -1], w: vec![0.5, 0.5, 0.0, 0.0], keff: vec![2], k: 4 };
+        let (all_low, distinct) = union_all_low_gate(&r, 1, LOW_GATE_SHARE);
+        assert_eq!((all_low, distinct), (0, 2), "two experts at 50% each, neither low");
+        // A position with no kept experts contributes nothing rather than
+        // dividing by zero.
+        let empty = Routed { idx: vec![0, 1], w: vec![0.0, 0.0], keff: vec![0], k: 2 };
+        assert_eq!(union_all_low_gate(&empty, 1, LOW_GATE_SHARE), (0, 0));
+        Ok(())
     }
 
     #[test]
