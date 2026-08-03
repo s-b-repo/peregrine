@@ -2,14 +2,14 @@
 
 # Testing & quality gates
 
-**452 tests passing, 0 warnings, clippy clean** (debug + release), plus a
+**482 tests passing, 0 warnings, clippy clean** (debug + release), plus a
 strict bad-patterns audit. This page is what to run, what each gate enforces,
 and the correctness philosophy behind the test suite.
 
 ## The gates
 
 ```bash
-cargo test --workspace                     # 452 tests, CPU-only, no GPU needed
+cargo test --workspace                     # 482 tests, CPU-only, no GPU needed
 cargo clippy --workspace --all-targets     # clean
 scripts/audit-bad-patterns.sh --strict     # panic / UB / suppression / Cargo gate (CI)
 scripts/audit-reachability.py --list       # [R] shipped-but-unreachable pass
@@ -60,7 +60,15 @@ The suite is built around **bit-identity anchors** rather than tolerances:
     call* at 10% relative; end-to-end that difference compounds through the stack,
     and it has not been measured on a real checkpoint. Off by default, and its
     test asserts only what is verifiable — inert when unset, genuinely wired when
-    set — rather than an invented closeness bound.
+    set — rather than an invented closeness bound. **And it does not reach the
+    batched decode path at all**: `forward_layer_batched` calls
+    `mla_attention_batched` unconditionally, which is absorb-only because the
+    dense core reconstructs against one cache and B sequences have B of them. So
+    on `peregrine-serve` a request's prefill runs dense and its decode tokens run
+    absorption regardless of the setting — two numerically different cores inside
+    one response. `batched_decode_is_absorb_whatever_the_knob_says` pins it:
+    bit-identical with the flag on and off, and different from the dense
+    single-sequence decode.
   - `COLI_KV_DTYPE=f16` stores the KV latents rounded, halving resident KV
     exactly. Unlike the two above, its cost is *bounded by construction* on the
     absorb path — the latent is dotted in f32, so the error is f16's own

@@ -409,6 +409,41 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                             pct(below[3])
                         );
                     }
+                    // Router look-ahead (COLI_ROUTER_LOOKAHEAD, on by default).
+                    // `issued` is speculative reads started from the *next* layer's
+                    // own router during the boundary the disk would otherwise spend
+                    // idle. Deliberately reported apart from the [prefetch] line
+                    // above: a speculative read is not a demand access, and folding
+                    // it in would make a look-ahead that guessed wrong look like a
+                    // cache that performed badly. Silent when it never fired.
+                    let la = peregrine_model::lookahead_issued();
+                    if la > 0 {
+                        eprintln!("[lookahead] issued={la}");
+                    }
+                    // Predictor scoreboard (COLI_PREDICT_EVAL=1). Recall is the share
+                    // of the next layer's real routing each predictor named; `p@r` is
+                    // precision by rank, and a steep profile is what justifies
+                    // prefetching only the head of a ranking. Compare every arm
+                    // against `prev-token`: that baseline costs nothing and the warm
+                    // cache already exploits it, so a predictor that fails to beat it
+                    // has bought nothing whatever its recall looks like alone.
+                    if let Some((arms, layers)) = model.predict_eval_report() {
+                        eprintln!("[predict-eval] scored {layers} layer transitions, width={}",
+                            arms.first().map(|a| a.precision_at.len()).unwrap_or(0));
+                        for a in &arms {
+                            let by_rank: Vec<String> =
+                                a.precision_at.iter().map(|p| format!("{:.0}%", 100.0 * p)).collect();
+                            eprintln!(
+                                "[predict-eval] {:<16} recall={:.1}% precision={:.1}% silent={}/{} p@r=[{}]",
+                                a.name,
+                                100.0 * a.recall,
+                                100.0 * a.precision,
+                                a.silent,
+                                a.asked,
+                                by_rank.join(" ")
+                            );
+                        }
+                    }
                     // Batch-union sharing (COLI_UNION_STATS=1). `share` is how many
                     // routed selections each distinct expert read actually served —
                     // the amortization batching is supposed to buy. benchmarks.md

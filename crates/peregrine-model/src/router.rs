@@ -581,7 +581,8 @@ mod tests {
         let (d_n, e_n) = (8usize, 16usize);
         let (x, w, bias) = synth_router(d_n, e_n);
         let before = gate_stats_snapshot();
-        let _ = route_ranks(&x, &w, &bias, d_n, e_n, 6);
+        let ranks = route_ranks(&x, &w, &bias, d_n, e_n, 6);
+        assert_eq!(ranks.len(), 6, "the ranking is still produced — this asserts silence, not inaction");
         assert_eq!(before, gate_stats_snapshot());
     }
 

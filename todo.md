@@ -17,8 +17,8 @@ concurrent CPU/GPU/SSD scheduler + `io_uring`.
 
 | Scope | ✅ Done | 🟡 Partial | ⬜ Not started | Total | Completion |
 |---|---:|---:|---:|---:|---:|
-| **Full roadmap** | 103 | 11 | 11 | 125 | **~82% strict · ~87% weighted** |
-| **Priority shortlist** | 15 | 1 | 3 | 19 | **~79% strict · ~82% weighted** |
+| **Full roadmap** | 108 | 11 | 11 | 130 | **~83% strict · ~87% weighted** |
+| **Priority shortlist** | 16 | 1 | 3 | 20 | **~80% strict · ~83% weighted** |
 
 *Strict = Done ÷ Total. Weighted = (Done + ½·Partial) ÷ Total. "Fast matrix multiplication" is excluded.
 Total is now 125, up from the 108 this table tracked through 2026-08-01: the 93 source items, 2
@@ -30,9 +30,17 @@ which is the honest reading: the roadmap was ~89% done against a scope that excl
 strict figure has barely moved since because each wave opens roughly as much as it closes. Counts are generated from the checkboxes below — recount with
 `awk '/^## 1\./,/^## ❄️/' todo.md | grep -c '^- \[x\]'`.*
 
-**Per-section:** Prefetch **9/9 ✅** · GPU 5/9 · Caching **12/12 ✅** · I/O 9/11 · Memory/NUMA
-**4/5** · Scheduling 16/18 · Disk-layout **10/10 ✅** · Workload **5/5 ✅** · Compilation
-**5/5 ✅** · Self-optimizing 9/10 · Multi-GPU 0/4 · Attention/serving **3/5** · Workload-reduction **14/16**.
+**Per-section:** Prefetch **11/11 ✅** · GPU 5/9 · Caching **12/12 ✅** · I/O 9/11 · Memory/NUMA
+**7/8** · Scheduling 16/18 · Disk-layout **10/10 ✅** · Workload **5/5 ✅** · Compilation
+**5/5 ✅** · Self-optimizing 9/10 · Multi-GPU 0/4 · Attention/serving **4/7** · Workload-reduction **14/16**.
+
+*2026-08-03 wave (+5, all from a cross-read of two parallel projects —
+[WASTE](https://github.com/sqliteai/waste) and [deltafin](https://github.com/gavamedia/deltafin)):
+the router look-ahead and its scoreboard in §1, trunk wiring and cgroup-aware budgeting in §5, the
+response memo in §12. The borrowed **negative** results are recorded in
+[prefetch-and-caching.md](docs/prefetch-and-caching.md#borrowed-negative-results) — they close off
+per-expert bit allocation, routed-tail truncation and prefill-path look-ahead, and they put an
+open question against §1's entire statistical predictor stack.*
 
 **The 19 open items fall into three groups**, and only the first is blocked by this workspace:
 
@@ -133,6 +141,7 @@ These aren't roadmap line-items but represent the substantial completed groundwo
 Highest expected throughput per unit effort. **15 done, 1 partial, 3 to go.**
 
 - [x] ✅ **Layer look-ahead prefetch** — per-layer emission mid-forward, staggered ahead of the compute cursor (`PrefetchCtx::emit_layer`) _(★★★★★ · Medium)_
+- [x] ✅ **Router look-ahead** — run layer L+1's *own* router on layer L's output and prefetch that ranking, filling the layer boundary the readers would otherwise spend idle. Output-neutral, decode-only, no artifact, works on a cold process. The one predictor here that asks the router instead of its history `model.rs::LookaheadCtx` _(★★★★★ · Medium)_
 - [ ] ⬜ **Persistent CUDA kernels** — launch once, threadblocks loop `dequeue → compute → enqueue` _(★★★★★ · Hard, CUDA-only)_
 - [ ] 🟡 **CUDA Graphs** — capture/replay built but **not wired into decode loop** `backend_cuda.cu:453-496`, `cuda/lib.rs:394-450` _(★★★★☆ · Medium, CUDA-only)_
 - [x] ✅ **Dynamic expert VRAM cache** — `reheat()` re-selects hottest experts by routing frequency every 256 steps `gpu.rs:363-382` _(★★★★☆ · Hard)_
@@ -154,7 +163,7 @@ Highest expected throughput per unit effort. **15 done, 1 partial, 3 to go.**
 
 ---
 
-## 1. Prefetching & Speculation — 9/9 ✅
+## 1. Prefetching & Speculation — 11/11 ✅
 
 Shared spine in `predict.rs` (`RouteHistory` K-deep + `PredictSource` momentum/automaton/phase-aware +
 `PrefetchTuner` + `TransitionTable`) feeding a per-layer emitter (`PrefetchCtx::emit_layer`) and a
@@ -176,6 +185,9 @@ pool (`COLI_PREFETCH_LANES`) — each concurrent stream predicts + prefetches fr
 (`forward_step_batched` per-sequence `route_log_multi`, `batch.rs` field-split unzip). Plus
 **`PredictSource::PhaseAware`** — wraps any inner source and boosts newest-frame vote when Jaccard
 distance between the top two frames exceeds a basis-points threshold.
+
+- [x] ✅ **Router look-ahead** (2026-08-03) — every predictor above is a statistic over the router's *past answers*; this one asks the router. At the end of layer `L`, apply layer `L+1`'s own `post_ln` + router to layer `L`'s output and prefetch that ranking's top `COLI_ROUTER_LOOKAHEAD_N` (default 6) — one extra `E×D` matvec against resident weights, no artifact, no format change, works on the first token of a cold process where every history-based predictor is still empty. Correctness-neutral: the authoritative router still runs at `L+1` and still decides, pinned by `router_lookahead_cannot_move_a_token` (streamed decode bit-identical to resident). **Decode only** — WASTE built the prefill-chunk version and measured bytes read +6.9 % with flat wall clock, because a chunk layer's speculative records are exactly what eviction takes first and its readers are never idle. Speculative reads stay out of `misses`. `model.rs::LookaheadCtx`, `router.rs::route_ranks`; `COLI_ROUTER_LOOKAHEAD` _(★★★★★ · Medium)_
+- [x] ✅ **Predictor scoreboard** (2026-08-03) — `COLI_PREDICT_EVAL=1` scores the router look-ahead, the configured `PredictSource` and a previous-token baseline against the routing that actually happened, and prints recall + precision-by-rank at shutdown (`[predict-eval]`). Built because the §1 spine is entirely correctness-neutral, which means **no test can catch a predictor that has degraded to noise** — it costs throughput silently. Pure and unit-tested (`predeval.rs`); an arm that abstains is counted as silent rather than wrong, and recall counts distinct coverage so a degenerate arm cannot report >1. **This is the open question against every other item in this section**: WASTE measured held-out co-occurrence at 29.0 % recall@16 against "reuse the previous token's set" at 29.5 %, i.e. no better than the baseline the cache already exploits for free. Whether `automaton.json` / `macrostates.json` beat it *here* is now measurable and unmeasured `predeval.rs`, `model.rs::score_and_stash`
 
 ## 2. GPU Execution — 5/9
 
@@ -231,7 +243,7 @@ code that never runs cannot be wrong — it can only mislead.*
 - [x] ✅ Adaptive `io_uring` SQ/CQ sizing — `IoTuner::step` grows/halves the `(bounded, unbounded)` cap; `COLI_IO_TUNE`; last applied cap exposed on `Model::last_iowq()` `iotune.rs`
 - [x] ✅ Fault-tolerant I/O recovery + degraded-mode execution — on a batched-read failure the buffered path re-issues each region via `Reactor::read_exact_retry` (linear backoff, transient EIO/EAGAIN/EINTR); `COLI_IO_RECOVERY` `concurrent.rs::read_regions_with_retry`, `ring.rs`
 
-## 5. Memory & NUMA — 4/5
+## 5. Memory & NUMA — 7/8
 
 - [x] ✅ Huge pages (2 MB / 1 GB) — `advise_hugepages` (`MADV_HUGEPAGE`) applied at every ≥ 2 MB allocation choke point: `AlignedBuf::with_capacity`, `Reactor::register_read_buffers`, the safetensors `read_*` landing buffers `peregrine-io/src/mem.rs`, `safetensors.rs::maybe_hugepage`; `COLI_HUGEPAGE` (default on)
 - [x] ✅ Automatic huge-page allocation and promotion — implicit via the `≥ 2 MB` threshold above; `MAP_HUGETLB` explicit-hugetlb variant is planned as a future opt-in
@@ -239,6 +251,8 @@ code that never runs cannot be wrong — it can only mislead.*
 - [x] ✅ NUMA-aware RAM allocation and thread placement — `bind_local_if_enabled` (`sched_getcpu` → node → `mbind`) binds every ≥ 2 MB `AlignedBuf` to the allocating thread's node **before first touch**; thread placement via the pin hook `mem.rs::current_numa_node`, `slab.rs`
 - [x] ✅ **int3-g64 AVX2** — the format shipped scalar-only, so an int3 checkpoint computed slower than the int4 it replaced, and it was the one kernel in `idot.rs` without the `_scalar` + dispatched-SIMD pair the convention requires. The low plane is byte-for-byte the int2 layout so its unpack is shared; the high plane's 1-bit-per-value is broadcast eight lanes per source byte and tested against a bit mask. Bit-exact against the reference (`int3_g64_avx2_matches_scalar`, which packs its own fixtures so the two kernels are compared to each other rather than to a shared producer bug) `idot.rs`
 - [ ] 🟡 Lock-free slab allocator with recycling by generation — the pool is live (`checkout`/`checkin`, 7 and 5 call sites), but the **generation-tagged** variants that make it safe against a straggler write into a recycled slab (`checkout_tagged`/`checkin_tagged`, verifying `SlabHandle { gen }`) have **zero callers, including tests**. `docs/io-and-storage.md` described that protection as active; it is not on any path. Found by the [R] reachability pass `slab.rs`
+- [x] ✅ **Wire the resident trunk** (2026-08-03) — `COLI_MLOCK=1` runs `mlockall(MCL_CURRENT)` after the weights load and *before* the warm cache fills, so the trunk is pinned and every later allocation stays ordinary reclaimable memory. `MCL_CURRENT` not `MCL_FUTURE` is the design, not an oversight: the cache is supposed to be the part the kernel can take back, and wiring it too converts a gentle slowdown into an allocation failure. **This does not raise the ceiling, it removes variance** — a streaming engine with a large trunk and a cache sized to the remainder is exactly the shape that invites the kernel to reclaim trunk pages to grow the page cache, and each one is re-read at disk speed mid-token. Refusal (the normal outcome on a desktop `RLIMIT_MEMLOCK`) is reported with the limit and the fix, never fatal `peregrine-io/src/mem.rs::wire_resident`
+- [x] ✅ **cgroup-aware memory budgeting** (2026-08-03) — `/proc/meminfo` is not namespaced, so inside a container `MemAvailable` is the *host's*: a small container on a large machine sized its caches for hardware it was not running on and got OOM-killed while every projection reported room to spare. `mem_available_bytes` is now `min(MemAvailable, cgroup v2 memory.max − memory.current, cgroup v1 limit − usage)`, with unlimited sentinels recognized by magnitude. Parsing is pure and unit-tested; both reference projects hit this independently `ram.rs::effective_available`
 
 *Note: weight loading uses `pread` + `fadvise(DONTNEED)` (flat RSS), not `mmap` — deliberate `safetensors.rs:3`.*
 
@@ -316,7 +330,7 @@ code that never runs cannot be wrong — it can only mislead.*
 
 ---
 
-## 12. Attention & Serving Memory — 3/5 (+1 partial)
+## 12. Attention & Serving Memory — 4/7
 
 *A whole axis §1-§11 has no category for. Those sections optimize how fast expert bytes
 move; this one is about the KV cache, per-request memory, and work the engine repeats.
@@ -326,6 +340,8 @@ All of it is CPU-side and needs no hardware this workspace lacks.*
 - [ ] ⬜ Fuse prefill rows into the decode batch — on a tick with both, the engine runs `prefill_step` → `forward_prefill_seq` (single-sequence) **and** `forward_step_batched`, two disjoint forwards each streaming their own routed-expert union off disk. Both end in the same `moe_forward_concurrent`, which is row-agnostic. Since batching is the one regime measured to scale (4.4× at B=16, entirely from sharing each expert read across the batch), fusing removes a redundant pass over ~11.3 GB. Blocked on `forward_step_batched` taking one token per sequence — a prefill chunk is many tokens for one sequence, so the batched attention/MoE row plumbing has to generalize `batch.rs`, `model.rs`
 - [x] ✅ Cross-request prefix cache — every request built a fresh `SeqKv` and prefilled from position 0, so N requests sharing a system prompt each paid its full prefill; on a disk-bound engine that is the dominant cost, since every prompt token routes its own experts. `PrefixCache` (`COLI_PREFIX_CACHE_MB`, byte-budgeted LRU) seeds a new sequence from the longest cached prefix of its prompt. Sound because each position attends only its causal prefix, so two prompts agreeing on their first `n` tokens have identical KV there — asserted bit-exact by `prefix_cache_seeded_prefill_matches_cold_prefill`. Entries are matched by **comparing tokens, not a hash**: a hash collision would silently serve another prompt's KV, and that is the one failure mode this must not have. A hit never consumes the whole prompt, since prefill still has to produce the logits the first token is sampled from. Unset = disabled = the historical cold start `batch.rs`, `attention.rs`, `model.rs`
 - [x] ✅ **KV element type (`COLI_KV_DTYPE=f16`)** — `LayerKv` stored `lc`/`rc` as **f32**, which at GLM-5.2 shapes is `(512 + 64) × 4 B × 78` = **175.5 KiB/token ≈ 180 MB per 1,000 tokens**. f16 halves that exactly, and under `COLI_KV_BUDGET_MB` the saving converts straight into batch slots. Worth doing before any cleverer scheme and easy to miss: **every published KV-quantization result is measured against an fp16 baseline**, so at f32 the engine started a full 2× behind the number it would be compared to — a gap no amount of int8/int4 work closes, because it is in the baseline. Needed `f32_to_f16`, which the container never did (it only ever *read* half-precision); written to round-to-nearest-even rather than the convenient truncation, since a KV row is re-read thousands of times per sequence and a systematic bias toward zero compounds where a rounding error cancels. **The readers had to stop returning rows**: `row(t) -> &[f32]` forces the store to be f32, so `KvSpan` exposes the three things the cores actually do — `dot_row`, `axpy_row`, `extend_f32` — with every f32 arm term-for-term the historical code, so the default path stays bit-identical. **Its exhaustive f16 round-trip found a live defect in the decoder**: `f16_to_f32`'s `exp - 15 + 127`, ported verbatim from C where unsigned wraparound is defined, underflows in Rust — a debug-build overflow panic across the whole of [2^-14, 1), which no existing test reached. **The cost is not where it looks**: absorb dots the latent in f32 and errs at f16's own precision (1.8e-4 measured), while dense pushes it back through `kv_b.apply_vec`, whose per-row int8 activation scale can be moved by the perturbation and rescale the entire grid — 1.7e-2, two orders worse, and from int8 activations rather than from f16. Off by default; pair with `COLI_MLA_ABSORB` `attention.rs`, `model.rs`, `dtype.rs`
+- [ ] ⬜ **`COLI_MLA_ABSORB` does not reach the batched decode path** — `forward_layer_batched` calls `mla_attention_batched` unconditionally, with no `ctx.absorb` check, and that core is absorb-only: the dense core reconstructs `[k_nope|v]` against *one* cache and B sequences have B of them. So on `peregrine-serve` every request runs **prefill on the dense core and every decode token on absorption**, whatever the knob says — two cores that are algebraically equal but not numerically identical, inside one response. The docs called absorb opt-in, off by default and unvalidated on a real checkpoint; on the serving path it has been mandatory all along. Found while scoping the prefill/decode fusion, which this blocks: folding prefill rows into the batched call would silently move prefill from dense to absorb, so the fusion is **not** output-neutral until this is resolved. `batched_decode_is_absorb_whatever_the_knob_says` pins the current behaviour (bit-identical with the flag on and off, and different from the dense single-sequence decode) so it cannot be lost a second time. Resolving it means either a batched dense core or making the serving path's choice explicit rather than incidental `model.rs`, `attention.rs`
+- [x] ✅ **Bounded exact response memo** (2026-08-03) — an OpenAI-compatible server is re-asked the same question constantly (health probes, retries, eval fixtures, clients re-sending an unchanged conversation), and on an engine where one token costs a pass over gigabytes of streamed experts, serving one from memory is worth more here than almost anywhere else. `COLI_MEMO_ENTRIES`/`COLI_MEMO_MB` (32 / 64 MiB; either at 0 disables). Three rules keep it from becoming a correctness hazard: the key is the **complete request semantics** — prompt token ids, `max_tokens`, `top_p` by bit pattern, model id — **compared field-by-field, never hashed**, following the prefix cache's rule and for the same reason; only `temperature == 0` requests are eligible, because replaying a stored sample would silently convert a sampling endpoint into a deterministic one and the caller would never know why; and a hit is answered **before `submit_request`**, so it never enters the engine, never occupies a batch slot and can never become a KV boundary. Entries hold **token ids, not wire bytes**, so framing is rebuilt per request — this request's own completion id and timestamp — and a streaming call can be served from a non-streaming entry. A truncated generation (engine error, client disconnect mid-stream) is never stored. Counters on `/health` `peregrine-serve/src/memo.rs`
 - [ ] 🟡 Paged / block-pooled KV — **three of the four things this item carried have landed separately, and the fourth is now the only one left.** The unbounded ~53 GB worst case is bounded by `COLI_KV_BUDGET_MB`; cross-sequence sharing is the `Arc` prefix; and the growth overshoot is capped: `Vec` doubles, so a cache grown one position at a time held up to **2× the capacity it used** — a 32-sequence batch of 4 k-token contexts is ~23 GB of KV that could sit in ~46 GB of allocation — and `KvBuf::reserve_for` now doubles below 256 rows and adds a fixed block above it, so the unused tail is `min(len, 256)` rows instead of `len`. `kv_growth_overshoot_is_bounded_by_a_block_not_by_the_sequence` asserts it at both ends, because a naive fixed block would charge 46 MB to a ten-token sequence. **What remains is pooling across sequences**: a finished sequence's 78 allocations return to the allocator rather than to the next admission. That is the genuinely hard part and also the smallest — **the reclaimable waste is ~33%, not vLLM's 62–80%**, because peregrine never pre-allocates (`LayerKv::new` starts at `Vec::new()`), so it has zero reservation waste, which is the largest bar in that figure. `KvSpan` generalizes from two runs to a block list without touching a reader, so the seam is ready when the measurement justifies the work `model.rs`, `attention.rs`
 
 ---
@@ -400,6 +416,10 @@ change, and needs the two shipped measurement items first.*
 | `COLI_ROUTE_STATS_PERSIST` | on | Save `route_stats.json` at Drop; auto-load matching one on `Model::load` |
 | `COLI_LAYOUT_SCHEDULE` | on | Use `<dir>/schedule.json` (if present) to pre-sort disk reads |
 | `COLI_PHASE_THRESHOLD` | 0.6 | Jaccard distance above which `PhaseTracker` declares a phase change |
+| `COLI_ROUTER_LOOKAHEAD` / `_N` | on / 6 | Router look-ahead: prefetch layer L+1's experts by running its own router on layer L's output. Decode-only, output-neutral |
+| `COLI_PREDICT_EVAL` / `_N` | off / topk | Score every predictor against the real routing; `[predict-eval]` recall + precision-by-rank at shutdown |
+| `COLI_MLOCK` | off | `mlockall(MCL_CURRENT)` after load, before the cache fills — wires the trunk, leaves the cache reclaimable |
+| `COLI_MEMO_ENTRIES` / `COLI_MEMO_MB` | 32 / 64 | Exact response memo in `peregrine-serve`; greedy requests only, keyed on full request semantics |
 | `COLI_PERF_COUNTERS` | off | Open a real `perf_event_open` LLC-miss counter (needs kernel grant) |
 | `COLI_THERMAL_LIMIT_C` | unset | Thermal governor: shrink workers above this package temperature |
 | `COLI_POWER_CAP_W` | unset | Power governor: shrink workers when RAPL watts exceed the cap |

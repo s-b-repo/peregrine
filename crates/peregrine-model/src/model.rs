@@ -130,6 +130,11 @@ pub struct Model {
     /// Strategy that turns [`Self::route_hist`] into a ranked list of experts to
     /// prefetch for the next forward. Defaults to recency-weighted momentum.
     predictor: PredictSource,
+    /// Predictor scoreboard (`COLI_PREDICT_EVAL=1`). Scores the router look-ahead,
+    /// the statistical predictor and a previous-token baseline against the routing
+    /// that actually happened, so the choice between them is measured rather than
+    /// argued. `None` — and free — unless asked for.
+    predict_eval: Option<Mutex<crate::predeval::PredictEval>>,
     /// Multi-path tiering: how many ranked candidates per layer to fully stream vs.
     /// merely page-cache-hint.
     prefetch_policy: PrefetchPolicy,
@@ -326,8 +331,19 @@ impl SeqKv {
     }
 }
 
-/// `MemAvailable` from `/proc/meminfo`, in bytes (0 if unreadable).
+/// Memory this process may actually use, in bytes (0 if unreadable): the smaller of
+/// the host's `MemAvailable` and whatever its cgroup permits.
+///
+/// `/proc/meminfo` is not namespaced, so inside a container it describes the host.
+/// Sizing a cache against it there is how a small container on a large machine gets
+/// OOM-killed while every projection in the engine reports room to spare — see
+/// [`crate::ram::effective_available`].
 fn mem_available_bytes() -> u64 {
+    crate::ram::effective_available(host_mem_available_bytes(), cgroup_available_bytes())
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes (0 if unreadable). The host's view.
+fn host_mem_available_bytes() -> u64 {
     let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return 0 };
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
@@ -336,6 +352,48 @@ fn mem_available_bytes() -> u64 {
         }
     }
     0
+}
+
+/// Bytes left inside this process's cgroup memory controller, `None` when there is no
+/// limit or no controller. Tries v2's unified hierarchy first, then v1.
+///
+/// Reads the cgroup *root* paths rather than resolving `/proc/self/cgroup`, because in
+/// the case that matters — a containerized process — the container's cgroup is
+/// mounted as its root, so these are its own limits.
+fn cgroup_available_bytes() -> Option<u64> {
+    let v2 = (read_cgroup_file("/sys/fs/cgroup/memory.max"), read_cgroup_file("/sys/fs/cgroup/memory.current"));
+    if let (Some(max), Some(cur)) = v2 {
+        if let Some(v) = crate::ram::cgroup_v2_available(&max, &cur) {
+            return Some(v);
+        }
+    }
+    let limit = read_cgroup_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")?;
+    // An unreadable usage file means "unknown", which the parser reads as zero
+    // used. That reports the whole limit as available, which is the same
+    // direction as having no cgroup information at all — the projection is then
+    // no worse than it was before this probe existed.
+    let usage = match read_cgroup_file("/sys/fs/cgroup/memory/memory.usage_in_bytes") {
+        Some(u) => u,
+        None => String::from("0"),
+    };
+    crate::ram::cgroup_v1_available(&limit, &usage)
+}
+
+/// One cgroup control file, `None` when it is not there.
+///
+/// Absence is the ordinary case — no memory controller, or simply not running in
+/// a container — so it is not reported. A *genuine* read failure is advisory
+/// (`COLI_DEBUG=1` surfaces it): the host's own `MemAvailable` still stands, so
+/// the run continues with the figure it would have used anyway.
+fn read_cgroup_file(path: &str) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            peregrine_io::note_advisory_err("cgroup memory limit read", &e);
+            None
+        }
+    }
 }
 
 /// Warm-cache byte budget from the environment: `COLI_ECACHE_GB` (GiB float) if
@@ -651,6 +709,31 @@ fn router_lookahead_width() -> usize {
     use std::sync::OnceLock;
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| env_usize("COLI_ROUTER_LOOKAHEAD_N", 6))
+}
+
+/// The arms the predictor scoreboard compares, in the order the forward loop stashes
+/// them. See [`predict_eval_init`].
+const PREDICT_EVAL_ARMS: [&str; 3] = ["router-lookahead", "predictor", "prev-token"];
+
+/// Build the predictor scoreboard when `COLI_PREDICT_EVAL=1`
+/// (`COLI_PREDICT_EVAL_N` candidates per arm, default: the model's top-k, so recall
+/// is directly comparable with a routing decision's own width).
+///
+/// Three arms, chosen so the comparison is the one that matters:
+///
+/// - **`router-lookahead`** — layer `L+1`'s router applied to layer `L`'s output.
+/// - **`predictor`** — whatever [`PredictSource`] is configured: momentum, the
+///   transition automaton, macro-states. A statistic over the router's past answers.
+/// - **`prev-token`** — the previous token's routed set at that layer, verbatim. The
+///   baseline that matters, because it is the one the expert cache already exploits
+///   for free: a predictor that does not beat it has bought nothing, whatever its
+///   recall looks like in isolation.
+fn predict_eval_init(topk: usize) -> Option<Mutex<crate::predeval::PredictEval>> {
+    if !matches!(std::env::var("COLI_PREDICT_EVAL").as_deref(), Ok("1") | Ok("true")) {
+        return None;
+    }
+    let width = env_usize("COLI_PREDICT_EVAL_N", topk).max(1);
+    Some(Mutex::new(crate::predeval::PredictEval::new(width, &PREDICT_EVAL_ARMS)))
 }
 
 /// Multi-path tiering: per layer, the top `warm_paths` ranked candidates are fully
@@ -1050,10 +1133,6 @@ impl PrefetchCtx<'_> {
         }
     }
 
-    /// This emitter's state, narrowed to what the router look-ahead needs.
-    fn lookahead(&self) -> LookaheadCtx<'_> {
-        LookaheadCtx { prefetch: self.prefetch, cache: self.cache, gpu: self.gpu, st: self.st, cfg: self.cfg }
-    }
 }
 
 /// The state the router look-ahead needs — which is [`PrefetchCtx`] minus the
@@ -1105,7 +1184,7 @@ impl LookaheadCtx<'_> {
             return;
         }
         let mut warms = Vec::new();
-        for (e, _rank) in self.rank(l, next, x, width) {
+        for e in self.rank(l, next, x, width) {
             let Ok(eu) = usize::try_from(e) else { continue };
             match crate::concurrent::prefetch_item(self.st, self.cfg, next, eu) {
                 Ok(item) => warms.push(item),
@@ -1121,26 +1200,21 @@ impl LookaheadCtx<'_> {
         }
     }
 
-    /// The `(expert, rank)` pairs this look-ahead would stream for layer `next`:
-    /// the next layer's router ranking, minus the candidates that would cost no read,
-    /// truncated to `width`. `rank` is the position in the router's *full* ranking,
-    /// which is what a precision-by-rank measurement needs.
+    /// The experts this look-ahead will actually stream for layer `next`: the router's
+    /// ranking, minus the candidates that would cost no read, truncated to `width`.
     ///
-    /// Split out from [`Self::emit`] so [`LookaheadEval`] scores exactly the set that
-    /// would have been fetched, rather than a re-derivation of it that could drift.
-    fn rank(&self, l: &LayerW, next: usize, x: &[f32], width: usize) -> Vec<(i32, usize)> {
-        let d = self.cfg.hidden as usize;
-        // One row: the look-ahead is decode-only (`s_n == 1` at every call site), so
-        // there is exactly one position to rank and no union to take.
-        let nrm = rmsnorm_rows(x, &l.post_ln, 1, d, self.cfg.eps);
+    /// Dropping the already-warm and the GPU-resident *after* ranking rather than
+    /// before is what keeps the window full: a prediction that is right and already
+    /// cached is not a read, so it should not consume one of the `width` slots.
+    fn rank(&self, l: &LayerW, next: usize, x: &[f32], width: usize) -> Vec<i32> {
         // Scan the router's top-`k` — the width of a real routing decision — and take
         // the first `width` that would cost a read. Past rank `k` the ranking's
         // precision has fallen far enough that the candidates are not worth the scan.
         let scan = width.max(self.cfg.topk.max(0) as usize);
-        let ranks = crate::router::route_ranks(&nrm, &l.router, &l.router_bias, d, self.cfg.n_experts as usize, scan);
+        let ranks = router_ranks_for(l, self.cfg, x, scan);
         let mut out = Vec::with_capacity(width.min(ranks.len()));
         let cache = self.cache.lock();
-        for (rank, e) in ranks.into_iter().enumerate() {
+        for e in ranks {
             if out.len() >= width {
                 break;
             }
@@ -1151,9 +1225,88 @@ impl LookaheadCtx<'_> {
             if self.gpu.is_some_and(|g| g.has(next, eu)) {
                 continue; // computed on the GPU lane, never streamed
             }
-            out.push((e, rank));
+            out.push(e);
         }
         out
+    }
+}
+
+/// Layer `l`'s router's own top-`n` ranking of the hidden state `x` — the router
+/// look-ahead's *prediction*, before any fetch policy is applied to it.
+///
+/// A free function rather than a method on [`LookaheadCtx`] because the two callers
+/// need different things from it and only one of them has a prefetch lane: the
+/// look-ahead ranks in order to fetch, and [`score_and_stash`] ranks in order to
+/// measure. Keeping measurement independent of the fetch machinery means a predictor
+/// can be evaluated on a model with no warm cache at all.
+fn router_ranks_for(l: &LayerW, cfg: &Cfg, x: &[f32], n: usize) -> Vec<i32> {
+    let d = cfg.hidden as usize;
+    if x.len() < d {
+        return Vec::new();
+    }
+    // One row: this is a decode-only path, so there is exactly one position to rank
+    // and no union to take.
+    let nrm = rmsnorm_rows(x, &l.post_ln, 1, d, cfg.eps);
+    crate::router::route_ranks(&nrm, &l.router, &l.router_bias, d, cfg.n_experts as usize, n)
+}
+
+/// Settle layer `li`'s outstanding prediction against what it actually routed, then
+/// predict layer `li + 1` with every arm. Called once per layer per decode step when
+/// `COLI_PREDICT_EVAL=1`; costs nothing otherwise, because the caller holds `None`.
+///
+/// The order matters and is the reason this is one function rather than two. At this
+/// instant `forward_layer` has just published layer `li`'s authoritative routed set,
+/// so `latest(li)` is the answer to the prediction stashed a layer ago — and
+/// `latest(li + 1)` has *not* been overwritten yet, so it is still the previous
+/// token's set there, which is precisely the `prev-token` baseline. Predicting before
+/// scoring, or scoring after the next layer runs, would quietly change what both
+/// numbers mean.
+fn score_and_stash(
+    eval: &Mutex<crate::predeval::PredictEval>,
+    rh: &Mutex<RouteHistory>,
+    predictor: &PredictSource,
+    layers: &[LayerW],
+    cfg: &Cfg,
+    li: usize,
+    x: &[f32],
+) {
+    let width = eval.lock().width();
+    let next = li + 1;
+    let predict_next = next < layers.len() && layers[next].sparse && next >= cfg.first_dense as usize;
+    // One history lock for everything that reads it, so the baseline and the
+    // statistical arm see the same frame.
+    let (actual, prev, statistical) = {
+        let hist = rh.lock();
+        // An absent frame means this layer has not routed yet — the normal
+        // state on the first decode step, not an error, and scoring against an
+        // empty set is exactly right there.
+        let actual = match hist.latest(li) {
+            Some(set) => set.clone(),
+            None => Vec::new(),
+        };
+        let (prev, statistical) = if predict_next {
+            let prev = match hist.latest(next) {
+                Some(set) => set.clone(),
+                None => Vec::new(),
+            };
+            let stat = predictor
+                .predict_layer(next, &hist)
+                .into_iter()
+                .take(width)
+                .map(|(e, _score)| e as i32)
+                .collect();
+            (prev, stat)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        (actual, prev, statistical)
+    };
+    let lookahead = if predict_next { router_ranks_for(&layers[next], cfg, x, width) } else { Vec::new() };
+    let mut ev = eval.lock();
+    ev.score(li, &actual);
+    if predict_next {
+        // Arm order must match `PREDICT_EVAL_ARMS`.
+        ev.stash(next, vec![lookahead, statistical, prev]);
     }
 }
 
@@ -1170,6 +1323,19 @@ static LOOKAHEAD_ISSUED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Experts the router look-ahead has speculatively streamed so far this process.
 pub fn lookahead_issued() -> u64 {
     LOOKAHEAD_ISSUED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Model {
+    /// Per-predictor recall and precision-by-rank (`COLI_PREDICT_EVAL=1`), with the
+    /// number of layer transitions they were scored over. `None` unless the
+    /// scoreboard is on and something has actually been scored — an evaluation with
+    /// no evidence reports nothing rather than a row of zeroes that reads like a
+    /// result.
+    pub fn predict_eval_report(&self) -> Option<(Vec<crate::predeval::ArmReport>, u64)> {
+        let ev = self.predict_eval.as_ref()?.lock();
+        let report = ev.report();
+        (!report.is_empty()).then(|| (report, ev.scored_layers()))
+    }
 }
 
 /// The prefetch lane: stream predicted experts into the shared warm cache on this
@@ -1642,13 +1808,16 @@ impl Model {
             let budget = if stream_experts && requested > 0 {
                 let per_expert = 4 * max_expert_region_bytes(&st);
                 let reserve = stream_transient_reserve(io_reactors.len(), workers, per_expert);
-                let capped = cap_ecache_budget(requested, mem_available_bytes() as usize, reserve, 1usize << 30);
-                if capped < requested {
-                    eprintln!(
-                        "peregrine: warm cache capped {} MiB -> {} MiB to keep RAM headroom for streaming buffers",
-                        requested >> 20,
-                        capped >> 20
-                    );
+                let avail = mem_available_bytes();
+                let capped = cap_ecache_budget(requested, avail as usize, reserve, 1usize << 30);
+                // One line covering both hazards: a request that had to be cut, and a
+                // request granted in full that is nonetheless large enough to make its
+                // own hits into page faults. The second is the counter-intuitive one —
+                // it improves every number the cache itself reports while collapsing
+                // throughput — so it is worth saying out loud rather than leaving to a
+                // benchmark nobody runs.
+                if let Some(w) = crate::ram::cache_cliff_warning(requested as u64, capped as u64, avail) {
+                    eprintln!("peregrine: {w}");
                 }
                 capped
             } else {
@@ -1705,6 +1874,7 @@ impl Model {
         };
 
         let model_n_layers = cfg.n_layers as usize; // read before `cfg` moves into the struct
+        let model_topk = cfg.topk.max(1) as usize; // likewise
         let mut model = Model {
             route_hist_epoch: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -1724,6 +1894,7 @@ impl Model {
             ecache,
             route_hist,
             predictor: PredictSource::default(),
+            predict_eval: predict_eval_init(model_topk),
             prefetch_policy: PrefetchPolicy::from_env(),
             prefetch_tuner: prefetch_tuner_init(),
             prefetch,
@@ -1770,6 +1941,27 @@ impl Model {
         // profile-guided artifact bundling all of the above; applied last so a
         // plan wins over the standalone files.
         model.try_load_plan(dir);
+        // Wire the trunk (`COLI_MLOCK=1`). Here specifically, and the position is the
+        // feature: every resident weight is loaded by now, and the warm cache has not
+        // filled yet, so `mlockall(MCL_CURRENT)` pins exactly the part that must never
+        // be paged out and leaves the part that is *supposed* to be reclaimable alone.
+        // Reported rather than silent — a refusal is the normal outcome on a desktop
+        // `RLIMIT_MEMLOCK`, and an operator who asked for wiring needs to know they
+        // did not get it.
+        match peregrine_io::wire_resident() {
+            peregrine_io::Wired::Skipped => {}
+            peregrine_io::Wired::Locked { bytes } => {
+                eprintln!("peregrine: [mlock] trunk wired, {:.1} GB resident and unswappable", bytes as f64 / 1e9);
+            }
+            peregrine_io::Wired::Refused { errno, limit } => {
+                let lim = if limit == u64::MAX { "unlimited".to_string() } else { format!("{:.1} MB", limit as f64 / 1e6) };
+                eprintln!(
+                    "peregrine: [mlock] COLI_MLOCK=1 but the kernel refused (errno {errno}, RLIMIT_MEMLOCK {lim}) \
+                     — running unwired. Raise it with `ulimit -l unlimited` or grant CAP_IPC_LOCK; \
+                     nothing else changes, the trunk is just page-out-eligible again."
+                );
+            }
+        }
         Ok(model)
     }
 
@@ -2869,7 +3061,7 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, stream_experts, direct, io_reactors, ecache, route_hist, predictor, prefetch, gpu, heat, lane_timings, layout_schedule, absorb, dsa, ..
+                cfg, layers, kv, st, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, lane_timings, layout_schedule, absorb, dsa, ..
             } = self;
             let ctx = ForwardCtx {
                 st,
@@ -2925,16 +3117,42 @@ impl Model {
             // layer's readers are busy continuously, so a speculative read does not
             // move a read into idle time, it moves it in front of another read.
             let la_width = if router_lookahead() && s_n == 1 { router_lookahead_width() } else { 0 };
+            // Built independently of `pfc`, not from it: the two are separate
+            // features with separate knobs, and one asks the routing history while
+            // the other asks the next layer's router. Deriving this from `pfc` would
+            // make `COLI_PREFETCH_LOOKAHEAD=0` silently disable the router look-ahead
+            // as well, which is not what that knob says it does.
+            let la = match (la_width > 0, prefetch.as_ref(), ecache.as_ref()) {
+                (true, Some(pool), Some(ec)) => {
+                    Some(LookaheadCtx { prefetch: pool.lane(0), cache: ec, gpu: gpu.as_ref(), st, cfg })
+                }
+                _ => None,
+            };
+            // The scoreboard rides the same decode-only rule, and on the same
+            // reasoning: a prefill chunk's "actual set" is a union over positions, so
+            // recall against it would not be the number any of these predictors is
+            // trying to hit.
+            let eval = (s_n == 1).then_some(predict_eval.as_ref()).flatten();
             let layers: &[LayerW] = layers;
             for (li, l) in layers.iter().enumerate() {
                 forward_layer(l, li, &mut kv[li], &ctx, &mut x, s_n, pos_base)?;
                 if let Some(pfc) = &pfc {
                     pfc.emit_layer(li);
-                    // Emitted here, after the layer's own reads have been consumed and
-                    // before the next layer's attention, because that gap is the whole
-                    // resource being spent. `x` is this layer's output, which is the
-                    // next layer's input.
-                    pfc.lookahead().emit(layers, li + 1, &x, la_width);
+                }
+                // Emitted here, after this layer's own reads have been consumed and
+                // before the next layer's attention, because that gap is the whole
+                // resource being spent. `x` is this layer's output, which is the next
+                // layer's input.
+                if let Some(la) = &la {
+                    la.emit(layers, li + 1, &x, la_width);
+                }
+                if let (Some(eval), Some(rh)) = (eval, route_hist.as_ref()) {
+                    // Score first, then predict. `forward_layer` has just pushed this
+                    // layer's authoritative set, so `latest(li)` is the answer to the
+                    // prediction stashed for `li` one layer ago — while `latest(li+1)`
+                    // is still the *previous token's* set there, which is exactly the
+                    // baseline arm.
+                    score_and_stash(eval, rh, predictor, layers, cfg, li, &x);
                 }
             }
         }
@@ -4341,6 +4559,57 @@ mod tests {
     }
 
     #[test]
+    fn batched_decode_is_absorb_whatever_the_knob_says() -> Result<(), peregrine_core::Error> {
+        // **A documented opt-in knob that the serving path ignores.**
+        // `COLI_MLA_ABSORB` is described as off by default, and `forward_step` /
+        // `forward_prefill_seq` honour that. `forward_step_batched` does not:
+        // it goes through `mla_attention_batched`, which is absorb-only because
+        // the dense core reconstructs `[k_nope|v]` against *one* cache and B
+        // sequences have B of them. So over HTTP, a request's prefill runs the
+        // dense core and every one of its decode tokens runs absorption — two
+        // cores that are algebraically equal but not numerically identical.
+        //
+        // This is pinned rather than left implicit in the code's shape. It is a
+        // real difference in served output, and the repo has twice been bitten
+        // by a claim that outlived the code it described.
+        let dir = tmp_model_dir("batched_absorb")?;
+        let mut m = Model::load(&dir)?;
+        assert!(!m.absorb, "the default must still be dense");
+        let prompt = [1i32, 5, 9];
+        let pos = prompt.len();
+
+        // Three identically prefilled sequences, all through the dense path, so
+        // the only thing that varies below is the decode step.
+        let prefilled = || -> Result<SeqKv, peregrine_core::Error> {
+            let mut sk = SeqKv::new(&m.cfg);
+            m.forward_prefill_seq(&prompt, &mut sk, 0)?;
+            Ok(sk)
+        };
+        let (mut a, mut b, mut c) = (prefilled()?, prefilled()?, prefilled()?);
+
+        // The single-sequence decode, which *does* honour the knob: dense.
+        let dense = m.forward_prefill_seq(&[4], &mut c, pos)?;
+        // The batched decode with the knob off.
+        let mut one: [&mut SeqKv; 1] = [&mut a];
+        let batched_off = m.forward_step_batched(&[4], &mut one, &[pos], None)?;
+        // …and with the knob on.
+        m.absorb = true;
+        let mut one: [&mut SeqKv; 1] = [&mut b];
+        let batched_on = m.forward_step_batched(&[4], &mut one, &[pos], None)?;
+
+        assert!(
+            batched_off.iter().zip(&batched_on).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "COLI_MLA_ABSORB does not reach the batched decode path"
+        );
+        assert!(
+            dense.iter().zip(&batched_off).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "…and what it runs instead is not the dense core either"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn batched_decode_matches_per_sequence() -> Result<(), peregrine_core::Error> {
         // Three sequences prefilled to different lengths, then one batched decode
         // step. Row s of the batched step must equal decoding sequence s alone
@@ -4378,6 +4647,170 @@ mod tests {
         for z in 0..3 * vocab {
             assert!((ref_logits[z] - bat[z]).abs() < 1e-4, "z={z} ref={} bat={}", ref_logits[z], bat[z]);
         }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn router_lookahead_cannot_move_a_token() -> Result<(), peregrine_core::Error> {
+        // The property that makes the look-ahead shippable on by default: it is a
+        // scheduling change and nothing else. Layer L+1's router is run early to
+        // decide what to *read*; the authoritative router still runs at L+1 and still
+        // decides what is *computed*. So a streamed model — which has the prefetch
+        // lane and therefore the look-ahead — must decode bit-identically to a
+        // resident one, which has neither.
+        let dir = tmp_model_dir("lookahead_exact")?;
+        let mut streamed = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        let mut resident = Model::load_streaming(&dir, false)?;
+        assert!(streamed.lookahead_ctx().is_some(), "the streamed model must have a look-ahead to test");
+        assert!(resident.lookahead_ctx().is_none(), "the resident model is the control: no lane, no look-ahead");
+
+        let issued_before = lookahead_issued();
+        let prompt = [3i32, 7, 1, 4];
+        assert_eq!(streamed.forward_step(&prompt, 0)?, resident.forward_step(&prompt, 0)?, "prefill diverged");
+        // Decode steps are what exercise it: the look-ahead is `s_n == 1` only.
+        for (i, tok) in [5i32, 2, 9, 6].iter().enumerate() {
+            let pos = prompt.len() + i;
+            let a = streamed.forward_step(&[*tok], pos)?;
+            let b = resident.forward_step(&[*tok], pos)?;
+            assert_eq!(a, b, "decode step {i} diverged — the look-ahead moved a token");
+        }
+        // Smoke signal that the emit path ran at all, so the identity above is not
+        // vacuously true of a look-ahead that never fired. The counter is
+        // process-global and monotonic, so a parallel test can only inflate it —
+        // this can false-pass, never false-fail. `rank` is pinned precisely by the
+        // two tests below; this pins that `emit` reaches it from a real forward.
+        assert!(
+            lookahead_issued() > issued_before,
+            "no speculative read was issued across four decode steps of a sparse model"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn router_lookahead_ranks_by_the_next_layers_router() -> Result<(), peregrine_core::Error> {
+        // The look-ahead's candidates must be layer L+1's router's own ranking of the
+        // hidden state — not layer L's, which is the thing every history-based
+        // predictor is stuck approximating. Asserting against `route` on the same
+        // input is what distinguishes "asked the router" from "asked a statistic".
+        let dir = tmp_model_dir("lookahead_ranks")?;
+        let m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        let d = m.cfg.hidden as usize;
+        let next = m.cfg.first_dense as usize; // the first sparse layer
+        assert!(m.layers[next].sparse, "fixture must have a sparse layer to rank");
+        let x: Vec<f32> = (0..d).map(|i| ((i * 13 + 5) as f32 * 0.07).sin()).collect();
+
+        let ranks = router_ranks_for(&m.layers[next], &m.cfg, &x, m.cfg.topk as usize);
+        // The oracle: normalize with that layer's post-attention norm, then route.
+        let nrm = rmsnorm_rows(&x, &m.layers[next].post_ln, 1, d, m.cfg.eps);
+        let routed = crate::router::route(
+            &nrm,
+            &m.layers[next].router,
+            &m.layers[next].router_bias,
+            crate::router::RouterCfg {
+                s_n: 1,
+                d_n: d,
+                e_n: m.cfg.n_experts as usize,
+                k: m.cfg.topk as usize,
+                norm_topk: m.cfg.norm_topk,
+                routed_scale: m.cfg.routed_scale,
+                min_share: 0.0,
+            },
+        );
+        assert_eq!(ranks, routed.idx, "look-ahead must rank exactly as that layer's router does");
+        // A short hidden state is refused rather than read out of bounds — the
+        // look-ahead is advisory and must degrade, never panic.
+        assert!(router_ranks_for(&m.layers[next], &m.cfg, &x[..2], 4).is_empty());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn router_lookahead_spends_its_window_on_experts_that_need_a_read() -> Result<(), peregrine_core::Error> {
+        // Filtering happens *after* ranking, and the window slides rather than
+        // shrinks: a candidate that is right but already warm costs no read, so it
+        // must not consume one of the `width` slots. Get that backwards and a warm
+        // cache silently narrows the look-ahead to nothing exactly when it is working.
+        let dir = tmp_model_dir("lookahead_window")?;
+        let m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        let la = m.lookahead_ctx().ok_or_else(|| Error::Format("streamed model has a look-ahead".into()))?;
+        let cache = m.ecache.as_ref().ok_or_else(|| Error::Format("streamed model has a warm cache".into()))?;
+        let d = m.cfg.hidden as usize;
+        let next = m.cfg.first_dense as usize;
+        let x: Vec<f32> = (0..d).map(|i| ((i * 13 + 5) as f32 * 0.07).sin()).collect();
+        let ranked = router_ranks_for(&m.layers[next], &m.cfg, &x, m.cfg.n_experts as usize);
+        assert_eq!(la.rank(&m.layers[next], next, &x, 1), vec![ranked[0]], "a cold cache takes the top rank");
+
+        let warm = |e: i32| {
+            let region = || (peregrine_io::Bytes::from(vec![0u8; 8]), peregrine_io::Bytes::from(vec![0u8; 4]));
+            cache.lock().insert((next as u32, e as u32), [region(), region(), region()]);
+        };
+        // Warm the top-ranked candidate: the one slot must slide to rank 2, not go
+        // unused. The scan reaches `max(width, topk)` ranks, so the slide stays
+        // inside the width of a real routing decision.
+        warm(ranked[0]);
+        assert_eq!(la.rank(&m.layers[next], next, &x, 1), vec![ranked[1]], "the freed slot slides down the ranking");
+
+        // Warm the whole scanned prefix and the look-ahead has nothing left to do.
+        // It must issue *nothing* rather than reach past the routing width for a
+        // candidate the layer is unlikely to route at all — a wrong speculative read
+        // displaces a needed one, so silence is the correct output here.
+        for &e in ranked.iter().take(m.cfg.topk as usize) {
+            warm(e);
+        }
+        assert!(la.rank(&m.layers[next], next, &x, 1).is_empty(), "a fully warm prefix issues no read");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_router_lookahead_does_not_depend_on_routing_history() -> Result<(), peregrine_core::Error> {
+        // The structural claim in `LookaheadCtx`'s doc: it reads the next layer's
+        // routing off that layer's own weights, so unlike every predictor in
+        // `predict.rs` it needs no history and is useful on the first token of a cold
+        // process. A `LookaheadCtx` that could not be built without a `RouteHistory`
+        // would quietly reintroduce the dependency it exists to avoid.
+        let dir = tmp_model_dir("lookahead_no_history")?;
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        m.route_hist = None;
+        let la = m.lookahead_ctx().ok_or_else(|| Error::Format("look-ahead without history".into()))?;
+        let d = m.cfg.hidden as usize;
+        let next = m.cfg.first_dense as usize;
+        let x: Vec<f32> = (0..d).map(|i| ((i * 3 + 1) as f32 * 0.11).cos()).collect();
+        assert!(!la.rank(&m.layers[next], next, &x, 2).is_empty(), "a cold process still gets a ranking");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn predict_eval_scores_every_arm_over_a_decode() -> Result<(), peregrine_core::Error> {
+        // End-to-end wiring for the scoreboard, set directly rather than through
+        // `COLI_PREDICT_EVAL` because the env knob is read once per process and the
+        // test suite shares one.
+        let dir = tmp_model_dir("predict_eval")?;
+        let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        m.predict_eval = Some(Mutex::new(crate::predeval::PredictEval::new(2, &PREDICT_EVAL_ARMS)));
+        m.forward_step(&[3, 7, 1, 4], 0)?;
+        assert!(m.predict_eval_report().is_none(), "prefill is not scored — its actual set is a union");
+        for (i, tok) in [5i32, 2, 9].iter().enumerate() {
+            m.forward_step(&[*tok], 4 + i)?;
+        }
+        let (arms, layers) = m
+            .predict_eval_report()
+            .ok_or_else(|| Error::Format("decode steps score layer transitions".into()))?;
+        assert_eq!(arms.len(), PREDICT_EVAL_ARMS.len());
+        assert!(layers > 0, "at least one transition scored");
+        for (a, name) in arms.iter().zip(PREDICT_EVAL_ARMS) {
+            assert_eq!(a.name, name, "arm order must match the stash order");
+            assert!((0.0..=1.0).contains(&a.recall), "{name} recall out of range: {}", a.recall);
+            assert!((0.0..=1.0).contains(&a.precision), "{name} precision out of range: {}", a.precision);
+            assert_eq!(a.precision_at.len(), 2, "one precision figure per scored rank");
+        }
+        // The look-ahead needs no routing history, so it is never silent — that is
+        // the structural advantage over both history-based arms, and it shows up on
+        // the very first decode step of a cold process.
+        assert_eq!(arms[0].silent, 0, "the router look-ahead always has an answer");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

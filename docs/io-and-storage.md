@@ -128,6 +128,43 @@ One shared zstd codec threads through both storage levels:
 - **Malloc arenas**: both binaries call `cap_malloc_arenas()` at startup
   (`M_ARENA_MAX=2`); setting `MALLOC_ARENA_MAX` yourself or `COLI_NO_ARENA_CAP`
   makes it a no-op.
+- **Trunk wiring** (`COLI_MLOCK=1`, `wire_resident`): `mlockall(MCL_CURRENT)`
+  called from `Model::load` *after* the resident weights are in and *before* the
+  warm cache fills, so it pins the trunk and leaves every later allocation —
+  cache slabs, KV, streaming buffers — ordinary reclaimable memory.
+
+  `MCL_CURRENT` and deliberately not `MCL_FUTURE`. That asymmetry is the whole
+  design: a streaming MoE engine lives with a large resident trunk and a cache
+  sized to the remainder, which is exactly the shape that invites the kernel to
+  reclaim trunk pages to grow the page cache — and every reclaimed trunk page is
+  re-read at disk speed in the middle of a token. The cache is *supposed* to be
+  the part the kernel can take back; wiring it too would turn a gentle slowdown
+  into an allocation failure.
+
+  **It does not raise the memory ceiling, it removes variance.** A model that did
+  not fit still does not fit — it now fails honestly instead of swapping, which is
+  the better of the two. Needs `RLIMIT_MEMLOCK` headroom (`ulimit -l unlimited`,
+  or `CAP_IPC_LOCK`); refusal is the normal outcome on a desktop default and is
+  reported with the limit and the fix rather than failing the load. Note the
+  interaction with `COLI_REGBUF_SLOTS`, which charges pinned pages against the
+  same limit.
+
+## Memory budgeting
+
+`mem_available_bytes` is the smaller of `/proc/meminfo` `MemAvailable` and what
+the process's cgroup permits (v2 `memory.max` − `memory.current`, else v1
+`limit_in_bytes` − `usage_in_bytes`; unlimited sentinels are recognized by
+magnitude and defer to the host figure).
+
+`/proc/meminfo` is **not namespaced**, so inside a container it reports the host.
+A 4 GB container on a 512 GB host would otherwise read 512 GB of headroom, size
+its warm cache for hardware it is not running on, and be OOM-killed by the cgroup
+while `[ram]` printed a comfortable projection. The parsing is pure and
+unit-tested (`ram.rs`); the projection itself is unchanged.
+
+See also the [expert-cache cliff](prefetch-and-caching.md#borrowed-negative-results):
+a cache that fits by this arithmetic can still be too large, because `MemAvailable`
+counts reclaimable page cache. `cache_cliff_warning` says so at load.
 
 ## Topology, sensors, perf (`topo.rs`, `sensors.rs`, `perf.rs`)
 

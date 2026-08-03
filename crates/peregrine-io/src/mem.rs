@@ -132,6 +132,91 @@ pub fn advise_dontneed_slice(slice: &mut [u8]) -> bool {
     unsafe { advise_dontneed(slice.as_mut_ptr(), len) }
 }
 
+/// What [`wire_resident`] did, so a caller can report it honestly rather than
+/// claiming a guarantee the kernel did not give.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wired {
+    /// Not asked for (`COLI_MLOCK` unset), or not Linux.
+    Skipped,
+    /// The resident set is wired. `bytes` is `VmLck` read back from
+    /// `/proc/self/status` — the kernel's number, not ours.
+    Locked { bytes: u64 },
+    /// The kernel refused. `limit` is the `RLIMIT_MEMLOCK` soft limit, because
+    /// that is almost always the reason and the message is useless without it.
+    Refused { errno: i32, limit: u64 },
+}
+
+/// Wire the process's *current* resident pages into RAM (`mlockall(MCL_CURRENT)`),
+/// so the kernel cannot page out the model trunk under later memory pressure.
+///
+/// **This does not raise the memory ceiling; it removes variance.** A streaming MoE
+/// engine spends its life with a large resident trunk and a cache sized to whatever
+/// is left, which is precisely the shape that invites the kernel to reclaim trunk
+/// pages to grow the page cache — and every reclaimed trunk page is re-read on the
+/// next token, at disk speed, in the middle of the critical path. Wiring the trunk
+/// makes that impossible. It cannot make a model that does not fit, fit; a machine
+/// that was going to swap will now fail honestly instead, which is the better of the
+/// two outcomes.
+///
+/// **`MCL_CURRENT` and deliberately not `MCL_FUTURE`.** Called after the resident
+/// weights are loaded and before the warm cache fills, it wires the trunk and leaves
+/// every later allocation — cache slabs, KV, streaming buffers — ordinary reclaimable
+/// memory. That asymmetry is the entire point: the cache is *supposed* to be the part
+/// the kernel can take back. `MCL_FUTURE` would wire the cache too and convert a
+/// gentle slowdown into an allocation failure.
+///
+/// Opt-in via `COLI_MLOCK=1`, because it needs `RLIMIT_MEMLOCK` headroom that most
+/// desktop defaults do not grant. Best-effort: a refusal is reported, never fatal.
+pub fn wire_resident() -> Wired {
+    if !matches!(std::env::var("COLI_MLOCK").as_deref(), Ok("1") | Ok("true")) {
+        return Wired::Skipped;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `mlockall` takes no pointers and mutates no process memory; it
+        // only changes the paging policy of the existing address space.
+        let rc = unsafe { libc::mlockall(libc::MCL_CURRENT) };
+        if rc == 0 {
+            return Wired::Locked { bytes: vm_locked_bytes().unwrap_or(0) };
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        Wired::Refused { errno, limit: memlock_limit() }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Wired::Skipped
+    }
+}
+
+/// `VmLck` from `/proc/self/status`, in bytes — how much the kernel says is wired.
+/// Read back rather than assumed, because `mlockall` succeeding does not by itself
+/// say how much it locked.
+#[cfg(target_os = "linux")]
+fn vm_locked_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmLck:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// The `RLIMIT_MEMLOCK` soft limit in bytes, `u64::MAX` for unlimited.
+#[cfg(target_os = "linux")]
+fn memlock_limit() -> u64 {
+    // SAFETY: `getrlimit` writes into the provided, fully-owned struct.
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) == 0 {
+            rl.rlim_cur as u64
+        } else {
+            0
+        }
+    }
+}
+
 /// Pin the *current* thread to a single logical CPU. Best-effort: returns
 /// `true` on kernel-accepted binding, `false` on rejection / non-Linux. No-op
 /// when `COLI_NUMA_PIN=0`.
@@ -281,6 +366,28 @@ mod tests {
         // SAFETY: null / zero-len are the documented no-op cases.
         assert!(!unsafe { advise_hugepages(std::ptr::null_mut(), 0) });
         assert!(!unsafe { advise_dontneed(std::ptr::null_mut(), 100) });
+    }
+
+    #[test]
+    fn wiring_is_opt_in_and_never_fatal() {
+        // Unset (the default) must be `Skipped`, not an attempt: `mlockall` on a
+        // desktop `RLIMIT_MEMLOCK` typically fails, and a failure on a path nobody
+        // asked for would be noise at best.
+        std::env::remove_var("COLI_MLOCK");
+        assert_eq!(wire_resident(), Wired::Skipped);
+        // Asked for: whatever the kernel says, the call returns rather than aborts.
+        // Both outcomes are legitimate here — CI containers usually refuse — so the
+        // assertion is on the shape, which is the contract callers depend on.
+        std::env::set_var("COLI_MLOCK", "1");
+        let w = wire_resident();
+        std::env::remove_var("COLI_MLOCK");
+        #[cfg(target_os = "linux")]
+        assert!(
+            matches!(w, Wired::Locked { .. } | Wired::Refused { .. }),
+            "COLI_MLOCK=1 on Linux must attempt the lock, got {w:?}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(w, Wired::Skipped, "there is no mlockall to attempt off Linux");
     }
 
     #[test]
