@@ -56,6 +56,12 @@ impl KvDtype {
     }
 }
 
+/// Rows a growing KV buffer reserves at a time once it is longer than this.
+/// Below it the buffer still doubles, so short sequences keep the allocation
+/// pattern they had; above it the unused tail is bounded by this rather than by
+/// the sequence length. See [`KvBuf::reserve_for`].
+const KV_GROW_ROWS: usize = 256;
+
 /// Stored latents in whichever element type the cache was created with.
 #[derive(Clone)]
 enum KvBuf {
@@ -90,9 +96,49 @@ impl KvBuf {
     }
 
     fn push(&mut self, row: &[f32]) {
+        self.reserve_for(row.len());
         match self {
             KvBuf::F32(v) => v.extend_from_slice(row),
             KvBuf::F16(v) => v.extend(row.iter().map(|&x| f32_to_f16(x))),
+        }
+    }
+
+    /// Make room for one more row of `width`, growing by a **bounded** amount.
+    ///
+    /// `Vec` doubles, so a cache grown one position at a time ends up holding
+    /// as much as 2× the capacity it uses. That is not a rounding error at
+    /// GLM-5.2's 175.5 KiB/token: a 32-sequence batch of 4 k-token contexts
+    /// uses ~23 GB of KV and can have ~46 GB allocated for it. Doubling below
+    /// [`KV_GROW_ROWS`] and adding a fixed block above it caps the overshoot at
+    /// `min(len, KV_GROW_ROWS)` rows instead of `len`, which costs one extra
+    /// reallocation per block and nothing else.
+    ///
+    /// This is the tractable part of block-pooled KV. It does not pool across
+    /// sequences — a finished sequence's blocks still return to the allocator
+    /// rather than to the next admission.
+    fn reserve_for(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+        let (len, cap) = match self {
+            KvBuf::F32(v) => (v.len(), v.capacity()),
+            KvBuf::F16(v) => (v.len(), v.capacity()),
+        };
+        if cap - len >= width {
+            return;
+        }
+        let grow = width * (len / width).clamp(1, KV_GROW_ROWS);
+        match self {
+            KvBuf::F32(v) => v.reserve_exact(grow),
+            KvBuf::F16(v) => v.reserve_exact(grow),
+        }
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        match self {
+            KvBuf::F32(v) => v.capacity(),
+            KvBuf::F16(v) => v.capacity(),
         }
     }
 
@@ -467,6 +513,14 @@ impl LayerKv {
         if key.len() == self.ix_width {
             self.ix.push(key);
         }
+    }
+
+    /// Unused capacity across all three streams, in rows — the allocated-but-
+    /// unwritten tail that [`KvBuf::reserve_for`] bounds.
+    #[cfg(test)]
+    fn slack_rows(&self) -> usize {
+        let own = |b: &KvBuf, w: usize| (b.capacity() - b.elems()).checked_div(w).unwrap_or(0);
+        own(&self.lc, self.kv_lora).min(own(&self.rc, self.qk_rope))
     }
 
     /// The whole cache as an attention view.
@@ -1516,6 +1570,49 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn kv_growth_overshoot_is_bounded_by_a_block_not_by_the_sequence() {
+        // `Vec` doubles, so a cache grown one position at a time can hold ~2× the
+        // capacity it uses — at GLM-5.2's 175.5 KiB/token that is ~23 GB of KV
+        // in a 32×4k batch sitting in ~46 GB of allocation. The fix has to hold
+        // at *both* ends: short sequences must not pay a fixed block, and long
+        // ones must not pay a proportional one.
+        let (kvl, qkr) = (8usize, 4usize);
+        let (lc, rc) = (vec![0.5f32; kvl], vec![0.25f32; qkr]);
+
+        // Short: still doubling, so the slack stays proportional and small in
+        // absolute terms — no fixed KV_GROW_ROWS block charged to a 10-token
+        // sequence.
+        let mut short = LayerKv::new(kvl, qkr);
+        for p in 0..10 {
+            assert!(short.append(p, &lc, &rc).is_ok());
+        }
+        assert!(short.slack_rows() < KV_GROW_ROWS, "a 10-row cache must not reserve a whole block");
+
+        // Long: past the block size the slack stops tracking the length.
+        let mut long = LayerKv::new(kvl, qkr);
+        let n = KV_GROW_ROWS * 4;
+        for p in 0..n {
+            assert!(long.append(p, &lc, &rc).is_ok());
+        }
+        assert_eq!(long.len(), n);
+        assert!(
+            long.slack_rows() <= KV_GROW_ROWS,
+            "slack {} exceeds one block at {n} rows — growth is still proportional",
+            long.slack_rows()
+        );
+        // …and that is a real saving, not a restatement: doubling would leave
+        // up to `n` rows of slack, which this is far below.
+        assert!(long.slack_rows() * 4 < n, "capping the growth must actually cap it");
+
+        // Rows are unharmed by the reservation strategy.
+        let span = long.lc_span(n);
+        assert_eq!(span.rows(kvl), n);
+        for t in [0usize, 1, KV_GROW_ROWS, n - 1] {
+            assert_eq!(span.dot_row(t, kvl, &vec![1.0f32; kvl]), 0.5 * kvl as f32, "row {t}");
+        }
     }
 
     #[test]

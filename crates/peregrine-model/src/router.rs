@@ -392,6 +392,70 @@ pub fn routed_at(r: &Routed, s: usize) -> Vec<i32> {
     (0..r.keff[s] as usize).map(|kk| r.idx[s * r.k + kk]).collect()
 }
 
+/// The router's own ranking of the top `n` experts for a **single** position — the
+/// selection order [`route`] would produce, and nothing else.
+///
+/// This exists for the router look-ahead ([`crate::model`]), which runs layer `L+1`'s
+/// router against layer `L`'s output to learn which experts that layer is *about* to
+/// want. Prediction needs the ranking; it does not need gate weights, `norm_topk`
+/// renormalization, `routed_scale`, or the negligible-tail truncation, so none of
+/// that is computed.
+///
+/// It deliberately does **not** touch the `COLI_GATE_STATS` accumulators. Those tally
+/// the *authoritative* routing decisions, and a speculative call folded into them
+/// would silently double-count every layer — the same reason a speculative read is
+/// not counted as a cache miss.
+///
+/// Ranking is by the bias-augmented `choice`, ties to the lowest index, exactly as in
+/// `route`'s selection loop: this must be the router's order, not an approximation of
+/// it, or the rank-precision profile the look-ahead's width is chosen from would not
+/// describe the thing being measured.
+///
+/// Returns at most `n` ids; fewer only when the row is degenerate (all-NaN logits
+/// select nothing, as in `route`).
+pub fn route_ranks(x: &[f32], router_w: &[f32], router_bias: &[f32], d_n: usize, e_n: usize, n: usize) -> Vec<i32> {
+    let n = n.min(e_n);
+    if n == 0 || x.len() < d_n || router_bias.len() < e_n || router_w.len() < d_n * e_n {
+        return Vec::new();
+    }
+    let mut logits = vec![0f32; e_n];
+    // Single row, so the decode split in `route` is the only shape that applies:
+    // parallelize across experts, each output element keeping its own left-to-right
+    // accumulation so the logits are bit-identical to the serial kernel.
+    if d_n.saturating_mul(e_n) < (1 << 20) {
+        matmul_f32(&mut logits, x, router_w, 1, d_n, e_n);
+    } else {
+        peregrine_par::par_chunks_mut(&mut logits, 1, e_n, peregrine_par::PAR_MATMUL_MIN, |start, end, chunk| {
+            matmul_f32(chunk, x, &router_w[start * d_n..end * d_n], 1, d_n, end - start);
+        });
+    }
+    let mut choice = vec![0f32; e_n];
+    for e in 0..e_n {
+        choice[e] = sigmoidf(logits[e]) + router_bias[e];
+    }
+    let mut out: Vec<i32> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut best = -1i32;
+        let mut bv = f32::NEG_INFINITY;
+        for (e, &c) in choice.iter().enumerate().take(e_n) {
+            if out.contains(&(e as i32)) {
+                continue;
+            }
+            if c > bv {
+                bv = c;
+                best = e as i32;
+            }
+        }
+        // Degenerate row (every candidate NaN): stop rather than emit a `-1` that
+        // would index out of bounds downstream.
+        if best < 0 {
+            break;
+        }
+        out.push(best);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +523,78 @@ mod tests {
         let sum_off: f32 = off.w[..off.keff[0] as usize].iter().sum();
         assert!((sum_on - 2.5).abs() < 1e-5, "kept mass must still be routed_scale, got {sum_on}");
         assert!((sum_off - 2.5).abs() < 1e-5, "baseline sums to routed_scale, got {sum_off}");
+    }
+
+    /// A deterministic pseudo-random router, so the ranking under test has a
+    /// non-trivial order rather than the identity permutation.
+    fn synth_router(d_n: usize, e_n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut s = 0x9E37_79B9u32;
+        let mut next = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 8) as f32 / (1 << 24) as f32) - 0.5
+        };
+        let x: Vec<f32> = (0..d_n).map(|_| next()).collect();
+        let w: Vec<f32> = (0..d_n * e_n).map(|_| next()).collect();
+        let bias: Vec<f32> = (0..e_n).map(|_| next() * 0.25).collect();
+        (x, w, bias)
+    }
+
+    #[test]
+    fn route_ranks_is_the_routers_own_selection_order() {
+        // The look-ahead's whole claim is that it asks the router rather than a
+        // statistic over the router's past answers. If this prefix ever diverged
+        // from `route`, the measured rank-precision profile would describe a
+        // different predictor than the one shipping.
+        let (d_n, e_n, k) = (32usize, 64usize, 8usize);
+        let (x, w, bias) = synth_router(d_n, e_n);
+        let full = route(
+            &x,
+            &w,
+            &bias,
+            RouterCfg { s_n: 1, d_n, e_n, k, norm_topk: true, routed_scale: 2.5, min_share: 0.0 },
+        );
+        let ranks = route_ranks(&x, &w, &bias, d_n, e_n, k);
+        assert_eq!(ranks, full.idx[..k], "look-ahead ranking must be the router's selection order");
+        // A prefix request is the same prefix, not a re-ranking.
+        assert_eq!(route_ranks(&x, &w, &bias, d_n, e_n, 3), full.idx[..3]);
+    }
+
+    #[test]
+    fn route_ranks_is_bounded_and_refuses_a_malformed_call() {
+        let (d_n, e_n) = (8usize, 16usize);
+        let (x, w, bias) = synth_router(d_n, e_n);
+        assert_eq!(route_ranks(&x, &w, &bias, d_n, e_n, 99).len(), e_n, "clamped to the expert count");
+        assert!(route_ranks(&x, &w, &bias, d_n, e_n, 0).is_empty());
+        // Short tensors return empty rather than indexing out of bounds — the
+        // look-ahead is advisory, so a malformed call must degrade, not panic.
+        assert!(route_ranks(&x[..2], &w, &bias, d_n, e_n, 4).is_empty());
+        assert!(route_ranks(&x, &w[..4], &bias, d_n, e_n, 4).is_empty());
+        assert!(route_ranks(&x, &w, &bias[..2], d_n, e_n, 4).is_empty());
+    }
+
+    #[test]
+    fn route_ranks_leaves_the_gate_accumulators_alone() {
+        // Speculation must not be tallied as an authoritative routing decision,
+        // for the same reason a speculative read is not a cache miss. (Under the
+        // default `COLI_GATE_STATS` off, both reads are `None`; the assertion is
+        // that the call is not what changes that.)
+        let (d_n, e_n) = (8usize, 16usize);
+        let (x, w, bias) = synth_router(d_n, e_n);
+        let before = gate_stats_snapshot();
+        let _ = route_ranks(&x, &w, &bias, d_n, e_n, 6);
+        assert_eq!(before, gate_stats_snapshot());
+    }
+
+    #[test]
+    fn route_ranks_survives_an_all_nan_row() {
+        let e_n = 4usize;
+        let x = vec![f32::NAN; 2];
+        let w = vec![1.0f32; 2 * e_n];
+        let bias = vec![0.0f32; e_n];
+        // `NaN > x` is false, so nothing is ever "best" — `route` records a short
+        // `keff` there and this must likewise come back short, never with a `-1`.
+        let ranks = route_ranks(&x, &w, &bias, 2, e_n, 3);
+        assert!(ranks.is_empty(), "degenerate row selects nothing, got {ranks:?}");
     }
 
     #[test]
