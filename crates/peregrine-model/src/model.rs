@@ -3337,6 +3337,11 @@ impl Model {
     /// `speculative_rows_emit_exactly_what_greedy_would` asserts it against a
     /// real greedy decode, with deliberately wrong drafts mixed in.
     ///
+    /// Returns the per-sequence results and the **pre-final-norm hidden states**
+    /// `[B, hidden]` at each sequence's accepted position — everything the next
+    /// round needs, from one forward. `mtp_draft` takes `&self`, so those
+    /// drafts can then run without serialising on a borrow.
+    ///
     /// Each sequence's KV is rewound to its committed length before returning,
     /// so a rejected draft leaves no trace. At temperature > 0 this is
     /// distribution-preserving rather than sequence-identical; that path is
@@ -3347,7 +3352,7 @@ impl Model {
         drafts: &[Vec<i32>],
         seqs: &mut [&mut SeqKv],
         pos_of: &[usize],
-    ) -> Result<Vec<Verified>, Error> {
+    ) -> Result<(Vec<Verified>, Vec<f32>), Error> {
         let b = next_of.len();
         if drafts.len() != b || seqs.len() != b || pos_of.len() != b {
             return Err(Error::Format(format!(
@@ -3373,7 +3378,12 @@ impl Model {
                 rows_pos.push(pos_of[s] + 1 + j);
             }
         }
-        let logits = self.forward_rows_batched(&tokens, &owner, seqs, &rows_pos, None)?;
+        // The hidden form, because the next round's draft starts from the
+        // hidden at the accepted position — and this forward already computed
+        // it. Recovering it with a second pass would hand back the speedup.
+        let (logits, hidden) = self.forward_rows_batched_hidden(&tokens, &owner, seqs, &rows_pos, None)?;
+        let d = self.cfg.hidden as usize;
+        let mut hlast = Vec::with_capacity(b * d);
 
         let vocab = self.cfg.vocab as usize;
         let mut out = Vec::with_capacity(b);
@@ -3401,9 +3411,33 @@ impl Model {
             // Rewind the speculated tail. Committed is `next_of` plus `k`
             // accepted drafts; anything beyond it was never real.
             seqs[s].truncate(pos_of[s] + 1 + k);
+            // Row `base + k` is the one whose logits produced `next`, so its
+            // hidden is what the next draft continues from.
+            let h = (base + k) * d;
+            hlast.extend_from_slice(hidden.get(h..h + d).unwrap_or(&[]));
             out.push(Verified { tokens: confirmed, next, accepted: k });
         }
-        Ok(out)
+        Ok((out, hlast))
+    }
+
+    /// [`Self::forward_rows_batched`], also returning the **pre-final-norm**
+    /// hidden states `[s_n, hidden]`.
+    ///
+    /// The MTP head drafts from that hidden, not from logits, so a batched
+    /// speculative loop cannot be built on the logits-only form without
+    /// re-running the stack to recover what this forward already computed.
+    /// Pre-final-norm specifically: `mtp_draft` applies `final_norm` itself on
+    /// its first step, so handing it a normalised hidden would norm it twice
+    /// and quietly degrade every draft.
+    pub fn forward_rows_batched_hidden(
+        &self,
+        tokens: &[i32],
+        owner: &[usize],
+        seqs: &mut [&mut SeqKv],
+        pos_of: &[usize],
+        histories: Option<&[&Mutex<RouteHistory>]>,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        self.forward_rows_inner(tokens, owner, seqs, pos_of, histories)
     }
 
     /// One batched forward over arbitrary **(token, sequence) rows**: `owner[r]`
@@ -3433,6 +3467,18 @@ impl Model {
         pos_of: &[usize],
         histories: Option<&[&Mutex<RouteHistory>]>,
     ) -> Result<Vec<f32>, Error> {
+        Ok(self.forward_rows_inner(tokens, owner, seqs, pos_of, histories)?.0)
+    }
+
+    /// Shared body of the two forms above: `(logits, pre-final-norm hidden)`.
+    fn forward_rows_inner(
+        &self,
+        tokens: &[i32],
+        owner: &[usize],
+        seqs: &mut [&mut SeqKv],
+        pos_of: &[usize],
+        histories: Option<&[&Mutex<RouteHistory>]>,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
         let s_n = tokens.len();
         if owner.len() != s_n || pos_of.len() != s_n {
             return Err(Error::Format(format!(
@@ -3503,7 +3549,7 @@ impl Model {
         }
         self.publish_lane_timings();
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
-        Ok(self.lm_head.apply_vec(&xf, s_n))
+        Ok((self.lm_head.apply_vec(&xf, s_n), x))
     }
 
     /// Re-select the GPU tier's resident experts as the current hottest set (by
@@ -3598,7 +3644,12 @@ impl Model {
     /// the pre-final-norm hidden `hlast`. Uses a fresh local KV at relative
     /// positions (context flows through the hidden state), so it never touches the
     /// main KV. The drafts are only *guesses* — the caller verifies them.
-    fn mtp_draft(&mut self, next_tok: i32, g_draft: usize, hlast: &[f32]) -> Result<Vec<i32>, Error> {
+    /// Takes `&self`, not `&mut self`: the body only reads the model and builds
+    /// its own local `LayerKv`, so the `&mut` was incidental to the destructure.
+    /// That matters — the batching thread holds `&Model` while several
+    /// sequences draft, and a `&mut` here would have serialised them behind the
+    /// one borrow.
+    pub fn mtp_draft(&self, next_tok: i32, g_draft: usize, hlast: &[f32]) -> Result<Vec<i32>, Error> {
         let d = self.cfg.hidden as usize;
         let eps = self.cfg.eps;
         let vocab = self.cfg.vocab as usize;
@@ -4752,6 +4803,62 @@ mod tests {
     }
 
     #[test]
+    fn the_batched_forward_hands_back_the_hidden_a_draft_needs() -> Result<(), peregrine_core::Error> {
+        // A batched speculative loop needs two things from one forward: the
+        // logits to verify against, and the **pre-final-norm** hidden the MTP
+        // head drafts from. Without the second it would have to re-run the
+        // stack to recover what this forward already computed, which is the
+        // speedup.
+        //
+        // Pre-final-norm matters: `mtp_draft` applies `final_norm` itself on
+        // its first step. Handing it a normalised hidden would norm it twice —
+        // no error, no crash, just quietly worse drafts and a lower acceptance
+        // rate that would read as "MTP does not help here".
+        let dir = tmp_model_dir("rows_hidden")?;
+        let m = Model::load(&dir)?;
+        let (d, vocab) = (m.cfg.hidden as usize, m.cfg.vocab as usize);
+        let prompt = [1i32, 5, 9];
+        let mut sk = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&prompt, &mut sk, 0)?;
+        let tok = 7i32;
+        let pos = prompt.len();
+
+        // The logits-only form and the hidden form must agree bit for bit on
+        // the logits — one is a wrapper over the other, and a divergence would
+        // mean the speculative path verifies against different numbers than
+        // the plain decode path.
+        let mut a = sk.clone_prefix(pos);
+        let mut one: [&mut SeqKv; 1] = [&mut a];
+        let plain = m.forward_rows_batched(&[tok], &[0], &mut one, &[pos], None)?;
+        let mut b = sk.clone_prefix(pos);
+        let mut one: [&mut SeqKv; 1] = [&mut b];
+        let (with_h, hidden) = m.forward_rows_batched_hidden(&[tok], &[0], &mut one, &[pos], None)?;
+        assert_eq!(plain.len(), vocab);
+        assert!(plain.iter().zip(&with_h).all(|(p, q)| p.to_bits() == q.to_bits()), "the two forms must agree");
+        assert_eq!(hidden.len(), d, "one row of hidden per row of input");
+        assert!(hidden.iter().all(|v| v.is_finite()));
+
+        // It is genuinely pre-norm: applying `final_norm` changes it. If the
+        // forward had already normalised, this would be a no-op and the double
+        // norm would be invisible.
+        let normed = rmsnorm_rows(&hidden, &m.final_norm, 1, d, m.cfg.eps);
+        assert!(
+            hidden.iter().zip(&normed).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "the hidden must be pre-final-norm, or mtp_draft will norm it twice"
+        );
+
+        // And it is what the drafter accepts: `mtp_draft` takes `&self`, so
+        // several sequences can draft from one `&Model` without serialising.
+        if m.has_mtp() {
+            let draft = m.mtp_draft(tok, 2, &hidden)?;
+            assert_eq!(draft.len(), 2, "the head drafts to the requested depth");
+            assert!(draft.iter().all(|&t| t >= 0 && (t as usize) < vocab), "drafts must be real token ids");
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn speculative_rows_emit_exactly_what_greedy_would() -> Result<(), peregrine_core::Error> {
         // **The property speculation exists to preserve.** A draft is accepted
         // only where it equals the model's own argmax, so the emitted stream
@@ -4805,7 +4912,7 @@ mod tests {
                     vec![(vocab as i32) - 1, 0]
                 };
                 let mut one: [&mut SeqKv; 1] = [&mut sk];
-                let v = m.verify_drafts_batched(&[next], std::slice::from_ref(&draft), &mut one, &[pos])?;
+                let (v, _h) = m.verify_drafts_batched(&[next], std::slice::from_ref(&draft), &mut one, &[pos])?;
                 let r = v.first().ok_or_else(|| Error::Format("no verification result".into()))?;
                 any_accepted |= r.accepted > 0;
                 any_rejected |= r.accepted < draft.len();
@@ -4839,7 +4946,7 @@ mod tests {
         // Four drafts, all deliberately wrong, so none can be accepted.
         let draft = vec![(vocab as i32) - 1, (vocab as i32) - 2, 0, 1];
         let mut one: [&mut SeqKv; 1] = [&mut sk];
-        let v = m.verify_drafts_batched(&[next], &[draft], &mut one, &[prompt.len()])?;
+        let (v, _h) = m.verify_drafts_batched(&[next], &[draft], &mut one, &[prompt.len()])?;
         let r = v.first().ok_or_else(|| Error::Format("no verification result".into()))?;
         assert_eq!(r.accepted, 0, "a wrong draft must not be accepted");
         assert_eq!(r.tokens, vec![next], "only the already-confirmed token is emitted");
@@ -4868,7 +4975,7 @@ mod tests {
             let next = argmax(&lg[(p.len() - 1) * vocab..]) as i32;
             let draft: Vec<i32> = (0..i).map(|j| ((j + i) % vocab) as i32).collect();
             let mut one: [&mut SeqKv; 1] = [&mut sk];
-            let v = m.verify_drafts_batched(&[next], &[draft], &mut one, &[p.len()])?;
+            let (v, _h) = m.verify_drafts_batched(&[next], &[draft], &mut one, &[p.len()])?;
             want.push(v.into_iter().next().ok_or_else(|| Error::Format("no result".into()))?);
         }
 
@@ -4885,9 +4992,14 @@ mod tests {
         }
         let pos_of: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
         let mut refs: Vec<&mut SeqKv> = seqs.iter_mut().collect();
-        let got = m.verify_drafts_batched(&next_of, &drafts, &mut refs, &pos_of)?;
+        let (got, hlast) = m.verify_drafts_batched(&next_of, &drafts, &mut refs, &pos_of)?;
 
         assert_eq!(got.len(), 3);
+        // One hidden row per sequence, so the next round can draft from this
+        // forward instead of re-running the stack.
+        let d = m.cfg.hidden as usize;
+        assert_eq!(hlast.len(), 3 * d, "a hidden row per sequence");
+        assert!(hlast.iter().all(|v| v.is_finite()));
         for (i, (a, b)) in want.iter().zip(&got).enumerate() {
             assert_eq!(a, b, "sequence {i}: batched verification differs from verifying it alone");
         }
