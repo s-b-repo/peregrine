@@ -373,6 +373,36 @@ What to look for:
   `COLI_BATCH_SLA_MS` starts shrinking the working cap, the chunk is too large
   — that is what `COLI_PREFILL_CHUNK_DIV` is for.
 
+## 7. Is a pruned checkpoint worth its quality cost?
+
+`peregrine-prune` is the only item here whose output is a *different model*,
+so it is the one where "did it work" is entirely a quality question. Prune at
+the default 25% and measure before considering more:
+
+```bash
+peregrine dump-routes "$COLI_MODEL" > routes.json    # the workload you serve
+./target/release/peregrine-prune "$COLI_MODEL" --trace routes.json --dry-run
+./target/release/peregrine-prune "$COLI_MODEL" /path/glm52_p25 --trace routes.json
+```
+
+Three measurements, in this order:
+
+- **`prediction_flip_rate` against the source**, on the traced workload *and*
+  on one the trace did not cover. The second is the one that matters: the
+  published failure mode is a model that holds up on the calibration
+  distribution and collapses off it.
+- **Working-set size, not per-token bytes.** Compare peak RSS and warm-cache
+  hit rate. Per-token bytes will not move — top-k is unchanged — and a
+  benchmark that reports throughput alone cannot tell you whether pruning did
+  anything at all.
+- **The aggregate-fallback count** the tool prints. If more than the MTP head
+  fell back, the trace was too short and the plan is partly guesswork; extend
+  it and re-run before drawing conclusions.
+
+Only if 25% is clean is 50% (`--force`) worth trying, and then only with the
+off-distribution flip rate as the acceptance gate rather than a benchmark
+average.
+
 ## What to do with the results
 
 Write them into [benchmarks.md](benchmarks.md). Where a measurement contradicts

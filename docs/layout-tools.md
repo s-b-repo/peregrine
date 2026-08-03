@@ -113,3 +113,65 @@ Caveats worth knowing:
 `hilbert_order`, `two_opt`, `write_schedule`, `assign_tiers` / `write_tiers`
 (whole Louvain communities placed greedily by heat density into
 VRAM → RAM → disk byte budgets), `trace_heat`, and `apply_layout`.
+
+---
+
+## `peregrine-prune` — router-weighted expert pruning (REAP)
+
+Ranks each layer's experts by the gate mass they carried over a routing trace,
+drops the least salient, renumbers the survivors, and gathers the router's rows
+to match.
+
+```bash
+peregrine dump-routes "$COLI_MODEL" > routes.json     # trace the workload you serve
+peregrine-prune "$COLI_MODEL" --trace routes.json --dry-run
+peregrine-prune "$COLI_MODEL" /path/glm52_pruned25 --trace routes.json
+```
+
+### What it buys, and what it does not
+
+**Pruning does not reduce bytes per token.** Top-k is unchanged, so the same
+`k` experts are read for every position whatever the pool size — Cerebras'
+own model cards report identical activated parameters at 480B, 363B and 246B.
+What shrinks is the **working set**: fewer distinct experts to hold, cache,
+prefetch and lay out. On a disk-bound engine that is a residency win, not a
+bandwidth win, and the two are routinely conflated. The tool says so in its
+`--help` and again in its report, because a summary that read as a bandwidth
+win would be actively misleading.
+
+### Three things to get right before running it
+
+**Use 25%, not 50%.** `--frac` defaults to 0.25 and refuses more without
+`--force`. GLM-4.5-Air lost 11.2% on coding and 25.8% on multiple-choice at
+50%, and retention does not improve with model size — the honest reading is
+that GLM-family models degrade unusually.
+
+**The calibration trace dominates the result.** Generic web text collapsed code
+performance in the published runs. Saliency is measured from *your* trace; one
+that does not contain the workload you serve will prune the experts that
+workload needs.
+
+**Saliency is gate mass, not selection count.** A frequently routed but weakly
+weighted expert must not outrank a rare decisive one. If the trace carries no
+weights the ranking degrades to counting, and the report says so rather than
+letting a weaker signal pass as the stronger one.
+
+### Two structural constraints worth knowing
+
+`config.json` carries a **single** `n_routed_experts` for the whole model, so
+pruning is necessarily **uniform across layers**. A per-layer keep count cannot
+be expressed: it would produce a router whose width disagrees with the config
+the loader sizes its buffers from, and that fails at load — hours after the
+conversion finished.
+
+The **MTP head is a sparse layer with its own router and expert pool**, and a
+main-model trace never touches it. It cannot simply keep everything, because
+the width has to match, so it is ranked on saliency aggregated across the
+layers that *were* traced. The report counts how many layers took that
+fallback; more than one means the calibration run was too short.
+
+### After the run
+
+A pruned checkpoint that was never compared is a guess. Measure it with
+`Model::prediction_flip_rate` against the source container, on the workload you
+traced — see [validation-runbook.md](validation-runbook.md).
