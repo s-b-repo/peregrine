@@ -1,4 +1,4 @@
-CORRECTION (see commit c9a1 "Correct the attribution record on 1fd8b42").
+CORRECTION (see commit b940cf0).
 
 This commit's message describes only the KV growth-overshoot cap. It also
 carries a separately-authored body of work that was in flight in the same
