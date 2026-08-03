@@ -14,7 +14,7 @@
 
 ```bash
 cargo build --release                    # optimized (fat LTO)
-cargo test --workspace                   # 373 tests, CPU-only
+cargo test --workspace                   # 452 tests, CPU-only
 cargo clippy --workspace --all-targets   # clean
 scripts/audit-bad-patterns.sh --strict   # quality gate (see docs/BAD_PATTERNS.md)
 

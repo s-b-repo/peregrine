@@ -28,9 +28,41 @@ pub fn tiny_cfg_json() -> serde_json::Value {
     })
 }
 
+/// [`tiny_cfg_json`] with the DSA lightning indexer configured: two heads of
+/// width 4, keeping the top `topk` keys.
+///
+/// A *separate* config rather than a flag on the shared one, because
+/// `index_topk` here is deliberately tiny — small enough that a handful of
+/// prompt tokens crosses it and the sparse path actually engages. The shared
+/// tiny model keeps 4096, which no test prompt will ever exceed.
+#[cfg(test)]
+pub(crate) fn tiny_indexer_cfg_json(topk: i64) -> serde_json::Value {
+    let mut v = tiny_cfg_json();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("index_n_heads".into(), serde_json::json!(2));
+        o.insert("index_head_dim".into(), serde_json::json!(4));
+        o.insert("index_topk".into(), serde_json::json!(topk));
+    }
+    v
+}
+
 /// Write a tiny random model into `dir`, seeded by `seed` for reproducibility.
 pub fn build_tiny_model_seeded(dir: &Path, seed: u64) -> Result<(), Error> {
-    let cfg: Cfg = Cfg::from_json(&tiny_cfg_json())?;
+    build_tiny_model_cfg(dir, seed, tiny_cfg_json())
+}
+
+/// A tiny model that also carries DSA indexer tensors, keeping the top `topk`
+/// keys. Separate from [`build_tiny_model_seeded`] so the several hundred tests
+/// built on the shared fixture keep loading a checkpoint *without* an indexer —
+/// the state a real laptop-converted container is in.
+#[cfg(test)]
+pub(crate) fn build_tiny_model_with_indexer(dir: &Path, seed: u64, topk: i64) -> Result<(), Error> {
+    build_tiny_model_cfg(dir, seed, tiny_indexer_cfg_json(topk))
+}
+
+/// Write a tiny random model for an arbitrary tiny config.
+fn build_tiny_model_cfg(dir: &Path, seed: u64, cfg_json: serde_json::Value) -> Result<(), Error> {
+    let cfg: Cfg = Cfg::from_json(&cfg_json)?;
     let mut r = Lcg(seed);
     let rnd = |n: usize, r: &mut Lcg| (0..n).map(|_| r.f()).collect::<Vec<f32>>();
     let (d, h) = (cfg.hidden as usize, cfg.n_heads as usize);
@@ -94,6 +126,18 @@ pub fn build_tiny_model_seeded(dir: &Path, seed: u64) -> Result<(), Error> {
                 w4(&mut blobs, &pe("down_proj.weight"), d, mi, &mut r);
             }
         }
+        // DSA lightning indexer, when the config configures one. Same tensor
+        // names the real converter emits with `--indexer`, so `IndexerWeights`
+        // is loaded by the production path rather than a test-only shortcut.
+        if cfg.index_nh > 0 && cfg.index_hd > 0 {
+            let (inh, ihd) = (cfg.index_nh as usize, cfg.index_hd as usize);
+            w4(&mut blobs, &p("self_attn.indexer_projections.wq_b"), inh * ihd, ql, &mut r);
+            w4(&mut blobs, &p("self_attn.indexer_projections.wk"), ihd, d, &mut r);
+            w4(&mut blobs, &p("self_attn.indexer_projections.weights_proj"), inh, d, &mut r);
+            wf(&mut blobs, &p("self_attn.indexer.k_norm.weight"), ihd, &mut r);
+            let kb: Vec<f32> = (0..ihd).map(|_| r.f() * 0.1).collect();
+            blobs.push(Blob::new(p("self_attn.indexer.k_norm.bias"), "F32", vec![ihd as i64], f32_bytes(&kb)));
+        }
         // the MTP head layer also carries the embed/hidden projection + norms.
         if i == cfg.n_layers as usize {
             w4(&mut blobs, &p("eh_proj.weight"), d, 2 * d, &mut r);
@@ -104,7 +148,7 @@ pub fn build_tiny_model_seeded(dir: &Path, seed: u64) -> Result<(), Error> {
     }
 
     std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join("config.json"), serde_json::to_vec(&tiny_cfg_json())?)?;
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&cfg_json)?)?;
     write_safetensors(dir, &blobs)?;
     Ok(())
 }

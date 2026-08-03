@@ -12,7 +12,11 @@ use parking_lot::Mutex;
 use peregrine_core::{Cfg, Context, Error, SafeTensors};
 use peregrine_io::{Reactor, WarmCache};
 
-use crate::attention::{mla_attention, mla_attention_absorb, mla_attention_batched, AttnWeights, KvDtype, LayerKv};
+use crate::attention::{
+    mla_attention, mla_attention_absorb, mla_attention_batched, mla_attention_dsa_indexed, AttnWeights, KvDtype,
+    LayerKv,
+};
+use crate::dsa::IndexerWeights;
 use crate::concurrent::{default_workers, experts_per_batch, moe_forward_concurrent, ForwardCtx};
 use crate::gpu::{GpuTier, HeatTable};
 use crate::math::rmsnorm;
@@ -38,6 +42,9 @@ struct LayerW {
     router_bias: Vec<f32>,       // [E]
     shared: Option<Mlp>,
     experts: Vec<Mlp>,
+    /// DSA lightning-indexer weights, when the checkpoint carries them. Weights
+    /// only — the key cache is per-sequence and lives in `LayerKv`.
+    indexer: Option<IndexerWeights>,
 }
 
 impl LayerW {
@@ -83,6 +90,7 @@ pub struct Model {
     embed: QtWeight, // [vocab, hidden], packed
     /// `COLI_MLA_ABSORB`, resolved once at load (see `absorb_enabled`).
     absorb: bool,
+    dsa: bool,
     /// RSS ceiling the guard enforces, in bytes; 0 disables it.
     /// `COLI_RSS_GUARD_GB`, else the projected peak recorded at load.
     rss_limit_bytes: u64,
@@ -282,6 +290,13 @@ impl SeqKv {
         self.layers.iter().map(|k| k.bytes()).sum()
     }
 
+    /// DSA indexer keys cached so far, across the shared prefix and this
+    /// sequence's own tail. Equals [`Self::len`] once the indexer is running.
+    #[cfg(test)]
+    fn index_len(&self) -> usize {
+        self.layers.first().map_or(0, |k| k.index_len())
+    }
+
     /// Bytes held privately by this sequence, excluding any shared prefix.
     pub fn owned_bytes(&self) -> usize {
         self.layers.iter().map(|k| k.owned_bytes()).sum()
@@ -381,6 +396,14 @@ const RSS_GUARD_EVERY: usize = 16;
 /// that weight into the query instead. It therefore changes token values, which
 /// puts it in the same class as `COLI_ROUTE_MIN_SHARE` — size the cost with
 /// `Model::prediction_flip_rate` before turning it on.
+/// Whether the DSA lightning indexer runs (`COLI_DSA`). Default **off**: the
+/// indexer selects a subset of cached keys, so it changes token values, and the
+/// laptop-converted container skipped the indexer tensors entirely — with no
+/// indexer in the checkpoint the flag is inert.
+fn dsa_enabled() -> bool {
+    matches!(std::env::var("COLI_DSA").ok().as_deref(), Some("1") | Some("true"))
+}
+
 fn absorb_enabled() -> bool {
     matches!(std::env::var("COLI_MLA_ABSORB").ok().as_deref(), Some("1") | Some("true"))
 }
@@ -1130,6 +1153,7 @@ fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Re
         router_bias,
         shared,
         experts,
+        indexer: IndexerWeights::load(st, i, cfg)?,
     })
 }
 
@@ -1177,10 +1201,16 @@ fn forward_layer(
     // holds it to a 10% relative bound, because the dense path quantizes the
     // reconstruction through `kv_b` and absorb never materializes it. So this is
     // opt-in and off by default, like every other knob that can move a token.
-    let attn = if ctx.absorb {
-        mla_attention_absorb(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?
-    } else {
-        mla_attention(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?
+    // DSA first: it is the only path that maintains the indexer key cache, and
+    // that cache has to be built from position 0 or a later selection has no
+    // keys for the early positions. Absorb has no sparse form, so a checkpoint
+    // with an indexer and `COLI_DSA=1` takes the dense-sparse path even when
+    // `COLI_MLA_ABSORB` is also set — stated here rather than left to
+    // whichever branch happened to come first.
+    let attn = match (ctx.dsa.then_some(()).and(l.indexer.as_ref()), ctx.absorb) {
+        (Some(ix), _) => mla_attention_dsa_indexed(&l.attn(), ix, &nrm, s_n, pos_base, kv, cfg)?,
+        (None, true) => mla_attention_absorb(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?,
+        (None, false) => mla_attention(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?,
     };
     for z in 0..s_n * d {
         x[z] += attn[z];
@@ -1518,6 +1548,7 @@ impl Model {
             cfg,
             embed,
             absorb: absorb_enabled(),
+            dsa: dsa_enabled(),
             rss_limit_bytes,
             layers,
             final_norm,
@@ -2656,11 +2687,12 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, stream_experts, direct, io_reactors, ecache, route_hist, predictor, prefetch, gpu, heat, lane_timings, layout_schedule, absorb, ..
+                cfg, layers, kv, st, stream_experts, direct, io_reactors, ecache, route_hist, predictor, prefetch, gpu, heat, lane_timings, layout_schedule, absorb, dsa, ..
             } = self;
             let ctx = ForwardCtx {
                 st,
                 absorb: *absorb,
+                dsa: *dsa,
                 reactors: io_reactors,
                 gpu: gpu.as_ref(),
                 workers: eff_workers,
@@ -2778,6 +2810,7 @@ impl Model {
         ForwardCtx {
             st: &self.st,
             absorb: self.absorb,
+            dsa: self.dsa,
             reactors: &self.io_reactors,
             gpu: self.gpu.as_ref(),
             workers: self.effective_workers(),
@@ -2868,6 +2901,7 @@ impl Model {
         let ctx = ForwardCtx {
             st: &self.st,
             absorb: self.absorb,
+            dsa: self.dsa,
             reactors: &self.io_reactors,
             gpu: self.gpu.as_ref(),
             workers: self.effective_workers(),
@@ -2992,12 +3026,13 @@ impl Model {
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_lora as usize, self.cfg.qk_rope as usize);
 
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, stream_experts, cfg, absorb, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, stream_experts, cfg, absorb, dsa, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft without an MTP head".into()))?;
         let ctx = ForwardCtx {
             st,
             absorb: *absorb,
+            dsa: *dsa,
             reactors: io_reactors,
             gpu: gpu.as_ref(),
             workers: *workers,
@@ -3878,6 +3913,132 @@ mod tests {
         let external = m.forward_prefill_seq(&toks, &mut seq, 0)?;
         assert_eq!(internal, external, "external-KV prefill must equal internal forward_step");
         assert_eq!(seq.len(), toks.len());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    fn tmp_indexer_model_dir(tag: &str, topk: i64) -> Result<PathBuf, peregrine_core::Error> {
+        let d = std::env::temp_dir().join(format!("peregrine_dsa_{}_{}", std::process::id(), tag));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_model_with_indexer(&d, 0xD5A, topk)?;
+        Ok(d)
+    }
+
+    #[test]
+    fn dsa_is_inert_without_an_indexer_and_below_index_topk() -> Result<(), peregrine_core::Error> {
+        // Two ways the flag must change nothing, both bit-exact.
+        //
+        // (1) No indexer in the checkpoint — the state a laptop-converted
+        //     container is actually in — so `COLI_DSA` has nothing to run.
+        // (2) An indexer, but a context no longer than `index_topk`: attention
+        //     over at most that many keys *is* the selection, so skipping the
+        //     scoring pass is exactly output-neutral, not approximately so.
+        //     That is the C engine's activation rule, and getting it wrong
+        //     would show up as a silent quality regression on short prompts.
+        let dir = tmp_model_dir("dsa_inert")?;
+        let mut m = Model::load(&dir)?;
+        let toks = [1i32, 5, 9, 2];
+        let mut off = SeqKv::new(&m.cfg);
+        let a = m.forward_prefill_seq(&toks, &mut off, 0)?;
+        m.dsa = true;
+        let mut on = SeqKv::new(&m.cfg);
+        let b = m.forward_prefill_seq(&toks, &mut on, 0)?;
+        assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()), "no indexer: DSA must be inert");
+        std::fs::remove_dir_all(&dir)?;
+
+        let dir = tmp_indexer_model_dir("below", 64)?;
+        let mut m = Model::load(&dir)?;
+        assert!(m.layers.iter().any(|l| l.indexer.is_some()), "the fixture must carry indexer tensors");
+        let mut off = SeqKv::new(&m.cfg);
+        let a = m.forward_prefill_seq(&toks, &mut off, 0)?;
+        m.dsa = true;
+        let mut on = SeqKv::new(&m.cfg);
+        let b = m.forward_prefill_seq(&toks, &mut on, 0)?;
+        assert!(
+            a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "4 tokens under index_topk=64: selection is the identity, so output must be bit-identical"
+        );
+        // …and the key cache is built anyway, because a later selection needs
+        // keys for every earlier position.
+        assert_eq!(on.index_len(), toks.len(), "indexer keys must be cached from position 0");
+        assert_eq!(off.index_len(), 0, "…but only when DSA is on");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dsa_selects_a_subset_once_context_exceeds_index_topk() -> Result<(), peregrine_core::Error> {
+        // The path that was shipped, unit-tested and never once constructed.
+        // Past `index_topk` the indexer keeps a strict subset, so the output
+        // must *differ* from dense — a sparse-attention flag whose test would
+        // pass unchanged if selection did nothing is not testing selection.
+        let dir = tmp_indexer_model_dir("above", 2)?;
+        let mut m = Model::load(&dir)?;
+        let toks = [1i32, 5, 9, 2, 6, 3];
+        let mut off = SeqKv::new(&m.cfg);
+        let dense = m.forward_prefill_seq(&toks, &mut off, 0)?;
+        m.dsa = true;
+        let mut on = SeqKv::new(&m.cfg);
+        let sparse = m.forward_prefill_seq(&toks, &mut on, 0)?;
+        assert_eq!(dense.len(), sparse.len());
+        assert!(sparse.iter().all(|v| v.is_finite()), "sparse attention must not produce NaN");
+        assert!(
+            dense.iter().zip(&sparse).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "index_topk=2 over 6 positions must attend a strict subset"
+        );
+        // Decode continues on the sparse cache, and both streams stay aligned.
+        let mut one: [&mut SeqKv; 1] = [&mut on];
+        m.forward_step_batched(&[7], &mut one, &[toks.len()], None)?;
+        assert_eq!(on.len(), toks.len() + 1);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_keys_ride_the_kv_cache_through_sharing_and_rewind() -> Result<(), peregrine_core::Error> {
+        // The indexer key cache is a third stream in `LayerKv` precisely so it
+        // inherits the two lifecycle properties the latents already have. If it
+        // did not, a shared prefix would serve keys for the wrong positions and
+        // a speculative rewind would leave the two streams misaligned — both
+        // silent, both producing plausible-looking output.
+        let dir = tmp_indexer_model_dir("share", 2)?;
+        let mut m = Model::load(&dir)?;
+        m.dsa = true;
+        let toks = [1i32, 5, 9, 2, 6, 3];
+        let mut seq = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&toks, &mut seq, 0)?;
+        assert_eq!(seq.index_len(), toks.len());
+
+        let entry = seq.clone_prefix(4);
+        assert_eq!(entry.index_len(), 4, "a shared prefix carries its indexer keys");
+        assert_eq!(entry.len(), 4);
+        let seeded = entry.clone_prefix(4);
+        assert_eq!(seeded.index_len(), 4, "…and a refcounted view of it still sees them");
+
+        // Seeding from the shared prefix and prefilling the rest must be
+        // bit-identical to a cold run of the whole prompt — under DSA too,
+        // since the selection at position 4 scores keys 0..4, which are the
+        // same bytes either way. This is prefix sharing and sparse selection
+        // composing, which neither feature's own tests can show.
+        let mut warm = entry.clone_prefix(4);
+        let warm_logits = m.forward_prefill_seq(&toks[4..], &mut warm, 4)?;
+        let mut cold = SeqKv::new(&m.cfg);
+        let cold_logits = m.forward_prefill_seq(&toks, &mut cold, 0)?;
+        assert_eq!(warm.len(), toks.len());
+        assert_eq!(warm.index_len(), toks.len(), "the tail's keys append after the shared ones");
+        let vocab = m.cfg.vocab as usize;
+        let tail = &cold_logits[4 * vocab..];
+        assert_eq!(warm_logits.len(), tail.len());
+        for (k, (p, q)) in warm_logits.iter().zip(tail).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "logit {k}: seeding from a shared prefix moved a bit");
+        }
+
+        // A rewind takes both streams back together.
+        let mut r = seq;
+        r.truncate(2);
+        assert_eq!((r.len(), r.index_len()), (2, 2), "latents and indexer keys rewind together");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

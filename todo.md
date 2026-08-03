@@ -17,20 +17,22 @@ concurrent CPU/GPU/SSD scheduler + `io_uring`.
 
 | Scope | ✅ Done | 🟡 Partial | ⬜ Not started | Total | Completion |
 |---|---:|---:|---:|---:|---:|
-| **Full roadmap** | 89 | 6 | 13 | 108 | **~82% strict · ~85% weighted** |
+| **Full roadmap** | 103 | 10 | 12 | 125 | **~82% strict · ~86% weighted** |
 | **Priority shortlist** | 15 | 1 | 3 | 19 | **~79% strict · ~82% weighted** |
 
 *Strict = Done ÷ Total. Weighted = (Done + ½·Partial) ÷ Total. "Fast matrix multiplication" is excluded.
-Total is 108: the 93 source items, 2 shipped extras tracked in §6 (adaptive prefill/decode window,
-telemetry feedback loop), 2 VRAM-residency fixes in §3, 1 open dispatch item in §2, and the 10 items
-of §12-§13 — an axis the original 11 sections had no category for (attention/serving memory, and
-reading fewer experts rather than reading them faster). Adding them *lowers* the percentage, which is
-the honest reading: the roadmap was ~89% done against a scope that excluded them. Counts are generated from the checkboxes below — recount with
+Total is now 125, up from the 108 this table tracked through 2026-08-01: the 93 source items, 2
+shipped extras in §6 (adaptive prefill/decode window, telemetry feedback loop), 2 VRAM-residency
+fixes in §3, 1 open dispatch item in §2, the 10 items of §12-§13 — an axis the original 11 sections
+had no category for (attention/serving memory, and reading fewer experts rather than reading them
+faster) — and 17 more the research waves added or split out. Adding them *lowers* the percentage,
+which is the honest reading: the roadmap was ~89% done against a scope that excluded them, and the
+strict figure has barely moved since because each wave opens roughly as much as it closes. Counts are generated from the checkboxes below — recount with
 `awk '/^## 1\./,/^## ❄️/' todo.md | grep -c '^- \[x\]'`.*
 
 **Per-section:** Prefetch **9/9 ✅** · GPU 5/9 · Caching **12/12 ✅** · I/O 9/11 · Memory/NUMA
 **4/5** · Scheduling 16/18 · Disk-layout **10/10 ✅** · Workload **5/5 ✅** · Compilation
-**5/5 ✅** · Self-optimizing 9/10 · Multi-GPU 0/4 · Attention/serving 2/5 · Workload-reduction 3/5.
+**5/5 ✅** · Self-optimizing 9/10 · Multi-GPU 0/4 · Attention/serving **3/5** · Workload-reduction **14/16**.
 
 **The 19 open items fall into three groups**, and only the first is blocked by this workspace:
 
@@ -210,7 +212,7 @@ Each needs a wire-or-delete decision; none is a correctness risk today, because
 code that never runs cannot be wrong — it can only mislead.*
 
 - [ ] 🟡 **LFRU eviction** (`tier.rs`) — zero callers; the live policy is priority-weighted LRU in `warmcache.rs::evict_to_budget`. Wire it or delete the module
-- [ ] 🟡 **DSA sparse attention** (`dsa.rs`, `mla_attention_dsa`) — `Indexer` never constructed, no key ever appended; with `index_topk=2048` this is the largest single workload reduction available on long contexts, so wiring it is worth real effort
+- [x] ✅ **DSA sparse attention wired (`COLI_DSA`)** — `dsa.rs` shipped complete and unit-tested with **zero call sites**: `Indexer` was never constructed and no key was ever appended, so the largest single workload reduction available on long context (`index_topk=2048` against a growing cache) sat inert. **The blocker was structural, not effort**: `Indexer` conflated per-*layer* weights (`wq`/`wk`/`wp`/`k_norm_*`) with per-*sequence* cache state (`keys`/`len`), so one indexer per layer on a `Model` serving concurrent requests would have let two sequences interleave keys into one buffer — silent cross-sequence corruption, not a crash. Split into `IndexerWeights` (per layer, on `LayerW`) and a key cache that lives **inside `LayerKv` as a third stream** beside `lc`/`rc`, because it has exactly the latents' lifecycle: appended in order, rewound by the same speculative `truncate`, shared across a common prefix by the same refcount. A parallel structure would have had to re-implement all three, and `indexer_keys_ride_the_kv_cache_through_sharing_and_rewind` pins that it does not have to. **Keys are cached every step, scoring is conditional**: a selection at position *t* needs keys for every earlier position, so only the scoring is gated on `len > index_topk` — and below that threshold the skip is *exactly* output-neutral, since attention over at most `index_topk` keys already is the selection (`dsa_is_inert_without_an_indexer_and_below_index_topk`, bit-exact on both counts). **`project_batched` now returns `qr`**, the post-`rmsnorm` q-LoRA row it used to drop: letting the indexer re-derive its own would have been a silent pre- vs post-norm fork that no output test could catch. **Single-sequence path only** — selection is implemented against the dense core's `sel`, and the batched engine runs the *absorb* core, which has no sparse form; documented rather than left looking wired. Determinism needed nothing: `select_topk` already sorts value-descending with an index tie-break, so the GLM-5 non-deterministic-top-k hazard does not apply. Off by default; **changes token values** `dsa.rs`, `attention.rs`, `model.rs`, `testkit.rs`
 - [ ] 🟡 **`peregrine-sched`** — no crate depends on it. Either make it the documented correctness oracle (a test comparing `moe_streamed` against `moe_forward_concurrent`, which does not exist) or remove it from the workspace
 - [ ] 🟡 **MTP speculative decode** — `generate_speculative` unreachable from either binary. colibrì measures MTP a net loss on disk-bound MoE decode, so wiring it needs a reason beyond completeness
 
@@ -314,7 +316,7 @@ code that never runs cannot be wrong — it can only mislead.*
 
 ---
 
-## 12. Attention & Serving Memory — 4/7
+## 12. Attention & Serving Memory — 3/5
 
 *A whole axis §1-§11 has no category for. Those sections optimize how fast expert bytes
 move; this one is about the KV cache, per-request memory, and work the engine repeats.
@@ -328,7 +330,7 @@ All of it is CPU-side and needs no hardware this workspace lacks.*
 
 ---
 
-## 13. Workload Reduction — 3/5
+## 13. Workload Reduction — 14/16
 
 *Reading fewer or smaller experts, rather than reading them faster. Two independent
 measurements motivate it. The warm cache hits **0.6%** on sustained decode, because a 10 GB
@@ -421,6 +423,7 @@ change, and needs the two shipped measurement items first.*
 | `COLI_REGBUF_SLOTS` | 16 | Registered-buffer count for the `regbuf` engine (pinned pages — see `RLIMIT_MEMLOCK`) |
 | `COLI_KV_BUDGET_MB` | 0 (off) | Resident-KV byte ceiling for admission, alongside the `--max-batch` count. Charges each private tail plus one per distinct shared prefix |
 | `COLI_KV_DTYPE` | `f32` | Element type for stored KV latents (`f32`/`f16`). f16 halves resident KV; **changes token values**. Pair with `COLI_MLA_ABSORB` |
+| `COLI_DSA` | off | Run the DSA lightning indexer where the checkpoint carries one; each query attends only the top `index_topk` cached keys. **Changes token values**. Single-sequence path only |
 | `COLI_DRAFT` | 0 (off) | MTP speculative-decode draft depth (`--draft N`); greedy, so output-identical |
 | `COLI_PREFIX_CACHE_MB` | 0 (off) | Cross-request KV prefix cache budget; seeds a new request from the longest cached prefix of its prompt |
 | `COLI_ROUTE_MIN_SHARE` | 0 (off) | Drop trailing routed experts below this share of a position's gate mass. **The only knob that changes token values** |
@@ -431,6 +434,6 @@ change, and needs the two shipped measurement items first.*
 
 - **Audit basis:** statuses verified against source; file:line evidence inline. `Done` = actually implemented and covered by a test — bit-identical or round-trip for everything except the one deliberately lossy knob (`COLI_ROUTE_MIN_SHARE`), which is gated by a bounded prediction flip rate instead. `Partial` = scaffolding present but not yet on the hot path.
 - **Documentation:** the full docs wiki is [`docs/`](docs/README.md) (2026-07-30) — user guides (CLI, HTTP API, configuration, model format) and subsystem deep dives; this file remains the per-item engineering audit.
-- **Compilation & test invariant:** 373 tests pass workspace-wide, clippy clean, `--strict` bad-patterns audit green.
+- **Compilation & test invariant:** 452 tests pass workspace-wide, clippy clean, `--strict` bad-patterns audit green.
 - **What's left is *not* all CUDA-shaped** (it used to be). Ten open items need `nvcc` + real hardware, but five — §12 fuse-prefill / KV quantization / paged KV, §13 int2 conversion + heat-tiered precision — are pure CPU work, blocked only by their size. See the three-way split under the dashboard.
 - **Validation caveat:** synthetic-model tests catch correctness; throughput impact needs a real model to measure — and now partly has been, in the [2026-08-01 pass](docs/benchmark-2026-08-01.md) (§1–§11 knob bundle 1.004×, CUDA lane 1.09×, batching 4.4× reproduced). Note that pass also found `peregrine bench 1 4 16` unsound for comparing configurations: running every batch point in one process inflates the later ones (baseline B=16 reads 0.143 in-sweep vs 0.224 isolated), which had manufactured an apparent 1.45×/1.64× that vanished under isolation. Use one batch size per fresh process. The pattern is "many small adaptive knobs, each bit-identical when off" — evaluate combined. Two knobs now need a *real checkpoint* to size at all: `COLI_ROUTE_MIN_SHARE` (how much gate mass the tail actually carries) and any int2 use (its accuracy cost). `COLI_GATE_STATS` and `prediction_flip_rate` exist to answer exactly those, and both are unanswerable on the synthetic model — 4 experts, top-2, so there is no weight tail to measure.

@@ -14,6 +14,7 @@
 
 use crate::math::{rmsnorm_inplace, rope_interleave, softmax};
 use crate::weight::QtWeight;
+use crate::dsa::IndexerWeights;
 use peregrine_core::{f16_to_f32, f32_to_f16, Cfg, Error};
 use std::sync::Arc;
 
@@ -210,6 +211,9 @@ impl<'a> KvRun<'a> {
 struct KvPrefix {
     lc: KvBuf,
     rc: KvBuf,
+    /// DSA indexer keys, when the layer has an indexer. Empty otherwise — the
+    /// stream costs nothing on a checkpoint without one.
+    ix: KvBuf,
 }
 
 /// Per-layer KV cache holding the compressed latents and roped keys. Positions
@@ -233,6 +237,15 @@ pub struct LayerKv {
     /// This sequence's own positions, appended after the shared prefix.
     lc: KvBuf, // [len - shared_rows, kv_lora]
     rc: KvBuf, // [len - shared_rows, qk_rope]
+    /// DSA indexer keys for this sequence's own positions. A *third stream with
+    /// the same lifecycle* as the latents — appended in order, rewound by the
+    /// same speculative truncate, shared across a common prefix by the same
+    /// refcount — which is why it lives here rather than in a parallel
+    /// structure that would have to re-implement all three.
+    ix: KvBuf, // [len - shared_rows, ix_width], or empty when there is no indexer
+    /// Width of one indexer key. `0` until the first key is appended, which is
+    /// also the "no indexer" state.
+    ix_width: usize,
     len: usize,
     kv_lora: usize,
     qk_rope: usize,
@@ -254,6 +267,8 @@ impl LayerKv {
             shared_rows: 0,
             lc: KvBuf::new(dt),
             rc: KvBuf::new(dt),
+            ix: KvBuf::new(dt),
+            ix_width: 0,
             len: 0,
             kv_lora,
             qk_rope,
@@ -315,6 +330,7 @@ impl LayerKv {
             let own = new_len - self.shared_rows;
             self.lc.truncate(own * self.kv_lora);
             self.rc.truncate(own * self.qk_rope);
+            self.ix.truncate(own * self.ix_width);
         } else {
             // Rewinding into the shared prefix. It is immutable and other
             // sequences may still be reading it, so narrow this cache's *view*
@@ -323,6 +339,7 @@ impl LayerKv {
             self.shared_rows = new_len;
             self.lc.clear();
             self.rc.clear();
+            self.ix.clear();
         }
         self.len = new_len;
     }
@@ -332,19 +349,19 @@ impl LayerKv {
     /// it stays correct (conservatively) however prefixes are shared — see
     /// [`Self::owned_bytes`] and [`Self::shared_bytes`] for the exact split.
     pub fn bytes(&self) -> usize {
-        self.shared_rows * (self.kv_lora + self.qk_rope) * self.dtype().elem_size() + self.owned_bytes()
+        self.shared_rows * (self.kv_lora + self.qk_rope + self.ix_width) * self.dtype().elem_size() + self.owned_bytes()
     }
 
     /// Bytes this cache holds *by itself*, excluding any shared prefix.
     pub fn owned_bytes(&self) -> usize {
-        self.lc.bytes() + self.rc.bytes()
+        self.lc.bytes() + self.rc.bytes() + self.ix.bytes()
     }
 
     /// Bytes of the whole shared prefix allocation — not just this cache's view
     /// of it, because the allocation is what actually occupies RAM while any
     /// sequence holds it.
     pub fn shared_bytes(&self) -> usize {
-        self.shared.as_ref().map_or(0, |p| p.lc.bytes() + p.rc.bytes())
+        self.shared.as_ref().map_or(0, |p| p.lc.bytes() + p.rc.bytes() + p.ix.bytes())
     }
 
     /// Identity of the shared prefix allocation, if any. A budget summing many
@@ -376,6 +393,8 @@ impl LayerKv {
                     shared_rows: n,
                     lc: KvBuf::new(dt),
                     rc: KvBuf::new(dt),
+                    ix: KvBuf::new(dt),
+                    ix_width: self.ix_width,
                     len: n,
                     kv_lora: self.kv_lora,
                     qk_rope: self.qk_rope,
@@ -388,17 +407,23 @@ impl LayerKv {
         // narrowed cache must not be re-rounded on every admission.
         let mut lc = KvBuf::new(dt);
         let mut rc = KvBuf::new(dt);
+        let mut ix = KvBuf::new(dt);
         for run in self.lc_span(n).runs() {
             lc.extend_run(run);
         }
         for run in self.rc_span(n).runs() {
             rc.extend_run(run);
         }
+        for run in self.ix_span(n).runs() {
+            ix.extend_run(run);
+        }
         LayerKv {
-            shared: Some(Arc::new(KvPrefix { lc, rc })),
+            shared: Some(Arc::new(KvPrefix { lc, rc, ix })),
             shared_rows: n,
             lc: KvBuf::new(dt),
             rc: KvBuf::new(dt),
+            ix: KvBuf::new(dt),
+            ix_width: self.ix_width,
             len: n,
             kv_lora: self.kv_lora,
             qk_rope: self.qk_rope,
@@ -415,6 +440,33 @@ impl LayerKv {
     pub fn rc_span(&self, n: usize) -> KvSpan<'_> {
         let shared = self.shared.as_ref().map_or_else(|| KvRun::empty_like(&self.rc), |p| p.rc.run());
         span_of(shared, self.rc.run(), self.shared_rows, n, self.qk_rope)
+    }
+
+    /// The DSA indexer keys of the first `n` positions, in causal order. Empty
+    /// unless the layer has an indexer and `COLI_DSA` is on.
+    pub fn ix_span(&self, n: usize) -> KvSpan<'_> {
+        let shared = self.shared.as_ref().map_or_else(|| KvRun::empty_like(&self.ix), |p| p.ix.run());
+        span_of(shared, self.ix.run(), self.shared_rows, n, self.ix_width)
+    }
+
+    /// Indexer keys cached so far. Equals [`Self::len`] once the indexer is
+    /// running, `0` before its first append — the two can differ only across
+    /// the step that enables DSA mid-sequence, which is why selection checks
+    /// this rather than `len`.
+    pub fn index_len(&self) -> usize {
+        self.ix_span(self.len).rows(self.ix_width)
+    }
+
+    /// Cache one position's indexer key. Appended in the same order as the
+    /// latents, immediately after that position's [`Self::append`], so the two
+    /// streams stay row-aligned.
+    pub fn append_index_key(&mut self, key: &[f32]) {
+        if self.ix_width == 0 {
+            self.ix_width = key.len();
+        }
+        if key.len() == self.ix_width {
+            self.ix.push(key);
+        }
     }
 
     /// The whole cache as an attention view.
@@ -593,9 +645,16 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// per-head query RoPE and the compressed KV (`Lc` normalized latent, `Rc` roped
 /// key) use each row's own position `pos_of[s]`. Returns the roped queries
 /// `Q[s_n, H*qk_head]` plus the per-row latents to append to each row's own
-/// cache (`lc_rows[s_n, kv_lora]`, `rc_rows[s_n, qk_rope]`). Performs no cache
-/// mutation, so it is storage-agnostic (single cache or per-sequence caches).
-fn project_batched(w: &AttnWeights, x: &[f32], s_n: usize, pos_of: &[usize], c: &Cfg) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+/// cache (`lc_rows[s_n, kv_lora]`, `rc_rows[s_n, qk_rope]`), and the normalized
+/// q-LoRA rows `qr[s_n, q_lora]`. Performs no cache mutation, so it is
+/// storage-agnostic (single cache or per-sequence caches).
+///
+/// `qr` is handed back because the DSA indexer's query projection consumes it
+/// and it was otherwise dropped here. Returning the **post-`rmsnorm`** row —
+/// the same tensor `q_b` consumes — rather than letting the indexer re-derive
+/// its own keeps it from silently scoring against a differently normalized
+/// query, which is a correctness fork no output test would catch.
+fn project_batched(w: &AttnWeights, x: &[f32], s_n: usize, pos_of: &[usize], c: &Cfg) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let h_n = c.n_heads as usize;
     let qk_nope = c.qk_nope as usize;
     let qk_rope = c.qk_rope as usize;
@@ -631,7 +690,7 @@ fn project_batched(w: &AttnWeights, x: &[f32], s_n: usize, pos_of: &[usize], c: 
         dst_rc.copy_from_slice(&cs[kvl..cw]);
         rope_interleave(dst_rc, pos, c);
     }
-    (q, lc_rows, rc_rows)
+    (q, qr, lc_rows, rc_rows)
 }
 
 /// Shared single-sequence front end: [`project_batched`] over the consecutive
@@ -642,7 +701,7 @@ fn project(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut 
     let kvl = c.kv_lora as usize;
     let qk_rope = c.qk_rope as usize;
     let pos_of: Vec<usize> = (0..s_n).map(|s| pos_base + s).collect();
-    let (q, lc_rows, rc_rows) = project_batched(w, x, s_n, &pos_of, c);
+    let (q, _qr, lc_rows, rc_rows) = project_batched(w, x, s_n, &pos_of, c);
     for s in 0..s_n {
         cache.append(pos_base + s, &lc_rows[s * kvl..s * kvl + kvl], &rc_rows[s * qk_rope..s * qk_rope + qk_rope])?;
     }
@@ -809,10 +868,17 @@ pub fn mla_attention(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, ca
     Ok(w.o.apply_vec(&ctx, s_n))
 }
 
-/// MLA attention with a DSA lightning-indexer selection: each new query attends
-/// only the `sel[s]` cached keys (top-`index_topk`) instead of all — the sparse
-/// path for long context. Selecting every causal key reproduces [`mla_attention`].
-pub fn mla_attention_dsa(
+/// MLA attention over a caller-supplied DSA selection: each new query attends
+/// only the `sel[s]` cached keys instead of all. Selecting every causal key
+/// reproduces [`mla_attention`].
+///
+/// Private: [`mla_attention_dsa_indexed`] is the entry point the engine uses,
+/// because a selection has to come from the layer's own indexer over its own
+/// cached keys. This form exists so the selection-handling itself — causal
+/// clamping, the empty-selection guard, dense equivalence — can be tested with
+/// selections chosen by hand rather than ones the indexer happens to produce.
+#[cfg(test)]
+fn mla_attention_dsa(
     w: &AttnWeights,
     x: &[f32],
     s_n: usize,
@@ -829,6 +895,71 @@ pub fn mla_attention_dsa(
     }
     let q = project(w, x, s_n, pos_base, cache, c)?;
     let ctx = attend_dense(w, &q, s_n, pos_base, &cache.view(), c, Some(sel));
+    Ok(w.o.apply_vec(&ctx, s_n))
+}
+
+/// MLA attention driven by the layer's own DSA lightning indexer.
+///
+/// Caches this step's indexer keys, then — once the context exceeds
+/// `index_topk` — scores every cached key per query and attends only the top
+/// `index_topk`. Below that threshold it attends densely and skips the scoring
+/// pass entirely: attention over at most `index_topk` keys *is* the selection,
+/// so this is exactly output-neutral rather than approximately so. That is the
+/// C engine's activation rule.
+///
+/// **Keys are cached on every step regardless**, because a selection at
+/// position `t` needs keys for every position before it. Only the scoring is
+/// conditional.
+///
+/// Single-sequence only, deliberately: selection is implemented against the
+/// dense core's `sel` argument, and [`mla_attention_batched`] runs the *absorb*
+/// core, which has no sparse form. The batched engine therefore stays dense —
+/// see `docs/configuration.md` under `COLI_DSA`.
+pub fn mla_attention_dsa_indexed(
+    w: &AttnWeights,
+    ix: &IndexerWeights,
+    x: &[f32],
+    s_n: usize,
+    pos_base: usize,
+    cache: &mut LayerKv,
+    c: &Cfg,
+) -> Result<Vec<f32>, Error> {
+    let hidden = c.hidden as usize;
+    let ql = c.q_lora as usize;
+    let kvl = c.kv_lora as usize;
+    let qk_rope = c.qk_rope as usize;
+    let pos_of: Vec<usize> = (0..s_n).map(|s| pos_base + s).collect();
+    let (q, qr, lc_rows, rc_rows) = project_batched(w, x, s_n, &pos_of, c);
+    // Latents and indexer keys advance together, position by position: a query
+    // attends its own position, so its key has to be cached before selection.
+    // The indexer reads the same input-normalized hidden the q/kv projections
+    // do, which is what `project_batched` was handed.
+    for s in 0..s_n {
+        let pos = pos_base + s;
+        let xs = &x[s * hidden..s * hidden + hidden];
+        cache.append(pos, &lc_rows[s * kvl..s * kvl + kvl], &rc_rows[s * qk_rope..s * qk_rope + qk_rope])?;
+        cache.append_index_key(&ix.key_row(xs, pos, c));
+    }
+
+    let tk = cache.len();
+    let dense_is_identical = ix.topk() == 0 || tk <= ix.topk() || cache.index_len() < tk;
+    let ctx = if dense_is_identical {
+        attend_dense(w, &q, s_n, pos_base, &cache.view(), c, None)
+    } else {
+        // One materialization of the key cache per call, reused across every
+        // query in this step — `score_keys` is pinned to a flat `&[f32]` by its
+        // own arithmetic test, and re-gathering per row would cost `s_n` times
+        // as much for the same bytes.
+        let mut keys: Vec<f32> = Vec::with_capacity(tk * ix.hd());
+        cache.ix_span(tk).extend_f32(tk, ix.hd(), &mut keys);
+        let sel: Vec<Vec<usize>> = (0..s_n)
+            .map(|s| {
+                let pos = pos_base + s;
+                ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], pos, c, &keys)
+            })
+            .collect();
+        attend_dense(w, &q, s_n, pos_base, &cache.view(), c, Some(&sel))
+    };
     Ok(w.o.apply_vec(&ctx, s_n))
 }
 
@@ -874,7 +1005,7 @@ pub fn mla_attention_batched(
     }
     let kvl = c.kv_lora as usize;
     let qk_rope = c.qk_rope as usize;
-    let (q, lc_rows, rc_rows) = project_batched(w, x, s_n, pos_of, c);
+    let (q, _qr, lc_rows, rc_rows) = project_batched(w, x, s_n, pos_of, c);
     for s in 0..s_n {
         caches[s].append(pos_of[s], &lc_rows[s * kvl..s * kvl + kvl], &rc_rows[s * qk_rope..s * qk_rope + qk_rope])?;
     }
