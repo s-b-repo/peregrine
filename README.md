@@ -49,7 +49,7 @@ is the audited per-item roadmap.
 
 ## Status
 
-**452 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
+**482 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
 numeric kernel is ported from colibrì's `c/glm.c` and validated; the scalar
 integer-dot kernels are the token-exactness reference and the SIMD variants are
 checked bit-for-bit against them. The 2026-07-30 "adaptive-runtime wave" added
@@ -74,9 +74,28 @@ the `compile-plan` profile-guided execution plan. The serve layer now runs a
 faster than HF `tokenizers` on this box** (204 vs 6 MB/s, the per-line serve
 pattern; the whole-buffer and parallel-batch paths run 3–7× higher still — see
 [docs/tokenizer.md](docs/tokenizer.md#throughput-anatomy)), id-for-id parity-gated
-(the HF crate remains only as the test-suite oracle). See
-[`todo.md`](todo.md) for the audited roadmap (**~82% strict / ~86% weighted of
-125 tracked items**).
+(the HF crate remains only as the test-suite oracle).
+
+The 2026-08-03 wave came from cross-reading two parallel projects solving the same
+problem — [WASTE](https://github.com/sqliteai/waste) (C) and
+[deltafin](https://github.com/gavamedia/deltafin) (Rust) — both of which publish
+their measurements, including the ones that failed. Its headline is the **router
+look-ahead**: every predictor peregrine had was a statistic over the router's *past
+answers*, and this one asks the router, running layer `L+1`'s own norm and router
+against layer `L`'s output to start the next layer's reads during the boundary the
+disk would otherwise spend idle. It needs no stored artifact and works on the first
+token of a cold process. It cannot change a token — the authoritative router still
+decides — so it is on by default. Alongside it: a **predictor scoreboard**
+(`COLI_PREDICT_EVAL`) that scores every predictor against the routing that actually
+happened, because a correctness-neutral predictor that has degraded to noise costs
+throughput silently and no test can catch it; **trunk wiring** (`COLI_MLOCK`);
+**cgroup-aware memory budgeting**, since `/proc/meminfo` is not namespaced and
+describes the host from inside a container; and a **bounded exact response memo** in
+the serve layer. The borrowed *negative* results are recorded too, in
+[prefetch & caching](docs/prefetch-and-caching.md#borrowed-negative-results).
+
+See [`todo.md`](todo.md) for the audited roadmap (**~83% strict / ~87% weighted of
+130 tracked items**).
 
 | Area | Crate(s) | Status | Validated by |
 |---|---|---|---|
@@ -155,7 +174,7 @@ server) are mapped in [`DESIGN.md`](DESIGN.md#concurrency--parallelism-map-where
 ## Build & test
 
 ```bash
-cargo test --workspace          # 452 tests, CPU-only, no GPU needed
+cargo test --workspace          # 482 tests, CPU-only, no GPU needed
 cargo build --release           # optimized (fat LTO)
 cargo clippy --workspace --all-targets    # clean
 scripts/audit-bad-patterns.sh --strict   # quality gate: no panic-vectors/UB (see docs/BAD_PATTERNS.md)

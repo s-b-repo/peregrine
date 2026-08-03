@@ -16,6 +16,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod batch;
+mod memo;
 mod tok;
 
 use std::sync::Arc;
@@ -80,6 +81,10 @@ struct Inner {
     engine: EngineHandle,
     tokenizer: Arc<TokenBackend>,
     args: Args,
+    /// Bounded exact response memo. Serves a byte-identical greedy request from a
+    /// prior certified completion without entering the model. Deliberately *not*
+    /// part of the engine: a memo hit must never become a KV boundary.
+    memo: parking_lot::Mutex<memo::ResponseMemo>,
 }
 
 // ---- OpenAI request/response shapes ----
@@ -289,7 +294,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "tokenizer": state.inner.tokenizer.name() }))
+    let (hits, misses, entries, bytes) = state.inner.memo.lock().stats();
+    Json(serde_json::json!({
+        "status": "ok",
+        "tokenizer": state.inner.tokenizer.name(),
+        // Response-memo counters. `hits` are requests answered without entering the
+        // model at all, so this is the one rate on this endpoint that describes work
+        // *not* done. Zeroes when COLI_MEMO_ENTRIES/COLI_MEMO_MB disable it.
+        "memo": { "hits": hits, "misses": misses, "entries": entries, "bytes": bytes }
+    }))
 }
 
 async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<ModelList>, ApiError> {
@@ -310,12 +323,34 @@ async fn chat_completions(
     let model_id = state.inner.args.model_id.clone();
     let priority = priority_from_header(headers.get("x-peregrine-priority").and_then(header_utf8));
     let class = classify_request(&req.messages);
-    let mut rx = submit_request(&state, &ids, max_new, temperature, top_p, priority, class)?;
     let tokenizer = state.inner.tokenizer.clone();
 
     let completion_id = format!("chatcmpl-{}", seed());
     let created = unix_seconds();
     let prompt_tokens = ids.len();
+
+    // Response memo. Only greedy requests are eligible (see `MemoKey::eligible`), and
+    // the key is the complete request semantics, so a one-token or one-option change
+    // misses. A hit is answered here — before `submit_request` — so it never enters
+    // the engine, never occupies a batch slot and never publishes KV state.
+    let memo_key = memo::MemoKey::eligible(temperature).then(|| memo::MemoKey {
+        ids: ids.clone(),
+        max_new,
+        top_p_bits: top_p.to_bits(),
+        model: model_id.clone(),
+    });
+    if let Some(key) = &memo_key {
+        let hit = state.inner.memo.lock().get(key);
+        if let Some(out_ids) = hit {
+            // Stored as token ids, so the transport framing is rebuilt fresh: this
+            // request's own completion id and timestamp, and whichever wire format it
+            // asked for. A streaming request can be served from an entry a
+            // non-streaming one created.
+            return memo_response(&req, &tokenizer, &out_ids, &completion_id, &model_id, created, prompt_tokens);
+        }
+    }
+
+    let mut rx = submit_request(&state, &ids, max_new, temperature, top_p, priority, class)?;
 
     if req.stream {
         // SSE: an async task decodes engine token ids into text deltas and pushes
@@ -323,11 +358,13 @@ async fn chat_completions(
         let (sse_tx, sse_rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
         let mid = model_id.clone();
         let cid = completion_id.clone();
+        let memo_state = state.inner.clone();
         tokio::spawn(async move {
             // Token payloads split multi-byte characters, so deltas come from an
             // incremental decoder that holds an unfinished character until the
             // next token completes it (see `IncrementalDecoder`).
             let mut dec = tok::IncrementalDecoder::new();
+            let mut out_ids: Vec<u32> = Vec::new();
             // OpenAI clients expect the role in the first chunk.
             if sse_tx.send(Ok(chunk_event(&cid, &mid, created, None, Some("assistant"), None))).await.is_err() {
                 return; // client disconnected before the first frame
@@ -335,6 +372,7 @@ async fn chat_completions(
             while let Some(msg) = rx.recv().await {
                 match msg {
                     EngineOut::Token(t) => {
+                        out_ids.push(t);
                         let delta = dec.push(&tokenizer.decode_bytes(&[t]));
                         if delta.is_empty() {
                             continue; // token only extended an unfinished character
@@ -351,6 +389,14 @@ async fn chat_completions(
                         return;
                     }
                 }
+            }
+            // Reaching here means the engine's channel closed with no error, so the
+            // completion is whole. Every earlier exit — an engine error, a client
+            // disconnect mid-stream — returns above with a partial `out_ids` and
+            // memoizes nothing: a truncated answer replayed as a complete one would
+            // be worse than no memo at all.
+            if let Some(key) = memo_key {
+                memo_state.memo.lock().insert(key, out_ids);
             }
             // tail frames: a send error just means the client hung up first
             let tail = dec.finish();
@@ -381,26 +427,93 @@ async fn chat_completions(
                 EngineOut::Error(m) => return Err(ApiError::internal(m)),
             }
         }
-        let completion_tokens = out_ids.len();
-        let text = tk(tokenizer.decode(&out_ids))?;
-        let body = serde_json::json!({
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model_id,
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": text },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens
-            }
-        });
-        Ok(Json(body).into_response())
+        // The stream closed without an error, so this completion is whole and may be
+        // memoized. The error arm above returns instead, so a failed generation is
+        // never stored.
+        if let Some(key) = memo_key {
+            state.inner.memo.lock().insert(key, out_ids.clone());
+        }
+        Ok(Json(json_completion(
+            &tk(tokenizer.decode(&out_ids))?,
+            &completion_id,
+            &model_id,
+            created,
+            prompt_tokens,
+            out_ids.len(),
+        ))
+        .into_response())
     }
+}
+
+/// The OpenAI `chat.completion` body. Shared by the generated and memoized paths so
+/// a replayed response cannot drift in shape from a fresh one.
+fn json_completion(
+    text: &str,
+    completion_id: &str,
+    model_id: &str,
+    created: u64,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_id,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
+    })
+}
+
+/// Serve a memoized completion in whichever wire format this request asked for.
+///
+/// The memo holds token ids, so the framing is rebuilt here rather than replayed:
+/// this request's own completion id and `created` timestamp, and its own choice of
+/// SSE or JSON. That is what lets a streaming request be answered from an entry a
+/// non-streaming one created — and it is why storing rendered wire bytes would have
+/// been a mistake, since it would leak the original request's identifiers.
+///
+/// The SSE path re-chunks through the same [`tok::IncrementalDecoder`] as a live
+/// stream, so a multi-byte character is split across deltas identically. It is sent
+/// as one ready-made stream with no engine behind it.
+fn memo_response(
+    req: &ChatRequest,
+    tokenizer: &Arc<TokenBackend>,
+    out_ids: &[u32],
+    completion_id: &str,
+    model_id: &str,
+    created: u64,
+    prompt_tokens: usize,
+) -> Result<Response, ApiError> {
+    if !req.stream {
+        let text = tk(tokenizer.decode(out_ids))?;
+        return Ok(Json(json_completion(&text, completion_id, model_id, created, prompt_tokens, out_ids.len()))
+            .into_response());
+    }
+    let mut events: Vec<Result<Event, std::convert::Infallible>> =
+        vec![Ok(chunk_event(completion_id, model_id, created, None, Some("assistant"), None))];
+    let mut dec = tok::IncrementalDecoder::new();
+    for &t in out_ids {
+        let delta = dec.push(&tokenizer.decode_bytes(&[t]));
+        if !delta.is_empty() {
+            events.push(Ok(chunk_event(completion_id, model_id, created, Some(&delta), None, None)));
+        }
+    }
+    let tail = dec.finish();
+    if !tail.is_empty() {
+        events.push(Ok(chunk_event(completion_id, model_id, created, Some(&tail), None, None)));
+    }
+    events.push(Ok(chunk_event(completion_id, model_id, created, None, None, Some("stop"))));
+    events.push(Ok(Event::default().data("[DONE]")));
+    Ok(Sse::new(tokio_stream::iter(events)).keep_alive(KeepAlive::default()).into_response())
 }
 
 /// Wall-clock seconds since the epoch, for the OpenAI `created` field.
@@ -553,7 +666,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (engine, _engine_join) = batch::spawn(model, args.max_batch)?;
 
     let addr = format!("{}:{}", args.host, args.port);
-    let state = AppState { inner: Arc::new(Inner { engine, tokenizer: Arc::new(tokenizer), args }) };
+    let state = AppState {
+        inner: Arc::new(Inner {
+            engine,
+            tokenizer: Arc::new(tokenizer),
+            args,
+            memo: parking_lot::Mutex::new(memo::ResponseMemo::from_env()),
+        }),
+    };
 
     let app = Router::new()
         .route("/health", get(health))
