@@ -280,6 +280,33 @@ Note the batched serving engine runs the absorb core, which has no sparse form,
 so a `peregrine-serve` run sees DSA during prefill only. Compare against
 `peregrine` (stdio) before concluding the effect is small.
 
+### 5b. Is the remaining KV fragmentation worth a block pool?
+
+`KvBuf::reserve_for` capped the growth overshoot at 256 rows; what is left is
+allocator churn across sequences, and whether that is worth a block pool is a
+measurement, not an argument. Run a long serve session and compare **peak RSS
+against live KV**:
+
+```bash
+COLI_KV_BUDGET_MB=16384 ./target/release/peregrine-serve --max-batch 16 &
+# drive it for an hour with varied prompt lengths, then:
+grep VmHWM /proc/$(pgrep -f peregrine-serve)/status
+```
+
+`VmHWM` minus the sum of `SeqKv::bytes()` over live sequences is the headroom a
+pool could reclaim. Two readings decide it:
+
+- **If the gap is flat over the session**, it is allocator slack that a pool
+  would just relocate — stop, and record the number so the item can be closed
+  rather than left open forever.
+- **If the gap grows** with a workload of mixed prompt lengths, that is real
+  fragmentation from freeing 78 differently-sized allocations per sequence, and
+  it is the case a block pool exists for.
+
+Note the ceiling before spending on it: peregrine never pre-allocates, so it has
+none of the reservation waste that is the largest bar in vLLM's 62–80% figure.
+~33% is the honest upper bound here.
+
 ### 5a. Does prefix sharing show up in RSS and admission?
 
 Refcounted prefixes and the KV byte budget are the two halves of one change, and

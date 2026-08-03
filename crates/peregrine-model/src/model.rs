@@ -612,6 +612,47 @@ fn prefetch_lookahead() -> bool {
     *ON.get_or_init(|| !matches!(std::env::var("COLI_PREFETCH_LOOKAHEAD").as_deref(), Ok("0") | Ok("false")))
 }
 
+/// Whether to run the **router look-ahead**: at the end of layer `L`, apply layer
+/// `L+1`'s post-attention norm and router to layer `L`'s output and prefetch the
+/// experts that ranking names. On by default; disable with `COLI_ROUTER_LOOKAHEAD=0`.
+///
+/// This is a different predictor from everything in [`crate::predict`], and the
+/// difference is the point. `PredictSource` is a *statistic over the router's past
+/// answers* — momentum, a transition automaton, macro-states, co-activation. The
+/// look-ahead asks the router itself. Measured on WASTE's K3 container (their
+/// `LEARNED.md` §29/§34, 1092 layer transitions), recall@16 of the next layer's
+/// actual set: 29.0 % for held-out co-occurrence, 29.5 % for "the previous token's
+/// set" — and **59.0 %** for the next layer's router run on this layer's hidden
+/// state. Those are their numbers on their model; `COLI_PREDICT_EVAL` is how to get
+/// ours (see [`LookaheadEval`]).
+///
+/// It cannot change a token. The authoritative router still runs at layer `L+1` and
+/// still decides; this only starts I/O early, and a wrong guess costs a read the
+/// cache will evict unused. That is what makes it safe to leave on.
+fn router_lookahead() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_ROUTER_LOOKAHEAD").as_deref(), Ok("0") | Ok("false")))
+}
+
+/// How many of the next layer's ranked experts the look-ahead actually streams
+/// (`COLI_ROUTER_LOOKAHEAD_N`, default 6).
+///
+/// **This is a window, not a tuning constant.** The right value is however many
+/// reads fit in the layer boundary — the stretch of attention and non-expert MoE
+/// work during which the readers would otherwise have nothing queued — and that is
+/// a property of the disk and the model, not a number to carry between machines.
+/// Six is where WASTE landed on an M5 Pro (~5.9 ms boundary, ~0.92 ms a read); they
+/// measured 3, 4 and 10 all worse, and at 10 total bytes read rose 4 %. Their
+/// rank-precision profile is the reason a small number wins: 92.2 % at rank 1,
+/// 81.4 % cumulative at 6, 59.0 % at 16 — so widening past the boundary buys
+/// steadily worse guesses that displace reads the engine actually needs.
+fn router_lookahead_width() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| env_usize("COLI_ROUTER_LOOKAHEAD_N", 6))
+}
+
 /// Multi-path tiering: per layer, the top `warm_paths` ranked candidates are fully
 /// streamed and the next `hint_paths` get a page-cache `fadvise` hint. The default
 /// (`warm_paths = MAX`, `hint_paths = 0`) reproduces "warm everything predicted".
@@ -1008,6 +1049,127 @@ impl PrefetchCtx<'_> {
             peregrine_io::note_advisory_err("prefetch hint dispatch", &"prefetch lane is down");
         }
     }
+
+    /// This emitter's state, narrowed to what the router look-ahead needs.
+    fn lookahead(&self) -> LookaheadCtx<'_> {
+        LookaheadCtx { prefetch: self.prefetch, cache: self.cache, gpu: self.gpu, st: self.st, cfg: self.cfg }
+    }
+}
+
+/// The state the router look-ahead needs — which is [`PrefetchCtx`] minus the
+/// routing history and minus the predictor.
+///
+/// That absence is the substantive difference between the two emitters, not an
+/// implementation detail. Everything in [`crate::predict`] is a function of what the
+/// router has answered before, so it needs a history and needs it to be warm. The
+/// look-ahead needs neither: it reads the answer off the next layer's own weights,
+/// which are already resident. It is therefore right on the first token of a cold
+/// process, where every history-based predictor is still empty.
+#[derive(Clone, Copy)]
+struct LookaheadCtx<'a> {
+    prefetch: &'a PrefetchHandle,
+    cache: &'a Mutex<WarmCache>,
+    gpu: Option<&'a GpuTier>,
+    st: &'a SafeTensors,
+    cfg: &'a Cfg,
+}
+
+impl LookaheadCtx<'_> {
+    /// Ask layer `next`'s own router which experts it is about to want, and start
+    /// those reads now — during the boundary the disk would otherwise spend idle.
+    ///
+    /// `x` is layer `next - 1`'s output, which is exactly layer `next`'s input. The
+    /// authoritative router at layer `next` will see `rmsnorm(x + attn_next,
+    /// post_ln_next)`; this sees `rmsnorm(x, post_ln_next)`. The one term missing is
+    /// that layer's own attention delta, and the residual stream dominates it — which
+    /// is why a ranking taken from the router beats every statistic over the router's
+    /// history by roughly 2× (see [`router_lookahead`]).
+    ///
+    /// Ordering matches [`PrefetchCtx::emit_layer`]: rank by the router, then drop the
+    /// candidates that need no read (already warm, or GPU-resident and never
+    /// streamed), and spend the window on the top `width` of what is left. Filtering
+    /// after ranking rather than before is what keeps the window full — a prediction
+    /// that is right and already cached is not a read, so it should not consume one
+    /// of the six slots.
+    ///
+    /// Advisory throughout: a resolve failure or a dead lane costs nothing but the
+    /// speculation, because the real forward streams the expert through the ordinary
+    /// path regardless.
+    fn emit(&self, layers: &[LayerW], next: usize, x: &[f32], width: usize) {
+        let d = self.cfg.hidden as usize;
+        if width == 0 || next >= layers.len() || next < self.cfg.first_dense as usize || x.len() < d {
+            return;
+        }
+        let l = &layers[next];
+        if !l.sparse {
+            return;
+        }
+        let mut warms = Vec::new();
+        for (e, _rank) in self.rank(l, next, x, width) {
+            let Ok(eu) = usize::try_from(e) else { continue };
+            match crate::concurrent::prefetch_item(self.st, self.cfg, next, eu) {
+                Ok(item) => warms.push(item),
+                Err(err) => peregrine_io::note_advisory_err("lookahead item resolve", &err),
+            }
+        }
+        if warms.is_empty() {
+            return;
+        }
+        LOOKAHEAD_ISSUED.fetch_add(warms.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if self.prefetch.tx.send(PrefetchMsg::Warm(warms)).is_err() {
+            peregrine_io::note_advisory_err("lookahead dispatch", &"prefetch lane is down");
+        }
+    }
+
+    /// The `(expert, rank)` pairs this look-ahead would stream for layer `next`:
+    /// the next layer's router ranking, minus the candidates that would cost no read,
+    /// truncated to `width`. `rank` is the position in the router's *full* ranking,
+    /// which is what a precision-by-rank measurement needs.
+    ///
+    /// Split out from [`Self::emit`] so [`LookaheadEval`] scores exactly the set that
+    /// would have been fetched, rather than a re-derivation of it that could drift.
+    fn rank(&self, l: &LayerW, next: usize, x: &[f32], width: usize) -> Vec<(i32, usize)> {
+        let d = self.cfg.hidden as usize;
+        // One row: the look-ahead is decode-only (`s_n == 1` at every call site), so
+        // there is exactly one position to rank and no union to take.
+        let nrm = rmsnorm_rows(x, &l.post_ln, 1, d, self.cfg.eps);
+        // Scan the router's top-`k` — the width of a real routing decision — and take
+        // the first `width` that would cost a read. Past rank `k` the ranking's
+        // precision has fallen far enough that the candidates are not worth the scan.
+        let scan = width.max(self.cfg.topk.max(0) as usize);
+        let ranks = crate::router::route_ranks(&nrm, &l.router, &l.router_bias, d, self.cfg.n_experts as usize, scan);
+        let mut out = Vec::with_capacity(width.min(ranks.len()));
+        let cache = self.cache.lock();
+        for (rank, e) in ranks.into_iter().enumerate() {
+            if out.len() >= width {
+                break;
+            }
+            let Ok(eu) = usize::try_from(e) else { continue };
+            if cache.contains((next as u32, e as u32)) {
+                continue; // already warm — the look-ahead's job is done for it
+            }
+            if self.gpu.is_some_and(|g| g.has(next, eu)) {
+                continue; // computed on the GPU lane, never streamed
+            }
+            out.push((e, rank));
+        }
+        out
+    }
+}
+
+/// Experts the router look-ahead has speculatively streamed. Monotonic, lock-free,
+/// diagnostic — read at shutdown beside the warm cache's `prefetch_used` /
+/// `prefetch_wasted`, which already tell whether a speculative read was later hit.
+///
+/// Deliberately **not** folded into the cache's `misses`: a speculative read is not a
+/// demand access, and counting it as one would make a look-ahead that guessed wrong
+/// look like a cache that performed badly — and would quietly change what every
+/// hit-rate number in the engine's telemetry means.
+static LOOKAHEAD_ISSUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Experts the router look-ahead has speculatively streamed so far this process.
+pub fn lookahead_issued() -> u64 {
+    LOOKAHEAD_ISSUED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The prefetch lane: stream predicted experts into the shared warm cache on this
@@ -1744,6 +1906,26 @@ impl Model {
                 warm_paths: policy.warm_paths,
                 hint_paths: policy.hint_paths,
                 direct: self.direct,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Borrow `self`'s prefetch lane, cache and tensor handles as a [`LookaheadCtx`].
+    /// `None` unless both the prefetch lane and the warm cache exist — with nowhere to
+    /// put a speculative slab, there is nothing for the look-ahead to do.
+    ///
+    /// Note what is *not* required: a [`RouteHistory`]. The look-ahead reads the next
+    /// layer's routing off that layer's own weights, so it works on a cold process
+    /// where every history-based predictor is still empty.
+    fn lookahead_ctx(&self) -> Option<LookaheadCtx<'_>> {
+        match (&self.prefetch, &self.ecache) {
+            (Some(pool), Some(cache)) => Some(LookaheadCtx {
+                prefetch: pool.lane(0),
+                cache,
+                gpu: self.gpu.as_ref(),
+                st: &self.st,
+                cfg: &self.cfg,
             }),
             _ => None,
         }
@@ -2729,10 +2911,30 @@ impl Model {
                 }),
                 _ => None,
             };
+            // The router look-ahead is **decode-only**, and that is a measured
+            // boundary rather than a simplification. A decode layer claims `k` cache
+            // slots and leaves a real idle window — its attention — for six
+            // speculative reads to land in. A prefill chunk claims the union over
+            // every position in the chunk (hundreds of slots), so the speculative
+            // records are the freshest unpinned entries in the cache and are exactly
+            // what eviction takes first: WASTE built this hook on their chunk path
+            // and measured the signature of a prefetch thrown away and re-fetched —
+            // demand hit rate tripled, total bytes read rose 6.9 %, wall clock did
+            // not move (their `LEARNED.md` §36). They removed it rather than
+            // defaulting it off. There is also no window to fill there: a chunk
+            // layer's readers are busy continuously, so a speculative read does not
+            // move a read into idle time, it moves it in front of another read.
+            let la_width = if router_lookahead() && s_n == 1 { router_lookahead_width() } else { 0 };
+            let layers: &[LayerW] = layers;
             for (li, l) in layers.iter().enumerate() {
                 forward_layer(l, li, &mut kv[li], &ctx, &mut x, s_n, pos_base)?;
                 if let Some(pfc) = &pfc {
                     pfc.emit_layer(li);
+                    // Emitted here, after the layer's own reads have been consumed and
+                    // before the next layer's attention, because that gap is the whole
+                    // resource being spent. `x` is this layer's output, which is the
+                    // next layer's input.
+                    pfc.lookahead().emit(layers, li + 1, &x, la_width);
                 }
             }
         }
@@ -2918,9 +3120,21 @@ impl Model {
             layout_schedule: self.layout_schedule.as_deref(),
             affinity: Some(aff.as_ref()),
         };
-        for (li, l) in self.layers.iter().enumerate() {
+        // Router look-ahead, on the same decode-only rule as `forward_hidden`. B == 1
+        // *is* a decode step — the serving engine reaching this path with one live
+        // sequence is the ordinary single-stream shape — so it gets the window. B > 1
+        // does not: the batch routes a union over B rows, which grows the speculative
+        // set while the boundary it has to fit in stays the same, and that is the
+        // regime WASTE measured as a net loss on their chunk path.
+        let la_width = if router_lookahead() && s_n == 1 { router_lookahead_width() } else { 0 };
+        let la = (la_width > 0).then(|| self.lookahead_ctx()).flatten();
+        let layers: &[LayerW] = &self.layers;
+        for (li, l) in layers.iter().enumerate() {
             let mut caches: Vec<&mut LayerKv> = seqs.iter_mut().map(|sk| &mut sk.layers[li]).collect();
             forward_layer_batched(l, li, &mut caches, &ctx, &mut x, s_n, pos_of)?;
+            if let Some(la) = &la {
+                la.emit(layers, li + 1, &x, la_width);
+            }
         }
         self.publish_lane_timings();
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
