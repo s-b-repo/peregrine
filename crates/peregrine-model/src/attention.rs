@@ -762,13 +762,28 @@ fn project(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut 
     Ok(q)
 }
 
-/// Dense core: reconstruct `[k_nope|v]` for all cached positions via `kv_b`,
-/// then causal scored attention. Returns `ctx[s_n, H*v_head]`.
+/// Dense core over independent rows: reconstruct `[k_nope|v]` through `kv_b`,
+/// then causal scored attention. Row `r` attends its own `rows[r]` view and
+/// writes `ctx[r]`.
 ///
-/// `sel`, when `Some`, restricts each query `s` to attend only the cached key
-/// indices in `sel[s]` (the DSA lightning-indexer selection); `None` attends all
-/// causal keys (dense). Selecting every causal key is identical to dense.
-fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, kv: &RowAttn, c: &Cfg, sel: Option<&[Vec<usize>]>) -> Vec<f32> {
+/// **`owner[r]` is what makes the dense path affordable in a batch.** The `kv_b`
+/// reconstruction is the expensive half and it is per *cache*, not per query, so
+/// rows sharing an owner share one reconstruction sized to their longest. Pure
+/// decode gives one row per owner and no sharing (which is why absorb exists);
+/// a prefill chunk gives many rows on one owner and full sharing.
+///
+/// `sel`, when `Some`, restricts row `r` to the cached key indices in `sel[r]`
+/// (the DSA lightning-indexer selection); `None` attends all causal keys.
+/// Selecting every causal key is identical to dense.
+fn attend_dense_rows(
+    w: &AttnWeights,
+    q: &[f32],
+    rows: &[RowAttn],
+    owner: &[usize],
+    c: &Cfg,
+    sel: Option<&[Vec<usize>]>,
+) -> Vec<f32> {
+    let s_n = rows.len();
     let h_n = c.n_heads as usize;
     let qk_nope = c.qk_nope as usize;
     let qk_rope = c.qk_rope as usize;
@@ -777,65 +792,101 @@ fn attend_dense(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, kv: &Ro
     let kvl = c.kv_lora as usize;
     let kvb_head = qk_nope + vh;
 
-    let tk = kv.len;
-    // Reconstruct `[k_nope|v]` for every cached position. `kv_b` wants one f32
-    // block, which a contiguous f32 cache already is — the default path hands
-    // it the backing slice and copies nothing. A split or narrowed cache is
-    // gathered into scratch first, which costs `tk × kv_lora` floats against
-    // the `tk × H × (qk_nope + v_head)` this call is about to produce anyway.
-    let mut scratch: Vec<f32> = Vec::new();
-    let lc_all: &[f32] = match kv.lc.as_contiguous_f32(tk, kvl) {
-        Some(s) => s,
-        None => {
-            kv.lc.extend_f32(tk, kvl, &mut scratch);
-            &scratch
-        }
-    };
-    let kvb_all = w.kv_b.apply_vec(lc_all, tk);
-
     let mut ctx = vec![0f32; s_n * h_n * vh];
-    for s in 0..s_n {
-        let pos = pos_base + s;
-        // keys this query attends: the DSA selection (clamped causal), or all 0..=pos
-        let mut keys: Vec<usize> = match sel.and_then(|sets| sets.get(s)) {
-            // DSA selection for this row, clamped to its causal prefix.
-            Some(set) => set.iter().copied().filter(|&t| t <= pos).collect(),
-            // Dense (`sel` is None) — or a selection that does not cover this
-            // row, which the public entry point rejects before we get here.
-            None => match sel {
-                Some(_) => Vec::new(),
-                None => (0..=pos).collect(),
-            },
-        };
-        // A query must always attend at least its own position. An empty
-        // selection (indexer configured with no keys, or every selected key
-        // beyond `pos`) would otherwise softmax an empty score row and leave the
-        // context vector identically zero — silently blanking attention.
-        if keys.is_empty() {
-            keys.push(pos.min(tk.saturating_sub(1)));
-        }
-        for h in 0..h_n {
-            let qp = &q[s * h_n * qh + h * qh..s * h_n * qh + h * qh + qh];
-            let (q_nope, q_rope) = qp.split_at(qk_nope);
-            let mut sc = vec![0f32; keys.len()];
-            for (i, &t) in keys.iter().enumerate() {
-                let base = t * h_n * kvb_head + h * kvb_head;
-                let kn = &kvb_all[base..base + qk_nope];
-                sc[i] = (dot(q_nope, kn) + kv.rc.dot_row(t, qk_rope, q_rope)) * c.attn_scale;
+    let n_owners = owner.iter().copied().max().map_or(0, |m| m + 1);
+    for o in 0..n_owners {
+        let members: Vec<usize> = (0..s_n).filter(|&r| owner.get(r) == Some(&o)).collect();
+        let Some(&first) = members.first() else { continue };
+        // One reconstruction per owner, sized to its longest row — every shorter
+        // row of the same cache is a prefix of it.
+        let mut longest = first;
+        for &r in &members {
+            if rows[r].len > rows[longest].len {
+                longest = r;
             }
-            softmax(&mut sc);
-            let cx = &mut ctx[(s * h_n + h) * vh..(s * h_n + h) * vh + vh];
-            for (i, &t) in keys.iter().enumerate() {
-                let base = t * h_n * kvb_head + h * kvb_head + qk_nope;
-                let vv = &kvb_all[base..base + vh];
-                let a = sc[i];
-                for d in 0..vh {
-                    cx[d] += a * vv[d];
+        }
+        let tk = rows[longest].len;
+        if tk == 0 {
+            continue;
+        }
+        // `kv_b` wants one f32 block, which a contiguous f32 cache already is —
+        // the default path hands it the backing slice and copies nothing. A
+        // split or narrowed cache is gathered into scratch first, which costs
+        // `tk × kv_lora` floats against the `tk × H × (qk_nope + v_head)` this
+        // call is about to produce anyway.
+        let lc_span = rows[longest].lc;
+        let mut scratch: Vec<f32> = Vec::new();
+        let lc_all: &[f32] = match lc_span.as_contiguous_f32(tk, kvl) {
+            Some(v) => v,
+            None => {
+                lc_span.extend_f32(tk, kvl, &mut scratch);
+                &scratch
+            }
+        };
+        let kvb_all = w.kv_b.apply_vec(lc_all, tk);
+
+        for &r in &members {
+            let nt = rows[r].len;
+            let pos = nt.saturating_sub(1);
+            // keys this query attends: the DSA selection (clamped causal), or all of them
+            let mut keys: Vec<usize> = match sel.and_then(|sets| sets.get(r)) {
+                // DSA selection for this row, clamped to its causal prefix.
+                Some(set) => set.iter().copied().filter(|&t| t < nt).collect(),
+                // Dense (`sel` is None) — or a selection that does not cover this
+                // row, which the public entry point rejects before we get here.
+                None => match sel {
+                    Some(_) => Vec::new(),
+                    None => (0..nt).collect(),
+                },
+            };
+            // A query must always attend at least its own position. An empty
+            // selection (indexer configured with no keys, or every selected key
+            // beyond `pos`) would otherwise softmax an empty score row and leave
+            // the context vector identically zero — silently blanking attention.
+            if keys.is_empty() {
+                keys.push(pos);
+            }
+            for h in 0..h_n {
+                let qp = &q[r * h_n * qh + h * qh..r * h_n * qh + h * qh + qh];
+                let (q_nope, q_rope) = qp.split_at(qk_nope);
+                let mut sc = vec![0f32; keys.len()];
+                for (i, &t) in keys.iter().enumerate() {
+                    let base = t * h_n * kvb_head + h * kvb_head;
+                    let kn = &kvb_all[base..base + qk_nope];
+                    sc[i] = (dot(q_nope, kn) + rows[r].rc.dot_row(t, qk_rope, q_rope)) * c.attn_scale;
+                }
+                softmax(&mut sc);
+                let cx = &mut ctx[(r * h_n + h) * vh..(r * h_n + h) * vh + vh];
+                for (i, &t) in keys.iter().enumerate() {
+                    let base = t * h_n * kvb_head + h * kvb_head + qk_nope;
+                    let vv = &kvb_all[base..base + vh];
+                    let a = sc[i];
+                    for d in 0..vh {
+                        cx[d] += a * vv[d];
+                    }
                 }
             }
         }
     }
     ctx
+}
+
+/// Single-sequence dense core: `s_n` new queries from `pos_base`, each attending
+/// its own causal prefix of one `cache`. A thin wrapper over
+/// [`attend_dense_rows`] with every row on owner 0, so they share the one
+/// reconstruction — exactly what this did before it learned about owners.
+fn attend_dense(
+    w: &AttnWeights,
+    q: &[f32],
+    s_n: usize,
+    pos_base: usize,
+    cache: &LayerKv,
+    c: &Cfg,
+    sel: Option<&[Vec<usize>]>,
+) -> Vec<f32> {
+    let rows: Vec<RowAttn> = (0..s_n).map(|s| cache.view_prefix(pos_base + s + 1)).collect();
+    let owner = vec![0usize; s_n];
+    attend_dense_rows(w, q, &rows, &owner, c, sel)
 }
 
 /// Absorb core over `s_n` independent rows: row `s` folds `kv_b`'s k_nope rows
@@ -918,7 +969,7 @@ fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache:
 /// appended to `cache`; returns `out[s_n, hidden]`.
 pub fn mla_attention(w: &AttnWeights, x: &[f32], s_n: usize, pos_base: usize, cache: &mut LayerKv, c: &Cfg) -> Result<Vec<f32>, Error> {
     let q = project(w, x, s_n, pos_base, cache, c)?;
-    let ctx = attend_dense(w, &q, s_n, pos_base, &cache.view(), c, None);
+    let ctx = attend_dense(w, &q, s_n, pos_base, cache, c, None);
     Ok(w.o.apply_vec(&ctx, s_n))
 }
 
@@ -948,7 +999,7 @@ fn mla_attention_dsa(
         )));
     }
     let q = project(w, x, s_n, pos_base, cache, c)?;
-    let ctx = attend_dense(w, &q, s_n, pos_base, &cache.view(), c, Some(sel));
+    let ctx = attend_dense(w, &q, s_n, pos_base, cache, c, Some(sel));
     Ok(w.o.apply_vec(&ctx, s_n))
 }
 
@@ -998,7 +1049,7 @@ pub fn mla_attention_dsa_indexed(
     let tk = cache.len();
     let dense_is_identical = ix.topk() == 0 || tk <= ix.topk() || cache.index_len() < tk;
     let ctx = if dense_is_identical {
-        attend_dense(w, &q, s_n, pos_base, &cache.view(), c, None)
+        attend_dense(w, &q, s_n, pos_base, cache, c, None)
     } else {
         // One materialization of the key cache per call, reused across every
         // query in this step — `score_keys` is pinned to a flat `&[f32]` by its
@@ -1012,7 +1063,7 @@ pub fn mla_attention_dsa_indexed(
                 ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], pos, c, &keys)
             })
             .collect();
-        attend_dense(w, &q, s_n, pos_base, &cache.view(), c, Some(&sel))
+        attend_dense(w, &q, s_n, pos_base, cache, c, Some(&sel))
     };
     Ok(w.o.apply_vec(&ctx, s_n))
 }
@@ -1049,6 +1100,7 @@ pub fn mla_attention_batched(
     pos_of: &[usize],
     caches: &mut [&mut LayerKv],
     c: &Cfg,
+    absorb: bool,
 ) -> Result<Vec<f32>, Error> {
     let s_n = pos_of.len();
     if caches.len() != s_n {
@@ -1057,14 +1109,71 @@ pub fn mla_attention_batched(
             caches.len()
         )));
     }
+    let owner: Vec<usize> = (0..s_n).collect();
+    mla_attention_rows(w, x, pos_of, &owner, caches, c, absorb)
+}
+
+/// Batched MLA attention over arbitrary **(position, cache) rows**.
+///
+/// [`mla_attention_batched`] is the one-token-per-sequence case of this;
+/// `owner[r]` names which cache row `r` belongs to, so several rows may share
+/// one sequence. That is what a prefill chunk is — many consecutive positions on
+/// a single cache — and what a speculative draft is: `γ+1` tokens on one
+/// sequence. Both were blocked on this signature.
+///
+/// Rows of one owner must arrive in ascending position order with no gaps;
+/// [`LayerKv::append`] reports a violation rather than corrupting the cache, so
+/// a scheduler bug fails one request instead of silently attending the wrong
+/// history.
+pub fn mla_attention_rows(
+    w: &AttnWeights,
+    x: &[f32],
+    pos_of: &[usize],
+    owner: &[usize],
+    caches: &mut [&mut LayerKv],
+    c: &Cfg,
+    absorb: bool,
+) -> Result<Vec<f32>, Error> {
+    let s_n = pos_of.len();
+    if owner.len() != s_n {
+        return Err(Error::Format(format!("row attention: {s_n} positions but {} owners", owner.len())));
+    }
+    if let Some(&bad) = owner.iter().find(|&&o| o >= caches.len()) {
+        return Err(Error::Format(format!(
+            "row attention: owner {bad} is out of range for {} caches",
+            caches.len()
+        )));
+    }
     let kvl = c.kv_lora as usize;
     let qk_rope = c.qk_rope as usize;
     let (q, _qr, lc_rows, rc_rows) = project_batched(w, x, s_n, pos_of, c);
+    // Append in row order, so a chunk's later rows see its earlier ones — the
+    // causal prefix, exactly as sequential prefill builds it.
     for s in 0..s_n {
-        caches[s].append(pos_of[s], &lc_rows[s * kvl..s * kvl + kvl], &rc_rows[s * qk_rope..s * qk_rope + qk_rope])?;
+        caches[owner[s]].append(
+            pos_of[s],
+            &lc_rows[s * kvl..s * kvl + kvl],
+            &rc_rows[s * qk_rope..s * qk_rope + qk_rope],
+        )?;
     }
-    let rows: Vec<RowAttn> = caches.iter().map(|k| k.view()).collect();
-    let ctx = attend_absorb_batched(w, &q, &rows, c, peregrine_par::PAR_ATTN_MIN);
+    let views: Vec<&LayerKv> = caches.iter().map(|k| &**k).collect();
+    let rows: Vec<RowAttn> = (0..s_n).map(|s| views[owner[s]].view_prefix(pos_of[s] + 1)).collect();
+    // `absorb` is the caller's `COLI_MLA_ABSORB`. It used to be ignored here —
+    // this core was absorb-only, so a served request ran its prefill dense and
+    // every decode token absorbed, two numerically different implementations
+    // inside one response, whatever the knob said.
+    //
+    // Dense in a batch costs what absorb exists to avoid: each sequence has its
+    // own cache, so `attend_dense_rows` reconstructs once *per sequence* with
+    // nothing shared, and that cost grows with context. That is a real reason to
+    // set `COLI_MLA_ABSORB=1` for serving — but it is now the operator's
+    // decision, taken against the documented default, instead of one the code
+    // made silently.
+    let ctx = if absorb {
+        attend_absorb_batched(w, &q, &rows, c, peregrine_par::PAR_ATTN_MIN)
+    } else {
+        attend_dense_rows(w, &q, &rows, owner, c, None)
+    };
     Ok(w.o.apply_vec(&ctx, s_n))
 }
 
@@ -1375,7 +1484,10 @@ mod tests {
         let x: Vec<f32> = (0..b).flat_map(|s| newtok[s].clone()).collect();
         let pos_of: Vec<usize> = lens.iter().take(b).copied().collect();
         let mut refs: Vec<&mut LayerKv> = seq_caches.iter_mut().collect();
-        let bat_out = mla_attention_batched(&w.view(), &x, &pos_of, &mut refs, &c)?;
+        // This test's reference is built with `mla_attention_absorb`, so the
+        // batched call has to be the absorb core too — the comparison is
+        // batched-vs-sequential, not dense-vs-absorb.
+        let bat_out = mla_attention_batched(&w.view(), &x, &pos_of, &mut refs, &c, true)?;
 
         for z in 0..b * hidden {
             assert!((seq_out[z] - bat_out[z]).abs() < 1e-6, "z={z} seq={} bat={}", seq_out[z], bat_out[z]);
@@ -1720,6 +1832,91 @@ mod tests {
         mla_attention_absorb(&w.view(), &x[..2 * hidden], 2, n - 3, &mut a, &c)?;
         assert_eq!(a.len(), n - 1);
         assert_eq!(b.len(), n, "…and appending to a still does not touch b");
+        Ok(())
+    }
+
+    #[test]
+    fn many_rows_on_one_cache_match_a_sequential_prefill() -> Result<(), peregrine_core::Error> {
+        // The signature both the prefill/decode fusion and speculative decode
+        // were blocked on: several rows of one sequence in a single batched
+        // call. A prefill chunk is exactly that, and so is a γ+1 draft.
+        //
+        // The property is not "close" — a chunk of N rows must produce the same
+        // bits as feeding those N positions through the single-sequence path,
+        // because each row still attends only what precedes it. If it does not,
+        // fusing prefill into the decode batch changes served output.
+        let c = cfg()?;
+        let w = make_weights(&c, 53);
+        let hidden = c.hidden as usize;
+        let n = 5usize;
+        let mut r = Lcg(0xF05ED);
+        let x: Vec<f32> = (0..n * hidden).map(|_| r.f()).collect();
+
+        for absorb in [false, true] {
+            // Reference: one sequence, one call, the single-sequence core.
+            let mut refc = new_cache(&c);
+            let want = attend_either(!absorb, &w.view(), &x, n, 0, &mut refc, &c)?;
+
+            // Same n positions as n rows of one owner through the batched entry.
+            let mut got_kv = new_cache(&c);
+            let pos_of: Vec<usize> = (0..n).collect();
+            let owner = vec![0usize; n];
+            let mut refs: Vec<&mut LayerKv> = vec![&mut got_kv];
+            let got = mla_attention_rows(&w.view(), &x, &pos_of, &owner, &mut refs, &c, absorb)?;
+
+            assert_eq!(got.len(), want.len());
+            for (k, (p, q)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(p.to_bits(), q.to_bits(), "absorb={absorb}, output {k}: a chunk is not its sequence");
+            }
+            assert_eq!(got_kv.len(), n, "every row's latent is cached, once");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rows_of_different_sequences_do_not_see_each_other() -> Result<(), peregrine_core::Error> {
+        // Mixed ownership is the fusion's real shape: a prefill chunk for one
+        // sequence riding in the same call as another sequence's decode token.
+        // Row `r` must attend `owner[r]`'s history and nothing else — a leak
+        // here is silent, and would look like a plausible answer.
+        let c = cfg()?;
+        let w = make_weights(&c, 59);
+        let hidden = c.hidden as usize;
+        let mut r = Lcg(0x0FFE7);
+        // seq A: three fresh positions (a prefill chunk). seq B: one decode
+        // token at position 2, on a cache already holding two.
+        let xa: Vec<f32> = (0..3 * hidden).map(|_| r.f()).collect();
+        let xb_pre: Vec<f32> = (0..2 * hidden).map(|_| r.f()).collect();
+        let xb: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
+
+        for absorb in [false, true] {
+            let dense = !absorb;
+            // References, each sequence entirely on its own.
+            let mut ra = new_cache(&c);
+            let want_a = attend_either(dense, &w.view(), &xa, 3, 0, &mut ra, &c)?;
+            let mut rb = new_cache(&c);
+            attend_either(dense, &w.view(), &xb_pre, 2, 0, &mut rb, &c)?;
+            let want_b = attend_either(dense, &w.view(), &xb, 1, 2, &mut rb, &c)?;
+
+            // Fused: A's three rows and B's one, in one call.
+            let mut ka = new_cache(&c);
+            let mut kb = new_cache(&c);
+            attend_either(dense, &w.view(), &xb_pre, 2, 0, &mut kb, &c)?;
+            let mut fused = xa.clone();
+            fused.extend_from_slice(&xb);
+            let pos_of = [0usize, 1, 2, 2];
+            let owner = [0usize, 0, 0, 1];
+            let mut refs: Vec<&mut LayerKv> = vec![&mut ka, &mut kb];
+            let got = mla_attention_rows(&w.view(), &fused, &pos_of, &owner, &mut refs, &c, absorb)?;
+
+            for (k, (p, q)) in want_a.iter().zip(&got[..3 * hidden]).enumerate() {
+                assert_eq!(p.to_bits(), q.to_bits(), "absorb={absorb}, seq A output {k}");
+            }
+            for (k, (p, q)) in want_b.iter().zip(&got[3 * hidden..]).enumerate() {
+                assert_eq!(p.to_bits(), q.to_bits(), "absorb={absorb}, seq B output {k}");
+            }
+            assert_eq!((ka.len(), kb.len()), (3, 3), "each cache advanced by its own rows only");
+        }
         Ok(())
     }
 

@@ -60,15 +60,14 @@ The suite is built around **bit-identity anchors** rather than tolerances:
     call* at 10% relative; end-to-end that difference compounds through the stack,
     and it has not been measured on a real checkpoint. Off by default, and its
     test asserts only what is verifiable — inert when unset, genuinely wired when
-    set — rather than an invented closeness bound. **And it does not reach the
-    batched decode path at all**: `forward_layer_batched` calls
-    `mla_attention_batched` unconditionally, which is absorb-only because the
-    dense core reconstructs against one cache and B sequences have B of them. So
-    on `peregrine-serve` a request's prefill runs dense and its decode tokens run
-    absorption regardless of the setting — two numerically different cores inside
-    one response. `batched_decode_is_absorb_whatever_the_knob_says` pins it:
-    bit-identical with the flag on and off, and different from the dense
-    single-sequence decode.
+    set — rather than an invented closeness bound. **It did not reach the batched
+    decode path until 2026-08-03**: `forward_layer_batched` called an absorb-only
+    core unconditionally, so a served request ran its prefill dense and every
+    decode token absorbed — two numerically different cores inside one response,
+    whatever the knob said. The dense core now takes per-row cache owners, and
+    `batched_decode_honours_the_absorb_knob_and_defaults_to_dense` asserts the
+    documented contract from both sides: at the default, batched decode is
+    bit-identical to the single-sequence decode; with the knob set, it differs.
   - `COLI_KV_DTYPE=f16` stores the KV latents rounded, halving resident KV
     exactly. Unlike the two above, its cost is *bounded by construction* on the
     absorb path — the latent is dotted in f32, so the error is f16's own
