@@ -193,6 +193,11 @@ struct Prefilling {
     sampler: Sampler,
     out: mpsc::UnboundedSender<EngineOut>,
     max_new: usize,
+    /// This stream's routing history, created at admission rather than at
+    /// promotion so a fused prefill row has somewhere to record. Moves into the
+    /// `SeqState` when the prefill completes, so the sequence keeps one history
+    /// across its whole life instead of starting blank at its first decode.
+    hist: Mutex<RouteHistory>,
 }
 
 /// Request priority. Higher priority requests are admitted and drained before
@@ -264,7 +269,25 @@ pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle
     let cap = max_batch.max(1);
     let join = std::thread::Builder::new()
         .name("peregrine-batch".to_string())
-        .spawn(move || run(model, rx_normal, rx_high, cap))
+        .spawn(move || run(model, rx_normal, rx_high, cap, fuse_prefill()))
+        .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
+    Ok((EngineHandle { tx_normal, tx_high }, join))
+}
+
+/// [`spawn`] with the prefill/decode fusion forced on or off.
+///
+/// Exists because `COLI_FUSE_PREFILL` resolves through a process-wide
+/// `OnceLock`, and a test that mutated the environment would race every other
+/// test in the binary — the same reason `iotune.rs` gives for not gating a
+/// feature on one.
+#[cfg(test)]
+fn spawn_fused(model: Model, max_batch: usize, fuse: bool) -> Result<(EngineHandle, JoinHandle<()>), Error> {
+    let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
+    let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
+    let cap = max_batch.max(1);
+    let join = std::thread::Builder::new()
+        .name("peregrine-batch-test".to_string())
+        .spawn(move || run(model, rx_normal, rx_high, cap, fuse))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
     Ok((EngineHandle { tx_normal, tx_high }, join))
 }
@@ -277,6 +300,25 @@ fn batch_sla_ms() -> Option<u64> {
     use std::sync::OnceLock;
     static V: OnceLock<Option<u64>> = OnceLock::new();
     *V.get_or_init(|| std::env::var("COLI_BATCH_SLA_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0))
+}
+
+/// Fuse a prefill chunk into the same forward as the decode batch
+/// (`COLI_FUSE_PREFILL`). Default **off** — the historical two-forward tick.
+///
+/// On a tick with both, the engine runs `forward_prefill_seq` *and*
+/// `forward_step_batched`: two disjoint forwards, each streaming its own
+/// routed-expert union off disk, ~11.3 GB per token apiece at GLM-5.2 shapes.
+/// The MoE lane is row-batch-union'd and does not care which sequence a row
+/// belongs to, so the two can share one set of expert reads.
+///
+/// **Output-neutral, and proven so rather than argued**:
+/// `a_fused_chunk_is_indistinguishable_from_two_separate_forwards` (model) and
+/// `fused_prefill_emits_the_same_tokens_as_the_two_forward_tick` (here). It is
+/// still opt-in because the win is a *byte* win that this workspace cannot
+/// measure — see `docs/validation-runbook.md`.
+fn fuse_prefill() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("COLI_FUSE_PREFILL").ok().as_deref(), Some("1") | Some("true")))
 }
 
 /// Number of decode ticks per prefill tick when the adaptive window is on.
@@ -421,6 +463,7 @@ fn run(
     mut rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
     mut rx_high: mpsc::UnboundedReceiver<EngineRequest>,
     max_batch: usize,
+    fuse: bool,
 ) {
     let vocab = model.cfg.vocab as usize;
     let stop_ids = model.cfg.stop_ids.clone();
@@ -515,28 +558,64 @@ fn run(
         // If no decodes are active yet, always run prefill (else the engine stalls
         // waiting for a prefill that never fires).
         let win = adaptive_window_ratio();
-        if win == 1 || active.is_empty() || steps.is_multiple_of(win as usize) {
-            prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids, chunk_div, &mut prefix);
+        let do_prefill = win == 1 || active.is_empty() || steps.is_multiple_of(win as usize);
+        // Fusion needs something to fuse *with*: a live decode batch and a
+        // pending prefill. Otherwise there is only one forward to run anyway, so
+        // take the historical path and leave the row assembly out of it.
+        let mut fused: Option<(Prefilling, usize)> = None;
+        if do_prefill {
+            let fusable = fuse && !active.is_empty() && !pending.is_empty();
+            match fusable.then(|| pending.pop_front()).flatten() {
+                Some(p) => {
+                    let end = chunk_end(p.pos, p.prompt.len(), chunk_div);
+                    fused = Some((p, end));
+                }
+                None => prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids, chunk_div, &mut prefix),
+            }
         }
         if active.is_empty() {
             continue; // only prefilling so far (or everything retired) — no decode yet
         }
 
-        // One batched decode step: feed each active sequence's pending token.
-        let tokens: Vec<i32> = active.iter().map(|s| s.next_tok).collect();
-        let pos_of: Vec<usize> = active.iter().map(|s| s.pos).collect();
+        // One forward for the whole tick: each active sequence's pending decode
+        // token, plus — when fusing — every position of one prefill chunk. The
+        // MoE lane unions routed experts across *rows*, so those rows share one
+        // set of expert reads instead of streaming two disjoint unions.
+        let n_dec = active.len();
+        let mut tokens: Vec<i32> = active.iter().map(|s| s.next_tok).collect();
+        let mut pos_of: Vec<usize> = active.iter().map(|s| s.pos).collect();
+        let mut owner: Vec<usize> = (0..n_dec).collect();
+        if let Some((p, end)) = &fused {
+            for (j, &t) in p.prompt[p.pos..*end].iter().enumerate() {
+                tokens.push(t);
+                pos_of.push(p.pos + j);
+                owner.push(n_dec); // the prefilling sequence is appended after the decoders
+            }
+        }
         let t_decode = std::time::Instant::now();
         let logits = {
             // Split each SeqState into (KV, history) disjoint borrows so the batched
             // forward records each sequence's *own* routed set into its own history.
-            let (mut refs, hists): (Vec<&mut SeqKv>, Vec<&Mutex<RouteHistory>>) = active
+            let (mut refs, mut hists): (Vec<&mut SeqKv>, Vec<&Mutex<RouteHistory>>) = active
                 .iter_mut()
                 .map(|s| {
                     let SeqState { seq, hist, .. } = s;
                     (seq, &*hist)
                 })
                 .unzip();
-            match model.forward_step_batched(&tokens, &mut refs, &pos_of, Some(&hists)) {
+            // `hists` is per *row*, so a chunk contributes one entry per position —
+            // all pointing at the prefilling sequence's own history, which is why
+            // `Prefilling` carries one from admission rather than getting one at
+            // promotion.
+            if let Some((p, end)) = fused.as_mut() {
+                let rows = *end - p.pos;
+                let Prefilling { seq, hist, .. } = p;
+                refs.push(seq);
+                for _ in 0..rows {
+                    hists.push(&*hist);
+                }
+            }
+            match model.forward_rows_batched(&tokens, &owner, &mut refs, &pos_of, Some(&hists)) {
                 Ok(l) => l,
                 Err(e) => {
                     for s in &active {
@@ -545,6 +624,11 @@ fn run(
                         }
                     }
                     active.clear();
+                    if let Some((p, _)) = fused {
+                        if p.out.send(EngineOut::Error(e.to_string())).is_err() {
+                            peregrine_core::note_advisory_err("fused prefill error", &"client already disconnected");
+                        }
+                    }
                     continue;
                 }
             }
@@ -590,6 +674,14 @@ fn run(
             idx += 1;
             k
         });
+
+        // The chunk's logits are the rows after the decoders. Finishing it here,
+        // through the same `finish_prefill_chunk` the unfused path uses, is what
+        // keeps the two ticks observationally identical.
+        if let Some((p, end)) = fused {
+            let out_cfg = OutputCfg { vocab, stop_ids: &stop_ids };
+            finish_prefill_chunk(p, end, &logits[n_dec * vocab..], &mut pending, &mut active, out_cfg, &mut prefix);
+        }
 
         // Periodically migrate the hottest experts into VRAM (heat-ranked
         // residency). Between steps, so it holds the exclusive borrow reheat needs;
@@ -705,6 +797,7 @@ fn admit_pending(model: &Model, pending: &mut VecDeque<Prefilling>, req: EngineR
         sampler: req.sampler,
         out: req.out,
         max_new: req.max_new,
+        hist: Mutex::new(model.new_route_history()),
     });
 }
 
@@ -720,15 +813,14 @@ fn prefill_step(
     chunk_div: usize,
     prefix: &mut PrefixCache,
 ) {
-    let Some(p) = pending.pop_front() else {
+    let Some(mut p) = pending.pop_front() else {
         return;
     };
-    // Destructure so the prompt and the KV cache are disjoint borrows — the
-    // chunk is then a plain slice instead of a per-step copy.
-    let Prefilling { mut seq, prompt, pos, mut sampler, out, max_new } = p;
-    let end = (pos + prefill_chunk(pos, chunk_div)).min(prompt.len());
-    let chunk = &prompt[pos..end];
-    let logits = match model.forward_prefill_seq(chunk, &mut seq, pos) {
+    let end = chunk_end(p.pos, p.prompt.len(), chunk_div);
+    // The chunk is a plain slice of the prompt; `seq` is a disjoint field, so no
+    // per-step copy is needed to satisfy the borrow checker.
+    let Prefilling { seq, prompt, pos, out, .. } = &mut p;
+    let logits = match model.forward_prefill_seq(&prompt[*pos..end], seq, *pos) {
         Ok(l) => l,
         Err(e) => {
             if out.send(EngineOut::Error(e.to_string())).is_err() {
@@ -737,10 +829,45 @@ fn prefill_step(
             return; // drop this sequence
         }
     };
-    let chunk_len = chunk.len();
+    finish_prefill_chunk(p, end, &logits, pending, active, OutputCfg { vocab, stop_ids }, prefix);
+}
+
+/// The two things sampling needs, together — they are read as a pair
+/// everywhere and bundling them keeps [`finish_prefill_chunk`] under the
+/// argument limit without an `#[allow]`, which the strict audit rejects.
+#[derive(Clone, Copy)]
+struct OutputCfg<'a> {
+    vocab: usize,
+    stop_ids: &'a [i32],
+}
+
+/// Where this sequence's next prefill chunk ends.
+fn chunk_end(pos: usize, prompt_len: usize, chunk_div: usize) -> usize {
+    (pos + prefill_chunk(pos, chunk_div)).min(prompt_len)
+}
+
+/// Consume one prefill chunk's logits: either queue the next chunk, or complete
+/// the prefill — snapshot it for the prefix cache, sample the first token, and
+/// promote the sequence into the decode batch.
+///
+/// Split out of [`prefill_step`] so the fused tick, which produces these logits
+/// inside the *decode* forward, finishes a chunk by exactly the same rules. The
+/// two paths differing here is how a fusion silently changes served output.
+fn finish_prefill_chunk(
+    p: Prefilling,
+    end: usize,
+    logits: &[f32],
+    pending: &mut VecDeque<Prefilling>,
+    active: &mut Vec<SeqState>,
+    out_cfg: OutputCfg,
+    prefix: &mut PrefixCache,
+) {
+    let OutputCfg { vocab, stop_ids } = out_cfg;
+    let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist } = p;
+    let chunk_len = end - pos;
     if end < prompt.len() {
         // more chunks to go — round-robin with the others
-        pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new });
+        pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new, hist });
         return;
     }
     // Prefill complete. Snapshot it before the KV moves into the active set, so
@@ -762,16 +889,7 @@ fn prefill_step(
     if max_new <= 1 {
         return; // only one token requested
     }
-    active.push(SeqState {
-        seq,
-        hist: Mutex::new(model.new_route_history()),
-        pos: prompt.len(),
-        next_tok: t0,
-        sampler,
-        out,
-        produced: 1,
-        max_new,
-    });
+    active.push(SeqState { seq, hist, pos: prompt.len(), next_tok: t0, sampler, out, produced: 1, max_new });
 }
 
 #[cfg(test)]
@@ -1110,6 +1228,62 @@ mod tests {
                 assert_eq!(a.to_bits(), b.to_bits(), "div={div}: logit {i} differs");
             }
         }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fused_prefill_emits_the_same_tokens_as_the_two_forward_tick() -> Result<(), Error> {
+        // The fusion's whole justification is that it is a *byte* win and not a
+        // behaviour change: a prefill chunk and the decode batch go through one
+        // forward instead of two, sharing one routed-expert union.
+        //
+        // So the observable output must not move. Two requests, one long enough
+        // to prefill in chunks while the other decodes — which is exactly the
+        // mixed tick fusion targets — and the emitted token streams must be
+        // identical with the fusion on and off.
+        let dir = tiny_dir("fused")?;
+        let long: Vec<i32> = (0..80).map(|k| (k * 3 + 1) % 32).collect(); // > PREFILL_CHUNK
+        let short: Vec<i32> = vec![1, 5, 9, 2];
+        let n = 6usize;
+
+        let run_engine = |fuse: bool| -> Result<Vec<Vec<u32>>, Error> {
+            let (handle, join) = spawn_fused(Model::load(&dir)?, 8, fuse)?;
+            let mut rxs = Vec::new();
+            for prompt in [short.clone(), long.clone()] {
+                let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+                handle.submit(EngineRequest {
+                    prompt,
+                    max_new: n,
+                    sampler: Sampler::new(0.0, 0.9, 1),
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                })?;
+                rxs.push(rx);
+            }
+            drop(handle);
+            let mut out = Vec::new();
+            for mut rx in rxs {
+                let mut toks = Vec::new();
+                while let Some(msg) = rx.blocking_recv() {
+                    match msg {
+                        EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Error(e) => return Err(Error::Format(e)),
+                    }
+                }
+                out.push(toks);
+            }
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok(out)
+        };
+
+        let plain = run_engine(false)?;
+        let fused = run_engine(true)?;
+        assert!(plain.iter().all(|t| !t.is_empty()), "the reference run must actually generate");
+        assert_eq!(fused, plain, "fusing a prefill chunk into the decode forward changed the token stream");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
