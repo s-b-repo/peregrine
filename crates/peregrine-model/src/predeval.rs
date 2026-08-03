@@ -145,13 +145,20 @@ impl PredictEval {
                 arm.silent += 1;
                 continue;
             }
+            let mut seen: Vec<i32> = Vec::with_capacity(self.width);
             let mut covered = 0u64;
             for (rank, e) in pred.iter().take(self.width).enumerate() {
                 arm.rank_n[rank] += 1;
                 if actual.contains(e) {
                     arm.rank_hit[rank] += 1;
-                    covered += 1;
+                    // Recall counts *distinct* coverage. An arm that offers the same
+                    // right answer twice has covered one expert, and counting it twice
+                    // would let a degenerate arm report recall above 1.
+                    if !seen.contains(e) {
+                        covered += 1;
+                    }
                 }
+                seen.push(*e);
             }
             arm.covered += covered;
         }

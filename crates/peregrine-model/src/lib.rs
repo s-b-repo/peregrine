@@ -25,6 +25,7 @@ pub mod math;
 pub mod mlp;
 pub mod model;
 pub mod mtp;
+pub mod predeval;
 pub mod predict;
 pub mod ram;
 pub mod router;
@@ -41,13 +42,14 @@ pub use math::{
     RopeTable,
 };
 pub use mlp::{moe_forward, Mlp, MoeCfg};
-pub use model::{save_automaton, save_macrostates, Model, SeqKv};
+pub use model::{lookahead_issued, save_automaton, save_macrostates, Model, SeqKv};
 pub use iotune::{IoTuner, IowqCap};
 pub use lane::{Bias, BubbleTuner, LaneBalancer, LaneTimings, LaneTimingsAccum, Placement};
 pub use learn::{learn_mode, BanditScheduler, KnobArm, LearnMode, QAction, QScheduler, QState};
 pub use telemetry::{open_l3_miss_counter, PlanOptimizer, RuntimeTelemetry};
 pub use wmma_tune::{KernelShape, TileConfig, WmmaTuner};
 pub use workload::{classify_str, PhaseTracker, TokenClass};
+pub use predeval::{ArmReport, PredictEval};
 pub use predict::{Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 pub use mtp::speculative_sample;
 pub use router::{

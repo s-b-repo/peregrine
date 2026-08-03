@@ -33,7 +33,11 @@ graceful on Ctrl-C / SIGINT (in-flight connections drain; no SIGTERM handler).
 
 ### `GET /health`
 
-No auth. `200` → `{"status":"ok","tokenizer":"gigatoken"}`.
+No auth. `200` →
+`{"status":"ok","tokenizer":"gigatoken","memo":{"hits":0,"misses":0,"entries":0,"bytes":0}}`.
+
+`memo.hits` counts requests answered from the [response memo](#response-memo) without
+entering the model at all — the one rate here that measures work *not* done.
 
 ### `GET /v1/models`
 
@@ -110,6 +114,36 @@ On `/v1/chat/completions` only. `high`, `1`, or `true` (case-insensitive) →
 high priority; anything else, or absence, → normal. Each engine tick drains
 the high queue first. Priority reorders **admission only** — it never changes
 any request's token stream.
+
+## Response memo
+
+`COLI_MEMO_ENTRIES` (default 32) and `COLI_MEMO_MB` (default 64) bound a cache of
+completed responses; either at `0` disables it. A hit answers the request *before*
+it reaches the engine, so it consumes no batch slot and produces no KV state.
+
+This is worth more here than on a typical inference server: one token costs a pass
+over gigabytes of streamed experts, and an OpenAI-compatible endpoint is re-asked the
+same question constantly — health checks, retried requests, eval fixtures, clients
+that re-send an unchanged conversation.
+
+Three rules keep it from being a correctness hazard.
+
+- **The key is the complete request semantics** — prompt token ids, `max_tokens`,
+  `top_p` (by bit pattern) and the model id — **compared field-by-field, never
+  hashed.** Same rule as the prefix cache, same reason: a hash collision would serve
+  one caller another caller's answer, silently and unboundedly.
+- **Only `temperature == 0` is eligible.** Sampling draws against a clock-derived
+  seed; replaying a stored draw would quietly turn a sampling endpoint into a
+  deterministic one, and a user asking twice for variety would get the same text with
+  no indication why. Greedy decoding is reproducible by contract, so that is where
+  memoization is honest.
+- **Entries hold token ids, not wire bytes.** The framing is rebuilt per request —
+  its own completion id and `created` — so a streaming request can be served from an
+  entry a non-streaming request created, and no request's identifiers leak into
+  another's response.
+
+A generation that did not finish (engine error, client disconnect mid-stream) is
+never stored: a truncated answer replayed as a complete one is worse than no memo.
 
 ## Continuous batching
 

@@ -98,6 +98,99 @@ fn gb(n: u64) -> f64 {
     n as f64 / 1e9
 }
 
+/// A cgroup limit large enough to mean "no limit". cgroup v1 spells unlimited as
+/// `PAGE_COUNTER_MAX * PAGE_SIZE` — a number near `i64::MAX` that differs by kernel
+/// and page size, so it is recognized by magnitude rather than by an exact constant.
+/// No real machine has an exabyte of RAM, so anything this large is a sentinel.
+const CGROUP_UNLIMITED: u64 = 1 << 60;
+
+/// Bytes still available inside a cgroup v2 memory controller, from the contents of
+/// `memory.max` and `memory.current`. `None` when there is no limit (`max`) or the
+/// files are not parseable — in both cases the cgroup has nothing to say and the
+/// host's own figure stands.
+pub fn cgroup_v2_available(max: &str, current: &str) -> Option<u64> {
+    let max = max.trim();
+    if max == "max" {
+        return None;
+    }
+    let limit: u64 = max.parse().ok()?;
+    if limit >= CGROUP_UNLIMITED {
+        return None;
+    }
+    let used: u64 = current.trim().parse().unwrap_or(0);
+    Some(limit.saturating_sub(used))
+}
+
+/// The cgroup v1 equivalent, from `memory.limit_in_bytes` and `memory.usage_in_bytes`.
+pub fn cgroup_v1_available(limit: &str, usage: &str) -> Option<u64> {
+    let limit: u64 = limit.trim().parse().ok()?;
+    if limit >= CGROUP_UNLIMITED {
+        return None;
+    }
+    let used: u64 = usage.trim().parse().unwrap_or(0);
+    Some(limit.saturating_sub(used))
+}
+
+/// The memory this process may actually use: the smaller of what the host reports
+/// and what its cgroup permits.
+///
+/// Inside a container `/proc/meminfo` is the **host's**, not the container's — it is
+/// not namespaced. A 4 GB container on a 512 GB host reads 512 GB of `MemAvailable`,
+/// sizes its caches for a machine it is not running on, and is OOM-killed by the
+/// cgroup while every projection in the engine says it had room to spare. Both
+/// reference implementations of this problem hit exactly that (WASTE's `LEARNED.md`
+/// §40 is titled for it), which is a good sign it is not an exotic case.
+///
+/// `0` from either source means "unknown" and is treated as no constraint, matching
+/// [`ram_verdict`]'s rule that an unmeasurable machine is not a failing one.
+pub fn effective_available(host_available: u64, cgroup_available: Option<u64>) -> u64 {
+    match cgroup_available {
+        Some(c) if host_available == 0 => c,
+        Some(c) => host_available.min(c),
+        None => host_available,
+    }
+}
+
+/// A warning when the granted warm cache is a large enough share of available memory
+/// to risk the page-fault cliff, or when it had to be capped. `None` when the sizing
+/// is uncontroversial.
+///
+/// The failure mode this names is counter-intuitive enough to be worth a line of
+/// output. WASTE swept four cache sizes in one process on a 64 GB machine: at
+/// 17.3 GB of cache, 36.2 % hit rate and 0.63 tok/s; at 23.3 GB, a *higher* 38.4 %
+/// hit rate, *fewer* bytes read from disk — and 0.07 tok/s, an eightfold collapse.
+/// The engine was inside its budget and the machine was not, so every cache hit had
+/// become a page fault. More cache monotonically improves every metric the cache
+/// itself reports, right past the point where it destroys throughput; the cache's own
+/// telemetry cannot see the cliff, which is why the warning has to come from the
+/// sizing arithmetic instead.
+pub fn cache_cliff_warning(requested: u64, granted: u64, available: u64) -> Option<String> {
+    if available == 0 || granted == 0 {
+        return None;
+    }
+    if granted < requested {
+        return Some(format!(
+            "[ecache] requested {:.1} GB, granted {:.1} GB — capped to fit the streaming buffers and \
+             safety margin inside {:.1} GB available",
+            gb(requested),
+            gb(granted),
+            gb(available)
+        ));
+    }
+    // Half of what is available is the point past which the cache is competing with
+    // the resident set for the same pages rather than using memory nobody wants.
+    if granted.saturating_mul(2) > available {
+        return Some(format!(
+            "[ecache] {:.1} GB of cache against {:.1} GB available — a cache this large can lower \
+             throughput while *raising* its own hit rate, because a hit that has been paged out is a \
+             page fault. If decode is slow, measure a smaller COLI_ECACHE_GB before a larger one.",
+            gb(granted),
+            gb(available)
+        ));
+    }
+    None
+}
+
 /// One line describing the projection, always printed so a slow load is
 /// explicable and a later OOM has a number to be compared against.
 pub fn summary(p: &LoadProjection, mem_available: u64) -> String {
@@ -340,5 +433,62 @@ mod guard_tests {
         assert_eq!(rss_guard_decide(99_000_000_000, 0, 1 << 30), None, "no limit configured");
         assert_eq!(rss_guard_decide(0, 10_000_000_000, 1 << 30), None, "RSS unreadable");
         assert_eq!(rss_guard_decide(99_000_000_000, 10_000_000_000, 0), None, "no cache to give");
+    }
+
+    #[test]
+    fn cgroup_v2_reports_headroom_and_recognizes_unlimited() {
+        // 4 GiB limit, 1 GiB used → 3 GiB left.
+        assert_eq!(cgroup_v2_available("4294967296\n", "1073741824\n"), Some(3 << 30));
+        // The literal `max`, and the v1-style huge sentinel, both mean "no limit" —
+        // and "no limit" must be `None` (defer to the host) rather than a colossal
+        // number that would sail through every comparison as if it were real.
+        assert_eq!(cgroup_v2_available("max", "0"), None);
+        assert_eq!(cgroup_v2_available("9223372036854771712", "0"), None);
+        assert_eq!(cgroup_v2_available("garbage", "0"), None);
+        // Usage above the limit is a real transient state; it must floor at zero.
+        assert_eq!(cgroup_v2_available("1000", "4000"), Some(0));
+    }
+
+    #[test]
+    fn cgroup_v1_reports_headroom_and_recognizes_unlimited() {
+        assert_eq!(cgroup_v1_available("4294967296", "1073741824"), Some(3 << 30));
+        assert_eq!(cgroup_v1_available("9223372036854771712", "0"), None);
+        assert_eq!(cgroup_v1_available("", "0"), None);
+    }
+
+    #[test]
+    fn the_container_limit_wins_over_the_hosts_meminfo() {
+        // The case this exists for: a small container on a large host. `/proc/meminfo`
+        // is not namespaced, so the host's 512 GB is what the process reads, and
+        // sizing against it is how a 4 GB container gets OOM-killed while every
+        // projection says it had room.
+        let host = 512_000_000_000u64;
+        assert_eq!(effective_available(host, Some(4_000_000_000)), 4_000_000_000);
+        // And the reverse: a generous cgroup on a busy host does not conjure memory.
+        assert_eq!(effective_available(2_000_000_000, Some(64_000_000_000)), 2_000_000_000);
+        // Unknown from either side is not a constraint.
+        assert_eq!(effective_available(host, None), host);
+        assert_eq!(effective_available(0, Some(4_000_000_000)), 4_000_000_000);
+        assert_eq!(effective_available(0, None), 0);
+    }
+
+    #[test]
+    fn the_cliff_warning_fires_on_a_capped_or_oversized_cache() {
+        let avail = 20_000_000_000u64;
+        // Uncontroversial: a small cache against plenty of memory.
+        assert_eq!(cache_cliff_warning(2 << 30, 2 << 30, avail), None);
+        // Capped — the operator asked for more than they got and should know.
+        assert!(
+            cache_cliff_warning(16 << 30, 4 << 30, avail).is_some_and(|w| w.contains("capped")),
+            "a capped request must say so"
+        );
+        // Oversized: granted in full, but more than half of everything available.
+        assert!(
+            cache_cliff_warning(15 << 30, 15 << 30, avail).is_some_and(|w| w.contains("page fault")),
+            "an oversized cache must name the failure mode"
+        );
+        // Unmeasurable or disabled says nothing rather than guessing.
+        assert_eq!(cache_cliff_warning(4 << 30, 4 << 30, 0), None);
+        assert_eq!(cache_cliff_warning(0, 0, avail), None);
     }
 }
