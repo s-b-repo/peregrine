@@ -94,8 +94,8 @@ describes the host from inside a container; and a **bounded exact response memo*
 the serve layer. The borrowed *negative* results are recorded too, in
 [prefetch & caching](docs/prefetch-and-caching.md#borrowed-negative-results).
 
-See [`todo.md`](todo.md) for the audited roadmap (**~83% strict / ~87% weighted of
-130 tracked items**).
+See [`todo.md`](todo.md) for the audited roadmap (**~86% strict / ~89% weighted of
+136 tracked items**).
 
 | Area | Crate(s) | Status | Validated by |
 |---|---|---|---|
@@ -249,7 +249,7 @@ token stream is unchanged. (Annotated reference with deep-dive links:
 | `COLI_LANE_BALANCE` | off | `LaneBalancer` overrides static residency: downgrade cold GPU residents to CPU when GPU is bottlenecked |
 | `COLI_REPLICATE_K` | 0 | Top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
 | `COLI_NUMA_PIN` | off | Pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
-| `COLI_PERF_COUNTERS` | — | **not wired** — the counter exists, nothing calls the opener |
+| `COLI_PERF_COUNTERS` | off | LLC-miss counter on the decode thread; `[perf] llc-misses=N` at shutdown (that thread only) |
 | `COLI_DEBUG` | off | Surface advisory-operation failures (madvise/fadvise hints, NUMA pinning, route-stats persistence) on stderr |
 | `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
 | `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |

@@ -42,7 +42,7 @@ The `COLI_` prefix is kept from colibrì for drop-in compatibility.
 | `COLI_LANE_BALANCE` | off | `LaneBalancer` overrides static residency: downgrade cold GPU residents to CPU when GPU is bottlenecked |
 | `COLI_REPLICATE_K` | 0 | top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
 | `COLI_NUMA_PIN` | off | pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
-| `COLI_PERF_COUNTERS` | — | **not wired.** The counter (`PerfCounter::open_cache_misses`) works, but `open_l3_miss_counter` has no caller, so setting this has no effect. Listed because the docs advertised it as live |
+| `COLI_PERF_COUNTERS` | off | **Now wired** (it was documented as live for a year while `open_l3_miss_counter` had no caller). Opens an LLC-miss counter on the decode thread and prints `[perf] llc-misses=N` at shutdown. **Scoped to one thread on purpose**: `perf_event_open` follows the calling thread, so this counts attention and the deterministic reduce, *not* the io_uring workers or the `peregrine-par` pool. A whole-process figure needs a counter per thread; reporting this one as if it were that is how a number stops meaning anything. Silent when the kernel refuses — paranoid level, seccomp, or no PMU, which is most VMs |
 | `COLI_SHAPE_SPECIALIZE` | off | per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
 
 ## Governors & learning
