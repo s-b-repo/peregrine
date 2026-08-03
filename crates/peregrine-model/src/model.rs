@@ -13,8 +13,8 @@ use peregrine_core::{Cfg, Context, Error, SafeTensors};
 use peregrine_io::{Reactor, WarmCache};
 
 use crate::attention::{
-    mla_attention, mla_attention_absorb, mla_attention_batched, mla_attention_dsa_indexed, AttnWeights, KvDtype,
-    LayerKv,
+    mla_attention, mla_attention_absorb, mla_attention_dsa_indexed, mla_attention_rows, AttnWeights, KvDtype,
+    LayerKv, RowLayout,
 };
 use crate::dsa::IndexerWeights;
 use crate::concurrent::{default_workers, experts_per_batch, moe_forward_concurrent, ForwardCtx};
@@ -1573,16 +1573,16 @@ fn forward_layer_batched(
     l: &LayerW,
     li: usize,
     caches: &mut [&mut LayerKv],
+    rows_at: RowLayout,
     ctx: &ForwardCtx,
     x: &mut [f32],
-    s_n: usize,
-    pos_of: &[usize],
 ) -> Result<(), Error> {
     let cfg = ctx.cfg;
     let d = cfg.hidden as usize;
     let eps = cfg.eps;
+    let s_n = rows_at.len();
     let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
-    let attn = mla_attention_batched(&l.attn(), &nrm, pos_of, caches, cfg, ctx.absorb)?;
+    let attn = mla_attention_rows(&l.attn(), &nrm, rows_at, caches, cfg, ctx.absorb)?;
     for z in 0..s_n * d {
         x[z] += attn[z];
     }
@@ -3300,9 +3300,54 @@ impl Model {
                 pos_of.len()
             )));
         }
+        let owner: Vec<usize> = (0..s_n).collect();
+        self.forward_rows_batched(tokens, &owner, seqs, pos_of, histories)
+    }
+
+    /// One batched forward over arbitrary **(token, sequence) rows**: `owner[r]`
+    /// names which of `seqs` row `r` belongs to, so a sequence may contribute
+    /// several rows.
+    ///
+    /// [`Self::forward_step_batched`] is the one-row-per-sequence case.
+    /// Several rows on one owner is what a **prefill chunk** is — consecutive
+    /// positions on a single cache — and what a **speculative draft** is: `γ+1`
+    /// tokens on one sequence. Both were blocked on a signature that assumed one
+    /// token per sequence, which is why they are one change and not two.
+    ///
+    /// The MoE lane needs nothing: it is already row-batch-union'd over `s_n`
+    /// rows regardless of which sequence each belongs to, so fusing a prefill
+    /// chunk into a decode batch makes them share one set of expert reads
+    /// instead of streaming two disjoint unions off disk.
+    ///
+    /// `histories`, when given, is **per row**, not per sequence — a chunk's
+    /// rows each record their own routed set, exactly as sequential prefill
+    /// does. Rows of one owner must be in ascending position order with no gaps;
+    /// the cache reports a violation rather than absorbing it.
+    pub fn forward_rows_batched(
+        &self,
+        tokens: &[i32],
+        owner: &[usize],
+        seqs: &mut [&mut SeqKv],
+        pos_of: &[usize],
+        histories: Option<&[&Mutex<RouteHistory>]>,
+    ) -> Result<Vec<f32>, Error> {
+        let s_n = tokens.len();
+        if owner.len() != s_n || pos_of.len() != s_n {
+            return Err(Error::Format(format!(
+                "forward_rows_batched: {s_n} tokens but {} owners / {} positions",
+                owner.len(),
+                pos_of.len()
+            )));
+        }
+        if let Some(&bad) = owner.iter().find(|&&o| o >= seqs.len()) {
+            return Err(Error::Format(format!(
+                "forward_rows_batched: owner {bad} is out of range for {} sequences",
+                seqs.len()
+            )));
+        }
         if let Some(h) = histories {
             if h.len() != s_n {
-                return Err(Error::Format(format!("forward_step_batched: {s_n} tokens but {} histories", h.len())));
+                return Err(Error::Format(format!("forward_rows_batched: {s_n} rows but {} histories", h.len())));
             }
         }
         let d = self.cfg.hidden as usize;
@@ -3349,7 +3394,7 @@ impl Model {
         let layers: &[LayerW] = &self.layers;
         for (li, l) in layers.iter().enumerate() {
             let mut caches: Vec<&mut LayerKv> = seqs.iter_mut().map(|sk| &mut sk.layers[li]).collect();
-            forward_layer_batched(l, li, &mut caches, &ctx, &mut x, s_n, pos_of)?;
+            forward_layer_batched(l, li, &mut caches, RowLayout { pos_of, owner }, &ctx, &mut x)?;
             if let Some(la) = &la {
                 la.emit(layers, li + 1, &x, la_width);
             }
@@ -4599,6 +4644,72 @@ mod tests {
             batched_off.iter().zip(&batched_on).any(|(p, q)| p.to_bits() != q.to_bits()),
             "…and setting COLI_MLA_ABSORB must actually reach it"
         );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_fused_chunk_is_indistinguishable_from_two_separate_forwards() -> Result<(), peregrine_core::Error> {
+        // What the prefill/decode fusion buys, and the property it has to keep.
+        //
+        // On a tick with both, the engine runs `forward_prefill_seq` *and*
+        // `forward_step_batched` — two disjoint forwards, each streaming its own
+        // routed-expert union off disk, ~11.3 GB/token apiece at GLM-5.2 shapes.
+        // They can be one call, because the MoE lane is row-batch-union'd and
+        // does not care which sequence a row came from.
+        //
+        // "Can be" only if the fused call gives every row exactly what it would
+        // have got alone. That is asserted here bit for bit, because if it does
+        // not hold, fusing changes served output.
+        let dir = tmp_model_dir("fused_rows")?;
+        let m = Model::load(&dir)?;
+        let vocab = m.cfg.vocab as usize;
+        let (chunk, decode_tok) = ([1i32, 5, 9], 7i32);
+        let decode_prompt = [2i32, 6, 3];
+
+        // Reference: prefill sequence A alone, decode sequence B alone.
+        let mut ref_a = SeqKv::new(&m.cfg);
+        let want_a = m.forward_prefill_seq(&chunk, &mut ref_a, 0)?;
+        let mut ref_b = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&decode_prompt, &mut ref_b, 0)?;
+        let mut one: [&mut SeqKv; 1] = [&mut ref_b];
+        let want_b = m.forward_step_batched(&[decode_tok], &mut one, &[decode_prompt.len()], None)?;
+
+        // Fused: A's three prefill rows and B's one decode row, one forward.
+        let mut fa = SeqKv::new(&m.cfg);
+        let mut fb = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&decode_prompt, &mut fb, 0)?;
+        let tokens = [chunk[0], chunk[1], chunk[2], decode_tok];
+        let owner = [0usize, 0, 0, 1];
+        let pos_of = [0usize, 1, 2, decode_prompt.len()];
+        let mut refs: Vec<&mut SeqKv> = vec![&mut fa, &mut fb];
+        let got = m.forward_rows_batched(&tokens, &owner, &mut refs, &pos_of, None)?;
+
+        assert_eq!(got.len(), 4 * vocab);
+        for (k, (p, q)) in want_a.iter().zip(&got[..3 * vocab]).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "prefill logit {k} moved when fused with a decode row");
+        }
+        for (k, (p, q)) in want_b.iter().zip(&got[3 * vocab..]).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "decode logit {k} moved when fused with a prefill chunk");
+        }
+        assert_eq!((fa.len(), fb.len()), (3, decode_prompt.len() + 1), "each cache advanced by its own rows");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn forward_rows_batched_reports_a_bad_owner_rather_than_indexing_past_it() -> Result<(), peregrine_core::Error> {
+        // The fusion builds `owner` from scheduler state, so a scheduler bug
+        // must fail the request, not index out of bounds — the release profile
+        // aborts on panic and would take every concurrent sequence with it.
+        let dir = tmp_model_dir("rows_guard")?;
+        let m = Model::load(&dir)?;
+        let mut sk = SeqKv::new(&m.cfg);
+        let mut refs: Vec<&mut SeqKv> = vec![&mut sk];
+        assert!(m.forward_rows_batched(&[1], &[3], &mut refs, &[0], None).is_err(), "owner past the end");
+        assert!(m.forward_rows_batched(&[1, 2], &[0], &mut refs, &[0, 1], None).is_err(), "owner count mismatch");
+        // …and the engine is still usable afterwards.
+        assert!(m.forward_rows_batched(&[1], &[0], &mut refs, &[0], None).is_ok());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

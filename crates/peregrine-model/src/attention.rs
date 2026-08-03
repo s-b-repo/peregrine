@@ -1110,7 +1110,28 @@ pub fn mla_attention_batched(
         )));
     }
     let owner: Vec<usize> = (0..s_n).collect();
-    mla_attention_rows(w, x, pos_of, &owner, caches, c, absorb)
+    mla_attention_rows(w, x, RowLayout { pos_of, owner: &owner }, caches, c, absorb)
+}
+
+/// Where each row sits: its absolute position, and which cache it belongs to.
+///
+/// Bundled because they are always the same length and always travel together —
+/// a row *is* a (position, owner) pair, and passing them as two slices invites a
+/// length mismatch that shows up only as a wrong answer.
+#[derive(Clone, Copy)]
+pub struct RowLayout<'a> {
+    pub pos_of: &'a [usize],
+    pub owner: &'a [usize],
+}
+
+impl RowLayout<'_> {
+    pub fn len(&self) -> usize {
+        self.pos_of.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pos_of.is_empty()
+    }
 }
 
 /// Batched MLA attention over arbitrary **(position, cache) rows**.
@@ -1128,12 +1149,12 @@ pub fn mla_attention_batched(
 pub fn mla_attention_rows(
     w: &AttnWeights,
     x: &[f32],
-    pos_of: &[usize],
-    owner: &[usize],
+    rows_at: RowLayout,
     caches: &mut [&mut LayerKv],
     c: &Cfg,
     absorb: bool,
 ) -> Result<Vec<f32>, Error> {
+    let RowLayout { pos_of, owner } = rows_at;
     let s_n = pos_of.len();
     if owner.len() != s_n {
         return Err(Error::Format(format!("row attention: {s_n} positions but {} owners", owner.len())));
@@ -1862,7 +1883,7 @@ mod tests {
             let pos_of: Vec<usize> = (0..n).collect();
             let owner = vec![0usize; n];
             let mut refs: Vec<&mut LayerKv> = vec![&mut got_kv];
-            let got = mla_attention_rows(&w.view(), &x, &pos_of, &owner, &mut refs, &c, absorb)?;
+            let got = mla_attention_rows(&w.view(), &x, RowLayout { pos_of: &pos_of, owner: &owner }, &mut refs, &c, absorb)?;
 
             assert_eq!(got.len(), want.len());
             for (k, (p, q)) in want.iter().zip(&got).enumerate() {
@@ -1907,7 +1928,7 @@ mod tests {
             let pos_of = [0usize, 1, 2, 2];
             let owner = [0usize, 0, 0, 1];
             let mut refs: Vec<&mut LayerKv> = vec![&mut ka, &mut kb];
-            let got = mla_attention_rows(&w.view(), &fused, &pos_of, &owner, &mut refs, &c, absorb)?;
+            let got = mla_attention_rows(&w.view(), &fused, RowLayout { pos_of: &pos_of, owner: &owner }, &mut refs, &c, absorb)?;
 
             for (k, (p, q)) in want_a.iter().zip(&got[..3 * hidden]).enumerate() {
                 assert_eq!(p.to_bits(), q.to_bits(), "absorb={absorb}, seq A output {k}");
