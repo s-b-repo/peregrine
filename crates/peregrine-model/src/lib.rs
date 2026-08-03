@@ -45,7 +45,7 @@ pub use math::{
     RopeTable,
 };
 pub use mlp::{moe_forward, Mlp, MoeCfg};
-pub use model::{lookahead_issued, save_automaton, save_macrostates, Model, SeqKv};
+pub use model::{accept_run, lookahead_issued, save_automaton, save_macrostates, Model, SeqKv, Verified};
 pub use iotune::{IoTuner, IowqCap};
 pub use lane::{Bias, BubbleTuner, LaneBalancer, LaneTimings, LaneTimingsAccum, Placement};
 pub use learn::{learn_mode, BanditScheduler, KnobArm, LearnMode, QAction, QScheduler, QState};

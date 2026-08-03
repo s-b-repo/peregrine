@@ -282,12 +282,27 @@ pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle
 /// feature on one.
 #[cfg(test)]
 fn spawn_fused(model: Model, max_batch: usize, fuse: bool) -> Result<(EngineHandle, JoinHandle<()>), Error> {
+    spawn_tuned(model, max_batch, fuse, None)
+}
+
+/// [`spawn`] with the fusion and the draft depth forced.
+///
+/// Both resolve through process-wide `OnceLock`s, and a test that mutated the
+/// environment would race every other test in the binary — the same reason
+/// `iotune.rs` gives for not gating a feature on one.
+#[cfg(test)]
+fn spawn_tuned(
+    model: Model,
+    max_batch: usize,
+    fuse: bool,
+    depth: Option<usize>,
+) -> Result<(EngineHandle, JoinHandle<()>), Error> {
     let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
     let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
     let join = std::thread::Builder::new()
         .name("peregrine-batch-test".to_string())
-        .spawn(move || run(model, rx_normal, rx_high, cap, fuse))
+        .spawn(move || run_tuned(model, rx_normal, rx_high, cap, fuse, depth))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
     Ok((EngineHandle { tx_normal, tx_high }, join))
 }
@@ -300,6 +315,37 @@ fn batch_sla_ms() -> Option<u64> {
     use std::sync::OnceLock;
     static V: OnceLock<Option<u64>> = OnceLock::new();
     *V.get_or_init(|| std::env::var("COLI_BATCH_SLA_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0))
+}
+
+/// Speculative draft depth for the batched engine (`COLI_DRAFT`). `0`/unset is
+/// the historical one-token-per-sequence decode.
+///
+/// Use 4-6, never 2: the only published "MTP barely helps" figure for this
+/// model class came from a depth-2 fork where 2.46 accepted was already 82% of
+/// that configuration's ceiling of 3.
+fn draft_depth() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("COLI_DRAFT").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0))
+}
+
+/// How deep this sequence may speculate.
+///
+/// **Zero unless the request decodes greedily.** Accepting a draft only where
+/// it matches the model's argmax makes speculation *sequence*-identical to
+/// greedy decoding; at temperature > 0 it is only distribution-preserving, and
+/// silently changing which tokens a sampled request emits is not a speedup, it
+/// is a different answer. A sequence with depth 0 contributes exactly one row,
+/// which is the historical path — so greedy and sampled requests share a batch
+/// with no special casing anywhere else.
+///
+/// Pure so the policy is testable without a model.
+fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize) -> usize {
+    if global == 0 || !has_mtp || temp > 0.0 {
+        return 0;
+    }
+    // Never draft past what the request can still emit: a draft accepted beyond
+    // `max_new` is work done to produce a token that is thrown away.
+    global.min(budget_left.saturating_sub(1))
 }
 
 /// Fuse a prefill chunk into the same forward as the decode batch
@@ -453,17 +499,37 @@ struct SeqState {
     out: mpsc::UnboundedSender<EngineOut>,
     produced: usize,
     max_new: usize,
+    /// Tokens this sequence speculated for the *next* forward, drafted from
+    /// [`Self::hlast`] by the MTP head. Empty when speculation is off, when the
+    /// checkpoint has no MTP head, or when this request samples at
+    /// temperature > 0 — see [`draft_depth_for`].
+    draft: Vec<i32>,
+    /// Pre-final-norm hidden at this sequence's last committed position: what
+    /// the next draft continues from. Empty until the first verify produces it.
+    hlast: Vec<f32>,
 }
 
 /// The engine loop: admit + prefill new requests, then decode all active
 /// sequences one batched step at a time until each hits a stop id, its token
 /// budget, or a dropped client.
 fn run(
+    model: Model,
+    rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
+    rx_high: mpsc::UnboundedReceiver<EngineRequest>,
+    max_batch: usize,
+    fuse: bool,
+) {
+    run_tuned(model, rx_normal, rx_high, max_batch, fuse, None)
+}
+
+/// [`run`] with the draft depth overridable, for tests. `None` reads `COLI_DRAFT`.
+fn run_tuned(
     mut model: Model,
     mut rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
     mut rx_high: mpsc::UnboundedReceiver<EngineRequest>,
     max_batch: usize,
     fuse: bool,
+    depth_override: Option<usize>,
 ) {
     let vocab = model.cfg.vocab as usize;
     let stop_ids = model.cfg.stop_ids.clone();
@@ -476,6 +542,8 @@ fn run(
     let sla_ms = batch_sla_ms();
     // Resolved once: prefill chunking is a latency/work trade, not a per-tick decision.
     let chunk_div = prefill_chunk_div();
+    let depth = depth_override.unwrap_or_else(draft_depth);
+    let has_mtp = model.has_mtp();
     let mut prefix = PrefixCache::new(prefix_cache_budget());
     // Resolved once: the KV byte ceiling admission respects alongside the count.
     let kv_budget = kv_budget_bytes();
@@ -582,27 +650,65 @@ fn run(
         // MoE lane unions routed experts across *rows*, so those rows share one
         // set of expert reads instead of streaming two disjoint unions.
         let n_dec = active.len();
-        let mut tokens: Vec<i32> = active.iter().map(|s| s.next_tok).collect();
-        let mut pos_of: Vec<usize> = active.iter().map(|s| s.pos).collect();
-        let mut owner: Vec<usize> = (0..n_dec).collect();
+        // Each active sequence contributes its pending token plus whatever it
+        // speculated last tick — `1 + g_s` rows, and `g_s` differs per sequence
+        // because a sampled request drafts nothing and a nearly-finished one
+        // drafts less. `first_row[s]` is where sequence `s`'s block starts.
+        let mut tokens: Vec<i32> = Vec::with_capacity(n_dec);
+        let mut pos_of: Vec<usize> = Vec::with_capacity(n_dec);
+        let mut owner: Vec<usize> = Vec::with_capacity(n_dec);
+        let mut first_row: Vec<usize> = Vec::with_capacity(n_dec);
+        let mut rows_of: Vec<usize> = Vec::with_capacity(n_dec);
+        for (i, st) in active.iter().enumerate() {
+            first_row.push(tokens.len());
+            rows_of.push(1 + st.draft.len());
+            tokens.push(st.next_tok);
+            pos_of.push(st.pos);
+            owner.push(i);
+            for (j, &t) in st.draft.iter().enumerate() {
+                tokens.push(t);
+                pos_of.push(st.pos + 1 + j);
+                owner.push(i);
+            }
+        }
+        let n_dec_rows = tokens.len();
         if let Some((p, end)) = &fused {
             for (j, &t) in p.prompt[p.pos..*end].iter().enumerate() {
                 tokens.push(t);
                 pos_of.push(p.pos + j);
-                owner.push(n_dec); // the prefilling sequence is appended after the decoders
+                owner.push(n_dec); // the prefilling sequence is appended after the decoders (owners are per *sequence*, not per row)
             }
         }
+        // Dropped at the end of the tick: speculated rows record here so a
+        // rejected draft never reaches the prefetch predictor.
+        let scratch_hist = Mutex::new(model.new_route_history());
         let t_decode = std::time::Instant::now();
-        let logits = {
+        let (logits, hidden) = {
             // Split each SeqState into (KV, history) disjoint borrows so the batched
             // forward records each sequence's *own* routed set into its own history.
-            let (mut refs, mut hists): (Vec<&mut SeqKv>, Vec<&Mutex<RouteHistory>>) = active
+            let (mut refs, per_seq): (Vec<&mut SeqKv>, Vec<&Mutex<RouteHistory>>) = active
                 .iter_mut()
                 .map(|s| {
                     let SeqState { seq, hist, .. } = s;
                     (seq, &*hist)
                 })
                 .unzip();
+            // Histories are per **row**, so a sequence with `g` drafts needs
+            // `1 + g` entries. Only its first row — the already-confirmed token
+            // — records into the sequence's own history; the speculated rows
+            // record into a scratch that is dropped at the end of the tick.
+            //
+            // A rejected draft's routing is a plausible-but-wrong future, and
+            // feeding it to the prefetch predictor would have it warm experts
+            // for a token that never existed. `generate_speculative` refuses
+            // the same thing for the same reason (`route_log: None` on drafts).
+            let mut hists: Vec<&Mutex<RouteHistory>> = Vec::with_capacity(n_dec_rows);
+            for (i, h) in per_seq.iter().enumerate() {
+                hists.push(h);
+                for _ in 1..rows_of.get(i).copied().unwrap_or(1) {
+                    hists.push(&scratch_hist);
+                }
+            }
             // `hists` is per *row*, so a chunk contributes one entry per position —
             // all pointing at the prefilling sequence's own history, which is why
             // `Prefilling` carries one from admission rather than getting one at
@@ -615,7 +721,7 @@ fn run(
                     hists.push(&*hist);
                 }
             }
-            match model.forward_rows_batched(&tokens, &owner, &mut refs, &pos_of, Some(&hists)) {
+            match model.forward_rows_batched_hidden(&tokens, &owner, &mut refs, &pos_of, Some(&hists)) {
                 Ok(l) => l,
                 Err(e) => {
                     for s in &active {
@@ -654,19 +760,90 @@ fn run(
             model.enqueue_seq_prefetch(&s.hist, i);
         }
 
-        // Sample the next token per sequence, emit it, and decide who continues.
+        // Emit each sequence's confirmed run and decide who continues.
+        //
+        // Without speculation every sequence's block is one row and this is the
+        // historical sample-one-token loop. With drafts, `accept_run` says how
+        // many of them the model's own argmax agrees with, and the whole
+        // accepted run is emitted — which is exactly what greedy decoding would
+        // have produced, one forward at a time.
+        let d_hidden = model.cfg.hidden as usize;
         let mut keep: Vec<bool> = Vec::with_capacity(active.len());
         for (i, s) in active.iter_mut().enumerate() {
-            let tok = s.sampler.pick(&logits[i * vocab..i * vocab + vocab], -1) as i32;
-            s.pos += 1; // the token just fed now occupies its slot
-            if stop_ids.contains(&tok) {
-                keep.push(false); // stop token is not emitted
-                continue;
+            let base = first_row.get(i).copied().unwrap_or(i);
+            let g = s.draft.len();
+            // A drafting sequence is greedy by construction (`draft_depth_for`),
+            // so `accept_run`'s argmax and `sampler.pick` agree. A
+            // non-drafting one keeps its own sampler, temperature and all.
+            let (k, spec_next) = if g > 0 {
+                let rows = logits.get(base * vocab..(base + g + 1) * vocab).unwrap_or(&[]);
+                peregrine_model::accept_run(rows, vocab, &s.draft)
+            } else {
+                (0, 0)
+            };
+            // **`s.next_tok` was already emitted** — by the prefill that
+            // promoted this sequence, or by the previous round. It is the token
+            // being *fed* now, not one to send. What this round emits is
+            // whatever comes after it: every accepted draft, then the model's
+            // prediction past them.
+            //
+            // With no drafts that is a single token from row 0, which is the
+            // historical decode step exactly.
+            let final_next = if g > 0 {
+                spec_next // greedy by construction; `accept_run` already picked it
+            } else {
+                let lo = base * vocab;
+                match logits.get(lo..lo + vocab) {
+                    Some(r) => s.sampler.pick(r, -1) as i32,
+                    None => s.next_tok,
+                }
+            };
+            let mut run: Vec<i32> = Vec::with_capacity(k + 1);
+            run.extend_from_slice(&s.draft[..k.min(g)]);
+            run.push(final_next);
+
+            let mut alive = true;
+            let mut drafts_emitted = 0usize;
+            for (j, &tok) in run.iter().enumerate() {
+                if stop_ids.contains(&tok) {
+                    alive = false; // a stop token is not emitted, and ends the run
+                    break;
+                }
+                if s.out.send(EngineOut::Token(tok as u32)).is_err() {
+                    alive = false;
+                    break;
+                }
+                s.produced += 1;
+                if j < k {
+                    drafts_emitted += 1; // the final entry is not a cached row
+                }
+                if s.produced >= s.max_new {
+                    alive = false;
+                    break;
+                }
             }
-            let delivered = s.out.send(EngineOut::Token(tok as u32)).is_ok();
-            s.produced += 1;
-            s.next_tok = tok;
-            keep.push(delivered && s.produced < s.max_new);
+            // Commit the fed token plus every draft that was actually emitted.
+            // A run cut short by a stop token or the budget must not leave its
+            // speculated tail cached — the next round would append after rows
+            // the client never received.
+            s.pos += 1 + drafts_emitted;
+            s.seq.truncate(s.pos);
+            // `final_next` has been emitted but not yet fed, which is exactly
+            // the pending-token invariant. Only meaningful when the sequence
+            // survives; a retiring one is dropped below.
+            s.next_tok = final_next;
+            // Carry the hidden at the row that produced `final_next`, so the
+            // next draft continues from this forward rather than re-running
+            // the stack.
+            let hrow = (base + drafts_emitted) * d_hidden;
+            // An absent row means the forward returned less than it was asked
+            // for — clear the hidden rather than default it, so the next tick
+            // skips drafting instead of drafting from zeros.
+            s.hlast = match hidden.get(hrow..hrow + d_hidden) {
+                Some(h) => h.to_vec(),
+                None => Vec::new(),
+            };
+            keep.push(alive);
         }
         let mut idx = 0usize;
         active.retain(|_| {
@@ -675,12 +852,33 @@ fn run(
             k
         });
 
+        // Draft for the next tick. Done after retirement so a finished sequence
+        // is never drafted for, and from the hidden this forward produced —
+        // `mtp_draft` takes `&self`, so the drafts do not serialise on a borrow.
+        //
+        // A draft failure is not a request failure: speculation is a
+        // wall-clock optimisation, so an error here drops back to plain decode
+        // for that sequence rather than dropping the client.
+        if depth > 0 {
+            for s in active.iter_mut() {
+                let g = draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new));
+                s.draft.clear();
+                if g == 0 || s.hlast.is_empty() {
+                    continue;
+                }
+                match model.mtp_draft(s.next_tok, g, &s.hlast) {
+                    Ok(d) => s.draft = d,
+                    Err(e) => peregrine_core::note_advisory_err("mtp draft", &e),
+                }
+            }
+        }
+
         // The chunk's logits are the rows after the decoders. Finishing it here,
         // through the same `finish_prefill_chunk` the unfused path uses, is what
         // keeps the two ticks observationally identical.
         if let Some((p, end)) = fused {
             let out_cfg = OutputCfg { vocab, stop_ids: &stop_ids };
-            finish_prefill_chunk(p, end, &logits[n_dec * vocab..], &mut pending, &mut active, out_cfg, &mut prefix);
+            finish_prefill_chunk(p, end, &logits[n_dec_rows * vocab..], &mut pending, &mut active, out_cfg, &mut prefix);
         }
 
         // Periodically migrate the hottest experts into VRAM (heat-ranked
@@ -889,7 +1087,19 @@ fn finish_prefill_chunk(
     if max_new <= 1 {
         return; // only one token requested
     }
-    active.push(SeqState { seq, hist, pos: prompt.len(), next_tok: t0, sampler, out, produced: 1, max_new });
+    active.push(SeqState {
+        seq,
+        hist,
+        pos: prompt.len(),
+        next_tok: t0,
+        sampler,
+        out,
+        produced: 1,
+        max_new,
+        // No draft yet: the first verify produces the hidden a draft needs.
+        draft: Vec::new(),
+        hlast: Vec::new(),
+    });
 }
 
 #[cfg(test)]
@@ -1229,6 +1439,92 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn speculation_does_not_change_the_served_token_stream() -> Result<(), Error> {
+        // **The contract.** Speculation buys wall clock, never different
+        // output: a draft is accepted only where it matches the model's own
+        // argmax, so a greedy request must emit exactly what it emitted
+        // without speculation — same tokens, same count, same order.
+        //
+        // Two requests of different lengths so the batch is ragged and the
+        // per-sequence draft blocks are not all the same width.
+        let dir = tiny_dir("spec_engine")?;
+        let prompts = [vec![1i32, 5, 9, 2], vec![3i32, 8, 4]];
+        let n = 8usize;
+
+        let run_engine = |depth: usize| -> Result<Vec<Vec<u32>>, Error> {
+            let (handle, join) = spawn_tuned(Model::load(&dir)?, 8, false, Some(depth))?;
+            let mut rxs = Vec::new();
+            for p in &prompts {
+                let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+                handle.submit(EngineRequest {
+                    prompt: p.clone(),
+                    max_new: n,
+                    sampler: Sampler::new(0.0, 0.9, 1), // greedy: the case speculation is exact for
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                })?;
+                rxs.push(rx);
+            }
+            drop(handle);
+            let mut out = Vec::new();
+            for mut rx in rxs {
+                let mut toks = Vec::new();
+                while let Some(msg) = rx.blocking_recv() {
+                    match msg {
+                        EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Error(e) => return Err(Error::Format(e)),
+                    }
+                }
+                out.push(toks);
+            }
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok(out)
+        };
+
+        // The reference is an *independent* decode, not the engine with the knob
+        // off. Comparing on-vs-off only proves the two agree — and when this
+        // loop was first written both were equally wrong (a duplicated first
+        // token, because `next_tok` has already been emitted and was re-sent),
+        // which on-vs-off passed and `engine_batches_and_matches_reference`
+        // caught. A speculation test whose reference shares the code path it is
+        // testing is not a test.
+        let want: Vec<Vec<u32>> = {
+            let m = Model::load(&dir)?;
+            prompts.iter().map(|p| ref_decode(&m, p, n)).collect::<Result<_, Error>>()?
+        };
+        for depth in [0usize, 1, 4] {
+            let got = run_engine(depth)?;
+            assert!(got.iter().all(|t| !t.is_empty()), "COLI_DRAFT={depth}: nothing generated");
+            assert_eq!(got, want, "COLI_DRAFT={depth} changed the served token stream");
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_sampled_request_never_speculates() -> Result<(), Error> {
+        // Accepting on argmax makes speculation *sequence*-identical to greedy
+        // decoding. At temperature > 0 it is only distribution-preserving, and
+        // quietly changing which tokens a sampled request emits is not a
+        // speedup — it is a different answer. So a sampled request drafts
+        // nothing and takes the historical one-row path, in the same batch as
+        // greedy ones, with no special casing anywhere else.
+        assert_eq!(draft_depth_for(4, true, 0.7, 100), 0, "temperature > 0 must not speculate");
+        assert_eq!(draft_depth_for(4, true, 0.0, 100), 4, "greedy may");
+        assert_eq!(draft_depth_for(4, false, 0.0, 100), 0, "…but not without an MTP head");
+        assert_eq!(draft_depth_for(0, true, 0.0, 100), 0, "…nor with the knob off");
+        // Never draft past what the request can still emit: a draft accepted
+        // beyond `max_new` is work done to produce a token that is discarded.
+        assert_eq!(draft_depth_for(4, true, 0.0, 3), 2, "budget of 3 leaves room for 2 drafts");
+        assert_eq!(draft_depth_for(4, true, 0.0, 1), 0, "the last token needs no draft");
+        assert_eq!(draft_depth_for(4, true, 0.0, 0), 0);
         Ok(())
     }
 

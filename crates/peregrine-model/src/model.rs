@@ -342,6 +342,31 @@ fn mem_available_bytes() -> u64 {
     crate::ram::effective_available(host_mem_available_bytes(), cgroup_available_bytes())
 }
 
+/// Accept a draft run against the model's own greedy predictions.
+///
+/// `rows` is `[1 + drafts.len(), vocab]` — row `k` predicts the token *after*
+/// draft `k-1`, so row 0 judges the first draft. Returns how many drafts were
+/// accepted and the model's prediction at the first rejected position, which is
+/// the next round's token and is already paid for by this forward.
+///
+/// **This is the definition of "greedy-identical" and there is exactly one of
+/// it.** The model-level verify and the serving engine both call it; two copies
+/// of this rule would be two chances for speculation to start emitting
+/// something greedy decoding would not.
+pub fn accept_run(rows: &[f32], vocab: usize, drafts: &[i32]) -> (usize, i32) {
+    let row = |k: usize| rows.get(k * vocab..(k + 1) * vocab);
+    let mut k = 0usize;
+    while k < drafts.len() {
+        let Some(r) = row(k) else { break };
+        if crate::sample::argmax(r) as i32 != drafts[k] {
+            break;
+        }
+        k += 1;
+    }
+    let next = row(k).map_or(0, |r| crate::sample::argmax(r) as i32);
+    (k, next)
+}
+
 /// One sequence's speculative round: what was confirmed, and what comes next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified {
@@ -3390,24 +3415,13 @@ impl Model {
         for s in 0..b {
             let base = first_row[s];
             let g = drafts[s].len();
-            let row = |k: usize| -> &[f32] { &logits[(base + k) * vocab..(base + k + 1) * vocab] };
-            // Row `k`'s logits predict position `pos + k + 1`, so row 0 judges
-            // the first draft. `next_of[s]` itself is already confirmed — it was
-            // the model's argmax last round.
+            // `next_of[s]` is already confirmed — it was the model's argmax
+            // last round. Everything after it is judged by `accept_run`, the
+            // one definition of the greedy-identity rule.
+            let rows = logits.get(base * vocab..(base + g + 1) * vocab).unwrap_or(&[]);
+            let (k, next) = accept_run(rows, vocab, &drafts[s]);
             let mut confirmed = vec![next_of[s]];
-            let mut k = 0usize;
-            while k < g {
-                let pred = crate::sample::argmax(row(k)) as i32;
-                if pred != drafts[s][k] {
-                    break;
-                }
-                confirmed.push(drafts[s][k]);
-                k += 1;
-            }
-            // The prediction *at* the first rejected position (or past the last
-            // accepted one) is the next round's token — this forward already
-            // computed it, which is where the speedup comes from.
-            let next = crate::sample::argmax(row(k)) as i32;
+            confirmed.extend_from_slice(&drafts[s][..k.min(g)]);
             // Rewind the speculated tail. Committed is `next_of` plus `k`
             // accepted drafts; anything beyond it was never real.
             seqs[s].truncate(pos_of[s] + 1 + k);
