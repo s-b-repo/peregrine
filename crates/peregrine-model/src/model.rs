@@ -342,6 +342,22 @@ fn mem_available_bytes() -> u64 {
     crate::ram::effective_available(host_mem_available_bytes(), cgroup_available_bytes())
 }
 
+/// One sequence's speculative round: what was confirmed, and what comes next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    /// Tokens confirmed this round — `next` followed by every accepted draft.
+    /// Exactly what greedy decoding would have emitted, which is the property
+    /// speculation has to preserve to be worth anything.
+    pub tokens: Vec<i32>,
+    /// The model's prediction after the accepted run: the next round's `next`,
+    /// already paid for by this forward.
+    pub next: i32,
+    /// Drafts accepted this round (`tokens.len() - 1`), for an acceptance-rate
+    /// counter. A draft depth whose acceptance sits at its own ceiling is the
+    /// signal that the depth, not the mechanism, is the limit.
+    pub accepted: usize,
+}
+
 /// `MemAvailable` from `/proc/meminfo`, in bytes (0 if unreadable). The host's view.
 fn host_mem_available_bytes() -> u64 {
     let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return 0 };
@@ -3304,6 +3320,92 @@ impl Model {
         self.forward_rows_batched(tokens, &owner, seqs, pos_of, histories)
     }
 
+    /// Verify per-sequence speculative drafts in **one** forward.
+    ///
+    /// Sequence `s` contributes rows `[next_of[s], drafts[s]...]` starting at
+    /// `pos_of[s]`, and every sequence's rows go into a single
+    /// [`Self::forward_rows_batched`]. That is the whole point: B sequences
+    /// speculating `γ` deep is `B·(1+γ)` rows sharing **one** set of expert
+    /// reads, where B separate speculative decodes would stream B unions off
+    /// disk. Speculation only pays on a disk-bound engine if the verify is
+    /// shared, which is why this needed the row plumbing and not just a loop.
+    ///
+    /// **Greedy-identical by construction.** A draft is accepted only where it
+    /// equals the model's own argmax at that position, so the emitted stream is
+    /// exactly what one-token-at-a-time greedy decoding produces — speculation
+    /// buys wall clock, never different output.
+    /// `speculative_rows_emit_exactly_what_greedy_would` asserts it against a
+    /// real greedy decode, with deliberately wrong drafts mixed in.
+    ///
+    /// Each sequence's KV is rewound to its committed length before returning,
+    /// so a rejected draft leaves no trace. At temperature > 0 this is
+    /// distribution-preserving rather than sequence-identical; that path is
+    /// `speculative_sample`, not this.
+    pub fn verify_drafts_batched(
+        &self,
+        next_of: &[i32],
+        drafts: &[Vec<i32>],
+        seqs: &mut [&mut SeqKv],
+        pos_of: &[usize],
+    ) -> Result<Vec<Verified>, Error> {
+        let b = next_of.len();
+        if drafts.len() != b || seqs.len() != b || pos_of.len() != b {
+            return Err(Error::Format(format!(
+                "verify_drafts_batched: {b} tokens but {} drafts / {} seqs / {} positions",
+                drafts.len(),
+                seqs.len(),
+                pos_of.len()
+            )));
+        }
+        // Row layout: sequence `s` owns `1 + drafts[s].len()` consecutive rows.
+        let mut tokens: Vec<i32> = Vec::new();
+        let mut owner: Vec<usize> = Vec::new();
+        let mut rows_pos: Vec<usize> = Vec::new();
+        let mut first_row: Vec<usize> = Vec::with_capacity(b);
+        for s in 0..b {
+            first_row.push(tokens.len());
+            tokens.push(next_of[s]);
+            owner.push(s);
+            rows_pos.push(pos_of[s]);
+            for (j, &t) in drafts[s].iter().enumerate() {
+                tokens.push(t);
+                owner.push(s);
+                rows_pos.push(pos_of[s] + 1 + j);
+            }
+        }
+        let logits = self.forward_rows_batched(&tokens, &owner, seqs, &rows_pos, None)?;
+
+        let vocab = self.cfg.vocab as usize;
+        let mut out = Vec::with_capacity(b);
+        for s in 0..b {
+            let base = first_row[s];
+            let g = drafts[s].len();
+            let row = |k: usize| -> &[f32] { &logits[(base + k) * vocab..(base + k + 1) * vocab] };
+            // Row `k`'s logits predict position `pos + k + 1`, so row 0 judges
+            // the first draft. `next_of[s]` itself is already confirmed — it was
+            // the model's argmax last round.
+            let mut confirmed = vec![next_of[s]];
+            let mut k = 0usize;
+            while k < g {
+                let pred = crate::sample::argmax(row(k)) as i32;
+                if pred != drafts[s][k] {
+                    break;
+                }
+                confirmed.push(drafts[s][k]);
+                k += 1;
+            }
+            // The prediction *at* the first rejected position (or past the last
+            // accepted one) is the next round's token — this forward already
+            // computed it, which is where the speedup comes from.
+            let next = crate::sample::argmax(row(k)) as i32;
+            // Rewind the speculated tail. Committed is `next_of` plus `k`
+            // accepted drafts; anything beyond it was never real.
+            seqs[s].truncate(pos_of[s] + 1 + k);
+            out.push(Verified { tokens: confirmed, next, accepted: k });
+        }
+        Ok(out)
+    }
+
     /// One batched forward over arbitrary **(token, sequence) rows**: `owner[r]`
     /// names which of `seqs` row `r` belongs to, so a sequence may contribute
     /// several rows.
@@ -3661,6 +3763,7 @@ impl Drop for Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sample::argmax;
     use crate::testkit::build_tiny_model;
     use std::path::PathBuf;
 
@@ -4644,6 +4747,153 @@ mod tests {
             batched_off.iter().zip(&batched_on).any(|(p, q)| p.to_bits() != q.to_bits()),
             "…and setting COLI_MLA_ABSORB must actually reach it"
         );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_rows_emit_exactly_what_greedy_would() -> Result<(), peregrine_core::Error> {
+        // **The property speculation exists to preserve.** A draft is accepted
+        // only where it equals the model's own argmax, so the emitted stream
+        // must be indistinguishable from one-token-at-a-time greedy decoding —
+        // speculation buys wall clock, never different output.
+        //
+        // The drafts here are *deliberately* a mix of right and wrong: a test
+        // that only ever drafted correctly would pass with the reject path
+        // broken, and a test that only ever drafted wrongly would never
+        // exercise acceptance at all.
+        let dir = tmp_model_dir("spec_rows")?;
+        let m = Model::load(&dir)?;
+        let vocab = m.cfg.vocab as usize;
+        let prompt = [1i32, 5, 9, 2];
+        let n_new = 6usize;
+
+        // Greedy reference: one token at a time through the batched path.
+        let mut want = Vec::new();
+        {
+            let mut sk = SeqKv::new(&m.cfg);
+            let lg = m.forward_prefill_seq(&prompt, &mut sk, 0)?;
+            let mut next = argmax(&lg[(prompt.len() - 1) * vocab..]) as i32;
+            let mut pos = prompt.len();
+            while want.len() < n_new {
+                want.push(next);
+                let mut one: [&mut SeqKv; 1] = [&mut sk];
+                let lg = m.forward_step_batched(&[next], &mut one, &[pos], None)?;
+                next = argmax(&lg) as i32;
+                pos += 1;
+            }
+        }
+
+        // Speculative: same sequence, drafts that are sometimes right (taken
+        // from the reference) and sometimes deliberately wrong.
+        let mut got = Vec::new();
+        {
+            let mut sk = SeqKv::new(&m.cfg);
+            let lg = m.forward_prefill_seq(&prompt, &mut sk, 0)?;
+            let mut next = argmax(&lg[(prompt.len() - 1) * vocab..]) as i32;
+            let mut pos = prompt.len();
+            let mut round = 0usize;
+            let mut any_accepted = false;
+            let mut any_rejected = false;
+            while got.len() < n_new {
+                // Round 0 drafts correctly (from the reference), round 1 drafts
+                // garbage, and so on — so both paths are exercised.
+                let take = got.len() + 1;
+                let draft: Vec<i32> = if round.is_multiple_of(2) {
+                    want.iter().skip(take).take(2).copied().collect()
+                } else {
+                    vec![(vocab as i32) - 1, 0]
+                };
+                let mut one: [&mut SeqKv; 1] = [&mut sk];
+                let v = m.verify_drafts_batched(&[next], std::slice::from_ref(&draft), &mut one, &[pos])?;
+                let r = v.first().ok_or_else(|| Error::Format("no verification result".into()))?;
+                any_accepted |= r.accepted > 0;
+                any_rejected |= r.accepted < draft.len();
+                got.extend_from_slice(&r.tokens);
+                pos += r.tokens.len();
+                next = r.next;
+                round += 1;
+            }
+            got.truncate(n_new);
+            assert!(any_accepted, "the accept path was never taken — the test proves nothing about it");
+            assert!(any_rejected, "…nor was the reject path");
+        }
+        assert_eq!(got, want, "speculation changed the token stream");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejected_draft_leaves_no_trace_in_the_cache() -> Result<(), peregrine_core::Error> {
+        // The rewind. A speculated tail that was not accepted must not remain
+        // cached: the next round appends at the committed position, and a stale
+        // row there would silently attend a token the model never emitted.
+        let dir = tmp_model_dir("spec_rewind")?;
+        let m = Model::load(&dir)?;
+        let prompt = [1i32, 5, 9];
+        let mut sk = SeqKv::new(&m.cfg);
+        let lg = m.forward_prefill_seq(&prompt, &mut sk, 0)?;
+        let vocab = m.cfg.vocab as usize;
+        let next = argmax(&lg[(prompt.len() - 1) * vocab..]) as i32;
+
+        // Four drafts, all deliberately wrong, so none can be accepted.
+        let draft = vec![(vocab as i32) - 1, (vocab as i32) - 2, 0, 1];
+        let mut one: [&mut SeqKv; 1] = [&mut sk];
+        let v = m.verify_drafts_batched(&[next], &[draft], &mut one, &[prompt.len()])?;
+        let r = v.first().ok_or_else(|| Error::Format("no verification result".into()))?;
+        assert_eq!(r.accepted, 0, "a wrong draft must not be accepted");
+        assert_eq!(r.tokens, vec![next], "only the already-confirmed token is emitted");
+        assert_eq!(sk.len(), prompt.len() + 1, "the cache holds the prompt plus one committed token");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sequences_speculate_to_different_depths_in_one_forward() -> Result<(), peregrine_core::Error> {
+        // The shape that makes speculation pay on a disk-bound engine: B
+        // sequences × (1+γ) rows in *one* forward, sharing one routed-expert
+        // union. Depths differ per sequence, because a draft that hits a stop
+        // token or a budget is shorter — so the row layout cannot assume a
+        // rectangle.
+        let dir = tmp_model_dir("spec_multi")?;
+        let m = Model::load(&dir)?;
+        let vocab = m.cfg.vocab as usize;
+        let prompts: [&[i32]; 3] = [&[1, 5, 9], &[2, 7], &[3, 8, 4, 6]];
+
+        // Per-sequence reference: verify each one alone.
+        let mut want = Vec::new();
+        for (i, p) in prompts.iter().enumerate() {
+            let mut sk = SeqKv::new(&m.cfg);
+            let lg = m.forward_prefill_seq(p, &mut sk, 0)?;
+            let next = argmax(&lg[(p.len() - 1) * vocab..]) as i32;
+            let draft: Vec<i32> = (0..i).map(|j| ((j + i) % vocab) as i32).collect();
+            let mut one: [&mut SeqKv; 1] = [&mut sk];
+            let v = m.verify_drafts_batched(&[next], &[draft], &mut one, &[p.len()])?;
+            want.push(v.into_iter().next().ok_or_else(|| Error::Format("no result".into()))?);
+        }
+
+        // Batched: all three, depths 0, 1 and 2, in one call.
+        let mut seqs: Vec<SeqKv> = Vec::new();
+        let mut next_of = Vec::new();
+        let mut drafts = Vec::new();
+        for (i, p) in prompts.iter().enumerate() {
+            let mut sk = SeqKv::new(&m.cfg);
+            let lg = m.forward_prefill_seq(p, &mut sk, 0)?;
+            next_of.push(argmax(&lg[(p.len() - 1) * vocab..]) as i32);
+            drafts.push((0..i).map(|j| ((j + i) % vocab) as i32).collect::<Vec<i32>>());
+            seqs.push(sk);
+        }
+        let pos_of: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+        let mut refs: Vec<&mut SeqKv> = seqs.iter_mut().collect();
+        let got = m.verify_drafts_batched(&next_of, &drafts, &mut refs, &pos_of)?;
+
+        assert_eq!(got.len(), 3);
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(a, b, "sequence {i}: batched verification differs from verifying it alone");
+        }
+        for (i, (sk, p)) in seqs.iter().zip(prompts.iter()).enumerate() {
+            assert_eq!(sk.len(), p.len() + 1 + got[i].accepted, "sequence {i} cache length");
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
