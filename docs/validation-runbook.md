@@ -339,6 +339,40 @@ Also worth one run with `--draft 4`: speculative rewind is the path that
 truncates *into* a shared prefix, and `rewinding_into_a_shared_prefix_leaves_other_holders_intact`
 covers it only at synthetic scale.
 
+## 6. Does fusing prefill into the decode forward actually save the bytes?
+
+`COLI_FUSE_PREFILL` is the one item whose payoff is *entirely* an I/O saving:
+the arithmetic is identical either way, asserted bit-for-bit, so a wall-clock
+measurement alone cannot tell you whether it worked or whether the workload
+simply had no mixed ticks.
+
+Measure the bytes, not the clock. `COLI_UNION_STATS=1` reports how many routed
+selections each distinct expert read served:
+
+```bash
+for f in 0 1; do
+  COLI_FUSE_PREFILL=$f COLI_UNION_STATS=1 \
+    ./target/release/peregrine-serve --max-batch 16 &
+  # drive it with a mix: several short decoding requests plus a long new prompt,
+  # so ticks actually contain both. Then read the [union] line at shutdown.
+done
+```
+
+What to look for:
+
+- **`share` should rise with fusion on.** A prefill chunk's rows and the decode
+  rows now union into one read set. If it does not move, the workload never
+  produced a mixed tick — add a long prompt while short ones are decoding, and
+  check the prefill is actually chunked (`COLI_PREFILL_CHUNK_DIV`, prompt
+  longer than 64 tokens).
+- **Token streams must be identical between the two arms.** They are asserted
+  identical on the synthetic model; confirm it once on the real one, because
+  that is the property the whole item rests on.
+- **Watch decode latency, not just throughput.** Fusion makes one tick do more
+  work, so a decode step now waits on a chunk it previously ran beside. If
+  `COLI_BATCH_SLA_MS` starts shrinking the working cap, the chunk is too large
+  — that is what `COLI_PREFILL_CHUNK_DIV` is for.
+
 ## What to do with the results
 
 Write them into [benchmarks.md](benchmarks.md). Where a measurement contradicts
