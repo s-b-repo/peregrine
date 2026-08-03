@@ -239,6 +239,47 @@ is why this is measured rather than asserted.
 Note `COLI_MLA_ABSORB` is itself listed as unvalidated on a real checkpoint, so
 this run grades both at once.
 
+### 3b. DSA: the one item whose payoff grows with context
+
+Everything else in this runbook is measured at a fixed prompt length. DSA is
+not: it caps attention work at `index_topk` keys, so its benefit is zero at
+short context and grows without bound. Measure it as a **curve**, not a point.
+
+The dev box cannot produce it — the laptop-converted 349 GB container was built
+without `--indexer`, so `COLI_DSA` is inert there and the synthetic fixture's
+6-token prompts say nothing about a 2048-key threshold. Two prerequisites:
+
+```bash
+# 1. a container that actually carries indexer tensors
+grep -o 'indexer_projections' "$COLI_MODEL"/*.json | head    # none => reconvert with --indexer
+# 2. prompts long enough to cross index_topk (check config.json; GLM-5.2 ships 2048)
+```
+
+Then sweep prompt length across the threshold, dense vs sparse:
+
+```bash
+for n in 512 1024 2048 4096 8192; do
+  for dsa in 0 1; do
+    COLI_DSA=$dsa ./target/release/peregrine "$COLI_MODEL" < prompt.$n.txt
+  done
+done
+```
+
+What to look for, in order of what would change the recommendation:
+
+- **Below `index_topk` the two arms must be bit-identical.** If they are not,
+  the activation rule is wrong and everything above is untrustworthy.
+- **Above it, where does the curve cross?** Scoring every cached key is itself
+  `O(context)`, so DSA trades a cheap linear pass for an expensive one. The
+  crossover point is the whole result; a single long-prompt number hides it.
+- **`prediction_flip_rate` at each length.** Selection drops real attention
+  mass, and the dropped fraction grows with context — this is the one lossy
+  knob whose accuracy cost is *not* constant across the sweep.
+
+Note the batched serving engine runs the absorb core, which has no sparse form,
+so a `peregrine-serve` run sees DSA during prefill only. Compare against
+`peregrine` (stdio) before concluding the effect is small.
+
 ### 5a. Does prefix sharing show up in RSS and admission?
 
 Refcounted prefixes and the KV byte budget are the two halves of one change, and

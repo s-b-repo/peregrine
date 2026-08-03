@@ -2,14 +2,14 @@
 
 # Testing & quality gates
 
-**373 tests passing, 0 warnings, clippy clean** (debug + release), plus a
+**452 tests passing, 0 warnings, clippy clean** (debug + release), plus a
 strict bad-patterns audit. This page is what to run, what each gate enforces,
 and the correctness philosophy behind the test suite.
 
 ## The gates
 
 ```bash
-cargo test --workspace                     # 373 tests, CPU-only, no GPU needed
+cargo test --workspace                     # 452 tests, CPU-only, no GPU needed
 cargo clippy --workspace --all-targets     # clean
 scripts/audit-bad-patterns.sh --strict     # panic / UB / suppression / Cargo gate (CI)
 scripts/audit-reachability.py --list       # [R] shipped-but-unreachable pass
@@ -47,7 +47,7 @@ The suite is built around **bit-identity anchors** rather than tolerances:
   prefill (`engine_chunked_prefill_matches_reference`).
 - **Adaptive knobs are bit-identical when off.** Almost all are also
   correctness-neutral when on — they may change latency or residency, never
-  token values. **Four deliberate exceptions:**
+  token values. **Five deliberate exceptions:**
   - `COLI_ROUTE_MIN_SHARE` drops routed experts carrying a negligible share of the
     gate mass, which removes a real (if small) term from the MoE sum. It is off by
     default, and it is gated by `Model::prediction_flip_rate` rather than by an
@@ -71,6 +71,16 @@ The suite is built around **bit-identity anchors** rather than tolerances:
     `f16_kv_halves_the_bytes_and_tracks_f32_closely`, which also asserts the two
     dtypes *do* differ — a lossy knob whose test would pass unchanged if the
     knob did nothing is not testing the knob.
+  - `COLI_DSA` runs the lightning indexer, so each query attends the top
+    `index_topk` cached keys instead of all of them. **Inert two ways, both
+    asserted bit-exact**: with no indexer in the checkpoint there is nothing to
+    run, and at or below `index_topk` cached positions the selection is the
+    identity, so the scoring pass is skipped rather than run and discarded
+    (`dsa_is_inert_without_an_indexer_and_below_index_topk`). Above the
+    threshold it changes token values, and
+    `dsa_selects_a_subset_once_context_exceeds_index_topk` asserts that it
+    *does* — a sparse-attention flag whose test would pass unchanged if
+    selection did nothing is not testing selection.
   - **A requantized checkpoint** (`peregrine-requantize`) changes token values by
     existing, not by being toggled, so it has no knob row. int4 → int2 is a double
     quantization; measure it with `prediction_flip_rate` against the source

@@ -49,7 +49,7 @@ is the audited per-item roadmap.
 
 ## Status
 
-**373 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
+**452 tests passing, 0 warnings, `cargo clippy` clean** (debug + release). Every
 numeric kernel is ported from colibrì's `c/glm.c` and validated; the scalar
 integer-dot kernels are the token-exactness reference and the SIMD variants are
 checked bit-for-bit against them. The 2026-07-30 "adaptive-runtime wave" added
@@ -75,8 +75,8 @@ faster than HF `tokenizers` on this box** (204 vs 6 MB/s, the per-line serve
 pattern; the whole-buffer and parallel-batch paths run 3–7× higher still — see
 [docs/tokenizer.md](docs/tokenizer.md#throughput-anatomy)), id-for-id parity-gated
 (the HF crate remains only as the test-suite oracle). See
-[`todo.md`](todo.md) for the audited roadmap (**~82% strict / ~85% weighted of
-108 tracked items**).
+[`todo.md`](todo.md) for the audited roadmap (**~82% strict / ~86% weighted of
+125 tracked items**).
 
 | Area | Crate(s) | Status | Validated by |
 |---|---|---|---|
@@ -88,7 +88,7 @@ pattern; the whole-buffer and parallel-batch paths run 3–7× higher still — 
 | Data-parallel compute | `peregrine-par` | ✅ | persistent scoped pool for rmsnorm / resident MoE / per-row attention / every matmul; **bit-identical to serial** (`f32::to_bits`-exact), work-gated, nesting-safe |
 | Prefetch & prediction | `peregrine-model` (`predict.rs`) | ✅ | K-deep `RouteHistory` + momentum / offline transition automaton, per-layer look-ahead emission, EWMA distance tuner, predictive eviction — all correctness-neutral (a wrong guess just re-streams identical bytes) |
 | Continuous batching | `peregrine-serve` (`batch.rs`) | ✅ | one engine thread batches all in-flight requests; chunked prefill (64-token chunks) interleaved with decode, bit-identical to whole-prompt prefill (`engine_chunked_prefill_matches_reference`) |
-| MLA absorption / MTP | `peregrine-model` | 🟡 absorption opt-in / MTP unreachable | `mla_attention_absorb` behind `COLI_MLA_ABSORB` (off by default; ≈ dense within 10% on one call, unmeasured end to end). `speculative_sample` is statistically lossless but `generate_speculative` has no caller in either binary |
+| MLA absorption / MTP / DSA | `peregrine-model` | 🟡 all three opt-in, none measured on a real checkpoint | `mla_attention_absorb` behind `COLI_MLA_ABSORB` (≈ dense within 10% on one call, unmeasured end to end). MTP speculative decode is wired behind `--draft N` / `COLI_DRAFT`, greedy-identical, and refuses loudly without an MTP head. DSA sparse attention behind `COLI_DSA`: bit-identical below `index_topk` and with no indexer in the checkpoint, single-sequence path only |
 | Serve (stdio drop-in) | `peregrine-engine` | ✅ | `READY`/`END` handshake — a drop-in for colibrì's `c/glm` behind `openai_server.py` |
 | Serve (native HTTP) | `peregrine-serve` | ✅ | OpenAI-compatible `POST /v1/chat/completions` (SSE + non-streaming), `/v1/models`, `/health`; bearer auth, token caps, graceful shutdown, `#![forbid(unsafe_code)]`, two-tier priority queue via `X-Peregrine-Priority` |
 | Adaptive runtime | `peregrine-model` (`lane.rs`, `iotune.rs`, `telemetry.rs`, `workload.rs`) | ✅ | per-lane wall-time accum + `BubbleTuner` EWMA → `LaneBalancer` (CPU/GPU bias-driven downgrade); `IoTuner` adjusts `iowq_max_workers` between forwards; `PhaseTracker` + `PredictSource::PhaseAware`; per-class prefetch breadth from the serving layer's prompt classifier; heat-threshold cache admission; NUMA worker pinning; real `perf_event_open` LLC-miss counter; cross-session `route_stats.json` at Drop / auto-load on load |
@@ -155,7 +155,7 @@ server) are mapped in [`DESIGN.md`](DESIGN.md#concurrency--parallelism-map-where
 ## Build & test
 
 ```bash
-cargo test --workspace          # 373 tests, CPU-only, no GPU needed
+cargo test --workspace          # 452 tests, CPU-only, no GPU needed
 cargo build --release           # optimized (fat LTO)
 cargo clippy --workspace --all-targets    # clean
 scripts/audit-bad-patterns.sh --strict   # quality gate: no panic-vectors/UB (see docs/BAD_PATTERNS.md)
@@ -240,6 +240,7 @@ token stream is unchanged. (Annotated reference with deep-dive links:
 | `COLI_PREFIX_CACHE_MB` | 0 (off) | Cross-request KV prefix cache budget; a hit shares the prefix by refcount, it is not copied |
 | `COLI_KV_BUDGET_MB` | 0 (off) | Resident-KV byte ceiling for admission, alongside the `--max-batch` count |
 | `COLI_KV_DTYPE` | `f32` | KV latent element type; `f16` halves resident KV (**changes token values** — pair with `COLI_MLA_ABSORB`) |
+| `COLI_DSA` | off | DSA lightning-indexer sparse attention, where the checkpoint carries an indexer (**changes token values**) |
 | `COLI_ROUTE_MIN_SHARE` | 0 (off) | Drop negligible-gate-share routed experts (**changes token values**) |
 
 #### Governors & learning
