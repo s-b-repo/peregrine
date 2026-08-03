@@ -163,6 +163,52 @@ rather than wall clock, because wall clock cannot distinguish "it worked" from
 
 ---
 
+## 💽 Can the disk read match or beat colibrì?
+
+Asked often enough to be worth settling in writing. The short answer is that
+the gap most people quote is not measuring what it looks like, the engine-side
+lever already exists as a knob, and the largest lever is not code at all.
+
+**The 0.84 vs 2.02 GB/s gap is partly a harness artefact.** `benchmarks.md`
+records why: colibrì's 2.02 comes from `c/iobench.c`, which is **not io_uring
+at all** but 8 OpenMP threads issuing blocking `pread`s — while **its own
+production decode path is a 512-deep io_uring queue**. The two harnesses
+measure different things. On the other box the comparison *inverts*: peregrine
+~980 MB/s against colibrì's ~870 MB/s after the O_DIRECT and parallel-ring
+work. There is no stable "colibrì is 2.4× faster" fact to chase.
+
+**colibrì's approach is already selectable.** `COLI_IO_ENGINE` takes `uring`
+(the historical batched submit), `pread` (N blocking-`pread` threads —
+colibrì's shape) or `regbuf`, all behind the same `read_regions` choke point,
+so output is **byte-identical** and the three A/B against a bit-identity
+assertion rather than being eyeballed. If threaded `pread` wins on a given
+drive, it is one env var away. The dev-box run was **inconclusive and is
+recorded as such** — `pread` led on one file pair (2.02 vs 1.68 GB/s) and
+trailed on another (1.16 vs 1.26), at different sizes and page-cache states.
+
+**The largest lever is storage configuration, not the engine.** A LUKS volume
+at the 512-byte default sector size measured **~10% of raw throughput**;
+`--sector-size 4096` alone restored it to ~50%, roughly **5×**. Nothing in the
+I/O lane competes with that. Linux I/O schedulers cost **14–57%** versus `none`
+on NVMe. Neither is code, and both are checked in one command each
+(runbook §1b).
+
+**Order to work in**, so effort lands where the ratio is:
+
+1. `cryptsetup luksDump | grep -i sector` (want 4096) and
+   `cat /sys/block/nvme*/queue/scheduler` (want `[none]`). If the volume is
+   512-byte, that is the 5× and everything below is noise.
+2. Run the three engines on **real shards, cold cache, O_DIRECT** — runbook
+   §1a — using a different shard per run so the page cache flatters no arm.
+3. Only then consider code. If `pread` wins reproducibly on model shards, the
+   honest change is to make it the default *and say why*, not to add a fourth
+   mechanism.
+
+Step 2 cannot be done in this workspace: no model shards, and the attempt on
+system libraries is what produced the inconclusive result above.
+
+---
+
 ## ✅ Foundation already shipped (baseline the roadmap builds on)
 
 These aren't roadmap line-items but represent the substantial completed groundwork:
