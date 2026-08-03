@@ -118,6 +118,51 @@ what it cost. `COLI_GATE_STATS` tallies how much of the routed set carries a neg
 
 ---
 
+## 🎯 Which shipped work can actually move tokens/second
+
+The measurement that decides this is the repo's own: the 2026-08-01 pass ran a
+nine-knob adaptive/IO bundle at **1.004× with byte-identical disk reads**
+(0.225 vs 0.224 tok/s, B=16, GLM-5.2 744B int4). The knobs changed *how* bytes
+were fetched, not how many, and this workload is disk-bound. So the test for
+any change is one question: **does it cut bytes read per token?**
+
+Sorting the landed work by that test — because "it made things faster" is the
+claim this repo has most often had to walk back.
+
+**Can move tok/s**
+
+- **Speculation (`COLI_DRAFT`)** — the only one that raises *per-stream*
+  throughput. One expert union now yields `1 + accepted` tokens instead of 1,
+  so tok/s scales directly with the accepted run length. The acceptance rate is
+  the unmeasured term; the one published figure for this model class is 2.46 at
+  depth 2, already 82% of that configuration's ceiling, which is why the
+  default guidance is 4–6.
+- **Prefill fusion (`COLI_FUSE_PREFILL`)** — one union instead of two, but only
+  on ticks that have both prefill and decode.
+- **An int2-g64 container** — ~25% fewer expert bytes, but needs a converted
+  checkpoint and a flip-rate measurement first.
+
+**Cannot move tok/s, whatever else they are worth**
+
+- **f16 KV, the `Arc` prefix, the growth cap** — memory and admission, not
+  bytes streamed. They raise *concurrency* under `COLI_KV_BUDGET_MB`, which
+  lifts aggregate throughput, not per-stream.
+- **DSA (`COLI_DSA`)** — caps attention compute at long context; expert reads
+  are unchanged.
+- **Expert pruning (`peregrine-prune`)** — smaller working set, identical
+  activated parameters. Its own report says so, in its own output.
+- **The adaptive/IO knob bundle** — this is the 1.004× itself.
+
+This is a decomposition, not a measurement. No tok/s number is claimed for any
+of it: this workspace cannot load the checkpoint, and the synthetic model
+(3 layers, 16 hidden, fully resident, no streaming at all) is five orders of
+magnitude away and says nothing. `docs/validation-runbook.md` §2 and §6 are the
+procedures — and §6 specifically says to measure fusion with `COLI_UNION_STATS`
+rather than wall clock, because wall clock cannot distinguish "it worked" from
+"the workload had no mixed ticks".
+
+---
+
 ## ✅ Foundation already shipped (baseline the roadmap builds on)
 
 These aren't roadmap line-items but represent the substantial completed groundwork:
