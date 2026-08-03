@@ -17,7 +17,6 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Model format & artifacts](model-format.md) | model directory layout, weight naming, QT quant formats, safetensors extensions, every artifact JSON |
 | [Benchmarks](benchmarks.md) | headline numbers + how to reproduce; summary of the full [peregrine-vs-colibri study](peregrine-vs-colibri.md) |
 | [Validation runbook](validation-runbook.md) | what this workspace could not measure, and the procedure for settling it on a GPU box with the real checkpoint |
-| [Benchmark pass 2026-08-01](benchmark-2026-08-01.md) | post-improvement re-measure: adaptive knobs vs baseline vs the first CUDA-lane numbers, and a harness caveat |
 
 ## How it works
 
