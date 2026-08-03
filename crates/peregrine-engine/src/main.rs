@@ -336,6 +336,12 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut out = std::io::stdout();
+    // `COLI_PERF_COUNTERS=1`. Opened **here**, on the thread that will run the
+    // decode loop, because `perf_event_open` follows the calling thread
+    // (pid = 0): opened anywhere else it would count a thread that does no
+    // inference. `None` when the kernel refuses — paranoid level, seccomp, or
+    // no PMU, which is most VMs — and the report below simply says nothing.
+    let llc = peregrine_model::open_l3_miss_counter();
     out.write_all(READY)?;
     out.flush()?;
 
@@ -443,6 +449,15 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                                 by_rank.join(" ")
                             );
                         }
+                    }
+                    // LLC misses on this thread (COLI_PERF_COUNTERS=1). Scoped
+                    // deliberately: the counter follows one thread, so this is
+                    // attention and the deterministic reduce, *not* the io_uring
+                    // workers or the `peregrine-par` pool. A whole-process figure
+                    // would need a counter per thread, and reporting this one as
+                    // if it were that is how a number stops meaning anything.
+                    if let Some(misses) = llc.as_ref().and_then(|c| c.read()) {
+                        eprintln!("[perf] llc-misses={misses} (decode thread only)");
                     }
                     // Batch-union sharing (COLI_UNION_STATS=1). `share` is how many
                     // routed selections each distinct expert read actually served —
