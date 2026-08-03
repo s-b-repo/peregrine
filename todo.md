@@ -64,7 +64,7 @@ open question against §1's entire statistical predictor stack.*
    but unreachable and only need wiring: §4's registered-buffer read path, §1/§10's
    `perf_event_open` counter, and §5's slab generation tagging — all found by the [R]
    reachability pass (`docs/BAD_PATTERNS.md`). **This is where the remaining throughput is**,
-   and it is now measured rather than inferred: the [2026-08-01 pass](docs/benchmark-2026-08-01.md)
+   and it is now measured rather than inferred: the [2026-08-01 pass](docs/benchmarks.md#benchmark-pass--2026-08-01-post-improvement-re-measure)
    put nine §1–§11 knobs together at **1.004×** with byte-identical disk reads.
 
 Training-loop and research-scale items were completed in their user-approved pragmatic forms, marked
@@ -398,7 +398,7 @@ All of it is CPU-side and needs no hardware this workspace lacks.*
 measurements motivate it. The warm cache hits **0.6%** on sustained decode, because a 10 GB
 cache cannot hold a ~180 GB working set — caching cannot win at this capacity ratio whatever
 the router does, and whether a *better predictor* could is unmeasured until `route-stats` runs
-(see the §5.2 correction). And the [2026-08-01 benchmark pass](docs/benchmark-2026-08-01.md)
+(see the §5.2 correction). And the [2026-08-01 benchmark pass](docs/benchmarks.md#benchmark-pass--2026-08-01-post-improvement-re-measure)
 measured nine §1–§11 knobs together — `COLI_DIRECT` `COLI_REGBUF` `COLI_IO_TUNE`
 `COLI_LANE_BALANCE` `COLI_SHAPE_SPECIALIZE` `COLI_HYPER_SCHED` `COLI_PREFETCH_TUNE`
 `COLI_ENTROPY_ADAPT` `COLI_REPLICATE_K=8` — at **1.004× baseline**, with **byte-identical
@@ -506,4 +506,4 @@ change, and needs the two shipped measurement items first.*
 - **Documentation:** the full docs wiki is [`docs/`](docs/README.md) (2026-07-30) — user guides (CLI, HTTP API, configuration, model format) and subsystem deep dives; this file remains the per-item engineering audit.
 - **Compilation & test invariant:** 452 tests pass workspace-wide, clippy clean, `--strict` bad-patterns audit green.
 - **What's left is *not* all CUDA-shaped** (it used to be). Ten open items need `nvcc` + real hardware, but five — §12 fuse-prefill / KV quantization / paged KV, §13 int2 conversion + heat-tiered precision — are pure CPU work, blocked only by their size. See the three-way split under the dashboard.
-- **Validation caveat:** synthetic-model tests catch correctness; throughput impact needs a real model to measure — and now partly has been, in the [2026-08-01 pass](docs/benchmark-2026-08-01.md) (§1–§11 knob bundle 1.004×, CUDA lane 1.09×, batching 4.4× reproduced). Note that pass also found `peregrine bench 1 4 16` unsound for comparing configurations: running every batch point in one process inflates the later ones (baseline B=16 reads 0.143 in-sweep vs 0.224 isolated), which had manufactured an apparent 1.45×/1.64× that vanished under isolation. Use one batch size per fresh process. The pattern is "many small adaptive knobs, each bit-identical when off" — evaluate combined. Two knobs now need a *real checkpoint* to size at all: `COLI_ROUTE_MIN_SHARE` (how much gate mass the tail actually carries) and any int2 use (its accuracy cost). `COLI_GATE_STATS` and `prediction_flip_rate` exist to answer exactly those, and both are unanswerable on the synthetic model — 4 experts, top-2, so there is no weight tail to measure.
+- **Validation caveat:** synthetic-model tests catch correctness; throughput impact needs a real model to measure — and now partly has been, in the [2026-08-01 pass](docs/benchmarks.md#benchmark-pass--2026-08-01-post-improvement-re-measure) (§1–§11 knob bundle 1.004×, CUDA lane 1.09×, batching 4.4× reproduced). Note that pass also found `peregrine bench 1 4 16` unsound for comparing configurations: running every batch point in one process inflates the later ones (baseline B=16 reads 0.143 in-sweep vs 0.224 isolated), which had manufactured an apparent 1.45×/1.64× that vanished under isolation. Use one batch size per fresh process. The pattern is "many small adaptive knobs, each bit-identical when off" — evaluate combined. Two knobs now need a *real checkpoint* to size at all: `COLI_ROUTE_MIN_SHARE` (how much gate mass the tail actually carries) and any int2 use (its accuracy cost). `COLI_GATE_STATS` and `prediction_flip_rate` exist to answer exactly those, and both are unanswerable on the synthetic model — 4 experts, top-2, so there is no weight tail to measure.

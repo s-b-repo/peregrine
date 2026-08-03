@@ -110,7 +110,7 @@ on NVMe.
 
 ## 2. Re-run the 2026-08-01 knob pass — its conclusion is suspect
 
-[`benchmark-2026-08-01.md`](benchmark-2026-08-01.md) measured nine adaptive knobs
+The [2026-08-01 pass](benchmarks.md#benchmark-pass--2026-08-01-post-improvement-re-measure) measured nine adaptive knobs
 together at **1.004×** with byte-identical disk reads, and that result is the
 foundation of `todo.md` §13's "moving bytes faster is spent" thesis. Two of the
 nine were not what they seemed:
