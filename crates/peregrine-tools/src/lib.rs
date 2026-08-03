@@ -4,6 +4,7 @@
 //!
 //! Everything is deterministic: same trace → same artifacts.
 
+pub mod prune;
 pub mod requant;
 
 use peregrine_core::{Context, Error};
