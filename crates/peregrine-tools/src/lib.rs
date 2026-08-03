@@ -6,6 +6,7 @@
 
 pub mod prune;
 pub mod requant;
+pub mod skipbound;
 
 use peregrine_core::{Context, Error};
 use serde_json::Value;
