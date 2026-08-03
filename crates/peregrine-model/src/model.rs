@@ -1582,7 +1582,7 @@ fn forward_layer_batched(
     let d = cfg.hidden as usize;
     let eps = cfg.eps;
     let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
-    let attn = mla_attention_batched(&l.attn(), &nrm, pos_of, caches, cfg)?;
+    let attn = mla_attention_batched(&l.attn(), &nrm, pos_of, caches, cfg, ctx.absorb)?;
     for z in 0..s_n * d {
         x[z] += attn[z];
     }
@@ -4559,19 +4559,16 @@ mod tests {
     }
 
     #[test]
-    fn batched_decode_is_absorb_whatever_the_knob_says() -> Result<(), peregrine_core::Error> {
-        // **A documented opt-in knob that the serving path ignores.**
-        // `COLI_MLA_ABSORB` is described as off by default, and `forward_step` /
-        // `forward_prefill_seq` honour that. `forward_step_batched` does not:
-        // it goes through `mla_attention_batched`, which is absorb-only because
-        // the dense core reconstructs `[k_nope|v]` against *one* cache and B
-        // sequences have B of them. So over HTTP, a request's prefill runs the
-        // dense core and every one of its decode tokens runs absorption — two
-        // cores that are algebraically equal but not numerically identical.
+    fn batched_decode_honours_the_absorb_knob_and_defaults_to_dense() -> Result<(), peregrine_core::Error> {
+        // **The knob used to stop at the batched path.** `forward_layer_batched`
+        // called an absorb-only core unconditionally, so over HTTP a request ran
+        // its prefill on the dense core and every decode token on absorption —
+        // two algebraically-equal, numerically-different implementations inside
+        // one response — while the docs called absorb opt-in and off by default.
         //
-        // This is pinned rather than left implicit in the code's shape. It is a
-        // real difference in served output, and the repo has twice been bitten
-        // by a claim that outlived the code it described.
+        // The contract this now asserts is the documented one: at the default,
+        // batched decode is the *same* core as the single-sequence decode, bit
+        // for bit; with the knob set, it is not.
         let dir = tmp_model_dir("batched_absorb")?;
         let mut m = Model::load(&dir)?;
         assert!(!m.absorb, "the default must still be dense");
@@ -4579,7 +4576,7 @@ mod tests {
         let pos = prompt.len();
 
         // Three identically prefilled sequences, all through the dense path, so
-        // the only thing that varies below is the decode step.
+        // the decode step below is the only thing that varies.
         let prefilled = || -> Result<SeqKv, peregrine_core::Error> {
             let mut sk = SeqKv::new(&m.cfg);
             m.forward_prefill_seq(&prompt, &mut sk, 0)?;
@@ -4587,23 +4584,20 @@ mod tests {
         };
         let (mut a, mut b, mut c) = (prefilled()?, prefilled()?, prefilled()?);
 
-        // The single-sequence decode, which *does* honour the knob: dense.
-        let dense = m.forward_prefill_seq(&[4], &mut c, pos)?;
-        // The batched decode with the knob off.
+        let dense = m.forward_prefill_seq(&[4], &mut c, pos)?; // single-sequence, honours the knob
         let mut one: [&mut SeqKv; 1] = [&mut a];
         let batched_off = m.forward_step_batched(&[4], &mut one, &[pos], None)?;
-        // …and with the knob on.
         m.absorb = true;
         let mut one: [&mut SeqKv; 1] = [&mut b];
         let batched_on = m.forward_step_batched(&[4], &mut one, &[pos], None)?;
 
+        assert_eq!(dense.len(), batched_off.len());
+        for (k, (p, q)) in dense.iter().zip(&batched_off).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "logit {k}: batched decode at the default must be the dense core");
+        }
         assert!(
-            batched_off.iter().zip(&batched_on).all(|(p, q)| p.to_bits() == q.to_bits()),
-            "COLI_MLA_ABSORB does not reach the batched decode path"
-        );
-        assert!(
-            dense.iter().zip(&batched_off).any(|(p, q)| p.to_bits() != q.to_bits()),
-            "…and what it runs instead is not the dense core either"
+            batched_off.iter().zip(&batched_on).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "…and setting COLI_MLA_ABSORB must actually reach it"
         );
         std::fs::remove_dir_all(&dir)?;
         Ok(())
