@@ -1,0 +1,26 @@
+CORRECTION (see commit c9a1 "Correct the attribution record on 1fd8b42").
+
+This commit's message describes only the KV growth-overshoot cap. It also
+carries a separately-authored body of work that was in flight in the same
+checkout and was swept up by `git add -A`. The file-level split is:
+
+  Mine (the message's subject):
+    crates/peregrine-model/src/attention.rs   +97   KV_GROW_ROWS, KvBuf::reserve_for,
+                                                    slack_rows, and their test
+    docs/validation-runbook.md                +27   section 5b, KV fragmentation
+    todo.md                                    +6   the 3b partial entry
+
+  Not mine, and undescribed by the message:
+    crates/peregrine-model/src/model.rs      +216   router look-ahead (LookaheadCtx,
+                                                    emit/rank, lookahead_issued),
+                                                    COLI_ROUTER_LOOKAHEAD
+    crates/peregrine-model/src/predeval.rs   +292   predictor scoreboard (PredictEval),
+                                                    COLI_PREDICT_EVAL
+    crates/peregrine-model/src/router.rs     +136   route_ranks
+
+The tree was green when this was committed and pushed, so what went out
+compiled and passed. The defect is the record, not the code.
+
+Not fixed by rewriting history: the branch is pushed and another working copy
+has it checked out, so amending would change this and every later hash and
+desync that copy. The message is wrong; the correction is additive.
