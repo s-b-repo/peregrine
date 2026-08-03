@@ -36,7 +36,10 @@ pub mod weight;
 pub mod wmma_tune;
 pub mod workload;
 
-pub use attention::{mla_attention, mla_attention_absorb, mla_attention_batched, AttnWeights, KvDtype, KvSpan, LayerKv, RowAttn};
+pub use attention::{
+    mla_attention, mla_attention_absorb, mla_attention_batched, mla_attention_rows, AttnWeights, KvDtype, KvSpan,
+    LayerKv, RowAttn, RowLayout,
+};
 pub use math::{
     layernorm, rmsnorm, rmsnorm_inplace, rope_interleave, rope_interleave_with, sigmoidf, siluf, silu_mul, softmax,
     RopeTable,
