@@ -36,6 +36,10 @@ pub struct ForwardCtx<'a> {
     /// read from the environment per forward, so tests can exercise both paths
     /// without mutating process-global state that parallel tests share.
     pub absorb: bool,
+    /// Run the DSA lightning indexer where a layer carries one (`COLI_DSA`).
+    /// Carried here for the same reason `absorb` is: so a test can exercise the
+    /// sparse path without mutating process-global state parallel tests share.
+    pub dsa: bool,
     /// A **pool of io_uring rings** for the I/O lane — one dedicated ring per I/O
     /// worker thread, so N reads proceed in parallel (each ring is locked only by
     /// its owner, so the lock is uncontended). Empty in resident mode.

@@ -53,25 +53,32 @@ pub fn select_topk(scores: &[f32], k: usize) -> Vec<usize> {
     sel
 }
 
-/// Per-layer lightning indexer: its own q/k/weight projections, key LayerNorm,
-/// and a cache of projected+normed+roped keys. Present only when the checkpoint
-/// carries `model.layers.{i}.self_attn.indexer*` tensors.
-pub struct Indexer {
+/// Per-layer lightning indexer weights: its own q/k/weight projections and key
+/// LayerNorm. Present only when the checkpoint carries
+/// `model.layers.{i}.self_attn.indexer*` tensors.
+///
+/// **Weights only — no cache.** These were one struct, which made the indexer
+/// structurally single-sequence: `keys`/`len` are per-*sequence* state, so one
+/// indexer per layer on a `Model` serving concurrent requests would have let
+/// two sequences interleave keys into one buffer. That is silent cross-sequence
+/// corruption, not a crash, and nothing downstream would have caught it. The
+/// cache now lives beside the KV latents in `LayerKv`, which already has
+/// exactly the lifecycle it needs: append in order, truncate on a speculative
+/// rewind, share a common prefix by refcount.
+pub struct IndexerWeights {
     wq: QtWeight,       // [nh*hd, q_lora]  query projection (from the q-LoRA)
     wk: QtWeight,       // [hd, hidden]     key projection (from the hidden)
     wp: QtWeight,       // [nh, hidden]     per-head weights projection
     k_norm_w: Vec<f32>, // [hd] key LayerNorm weight
     k_norm_b: Vec<f32>, // [hd] key LayerNorm bias
-    keys: Vec<f32>,     // [len*hd] cached keys
-    len: usize,
     nh: usize,
     hd: usize,
     topk: usize,
 }
 
-impl Indexer {
+impl IndexerWeights {
     /// Load the indexer for `layer` if present; `Ok(None)` otherwise.
-    pub fn load(st: &SafeTensors, layer: usize, cfg: &Cfg) -> Result<Option<Indexer>, Error> {
+    pub fn load(st: &SafeTensors, layer: usize, cfg: &Cfg) -> Result<Option<IndexerWeights>, Error> {
         let base = format!("model.layers.{layer}.self_attn");
         let wqn = format!("{base}.indexer_projections.wq_b");
         if !st.has(&wqn) {
@@ -83,46 +90,53 @@ impl Indexer {
         let mut k_norm_b = vec![0f32; hd];
         st.read_f32(&format!("{base}.indexer.k_norm.weight"), &mut k_norm_w)?;
         st.read_f32(&format!("{base}.indexer.k_norm.bias"), &mut k_norm_b)?;
-        Ok(Some(Indexer {
+        Ok(Some(IndexerWeights {
             wq: QtWeight::load(st, &wqn, nh * hd, ql)?,
             wk: QtWeight::load(st, &format!("{base}.indexer_projections.wk"), hd, hidden)?,
             wp: QtWeight::load(st, &format!("{base}.indexer_projections.weights_proj"), nh, hidden)?,
             k_norm_w,
             k_norm_b,
-            keys: Vec::new(),
-            len: 0,
             nh,
             hd,
             topk: cfg.index_topk.max(0) as usize,
         }))
     }
 
-    /// Clear the key cache for a new sequence.
-    pub fn reset(&mut self) {
-        self.keys.clear();
-        self.len = 0;
+    /// Width of one cached indexer key.
+    pub fn hd(&self) -> usize {
+        self.hd
     }
 
-    /// Project, LayerNorm (eps 1e-6), and RoPE a new position's key, then cache it.
-    pub fn append_key(&mut self, x_row: &[f32], pos: usize, cfg: &Cfg) {
+    /// How many keys a query keeps. Selection is a no-op at or below this
+    /// context length — attention is already dense over that many keys — which
+    /// is the activation rule the C engine uses.
+    pub fn topk(&self) -> usize {
+        self.topk
+    }
+
+    /// Project, LayerNorm (eps 1e-6) and RoPE one position's key. The caller
+    /// caches it; this borrows nothing mutable, so a layer's weights stay
+    /// shareable across concurrent sequences.
+    pub fn key_row(&self, x_row: &[f32], pos: usize, cfg: &Cfg) -> Vec<f32> {
         let mut k = self.wk.apply_vec(x_row, 1); // [hd]
         layernorm_affine(&mut k, &self.k_norm_w, &self.k_norm_b, 1e-6);
         rope_interleave(&mut k, pos, cfg);
-        self.keys.extend_from_slice(&k);
-        self.len += 1;
+        k
     }
 
-    /// Select the top-`index_topk` cached key indices for a query at `pos`.
-    /// `qr` is the query's q-LoRA row `[q_lora]`, `x_row` its hidden `[hidden]`.
-    pub fn select(&self, qr: &[f32], x_row: &[f32], pos: usize, cfg: &Cfg) -> Vec<usize> {
+    /// Select the top-`index_topk` key indices for a query at `pos`, over the
+    /// caller's cached `keys` (`[nkeys*hd]`, causal order). `qr` is the query's
+    /// **post-`rmsnorm`** q-LoRA row `[q_lora]` — the same tensor `q_b` consumes
+    /// — and `x_row` its hidden `[hidden]`.
+    pub fn select(&self, qr: &[f32], x_row: &[f32], pos: usize, cfg: &Cfg, keys: &[f32]) -> Vec<usize> {
         let (nh, hd) = (self.nh, self.hd);
         let mut qi = self.wq.apply_vec(qr, 1); // [nh*hd]
         for h in 0..nh {
             rope_interleave(&mut qi[h * hd..h * hd + hd], pos, cfg);
         }
         let w = self.wp.apply_vec(x_row, 1); // [nh]
-        let nt = (pos + 1).min(self.len);
-        let scores = score_keys(&qi, &w, &self.keys[..nt * hd], nh, hd);
+        let nt = (pos + 1).min(keys.len().checked_div(hd).unwrap_or(0));
+        let scores = score_keys(&qi, &w, &keys[..nt * hd], nh, hd);
         select_topk(&scores, self.topk)
     }
 }
