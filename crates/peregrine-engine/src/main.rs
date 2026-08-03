@@ -457,6 +457,21 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                             "[union] selections={sel} distinct={distinct} calls={calls} share={share:.3}x"
                         );
                     }
+                    // The number that decides gate-mass mixed-precision loading.
+                    // A read is issued per *union entry*, not per row, so an
+                    // expert one row leans on and another barely wants must be
+                    // read at the higher precision. Only experts low-gate for
+                    // *every* row that wants them could be read narrower — and
+                    // that share shrinks as the batch grows, which is the
+                    // tension with the amortization the line above measures.
+                    if let Some((all_low, distinct)) = peregrine_model::union_low_gate_snapshot() {
+                        let f = if distinct > 0 { all_low as f64 / distinct as f64 } else { 0.0 };
+                        eprintln!(
+                            "[union] all-low-gate reads={all_low}/{distinct} ({:.1}%) — the ceiling on \
+                             per-token precision selection under batch union",
+                            f * 100.0
+                        );
+                    }
                     let g = model.telemetry().gpu;
                     if g.calls > 0 {
                         match g.transfer_fraction() {

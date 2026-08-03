@@ -56,7 +56,8 @@ pub use predeval::{ArmReport, PredictEval};
 pub use predict::{Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 pub use mtp::speculative_sample;
 pub use router::{
-    batch_union, gate_share_below, gate_stats_snapshot, route, union_stats_snapshot, Routed, RouterCfg,
+    batch_union, gate_share_below, gate_stats_snapshot, route, union_low_gate_snapshot, union_stats_snapshot, Routed,
+    RouterCfg,
 };
 pub use sample::{argmax, pick_batch_greedy, Sampler};
 pub use weight::{QtWeight, QuantFmt};
