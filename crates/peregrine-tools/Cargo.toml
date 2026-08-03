@@ -22,6 +22,10 @@ path = "src/requant_main.rs"
 name = "peregrine-prune"
 path = "src/prune_main.rs"
 
+[[bin]]
+name = "peregrine-skipbound"
+path = "src/skipbound_main.rs"
+
 [dependencies]
 serde_json.workspace = true
 peregrine-core = { path = "../peregrine-core" }

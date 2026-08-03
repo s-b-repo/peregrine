@@ -403,6 +403,31 @@ Only if 25% is clean is 50% (`--force`) worth trying, and then only with the
 off-distribution flip rate as the acceptance gate rather than a benchmark
 average.
 
+## 8. Expert-skip bounds: confirm or close the negative result
+
+The offline prototype already ran here and came back negative — the weight
+bound adds ~0.12 points of skippable reads over the gate weight alone. That is
+a synthetic-model result with 4 random-weight experts, so `C_e` is near-uniform
+by construction; a real checkpoint is the only thing that can overturn it.
+
+```bash
+peregrine dump-routes "$COLI_MODEL" > routes.json
+./target/release/peregrine-skipbound "$COLI_MODEL" --trace routes.json
+```
+
+Read the **"the bound adds"** column, not the "with bound" one. The engine can
+already drop low-gate experts through `COLI_ROUTE_MIN_SHARE`; the only thing
+that justifies a sidecar, per-token norm arithmetic and a new file format is
+the margin over that baseline.
+
+- **Margin still under ~1 point** → close the item. Size `COLI_ROUTE_MIN_SHARE`
+  with `COLI_GATE_STATS` instead; it is the same saving with none of the
+  machinery.
+- **Margin materially larger on 256 experts** → then `C_e` does spread on a
+  real checkpoint, and the next step is *still* not the read path: re-measure
+  on a second workload, since the fraction is a property of the routing
+  distribution as much as of the weights.
+
 ## What to do with the results
 
 Write them into [benchmarks.md](benchmarks.md). Where a measurement contradicts
