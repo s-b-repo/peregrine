@@ -29,6 +29,22 @@ Thumbs.db
 /bench-results.log
 /b1-isolate.log
 /b16-repeat.log
+# Long-run scratch logs. Their durable content is transcribed into todo.md and
+# docs/benchmarks.md as prose; the files themselves are one run's stdout.
+/int2g64-convert.log
+/flip-rate-smoke.log
+/flip-rate-int2g64.log
+/union-rerun.log
+
+# Not peregrine. These live in this checkout for no better reason than that it
+# was the shell's working directory at the time, and they are ignored rather
+# than committed: `docs/polly/` is a separate Palworld mod project (it also
+# carries personal identifiers, so never `git add -f` it), and the two
+# screencast files are desktop/PipeWire debugging with nothing to do with an
+# inference engine.
+/docs/polly/
+/vesktop-screencast-bug-report.md
+/scripts/portal-screencast-test.py
 
 # Python bytecode (scripts/ carries runstat.py + audit-reachability.py)
 __pycache__/
