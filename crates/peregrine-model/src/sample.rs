@@ -176,6 +176,64 @@ impl Sampler {
         self.dist_build(lo);
         self.dist_sample(lo.len(), ban)
     }
+
+    /// This sampler's target distribution over `lo`: softmax at `temp`, nucleus-
+    /// truncated and renormalized — **the exact transform [`Self::pick`]
+    /// samples from**, which is the entire reason this is a method on `Sampler`
+    /// rather than a free function.
+    ///
+    /// [`crate::speculative_sample`]'s guarantee is that the emitted token is
+    /// distributed as `p`. It compares `p[d]/q[d]`, so if `p` and `q` come from
+    /// two different transforms — one nucleus-truncated and one not, one at the
+    /// request's temperature and one at the draft head's — the ratio is a
+    /// number with no meaning and the "provably distribution-preserving" claim
+    /// silently becomes false. Sharing this one builder is what makes it true.
+    ///
+    /// At `temp <= 0` the distribution is the one-hot at the argmax, which is
+    /// what greedy decoding *is* as a distribution.
+    pub fn distribution(&mut self, lo: &[f32]) -> &[f32] {
+        if self.temp <= 0.0 {
+            self.p.clear();
+            self.p.resize(lo.len(), 0.0);
+            if !lo.is_empty() {
+                self.p[argmax(lo)] = 1.0;
+            }
+            return &self.p;
+        }
+        self.dist_build(lo);
+        &self.p
+    }
+
+    /// Sample a token **and** return the distribution it was drawn from.
+    ///
+    /// One call, because the pair is a precondition rather than two
+    /// conveniences: `speculative_sample` assumes `drafted ~ q`, and a caller
+    /// that sampled with one call and described the distribution with another
+    /// could drift between them (a re-`dist_build` on different logits, a
+    /// nucleus change) with nothing detecting it.
+    pub fn pick_with_distribution(&mut self, lo: &[f32]) -> (usize, Vec<f32>) {
+        if self.temp <= 0.0 {
+            let t = argmax(lo);
+            let mut q = vec![0.0; lo.len()];
+            if !lo.is_empty() {
+                q[t] = 1.0;
+            }
+            return (t, q);
+        }
+        self.dist_build(lo);
+        let q = self.p.clone();
+        (self.dist_sample(lo.len(), -1), q)
+    }
+
+    /// One uniform in `[0,1)` from this sampler's stream.
+    ///
+    /// Exposed for [`crate::speculative_sample`]'s two draws. Taking them from
+    /// the *request's* stream rather than a private one is deliberate: it keeps
+    /// a seeded request reproducible end to end, and it is the only stream whose
+    /// consumption is already part of the request's contract.
+    pub fn uniform(&mut self) -> f64 {
+        self.rndu()
+    }
 }
 
 #[cfg(test)]

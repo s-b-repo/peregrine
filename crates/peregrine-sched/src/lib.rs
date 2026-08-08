@@ -233,6 +233,106 @@ pub fn moe_streamed(
     Ok(out)
 }
 
+/// [`moe_streamed`] as an installable [`peregrine_model::concurrent::MoeEngine`].
+///
+/// **This is what gives `moe_streamed` a production caller.** The direct wiring
+/// is impossible: this crate depends on `peregrine-model`, so `peregrine-model`
+/// calling into it would be a dependency cycle. The dependency is inverted
+/// instead — `peregrine-model` declares the trait, this implements it, and a
+/// binary installs it when `COLI_MOE_ENGINE=sched`.
+///
+/// **Opt-in, and it should stay opt-in.** `moe_streamed` is the two-lane
+/// ancestor: one io_uring ring, no GPU lane, no warm cache, no prefetch, no lane
+/// balancer. On any host with a GPU tier or a warm cache it will be slower than
+/// the default `moe_forward_concurrent`. Its value is as a second, independently
+/// written implementation that `streamed_matches_the_production_concurrent_path`
+/// checks the first against — and, now, as a runtime A/B of that same pair.
+///
+/// The `Streamer` owns an io_uring ring and `moe_streamed` needs it mutably,
+/// while the trait hands out `&self`; the `Mutex` is that adaptation and also
+/// serialises layers, which is correct — the ring is not shareable.
+pub struct SchedEngine {
+    streamer: std::sync::Mutex<Streamer>,
+}
+
+impl SchedEngine {
+    /// Build the engine with an io_uring ring `depth` entries deep.
+    pub fn new(depth: u32) -> Result<SchedEngine, Error> {
+        Ok(SchedEngine { streamer: std::sync::Mutex::new(Streamer::new(depth)?) })
+    }
+}
+
+impl peregrine_model::concurrent::MoeEngine for SchedEngine {
+    fn name(&self) -> &'static str {
+        "sched"
+    }
+
+    fn moe_forward(
+        &self,
+        ctx: &peregrine_model::concurrent::ForwardCtx,
+        call: peregrine_model::concurrent::MoeCall,
+    ) -> Result<Vec<f32>, Error> {
+        use peregrine_core::QtInfo;
+        let peregrine_model::concurrent::MoeCall { layer, x, router_w, router_bias, shared, s_n } = call;
+        let cfg = ctx.cfg;
+        let hidden = cfg.hidden as usize;
+        let mi = cfg.moe_inter as usize;
+        let e_n = cfg.n_experts as usize;
+
+        // Locate this layer's experts in the container the model already opened.
+        // `SafeTensors::region` yields the same `(fd, offset, len)` triples
+        // `concurrent.rs`'s private `tplan` builds its plans from, so both
+        // engines read one file rather than two.
+        let qt_of = |name: &str, o: usize, i: usize| -> Result<DiskQt, Error> {
+            let info = QtInfo::detect(ctx.st, name, o as i64, i as i64);
+            let sname = format!("{name}.qs");
+            let (w_fd, w_off, w_len) =
+                ctx.st.region(name).ok_or_else(|| Error::Format(format!("missing tensor {name}")))?;
+            let (s_fd, s_off, s_len) =
+                ctx.st.region(&sname).ok_or_else(|| Error::Format(format!("missing tensor {sname}")))?;
+            Ok(DiskQt {
+                w_fd,
+                w_off,
+                w_len,
+                s_fd,
+                s_off,
+                s_len,
+                meta: QtMeta { fmt: info.fmt, o, i, gs: info.gs as usize },
+            })
+        };
+        let mut disk: Vec<DiskExpert> = Vec::with_capacity(e_n);
+        for e in 0..e_n {
+            let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
+            disk.push(DiskExpert {
+                gate: qt_of(&p("gate_proj.weight"), mi, hidden)?,
+                up: qt_of(&p("up_proj.weight"), mi, hidden)?,
+                down: qt_of(&p("down_proj.weight"), hidden, mi)?,
+            });
+        }
+        let locs: Vec<ExpertLoc> = disk.iter().map(|d| ExpertLoc::Disk(Box::new(*d))).collect();
+
+        let mut streamer = self
+            .streamer
+            .lock()
+            .map_err(|e| Error::Format(format!("sched streamer lock poisoned: {e}")))?;
+        moe_streamed(
+            &mut streamer,
+            x,
+            router_w,
+            router_bias,
+            &locs,
+            shared,
+            MoeCfg {
+                s_n,
+                hidden,
+                k: cfg.topk as usize,
+                norm_topk: cfg.norm_topk,
+                routed_scale: cfg.routed_scale,
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::reconstruct::QtMeta;
@@ -292,8 +392,148 @@ mod tests {
         })
     }
 
+    /// **The oracle this crate exists to be.**
+    ///
+    /// `peregrine-sched` has no dependents: production MoE is
+    /// `peregrine-model/concurrent.rs::moe_forward_concurrent`, and until now
+    /// nothing compared the two, so the crate was neither used nor useful — the
+    /// `[R]` finding in `docs/BAD_PATTERNS.md`. A second, independently written
+    /// implementation of the same computation is worth keeping *only* if
+    /// something checks it against the first; otherwise it is a second thing to
+    /// keep correct with no benefit.
+    ///
+    /// The comparison is possible because both entry points take the router
+    /// weights as arguments, so both route identically by construction, and
+    /// because `SafeTensors::region` exposes the same `(fd, offset, len)` triples
+    /// `concurrent.rs`'s private `tplan` builds its own plans from. Pointing
+    /// `DiskQt` at the container's own bytes is what makes this an equivalence
+    /// test rather than two engines reading two different files.
+    ///
+    /// Tolerance, not bits: the lanes accumulate expert contributions in
+    /// different orders, and `f32 +=` is not associative. Bit-identity is
+    /// asserted *within* each engine (`concurrent`'s `pos`-keyed reduce), not
+    /// across them.
     #[test]
-    fn concurrent_matches_sequential() -> Result<(), peregrine_core::Error> {
+    fn streamed_matches_the_production_concurrent_path() -> Result<(), peregrine_core::Error> {
+        use peregrine_core::{Cfg, QtInfo, SafeTensors};
+        use peregrine_model::concurrent::{moe_forward_concurrent, ForwardCtx};
+        use peregrine_model::testkit::build_tiny_model_seeded;
+        use parking_lot::Mutex;
+
+        let dir = std::env::temp_dir().join(format!("peregrine_oracle_{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        build_tiny_model_seeded(&dir, 0x5EED)?;
+        let cfg = Cfg::load(&dir)?;
+        let st = SafeTensors::open(&dir)?;
+
+        let (hidden, e_n) = (cfg.hidden as usize, cfg.n_experts as usize);
+        let mi = cfg.moe_inter as usize;
+        let s_n = 3usize;
+        // The first sparse layer: `first_dense` is the count of leading dense
+        // layers, so it is also the index of the first layer with experts.
+        let layer = cfg.first_dense as usize;
+
+        let mut r = Lcg(0xC0FFEE);
+        let x: Vec<f32> = (0..s_n * hidden).map(|_| r.f()).collect();
+        // Our own router, not the checkpoint's: both engines take it as an
+        // argument, so supplying it directly removes the router from the
+        // comparison and leaves only the expert path — which is what differs.
+        let router_w: Vec<f32> = (0..e_n * hidden).map(|_| r.f()).collect();
+        let router_bias: Vec<f32> = (0..e_n).map(|_| r.f() * 0.1).collect();
+
+        let reactors = vec![Mutex::new(peregrine_io::Reactor::new(64)?)];
+        let ctx = ForwardCtx {
+            st: &st,
+            absorb: false,
+            dsa: false,
+            reactors: &reactors,
+            gpu: None,
+            workers: 1,
+            cfg: &cfg,
+            stream_experts: true,
+            ecache: None,
+            route_log: None,
+            route_log_multi: None,
+            direct: false,
+            heat: None,
+            timings: None,
+            balancer: None,
+            heat_counts: None,
+            layout_schedule: None,
+            affinity: None,
+        };
+        let production = moe_forward_concurrent(&ctx, layer, &x, &router_w, &router_bias, None, s_n)?;
+
+        // Point this crate's `DiskQt`s at the *same* container bytes. `region`
+        // is what `tplan` uses; a scale tensor is always `<name>.qs`.
+        let qt_of = |name: &str, o: usize, i: usize| -> Result<DiskQt, peregrine_core::Error> {
+            let info = QtInfo::detect(&st, name, o as i64, i as i64);
+            let sname = format!("{name}.qs");
+            let (w_fd, w_off, w_len) = st
+                .region(name)
+                .ok_or_else(|| peregrine_core::Error::Format(format!("missing tensor {name}")))?;
+            let (s_fd, s_off, s_len) = st
+                .region(&sname)
+                .ok_or_else(|| peregrine_core::Error::Format(format!("missing tensor {sname}")))?;
+            Ok(DiskQt {
+                w_fd,
+                w_off,
+                w_len,
+                s_fd,
+                s_off,
+                s_len,
+                meta: QtMeta { fmt: info.fmt, o, i, gs: info.gs as usize },
+            })
+        };
+        let mut disk: Vec<DiskExpert> = Vec::with_capacity(e_n);
+        for e in 0..e_n {
+            let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
+            disk.push(DiskExpert {
+                gate: qt_of(&p("gate_proj.weight"), mi, hidden)?,
+                up: qt_of(&p("up_proj.weight"), mi, hidden)?,
+                down: qt_of(&p("down_proj.weight"), hidden, mi)?,
+            });
+        }
+        let locs: Vec<ExpertLoc> = disk.iter().map(|d| ExpertLoc::Disk(Box::new(*d))).collect();
+
+        let mut streamer = Streamer::new(64)?;
+        let mcfg = MoeCfg {
+            s_n,
+            hidden,
+            k: cfg.topk as usize,
+            norm_topk: cfg.norm_topk,
+            routed_scale: cfg.routed_scale,
+        };
+        let streamed = moe_streamed(&mut streamer, &x, &router_w, &router_bias, &locs, None, mcfg)?;
+
+        assert_eq!(streamed.len(), production.len(), "both engines produce [s_n, hidden]");
+        // A model whose output is all zeros would satisfy any tolerance, so
+        // require the comparison to have had something to compare.
+        assert!(
+            production.iter().any(|v| v.abs() > 1e-6),
+            "the reference output is entirely zero — the fixture routed nothing and this test proves nothing"
+        );
+        for z in 0..s_n * hidden {
+            let tol = 1e-3 * production[z].abs().max(1.0);
+            assert!(
+                (production[z] - streamed[z]).abs() < tol,
+                "z={z} concurrent={} streamed={}",
+                production[z],
+                streamed[z]
+            );
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Historical name, kept: this compares `moe_streamed` against the fully
+    /// **resident** `moe_forward`, not against the production concurrent path —
+    /// see `streamed_matches_the_production_concurrent_path` for that. The old
+    /// name read as if this were the cross-engine check
+    /// (`docs/testing-and-quality.md` flags it), which is why the real one says
+    /// what it compares in its name.
+    #[test]
+    fn streamed_matches_the_resident_reference() -> Result<(), peregrine_core::Error> {
         let (hidden, inter, e_n, k, s_n) = (16usize, 8usize, 6usize, 2usize, 4usize);
         let mut r = Lcg(0xF00D);
 

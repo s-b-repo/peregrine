@@ -113,6 +113,18 @@ struct Slot {
     /// never bumps `used`/`clock`, so with all priorities equal the policy is
     /// byte-for-byte the original LRU.
     prio: u32,
+    /// Cache hits this slot has served since admission — the *frequency* half of
+    /// LFRU, and the reason `COLI_CACHE_LFRU` needs no `HeatTable`. The model's
+    /// heat table only exists when a GPU tier does (`model.rs`), so sourcing
+    /// frequency from it would make the policy silently degrade to LRU on every
+    /// CPU-only run. A hit is exactly "this expert was routed and we had it", so
+    /// counting hits per slot measures the same thing for the slots the victim
+    /// choice actually ranges over — the resident ones.
+    ///
+    /// Reset to 0 when a slot is *refreshed* (re-admitted from a new fetch), for
+    /// the same reason `ever_hit` is: the payload is a fresh fetch and its
+    /// predecessor's popularity is not evidence about it.
+    heat: u32,
 }
 
 /// Small Bloom filter over currently-resident `(layer, expert)` keys. Two hash
@@ -224,7 +236,25 @@ pub struct WarmCache {
     pub uncompressed_bytes_seen: u64,
     /// Cumulative bytes actually admitted (post-compression when enabled).
     pub compressed_bytes_seen: u64,
+    /// Rank victims by LFRU (`tier::lfru_score` over per-slot hit frequency and
+    /// recency) instead of recency alone, within a priority class.
+    /// `COLI_CACHE_LFRU=1`; off = the historical `(prio, used)` tuple, unchanged
+    /// bit for bit. Fixed at construction.
+    lfru: bool,
+    /// Hits served since the last frequency decay. `tier::decay` halves every
+    /// slot's `heat` when this crosses [`LFRU_DECAY_HITS`], so the score tracks
+    /// *recent* popularity rather than a lifetime total — without it, a slot that
+    /// was hot early becomes unevictable no matter how cold it goes.
+    hits_since_decay: u64,
 }
+
+/// Hits between `tier::decay` sweeps under `COLI_CACHE_LFRU`. A constant rather
+/// than a knob: the value only sets how many hits of history the score carries,
+/// and one more env var to mis-set is worse than a defensible default. At 4096
+/// a slot's frequency half-life is a few thousand routings — long enough to rank
+/// stable hot experts, short enough that a phase change is not outvoted by one
+/// that ended.
+const LFRU_DECAY_HITS: u64 = 4096;
 
 impl WarmCache {
     /// A cache bounded to `budget_bytes` of resident expert slabs.
@@ -234,7 +264,10 @@ impl WarmCache {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
         let compress = matches!(std::env::var("COLI_CACHE_COMPRESS").as_deref(), Ok("1") | Ok("true"));
+        let lfru = matches!(std::env::var("COLI_CACHE_LFRU").as_deref(), Ok("1") | Ok("true"));
         WarmCache {
+            lfru,
+            hits_since_decay: 0,
             budget: budget_bytes,
             used: 0,
             map: HashMap::new(),
@@ -264,6 +297,15 @@ impl WarmCache {
     /// threads sharing the process env.
     pub fn with_compression(mut self, on: bool) -> WarmCache {
         self.compress_on_admit = on;
+        self
+    }
+
+    /// Override the `COLI_CACHE_LFRU` gate. Same purpose as
+    /// [`Self::with_compression`]: the env is process-global and the test
+    /// binary is threaded, so a test that set the variable would decide the
+    /// policy for every other test running beside it.
+    pub fn with_lfru(mut self, on: bool) -> WarmCache {
+        self.lfru = on;
         self
     }
 
@@ -374,6 +416,11 @@ impl WarmCache {
         let (slab, first_prefetch_hit) = match self.map.get_mut(&key) {
             Some(slot) => {
                 slot.used = now;
+                // Frequency half of LFRU. Bumped unconditionally, not under the
+                // `lfru` gate: the counter costs one add on a path that is about
+                // to memcpy an expert slab, and gating it would make the knob's
+                // behavior depend on when it was switched on.
+                slot.heat = slot.heat.saturating_add(1);
                 let first = slot.from_prefetch && !slot.ever_hit;
                 if first {
                     slot.ever_hit = true;
@@ -388,6 +435,7 @@ impl WarmCache {
         match slab {
             Some(slab) => {
                 self.hits += 1;
+                self.maybe_decay_heat();
                 if first_prefetch_hit {
                     self.prefetch_used += 1;
                 }
@@ -414,6 +462,15 @@ impl WarmCache {
     /// re-streamed, so output stays correct, but it is worth surfacing.
     pub fn decode_failures(&self) -> u64 {
         self.decode_failures
+    }
+
+    /// A resident slot's accumulated hit frequency — the LFRU score's high bits.
+    /// Test-only: the policy is observable through eviction outcomes, and a
+    /// production reader would invite callers to depend on a counter that decays
+    /// out from under them.
+    #[cfg(test)]
+    fn heat_for_test(&self, key: (u32, u32)) -> Option<u32> {
+        self.map.get(&key).map(|s| s.heat)
     }
 
     /// Corrupt a resident compressed slot's payload, to exercise the
@@ -550,12 +607,13 @@ impl WarmCache {
                 // re-arm the used/wasted tracking from the new source.
                 slot.from_prefetch = from_prefetch;
                 slot.ever_hit = false;
+                slot.heat = 0;
                 was_new = false;
             }
             None => {
                 self.used += incoming;
                 self.map
-                    .insert(key, Slot { used: now, bytes: incoming, data: slot_data, from_prefetch, ever_hit: false, prio: 0 });
+                    .insert(key, Slot { used: now, bytes: incoming, data: slot_data, from_prefetch, ever_hit: false, prio: 0, heat: 0 });
                 was_new = true;
             }
         }
@@ -579,10 +637,24 @@ impl WarmCache {
         }
     }
 
-    /// Bulk [`Self::set_priority`]: protect every resident key in `keys` at `prio`.
+    /// Bulk [`Self::set_priority`]: apply `(key, prio)` pairs in one lock hold.
     /// Keys not currently resident are ignored (a miss re-streams them anyway).
-    pub fn set_protected(&mut self, keys: &[(u32, u32)], prio: u32) {
-        for &k in keys {
+    ///
+    /// **Takes per-key priorities, not one priority for a key slice.** The old
+    /// `(keys: &[(u32,u32)], prio: u32)` shape had no caller and could not have
+    /// had one: its only intended consumer, `Model::protect_from`, computes a
+    /// *different* score per expert (`pack_prio(predictor_score, heat)`), so a
+    /// single shared `prio` could not express what it needed. The signature was
+    /// written for a use that does not exist, which is its own explanation for
+    /// why it was never called.
+    ///
+    /// The point is the lock hold, not the loop. `protect_from` used to take the
+    /// cache lock and keep it across 78 layers × K predictions while also
+    /// holding the routing-history lock; the cache lock is contended by the
+    /// prefetch lane and every streamed read, so that window is expensive.
+    /// Building the pairs first and applying them here takes it once, briefly.
+    pub fn set_protected(&mut self, entries: &[((u32, u32), u32)]) {
+        for &(k, prio) in entries {
             self.set_priority(k, prio);
         }
     }
@@ -599,6 +671,39 @@ impl WarmCache {
     /// For introspection/tests.
     pub fn priority(&self, key: (u32, u32)) -> u32 {
         self.map.get(&key).map(|s| s.prio).unwrap_or(0)
+    }
+
+    /// Halve every slot's hit frequency once per [`LFRU_DECAY_HITS`] hits, so the
+    /// LFRU score reflects recent popularity rather than a lifetime total. Without
+    /// it a slab that was hot during one phase outranks everything forever and the
+    /// policy stops adapting — the failure mode plain LFU is known for.
+    ///
+    /// No-op unless `COLI_CACHE_LFRU` is set, so the default path pays one
+    /// comparison. Heats are gathered, decayed through [`crate::tier::decay`] and
+    /// written back **by key**, not by iteration position: `HashMap` order is
+    /// unspecified, and a gather/scatter that assumed it was stable would silently
+    /// hand each slab someone else's frequency.
+    fn maybe_decay_heat(&mut self) {
+        if !self.lfru {
+            return;
+        }
+        self.hits_since_decay += 1;
+        if self.hits_since_decay < LFRU_DECAY_HITS {
+            return;
+        }
+        self.hits_since_decay = 0;
+        let mut keys: Vec<(u32, u32)> = Vec::with_capacity(self.map.len());
+        let mut heats: Vec<u32> = Vec::with_capacity(self.map.len());
+        for (k, s) in self.map.iter() {
+            keys.push(*k);
+            heats.push(s.heat);
+        }
+        crate::tier::decay(&mut heats);
+        for (k, h) in keys.iter().zip(heats.iter()) {
+            if let Some(s) = self.map.get_mut(k) {
+                s.heat = *h;
+            }
+        }
     }
 
     /// Evict the least-recently-used slots until `used <= budget`, always keeping
@@ -639,11 +744,29 @@ impl WarmCache {
             // `prio: 0` while any predictor-protected slot is >= 1, so ordering
             // by `(prio, used)` would otherwise pick the newcomer first and make
             // every admission a silent no-op once anything is protected.
+            //
+            // Under `COLI_CACHE_LFRU` the second component becomes
+            // `tier::lfru_score`, which is `heat << 8 | (255 - age)` — one
+            // routing frequency count outweighs any recency advantage, so a
+            // merely-recent slab cannot displace a genuinely hotter one, while
+            // recency still breaks ties between equally-hot slabs. Priority stays
+            // the *primary* key either way: the protected set is a separate
+            // mechanism (`COLI_PREFETCH_PROTECT`) and LFRU reorders within a
+            // class rather than overriding it. Both arms are `(u32, u64)`, so the
+            // default arm is the historical tuple untouched.
+            let lfru = self.lfru;
+            let clock = self.clock as u32;
             let victim = self
                 .map
                 .iter()
                 .filter(|(k, _)| Some(**k) != keep)
-                .min_by_key(|(_, s)| (s.prio, s.used))
+                .min_by_key(|(_, s)| {
+                    // `used` and `clock` are u64 counters truncated to u32 here;
+                    // `lfru_score` takes their wrapping difference, which is the
+                    // true age for any age below 2^32 — i.e. always.
+                    let rank = if lfru { crate::tier::lfru_score(s.heat, s.used as u32, clock) } else { s.used };
+                    (s.prio, rank)
+                })
                 .map(|(k, _)| *k);
             let Some(vk) = victim else { break };
             if let Some(s) = self.map.remove(&vk) {
@@ -930,6 +1053,102 @@ mod tests {
         assert!(c.contains((0, 0)));
         assert!(!c.contains((0, 1))); // LRU victim, exactly as byte_budget_evicts_lru
         assert!(c.contains((0, 2)));
+    }
+
+    /// The default must be the historical policy, and the strongest way to say so
+    /// is to run the sequence the LFRU test uses and require the *opposite*
+    /// outcome. If this ever agrees with `lfru_keeps_the_hotter_slab_...`, the
+    /// knob has stopped being a knob.
+    #[test]
+    fn lfru_off_evicts_the_least_recent_however_hot_it_is() {
+        let mut c = WarmCache::new(80).with_lfru(false);
+        c.insert((0, 0), slab(10, 2));
+        c.insert((0, 1), slab(10, 2));
+        // (0,0) is hit three times, (0,1) once and last — so (0,0) is hotter but
+        // older, the exact case the two policies disagree about.
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 1)).is_some());
+        c.insert((0, 2), slab(10, 2));
+        assert!(!c.contains((0, 0)), "LRU must evict the least-recently-used slab, frequency notwithstanding");
+        assert!(c.contains((0, 1)));
+        assert!(c.contains((0, 2)));
+    }
+
+    #[test]
+    fn lfru_keeps_the_hotter_slab_over_the_more_recent_one() {
+        let mut c = WarmCache::new(80).with_lfru(true);
+        c.insert((0, 0), slab(10, 2));
+        c.insert((0, 1), slab(10, 2));
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 0)).is_some()); // heat 3
+        assert!(c.get((0, 1)).is_some()); // heat 1, but most recent
+        c.insert((0, 2), slab(10, 2));
+        // heat occupies bits 8+ of the score and recency only the low 8, so three
+        // routings (3 << 8 = 768) cannot be overtaken by any recency (max 255).
+        assert!(c.contains((0, 0)), "the hotter slab must survive being the least recent");
+        assert!(!c.contains((0, 1)), "the merely-recent slab is the victim under LFRU");
+        assert!(c.contains((0, 2)));
+    }
+
+    /// LFRU reorders *within* a priority class; it must not override the
+    /// protected set. A predictor-protected slab that is both cold and stale
+    /// still outranks a hot unprotected one.
+    #[test]
+    fn priority_still_dominates_under_lfru() {
+        let mut c = WarmCache::new(80).with_lfru(true);
+        c.insert((0, 0), slab(10, 2)); // will be protected, never hit → heat 0
+        c.insert((0, 1), slab(10, 2));
+        assert!(c.get((0, 1)).is_some());
+        assert!(c.get((0, 1)).is_some()); // hot and recent, but unprotected
+        c.set_priority((0, 0), 1);
+        c.insert((0, 2), slab(10, 2));
+        assert!(c.contains((0, 0)), "protection is the primary key under LFRU too");
+        assert!(!c.contains((0, 1)), "the hot unprotected slab is still the victim");
+    }
+
+    /// A slab hot in one phase must not stay unevictable forever. After a decay
+    /// sweep its frequency is halved, so a slab that has since become hotter
+    /// outranks it.
+    #[test]
+    fn lfru_frequency_decays_so_a_dead_phase_stops_winning() {
+        let mut c = WarmCache::new(1 << 20).with_lfru(true);
+        c.insert((0, 0), slab(10, 2));
+        for _ in 0..8 {
+            assert!(c.get((0, 0)).is_some());
+        }
+        let hot_before = c.heat_for_test((0, 0));
+        assert_eq!(hot_before, Some(8));
+        // Drive past the decay interval. Every hit lands on (0,0), so without
+        // decay its heat would only ever grow.
+        for _ in 0..LFRU_DECAY_HITS {
+            assert!(c.get((0, 0)).is_some());
+        }
+        let after = c.heat_for_test((0, 0)).unwrap_or(u32::MAX);
+        assert!(
+            after < (8 + LFRU_DECAY_HITS as u32),
+            "decay must halve accumulated frequency; got {after} against an undecayed {}",
+            8 + LFRU_DECAY_HITS as u32
+        );
+    }
+
+    /// `set_protected` must apply a *different* priority per key. Its previous
+    /// shape took one `prio` for a whole key slice, which no caller could use —
+    /// the one intended consumer scores each expert separately.
+    #[test]
+    fn set_protected_applies_a_distinct_priority_per_key() {
+        let mut c = WarmCache::new(1 << 20);
+        c.insert((0, 0), slab(10, 2));
+        c.insert((0, 1), slab(10, 2));
+        c.insert((0, 2), slab(10, 2));
+        c.set_protected(&[((0, 0), 5), ((0, 1), 9), ((9, 9), 7)]);
+        assert_eq!(c.priority((0, 0)), 5);
+        assert_eq!(c.priority((0, 1)), 9, "each key keeps its own score");
+        assert_eq!(c.priority((0, 2)), 0, "keys not listed are untouched");
+        assert_eq!(c.priority((9, 9)), 0, "a non-resident key is ignored, not inserted");
+        assert!(!c.contains((9, 9)), "protecting a missing key must not create it");
     }
 
     #[test]

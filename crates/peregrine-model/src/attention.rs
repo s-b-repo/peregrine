@@ -62,6 +62,125 @@ impl KvDtype {
 /// the sequence length. See [`KvBuf::reserve_for`].
 const KV_GROW_ROWS: usize = 256;
 
+/// Process-wide recycler for KV latent allocations (`COLI_KV_POOL_MB`, 0 = off).
+///
+/// The last open half of paged/block-pooled KV. The growth overshoot is already
+/// bounded by [`KvBuf::reserve_for`]; what remained is that a **finished
+/// sequence's buffers go back to the allocator rather than to the next
+/// admission**, so every admission re-climbs the same growth ladder —
+/// `n_layers × 3` buffers, each reallocating its way up from `Vec::new()`.
+///
+/// **Recycling happens in `Drop`, not at the engine's retirement points.** There
+/// are at least six places a `SeqKv` dies (`active.retain`, the prefill forward
+/// error, four early returns in `finish_prefill_chunk`, `active.clear()`,
+/// prefix-cache eviction, `Model::reset`) and a hook at each is a hook that can
+/// be forgotten when a seventh appears — silently, since a missed hook loses
+/// only the benefit and never correctness. `Drop` covers all of them including
+/// the refcounted prefix, whose buffers are freed by the `Arc` rather than by
+/// any engine code at all.
+///
+/// **Why this cannot change token values.** A recycled buffer is `clear()`ed
+/// before reuse, so its length is 0 and every reader goes through [`KvSpan`],
+/// which reads only `[0, len)`. Stale bytes past `len` are unreachable by
+/// construction. The pool changes *where an allocation comes from*, never what
+/// is in it.
+///
+/// **Sizing.** The pool holds memory the engine is not using, so its cap is
+/// additive to `COLI_KV_BUDGET_MB` rather than inside it: total KV RSS is
+/// roughly `budget + pool`. Making it share the budget would have been worse —
+/// admission would refuse sequences over memory that is free and about to be
+/// handed straight back to them.
+struct KvPool {
+    f32s: Vec<Vec<f32>>,
+    f16s: Vec<Vec<u16>>,
+    bytes: usize,
+    cap_bytes: usize,
+}
+
+impl KvPool {
+    fn new(cap_bytes: usize) -> KvPool {
+        KvPool { f32s: Vec::new(), f16s: Vec::new(), bytes: 0, cap_bytes }
+    }
+
+    /// Take the **largest** buffer of this dtype with capacity ≥ `min_elems`.
+    ///
+    /// Largest rather than best-fit, deliberately. The first `reserve_for` on a
+    /// virgin buffer asks for a single row, so best-fit would hand back the
+    /// smallest scrap in the pool and leave the sequence to climb the ladder
+    /// anyway — exactly the cost this exists to remove. Every buffer in the pool
+    /// was previously grown to a size some sequence actually needed on this
+    /// model, so the largest is the best guess at what the newcomer will need.
+    fn take(&mut self, dt: KvDtype, min_elems: usize) -> Option<KvBuf> {
+        match dt {
+            KvDtype::F32 => {
+                let i = Self::pick(self.f32s.iter().map(|v| v.capacity()), min_elems)?;
+                let mut v = self.f32s.swap_remove(i);
+                self.bytes = self.bytes.saturating_sub(v.capacity() * 4);
+                v.clear();
+                Some(KvBuf::F32(v))
+            }
+            KvDtype::F16 => {
+                let i = Self::pick(self.f16s.iter().map(|v| v.capacity()), min_elems)?;
+                let mut v = self.f16s.swap_remove(i);
+                self.bytes = self.bytes.saturating_sub(v.capacity() * 2);
+                v.clear();
+                Some(KvBuf::F16(v))
+            }
+        }
+    }
+
+    /// Index of the largest-capacity entry that is at least `min_elems`.
+    fn pick(caps: impl Iterator<Item = usize>, min_elems: usize) -> Option<usize> {
+        caps.enumerate()
+            .filter(|&(_, c)| c >= min_elems && c > 0)
+            .max_by_key(|&(_, c)| c)
+            .map(|(i, _)| i)
+    }
+
+    /// Return a buffer for reuse, or drop it if the pool is at its cap. Dropping
+    /// is the correct overflow behavior: an unbounded recycler is a memory leak
+    /// that reports as "reuse".
+    fn give(&mut self, buf: KvBuf) {
+        let b = match &buf {
+            KvBuf::F32(v) => v.capacity() * 4,
+            KvBuf::F16(v) => v.capacity() * 2,
+        };
+        if b == 0 || self.bytes.saturating_add(b) > self.cap_bytes {
+            return;
+        }
+        self.bytes += b;
+        match buf {
+            KvBuf::F32(mut v) => {
+                v.clear();
+                self.f32s.push(v);
+            }
+            KvBuf::F16(mut v) => {
+                v.clear();
+                self.f16s.push(v);
+            }
+        }
+    }
+}
+
+/// The pool, or `None` when `COLI_KV_POOL_MB` is unset/0 — in which case every
+/// hook below is a single `Option` test and allocation behaves exactly as it
+/// always has.
+fn kv_pool() -> Option<&'static parking_lot::Mutex<KvPool>> {
+    static P: std::sync::OnceLock<Option<parking_lot::Mutex<KvPool>>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let mb: usize = std::env::var("COLI_KV_POOL_MB")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        if mb == 0 {
+            None
+        } else {
+            Some(parking_lot::Mutex::new(KvPool::new(mb << 20)))
+        }
+    })
+    .as_ref()
+}
+
 /// Stored latents in whichever element type the cache was created with.
 #[derive(Clone)]
 enum KvBuf {
@@ -113,9 +232,8 @@ impl KvBuf {
     /// `min(len, KV_GROW_ROWS)` rows instead of `len`, which costs one extra
     /// reallocation per block and nothing else.
     ///
-    /// This is the tractable part of block-pooled KV. It does not pool across
-    /// sequences — a finished sequence's blocks still return to the allocator
-    /// rather than to the next admission.
+    /// Cross-sequence reuse is [`KvPool`], hooked below at the one moment it
+    /// pays: the first growth of a virgin buffer.
     fn reserve_for(&mut self, width: usize) {
         if width == 0 {
             return;
@@ -127,11 +245,34 @@ impl KvBuf {
         if cap - len >= width {
             return;
         }
+        // A virgin buffer (`cap == 0`) is a fresh admission about to climb the
+        // whole growth ladder. This is the only point where a recycled
+        // allocation replaces that climb rather than merely relocating it: past
+        // this, the buffer holds live rows and adopting a pooled one would mean
+        // copying them, which is what `reserve_exact` already does and
+        // sometimes avoids by extending in place.
+        if cap == 0 {
+            if let Some(pool) = kv_pool() {
+                if let Some(recycled) = pool.lock().take(self.dtype(), width) {
+                    *self = recycled;
+                    return;
+                }
+            }
+        }
         let grow = width * (len / width).clamp(1, KV_GROW_ROWS);
         match self {
             KvBuf::F32(v) => v.reserve_exact(grow),
             KvBuf::F16(v) => v.reserve_exact(grow),
         }
+    }
+
+    /// Hand this buffer's allocation to the pool, leaving an empty one behind.
+    /// Used by the `Drop` impls; a no-op when pooling is off.
+    fn recycle(&mut self) {
+        let Some(pool) = kv_pool() else { return };
+        let empty = KvBuf::new(self.dtype());
+        let taken = std::mem::replace(self, empty);
+        pool.lock().give(taken);
     }
 
     #[cfg(test)]
@@ -262,6 +403,17 @@ struct KvPrefix {
     ix: KvBuf,
 }
 
+/// A frozen prefix dies when its last holder does, which no engine code
+/// observes — the `Arc` decides. That is precisely why recycling belongs in
+/// `Drop`: there is no other place this allocation could be caught.
+impl Drop for KvPrefix {
+    fn drop(&mut self) {
+        self.lc.recycle();
+        self.rc.recycle();
+        self.ix.recycle();
+    }
+}
+
 /// Per-layer KV cache holding the compressed latents and roped keys. Positions
 /// are appended in order (`pos == len`), matching sequential prefill/decode.
 ///
@@ -295,6 +447,19 @@ pub struct LayerKv {
     len: usize,
     kv_lora: usize,
     qk_rope: usize,
+}
+
+/// Return this sequence's private tail to [`KvPool`]. The shared prefix is not
+/// touched here — it is owned by an `Arc` that other live sequences may still
+/// hold, and recycling it from one holder's drop is exactly the corruption
+/// `rewinding_into_a_shared_prefix_leaves_other_holders_intact` exists to
+/// prevent. `KvPrefix`'s own `Drop` handles it when the last holder goes.
+impl Drop for LayerKv {
+    fn drop(&mut self) {
+        self.lc.recycle();
+        self.rc.recycle();
+        self.ix.recycle();
+    }
 }
 
 impl LayerKv {
@@ -1702,6 +1867,88 @@ mod tests {
                 assert_eq!(a.to_bits(), b.to_bits(), "split at row {cut}, output {k}: not bit-identical");
             }
         }
+        Ok(())
+    }
+
+    /// The pool's whole correctness claim in one test: a recycled allocation
+    /// arrives holding another sequence's bytes, and none of them can be read.
+    /// `clear()` on take is what makes that true, so this asserts it against a
+    /// deliberately dirtied buffer rather than a fresh one.
+    #[test]
+    fn a_recycled_buffer_never_leaks_the_previous_sequence_s_bytes() -> Result<(), &'static str> {
+        let mut pool = KvPool::new(1 << 20);
+        // Hand-built so the donor's bytes are known exactly; `push` would route
+        // through the global pool. `9.0` is the poison this test looks for.
+        let mut dirty = KvBuf::F32(Vec::with_capacity(32));
+        if let KvBuf::F32(v) = &mut dirty {
+            v.extend(std::iter::repeat_n(9.0f32, 32));
+        }
+        assert_eq!(dirty.elems(), 32, "sanity: the donor holds real data");
+        pool.give(dirty);
+
+        let mut reused = pool.take(KvDtype::F32, 4).ok_or("a buffer was returned")?;
+        assert_eq!(reused.elems(), 0, "a recycled buffer is empty; readers see [0, len)");
+        reused.push(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(reused.elems(), 4);
+        match &reused {
+            KvBuf::F32(v) => {
+                assert_eq!(&v[..4], &[1.0, 2.0, 3.0, 4.0], "reads back exactly what was written")
+            }
+            KvBuf::F16(_) => return Err("dtype must round-trip"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn kv_pool_respects_its_cap_and_never_hands_back_an_undersized_buffer() {
+        // Cap of 64 bytes = 16 f32 elements. The second give must be refused
+        // rather than growing the pool past its bound — an unbounded recycler is
+        // a leak that reports as reuse.
+        //
+        // The fixtures are built by hand rather than through `push`, because
+        // `push` consults the **global** pool: with `COLI_KV_POOL_MB` set in the
+        // environment this test would otherwise adopt a recycled allocation of
+        // some unrelated capacity and stop testing its own cap. (Found exactly
+        // that way — the suite passes under `COLI_KV_POOL_MB=64` and this was
+        // the one test that did not.)
+        let mut pool = KvPool::new(64);
+        let a = KvBuf::F32(Vec::with_capacity(16));
+        let b = KvBuf::F32(Vec::with_capacity(16));
+        pool.give(a);
+        let before = pool.bytes;
+        pool.give(b);
+        assert!(pool.bytes <= 64, "pool must not exceed its cap (was {before}, now {})", pool.bytes);
+
+        // A request larger than anything held returns None, so the caller
+        // allocates rather than receiving a buffer it would overrun.
+        assert!(pool.take(KvDtype::F32, 1_000_000).is_none(), "no buffer is big enough");
+        // Dtypes are separate allocations and must not cross.
+        assert!(pool.take(KvDtype::F16, 1).is_none(), "an f32 buffer is not an f16 buffer");
+        assert!(pool.take(KvDtype::F32, 1).is_some(), "the f32 buffer is still there");
+    }
+
+    /// Largest-fit, not best-fit. The first `reserve_for` on a virgin buffer asks
+    /// for one row, and best-fit would answer with the smallest scrap — leaving
+    /// the sequence to climb exactly the growth ladder the pool exists to skip.
+    #[test]
+    fn kv_pool_hands_back_the_largest_buffer_not_the_smallest_that_fits() -> Result<(), &'static str> {
+        // Built by hand for the same reason as the cap test above: `push` would
+        // consult the global pool and hand back an allocation of its choosing.
+        let mut pool = KvPool::new(1 << 20);
+        let small = KvBuf::F32(Vec::with_capacity(4));
+        let large = KvBuf::F32(Vec::with_capacity(4096));
+        let large_cap = match &large {
+            KvBuf::F32(v) => v.capacity(),
+            KvBuf::F16(v) => v.capacity(),
+        };
+        pool.give(small);
+        pool.give(large);
+        let got = pool.take(KvDtype::F32, 1).ok_or("something fits a one-element request")?;
+        let got_cap = match &got {
+            KvBuf::F32(v) => v.capacity(),
+            KvBuf::F16(v) => v.capacity(),
+        };
+        assert_eq!(got_cap, large_cap, "a one-row request must still get the big allocation");
         Ok(())
     }
 

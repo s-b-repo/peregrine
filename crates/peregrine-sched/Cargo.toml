@@ -11,3 +11,9 @@ peregrine-core = { path = "../peregrine-core" }
 peregrine-kernels = { path = "../peregrine-kernels" }
 peregrine-model = { path = "../peregrine-model" }
 peregrine-io = { path = "../peregrine-io" }
+
+[dev-dependencies]
+# `ForwardCtx::reactors` is `&[parking_lot::Mutex<Reactor>]`, so the oracle test
+# has to build the same mutex type the production path uses. Dev-only: nothing
+# in this crate's own lanes locks anything.
+parking_lot = "0.12"

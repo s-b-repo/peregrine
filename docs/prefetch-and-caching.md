@@ -127,13 +127,29 @@ slab.
 
 - **Warm-cache eviction** (`peregrine-io/src/warmcache.rs::evict_to_budget`):
   the victim is the lowest `(priority, recency)` — a **priority-weighted LRU**.
-  Heat does not enter the victim score.
+  Heat does not enter the victim score at the default.
 - **LFRU tier scoring** (`peregrine-io/src/tier.rs`) computes
-  `(heat << 8) | recency` with hysteresis, and **nothing calls it.** It is
-  written, tested, and unreachable — the `[R]` defect class in
-  [BAD_PATTERNS](BAD_PATTERNS.md). This page previously described it, in the
-  present tense, as the policy in force; it never has been. Wire it into
-  `evict_to_budget` or delete the module — but do not read it as live.
+  `(heat << 8) | recency` with hysteresis. It was written, tested and
+  unreachable — the `[R]` defect class in [BAD_PATTERNS](BAD_PATTERNS.md) — and
+  this page once described it, in the present tense, as the policy in force.
+  **Wired 2026-08-06 behind `COLI_CACHE_LFRU=1`**: `lfru_score` becomes the
+  second component of the victim key and `decay` halves accumulated frequency
+  every 4096 hits. Priority stays primary, so LFRU reorders *within* a
+  protection class rather than overriding `COLI_PREFETCH_PROTECT`.
+
+  **Frequency comes from the cache, not from `HeatTable`.** A `Slot` counts its
+  own hits. Sourcing it from the model's heat table would have been the obvious
+  wiring and the wrong one: that table is constructed only when a GPU tier is
+  (`model.rs`), so on every CPU-only run — which is every run on a box without
+  `COLI_GPU` — the policy would have silently degraded to the LRU it was meant
+  to replace, while the knob read as enabled. A hit *is* a routing that found
+  its expert resident, which is the same quantity, measured over exactly the
+  slots the victim choice ranges over.
+
+  Still unreachable, deliberately: `pick_lfru` and `pick_swap` are the
+  **fixed-slot swap** form of the same policy — a pinned set of constant size,
+  which is the GPU tier's shape (`reheat`), not a byte-budgeted cache's. They
+  are a `reheat` question and are tracked there, not force-fitted here.
 - **Heat table** (`gpu.rs::HeatTable`): lock-free atomic routing-frequency
   counters, the substrate every residency/admission decision reads.
 - **Dynamic VRAM residency**: `reheat()` re-selects the hottest experts every

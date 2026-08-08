@@ -37,6 +37,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Testing & quality gates](testing-and-quality.md) | the 282-test suite, bit-identity philosophy, the bad-patterns audit, contribution ground rules |
 | [Bad-pattern catalogue](BAD_PATTERNS.md) | the panic-vector / UB audit gate in detail |
 | [Roadmap & status](roadmap.md) | completion dashboard, what shipped in which wave, the hardware-gated remainder |
+| [Scale-out designs](scale-out-design.md) | the five items needing a second GPU, a second host, or a GDS stack — what each would be, and the `file:line` seam it hooks into |
 | [peregrine vs colibrì](peregrine-vs-colibri.md) | the full same-hardware engineering study on the real GLM-5.2 744B model |
 
 Root-level references: [`README.md`](../README.md) (project overview) ·
