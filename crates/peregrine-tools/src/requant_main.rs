@@ -9,6 +9,12 @@
 //!                                       [--shard-bytes N] [--dry-run]
 //! ```
 
+// The last first-party crate to adopt the panic-lint denials the other nine
+// already carry. It qualified all along — zero unwrap/expect/panic in this
+// crate's sources — so this is a ratchet, not a cleanup. Each binary target
+// is its own crate root, so the attribute has to be repeated per target.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use peregrine_tools::requant::{plan_sizes, requantize, HeatTier, Plan, Target};
 use std::path::Path;
 

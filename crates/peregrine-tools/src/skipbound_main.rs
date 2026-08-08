@@ -5,6 +5,12 @@
 //! skip. It writes a sidecar and a verdict; it does **not** change the read
 //! path, because whether that is worth doing is exactly what this measures.
 
+// The last first-party crate to adopt the panic-lint denials the other nine
+// already carry. It qualified all along — zero unwrap/expect/panic in this
+// crate's sources — so this is a ratchet, not a cleanup. Each binary target
+// is its own crate root, so the attribute has to be repeated per target.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::path::PathBuf;
 
 use peregrine_core::Error;

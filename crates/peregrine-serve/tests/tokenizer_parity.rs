@@ -7,10 +7,23 @@
 use peregrine_token::GigaTokenizer;
 use tokenizers::Tokenizer as HfTokenizer;
 
-fn fixture_bytes() -> Vec<u8> {
+/// The committed fixture, or the reason it could not be read.
+///
+/// Returns `Result` rather than unwrapping: `clippy.toml` sets
+/// `allow-expect-in-tests = false`, and an integration test is its own crate so
+/// it inherits no crate-root `deny` to enforce that — the policy has to be kept
+/// by hand here.
+fn fixture_bytes() -> Result<Vec<u8>, String> {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../peregrine-token/tests/fixtures/gpt2_tokenizer.json");
-    std::fs::read(path).expect("committed GPT-2 fixture")
+    std::fs::read(&path).map_err(|e| format!("committed GPT-2 fixture at {}: {e}", path.display()))
+}
+
+/// Both tokenizers over the same fixture bytes.
+fn both(bytes: &[u8]) -> Result<(GigaTokenizer, HfTokenizer), String> {
+    let giga = GigaTokenizer::from_hf_json_bytes(bytes).map_err(|e| format!("fixture is BPE: {e}"))?;
+    let hf = HfTokenizer::from_bytes(bytes).map_err(|e| format!("HF loads the same fixture: {e}"))?;
+    Ok((giga, hf))
 }
 
 const CORPUS: &[&str] = &[
@@ -37,21 +50,21 @@ const CORPUS: &[&str] = &[
 ];
 
 #[test]
-fn giga_matches_hf_id_for_id() {
-    let bytes = fixture_bytes();
-    let mut giga = GigaTokenizer::from_hf_json_bytes(&bytes).expect("fixture is BPE");
-    let hf = HfTokenizer::from_bytes(&bytes).expect("HF loads the same fixture");
+fn giga_matches_hf_id_for_id() -> Result<(), String> {
+    let bytes = fixture_bytes()?;
+    let (mut giga, hf) = both(&bytes)?;
     for text in CORPUS {
         let g: Vec<u32> = giga.encode(text);
-        let h: Vec<u32> = hf.encode(*text, false).expect("hf encode").get_ids().to_vec();
-        assert_eq!(g, h, "encode mismatch on {text:?}");
+        let encoded = hf.encode(*text, false).map_err(|e| format!("hf encode {text:?}: {e}"))?;
+        assert_eq!(g, encoded.get_ids().to_vec(), "encode mismatch on {text:?}");
     }
+    Ok(())
 }
 
 #[test]
-fn giga_decode_round_trips() {
-    let bytes = fixture_bytes();
-    let mut giga = GigaTokenizer::from_hf_json_bytes(&bytes).expect("fixture is BPE");
+fn giga_decode_round_trips() -> Result<(), String> {
+    let bytes = fixture_bytes()?;
+    let (mut giga, _hf) = both(&bytes)?;
     for text in CORPUS {
         let ids = giga.encode(text);
         let decoded = giga.decode(&ids);
@@ -61,15 +74,16 @@ fn giga_decode_round_trips() {
             "decode round trip on {text:?}"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn repeated_prefix_hits_memo_cache_consistently() {
+fn repeated_prefix_hits_memo_cache_consistently() -> Result<(), String> {
     // The cross-request memo cache must never change ids: encode the same
     // chat-template prefix many times (cache-hot) and compare against a
     // fresh fork (cache-cold) every round.
-    let bytes = fixture_bytes();
-    let mut warm = GigaTokenizer::from_hf_json_bytes(&bytes).expect("fixture is BPE");
+    let bytes = fixture_bytes()?;
+    let (mut warm, _hf) = both(&bytes)?;
     let prefix = "[gMASK]<sop><|system|>\nYou are a helpful assistant.<|user|>\n";
     for i in 0..50 {
         let text = format!("{prefix}request number {i}<|assistant|>\n");
@@ -77,4 +91,5 @@ fn repeated_prefix_hits_memo_cache_consistently() {
         let cold = warm.fork().encode(&text);
         assert_eq!(hot, cold, "cache-hot ids must equal cache-cold ids (round {i})");
     }
+    Ok(())
 }
