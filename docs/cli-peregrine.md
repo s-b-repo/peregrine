@@ -68,6 +68,36 @@ The one-shot offline preprocessing pass: ONE corpus run emits every artifact —
 `COLI_TIER_VRAM_MB` and/or `COLI_TIER_RAM_MB` are set), and a
 `route_stats.json` seed. All are picked up automatically at the next load.
 
+### `flip-rate <source-dir> <candidate-dir> [--text FILE] [--tokens N]`
+
+The quality gate for a **lossy** container — a `peregrine-requantize` output
+measured against the checkpoint it was converted from. Every other gate in this
+repo is bit-identity, which a requantized container fails by construction, so
+`prediction_flip_rate` (top-1 agreement under teacher forcing) is what stands in
+its place. Prints `positions`, `flips` and `flip_rate` on stdout.
+
+```bash
+peregrine flip-rate ~/models/GLM-5.2-int4 /mnt/models/GLM-5.2-int2g64 \
+  --text sample.txt --tokens 512
+```
+
+- **The models load one at a time.** Two streaming loads would hold two warm
+  caches against one page cache, and the slower container would be measured
+  while the faster one evicted it. Peak RSS is one model's.
+- **`--text` uses the *source* container's `tokenizer.json`**, so the ids are
+  the ones that container was converted from. Without it the run uses
+  uniform-random token ids and says so loudly on stderr — that is a smoke test
+  of the harness, not a quality figure for the container.
+- **Pick `--tokens` large.** One forward covers every position, and the bytes
+  read are the routed *union*, which saturates: at top-8 over 256 experts a
+  128-position forward already touches ~98% of the container, so 512 positions
+  cost ~2% more bytes than 128 and buy 4× the statistics. There is no per-token
+  read cost to economize on here.
+- Top-1 on one text is a **floor** on quality, not a summary — a container can
+  hold argmax everywhere and still shift the distribution underneath. The gate
+  itself is pinned in both directions by `flip_rate_gate.rs`: zero flips against
+  an identical container, non-zero against a deliberately lossy one.
+
 ### `compile-plan <model-dir>`
 
 Pure file bundling, no model load: folds whatever artifacts exist
