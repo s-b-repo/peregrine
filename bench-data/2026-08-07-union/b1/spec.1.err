@@ -1,0 +1,11 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 37.2 GB | resident 10.9 + KV 0.7 + stream 3.8 + slack 1.4 + cache 2.1 -> peak 18.9 GB
+peregrine bench: loaded 78 layers, vocab 154880, mtp=yes, draft=γ=4, in 12.2s
+peregrine bench: speculative batched-verify on (γ=4 draft tokens per sequence per step)
+    [ecache] disk_reads this batch: 2695
+[gate] routed=3632 below_0.5%=0.4% below_1%=0.6% below_2%=1.8% below_5%=11.8%
+[union] selections=3632 distinct=2758 calls=154 share=1.317x
+[union] all-low-gate reads=15/2758 (0.5%) — the ceiling on per-token precision selection under batch union

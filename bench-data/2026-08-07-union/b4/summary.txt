@@ -1,0 +1,37 @@
+note: BATCH=4 > 1, so [predict-eval] and [lookahead] will be absent (model.rs:3517 gates the scoreboard on s_n == 1)
+== baseline.4: target/release/peregrine batch=4 steps=2 extra=[]
+   rc=0
+  batch   steps   tokens    seconds     agg tok/s   tok/s   per-seq tok/s
+      4       2        8      67.88         0.118      0.118          0.0295
+       [ecache] disk_reads this batch: 2235
+   [gate] routed=4800 below_0.5%=1.0% below_1%=1.2% below_2%=2.5% below_5%=12.9%
+   [union] selections=4800 distinct=2235 calls=150 share=2.148x
+   [union] all-low-gate reads=15/2235 (0.7%) — the ceiling on per-token precision selection under batch union
+   wall_s 80.80
+   peak_rss_gb 14.38
+   major_faults 0
+
+== spec.4: target/release/peregrine batch=4 steps=2 extra=[--draft 4]
+   rc=0
+  batch   steps   tokens    seconds     agg tok/s   tok/s   per-seq tok/s
+      4       2        8     200.63         0.040      0.040          0.0100
+       [ecache] disk_reads this batch: 5810
+   [gate] routed=14528 below_0.5%=0.4% below_1%=0.5% below_2%=1.5% below_5%=11.4%
+   [union] selections=14528 distinct=5866 calls=166 share=2.477x
+   [union] all-low-gate reads=19/5866 (0.3%) — the ceiling on per-token precision selection under batch union
+   wall_s 213.87
+   peak_rss_gb 14.84
+   major_faults 1
+
+== lookahead_batch.4: target/release/peregrine batch=4 steps=2 extra=[]
+   rc=0
+  batch   steps   tokens    seconds     agg tok/s   tok/s   per-seq tok/s
+      4       2        8      88.33         0.091      0.091          0.0226
+       [ecache] disk_reads this batch: 2030
+   [gate] routed=4800 below_0.5%=1.0% below_1%=1.2% below_2%=2.5% below_5%=12.9%
+   [union] selections=4800 distinct=2235 calls=150 share=2.148x
+   [union] all-low-gate reads=15/2235 (0.7%) — the ceiling on per-token precision selection under batch union
+   wall_s 102.60
+   peak_rss_gb 13.88
+   major_faults 1
+
