@@ -54,13 +54,15 @@ except that `messages` must be non-empty; unknown fields are ignored):
 
 | Field | Type | Default | Behavior |
 |---|---|---|---|
-| `messages` | `[{role, content}]` (both strings) | — | required non-empty; array-form `content` is not accepted |
+| `messages` | `[{role, content, …}]` | — | required non-empty. `content` may be a string, `null`, absent, or an **array of `{type, text}` parts** (parts without `text` are dropped, the rest concatenated). Assistant turns may carry `tool_calls`; `role: "tool"` is accepted and replayed as an observation |
+| `tools` | `[{type, function:{name, description, parameters}}]` | none | tool schemas, rendered into the system turn — see [Tool calling](#tool-calling) |
+| `tool_choice` | string or object | none | only the exact string `"none"` is honoured, and it disables tools for that request. Any other value (including `"auto"`, `"required"`, or an object naming a function) leaves all tools active — peregrine does not force a call |
 | `max_tokens` | int | `256` | clamped to `[1, --max-tokens]` |
 | `temperature` | float | `0.0` (greedy) | clamped to `[0.0, 2.0]`; note the default differs from OpenAI's `1.0` |
 | `top_p` | float | `0.95` | clamped to `[0.0, 1.0]` |
 | `stream` | bool | `false` | SSE streaming when `true` |
 
-`model`, `n`, `stop`, `seed`, `logprobs`, penalties, `tools`,
+`model`, `n`, `stop`, `seed`, `logprobs`, penalties,
 `response_format`, and `stream_options` are not supported (ignored). Stop ids
 come from the model's `config.json` `eos_token_id` and are never emitted.
 Non-greedy sampling is seeded from the clock, so it is not reproducible;
@@ -107,6 +109,51 @@ on the next engine step.
 
 (Unparseable JSON bodies are rejected by the framework before the handler and
 return plain-text 4xx, not the OpenAI shape.)
+
+### Tool calling
+
+OpenAI clients send tool *schemas* in a `tools` array and expect calls back in
+`choices[].message.tool_calls`. GLM-5.2 reads schemas from the system turn and
+emits calls as `<tool_call>` markup its tokenizer has dedicated tokens for.
+peregrine bridges the two in both directions, so an OpenAI-shaped client needs
+no changes.
+
+**Request → prompt.** Schemas render into a `# Tools` block inside the **first**
+system turn (a system turn is synthesized if the request has none). This is
+GLM's own template placement: a bare tools turn with no system content trains
+the model to answer the schema instead of using it. `tool_choice: "none"`
+suppresses the block entirely; see the field table for why no other value
+changes anything. Assistant turns carrying `tool_calls` are rendered back into
+`<tool_call>` markup so a multi-turn conversation replays to the model in the
+form it emitted, and `role: "tool"` turns become `<|observation|>` with the
+result wrapped in `<tool_response>`.
+
+**Output → response.** A streaming filter splits the token stream into visible
+text, tool calls, and `<think>` reasoning, holding back any suffix that could
+still turn out to be a marker — so a `<tool_call>` arriving one character at a
+time never leaks a fragment to the client. Then:
+
+- `finish_reason` is `"tool_calls"` when the turn produced any call, else `"stop"`.
+- `content` is `null` on a calls-only turn, and the text otherwise.
+- Call ids are `call_<completion-id-without-the-chatcmpl-prefix>_<index>`, stable
+  between the streaming and non-streaming paths for the same completion.
+- Argument values are typed **from the declared schema**, falling back to
+  sniffing only for undeclared parameters. This is what keeps a shell command
+  `1.10` a string instead of the float `1.1`, and a file named `true` a string
+  instead of a boolean.
+- `<think>` blocks are dropped, not shown.
+
+**One deliberate divergence from OpenAI's streaming shape:** peregrine emits one
+*whole* call per SSE chunk, where OpenAI fragments `arguments` across deltas. The
+markup is not a well-formed call until its closing tag arrives, so emitting
+partial arguments would mean emitting text that may never become valid JSON.
+Clients that accumulate `arguments` deltas still work — they receive one delta
+containing the whole string.
+
+**Truncation.** A call cut off at the token cap is still parsed and returned:
+the call is the point of the turn, so a recovered one beats a discarded one. An
+unclosed `<think>` block is *not* recovered — reasoning is not for the client —
+so a response truncated mid-reasoning is an empty one.
 
 ### `X-Peregrine-Priority` header
 
