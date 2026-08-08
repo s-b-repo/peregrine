@@ -16,6 +16,9 @@ cuda = ["peregrine-model/cuda"]
 
 [dependencies]
 peregrine-model = { path = "../peregrine-model" }
+# Alternative MoE engine, installed only when COLI_MOE_ENGINE selects it.
+# engine -> sched -> model is acyclic; model -> sched would not be.
+peregrine-sched = { path = "../peregrine-sched" }
 peregrine-core = { path = "../peregrine-core" }
 peregrine-token = { path = "../peregrine-token" }
 parking_lot = "0.12"

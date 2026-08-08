@@ -238,12 +238,36 @@ pub enum EngineOut {
     Error(String),
 }
 
+/// What the engine thread publishes each tick for `GET /metrics` to read.
+///
+/// The engine thread **owns** the `Model` exclusively — the HTTP handlers hold
+/// only channels — so a scrape cannot call `Model::telemetry()` itself. This is
+/// the seam: the engine writes a snapshot once per tick, the handler clones it.
+/// Cheap enough to publish unconditionally (a struct copy under an uncontended
+/// lock, once per decode step, against a step that reads gigabytes).
+#[derive(Clone, Debug, Default)]
+pub struct EngineTelemetry {
+    pub runtime: peregrine_model::RuntimeTelemetry,
+    /// Most recent forward's per-lane wall time.
+    pub lane_last: peregrine_model::LaneTimings,
+    /// The bubble tuner's smoothed per-lane times — what the balancer acts on.
+    /// Distinct from `lane_last`: one token's cost versus which lane dominates.
+    pub lane_ewma: peregrine_model::LaneTimings,
+    /// Sequences decoding right now, and prompts waiting to be prefilled.
+    pub active: usize,
+    pub pending: usize,
+    /// Decode steps the engine has run since start.
+    pub steps: u64,
+}
+
 /// Handle for submitting requests to the engine thread. Cheap to clone and
 /// `Send + Sync` (a tokio unbounded sender), so it lives in shared server state.
 #[derive(Clone)]
 pub struct EngineHandle {
     tx_normal: mpsc::UnboundedSender<EngineRequest>,
     tx_high: mpsc::UnboundedSender<EngineRequest>,
+    /// Published by the engine thread each tick; read by `/metrics`.
+    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
 }
 
 impl EngineHandle {
@@ -257,6 +281,12 @@ impl EngineHandle {
         };
         ch.send(req).map_err(|send_err| Error::Format(format!("batch engine is not running: {send_err}")))
     }
+
+    /// The engine's most recent published telemetry. All-zero before the first
+    /// tick, which is the honest answer to "what is it doing" at that point.
+    pub fn telemetry(&self) -> EngineTelemetry {
+        self.telemetry.lock().clone()
+    }
 }
 
 /// Spawn the engine on a dedicated OS thread that owns `model`, batching up to
@@ -267,11 +297,13 @@ pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle
     let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
     let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
+    let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
+    let tel = telemetry.clone();
     let join = std::thread::Builder::new()
         .name("peregrine-batch".to_string())
-        .spawn(move || run(model, rx_normal, rx_high, cap, fuse_prefill()))
+        .spawn(move || run(model, rx_normal, rx_high, cap, fuse_prefill(), tel))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high }, join))
+    Ok((EngineHandle { tx_normal, tx_high, telemetry }, join))
 }
 
 /// [`spawn`] with the prefill/decode fusion forced on or off.
@@ -285,9 +317,23 @@ fn spawn_fused(model: Model, max_batch: usize, fuse: bool) -> Result<(EngineHand
     spawn_tuned(model, max_batch, fuse, None)
 }
 
-/// [`spawn`] with the fusion and the draft depth forced.
+/// Override for the speculation knobs, `None` meaning "read the environment".
+/// Production passes the default (all `None`); tests force values so they never
+/// race each other on the process-wide `OnceLock`s the environment resolves
+/// through. Bundled rather than passed as two parameters because `run_tuned`
+/// already sits at clippy's argument limit, and because the two are one
+/// decision: sampled speculation without a depth is not a configuration.
+#[derive(Clone, Copy, Default)]
+struct SpecOverride {
+    /// `COLI_DRAFT`.
+    depth: Option<usize>,
+    /// `COLI_DRAFT_SAMPLED`.
+    sampled: Option<bool>,
+}
+
+/// [`spawn`] with the fusion and the speculation knobs forced.
 ///
-/// Both resolve through process-wide `OnceLock`s, and a test that mutated the
+/// These resolve through process-wide `OnceLock`s, and a test that mutated the
 /// environment would race every other test in the binary — the same reason
 /// `iotune.rs` gives for not gating a feature on one.
 #[cfg(test)]
@@ -297,14 +343,27 @@ fn spawn_tuned(
     fuse: bool,
     depth: Option<usize>,
 ) -> Result<(EngineHandle, JoinHandle<()>), Error> {
+    spawn_spec(model, max_batch, fuse, SpecOverride { depth, sampled: None })
+}
+
+/// [`spawn_tuned`] with the sampled-speculation knob forced too.
+#[cfg(test)]
+fn spawn_spec(
+    model: Model,
+    max_batch: usize,
+    fuse: bool,
+    spec: SpecOverride,
+) -> Result<(EngineHandle, JoinHandle<()>), Error> {
     let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
     let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
+    let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
+    let tel = telemetry.clone();
     let join = std::thread::Builder::new()
         .name("peregrine-batch-test".to_string())
-        .spawn(move || run_tuned(model, rx_normal, rx_high, cap, fuse, depth))
+        .spawn(move || run_tuned(model, rx_normal, rx_high, cap, fuse, spec, tel))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high }, join))
+    Ok((EngineHandle { tx_normal, tx_high, telemetry }, join))
 }
 
 /// Latency SLA target for adaptive batching, in milliseconds. When set
@@ -328,19 +387,41 @@ fn draft_depth() -> usize {
     *V.get_or_init(|| std::env::var("COLI_DRAFT").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0))
 }
 
+/// Extend speculation to temperature > 0 requests via rejection sampling
+/// (`COLI_DRAFT_SAMPLED`). Default **off**, and it is not a performance knob.
+///
+/// [`peregrine_model::speculative_sample`] emits exactly the target
+/// distribution, so this is *distributionally* invisible — but not
+/// *sequence*-invisible: the tokens a seeded request produces change, because
+/// rejection sampling draws two uniforms per draft where plain decode draws one
+/// per token. A caller pinning outputs by seed would see different text with the
+/// same seed and no error anywhere.
+///
+/// It also rests on a claim this engine cannot check: that the MTP head's
+/// distribution really is the `q` the drafts were drawn from. `mtp_draft_sampled`
+/// makes that true by construction *for the head as implemented*; whether that
+/// head is a good proposal distribution at temperature is a modelling question,
+/// and a bad one costs acceptance rate rather than correctness.
+fn draft_sampled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("COLI_DRAFT_SAMPLED").ok().as_deref(), Some("1") | Some("true")))
+}
+
 /// How deep this sequence may speculate.
 ///
-/// **Zero unless the request decodes greedily.** Accepting a draft only where
-/// it matches the model's argmax makes speculation *sequence*-identical to
-/// greedy decoding; at temperature > 0 it is only distribution-preserving, and
-/// silently changing which tokens a sampled request emits is not a speedup, it
-/// is a different answer. A sequence with depth 0 contributes exactly one row,
-/// which is the historical path — so greedy and sampled requests share a batch
+/// **Zero for a sampled request unless `sampled` is set.** Accepting a draft
+/// only where it matches the model's argmax makes speculation
+/// *sequence*-identical to greedy decoding; at temperature > 0 the best
+/// available guarantee is distribution-preservation, and silently changing which
+/// tokens a sampled request emits is not a speedup, it is a different answer.
+/// `sampled` (from `COLI_DRAFT_SAMPLED`) is the operator taking that trade
+/// deliberately. A sequence with depth 0 contributes exactly one row, which is
+/// the historical path — so drafting and non-drafting requests share a batch
 /// with no special casing anywhere else.
 ///
 /// Pure so the policy is testable without a model.
-fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize) -> usize {
-    if global == 0 || !has_mtp || temp > 0.0 {
+fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize, sampled: bool) -> usize {
+    if global == 0 || !has_mtp || (temp > 0.0 && !sampled) {
         return 0;
     }
     // Never draft past what the request can still emit: a draft accepted beyond
@@ -502,8 +583,17 @@ struct SeqState {
     /// Tokens this sequence speculated for the *next* forward, drafted from
     /// [`Self::hlast`] by the MTP head. Empty when speculation is off, when the
     /// checkpoint has no MTP head, or when this request samples at
-    /// temperature > 0 — see [`draft_depth_for`].
+    /// temperature > 0 without `COLI_DRAFT_SAMPLED` — see [`draft_depth_for`].
     draft: Vec<i32>,
+    /// The distribution each entry of [`Self::draft`] was drawn from, under
+    /// `COLI_DRAFT_SAMPLED`; empty on the greedy path, which needs no `q`.
+    ///
+    /// Carried beside `draft` rather than derived at verify time because
+    /// [`peregrine_model::accept_run_sampled`]'s correctness rests on `q` being
+    /// the distribution the draft *was* sampled from — re-deriving it from the
+    /// draft head at verify time would recompute a forward, and recomputing it
+    /// from anything else would be a different distribution wearing its name.
+    draft_q: Vec<Vec<f32>>,
     /// Pre-final-norm hidden at this sequence's last committed position: what
     /// the next draft continues from. Empty until the first verify produces it.
     hlast: Vec<f32>,
@@ -518,18 +608,21 @@ fn run(
     rx_high: mpsc::UnboundedReceiver<EngineRequest>,
     max_batch: usize,
     fuse: bool,
+    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
 ) {
-    run_tuned(model, rx_normal, rx_high, max_batch, fuse, None)
+    run_tuned(model, rx_normal, rx_high, max_batch, fuse, SpecOverride::default(), telemetry)
 }
 
-/// [`run`] with the draft depth overridable, for tests. `None` reads `COLI_DRAFT`.
+/// [`run`] with the speculation knobs overridable, for tests. Each `None` reads
+/// the corresponding environment variable.
 fn run_tuned(
     mut model: Model,
     mut rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
     mut rx_high: mpsc::UnboundedReceiver<EngineRequest>,
     max_batch: usize,
     fuse: bool,
-    depth_override: Option<usize>,
+    spec: SpecOverride,
+    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
 ) {
     let vocab = model.cfg.vocab as usize;
     let stop_ids = model.cfg.stop_ids.clone();
@@ -542,7 +635,8 @@ fn run_tuned(
     let sla_ms = batch_sla_ms();
     // Resolved once: prefill chunking is a latency/work trade, not a per-tick decision.
     let chunk_div = prefill_chunk_div();
-    let depth = depth_override.unwrap_or_else(draft_depth);
+    let depth = spec.depth.unwrap_or_else(draft_depth);
+    let sampled_spec = spec.sampled.unwrap_or_else(draft_sampled);
     let has_mtp = model.has_mtp();
     let mut prefix = PrefixCache::new(prefix_cache_budget());
     // Resolved once: the KV byte ceiling admission respects alongside the count.
@@ -772,12 +866,22 @@ fn run_tuned(
         for (i, s) in active.iter_mut().enumerate() {
             let base = first_row.get(i).copied().unwrap_or(i);
             let g = s.draft.len();
-            // A drafting sequence is greedy by construction (`draft_depth_for`),
-            // so `accept_run`'s argmax and `sampler.pick` agree. A
-            // non-drafting one keeps its own sampler, temperature and all.
+            // A greedy drafting sequence takes `accept_run`, whose argmax rule
+            // and `sampler.pick` agree by construction. A sampled one (only
+            // reachable under `COLI_DRAFT_SAMPLED`) takes the rejection-sampling
+            // rule, which needs the `q` each draft was drawn from. A
+            // non-drafting sequence keeps its own sampler, temperature and all.
             let (k, spec_next) = if g > 0 {
                 let rows = logits.get(base * vocab..(base + g + 1) * vocab).unwrap_or(&[]);
-                peregrine_model::accept_run(rows, vocab, &s.draft)
+                if s.sampler.temp > 0.0 {
+                    // `take`, not borrow: a `q` must never be scored against a
+                    // different forward's rows, so a tick that somehow skipped
+                    // drafting finds none rather than last tick's.
+                    let q = std::mem::take(&mut s.draft_q);
+                    peregrine_model::accept_run_sampled(rows, vocab, &s.draft, &q, &mut s.sampler)
+                } else {
+                    peregrine_model::accept_run(rows, vocab, &s.draft)
+                }
             } else {
                 (0, 0)
             };
@@ -790,7 +894,12 @@ fn run_tuned(
             // With no drafts that is a single token from row 0, which is the
             // historical decode step exactly.
             let final_next = if g > 0 {
-                spec_next // greedy by construction; `accept_run` already picked it
+                // Already chosen by whichever accept rule ran: `accept_run`'s
+                // argmax for a greedy request, `accept_run_sampled`'s residual
+                // or bonus draw for a sampled one. Re-picking here would take a
+                // second sample from the same row and emit a token the accept
+                // rule never verified against.
+                spec_next
             } else {
                 let lo = base * vocab;
                 match logits.get(lo..lo + vocab) {
@@ -860,15 +969,35 @@ fn run_tuned(
         // wall-clock optimisation, so an error here drops back to plain decode
         // for that sequence rather than dropping the client.
         if depth > 0 {
+            let sampled = sampled_spec;
             for s in active.iter_mut() {
-                let g = draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new));
+                let g =
+                    draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new), sampled);
                 s.draft.clear();
+                s.draft_q.clear();
                 if g == 0 || s.hlast.is_empty() {
                     continue;
                 }
-                match model.mtp_draft(s.next_tok, g, &s.hlast) {
+                // A sampled request needs its drafts drawn from a distribution
+                // it can hand to the verifier; a greedy one needs argmax, and
+                // handing it a sampled draft would break `accept_run`'s
+                // sequence-identity with greedy decoding.
+                let drafted = if s.sampler.temp > 0.0 {
+                    model.mtp_draft_sampled(s.next_tok, g, &s.hlast, &mut s.sampler).map(|(d, q)| {
+                        s.draft_q = q;
+                        d
+                    })
+                } else {
+                    model.mtp_draft(s.next_tok, g, &s.hlast)
+                };
+                match drafted {
                     Ok(d) => s.draft = d,
-                    Err(e) => peregrine_core::note_advisory_err("mtp draft", &e),
+                    // A partial `draft_q` from a failed draft must not survive:
+                    // the next verify would score this tick's rows against it.
+                    Err(e) => {
+                        s.draft_q.clear();
+                        peregrine_core::note_advisory_err("mtp draft", &e);
+                    }
                 }
             }
         }
@@ -890,6 +1019,17 @@ fn run_tuned(
                 eprintln!("peregrine: reheat failed: {e}");
             }
         }
+        // Publish this tick's view for `GET /metrics`. The engine thread owns
+        // the model exclusively, so this is the only place these numbers can be
+        // read from; a handler cannot reach `Model` at all.
+        *telemetry.lock() = EngineTelemetry {
+            runtime: model.telemetry(),
+            lane_last: model.last_lane_timings(),
+            lane_ewma: model.lane_ewma(),
+            active: active.len(),
+            pending: pending.len(),
+            steps: steps as u64,
+        };
     }
     // Shutdown: report what the prefix cache absorbed. Silent when it is off, so
     // a default run's output is unchanged.
@@ -1098,6 +1238,7 @@ fn finish_prefill_chunk(
         max_new,
         // No draft yet: the first verify produces the hidden a draft needs.
         draft: Vec::new(),
+        draft_q: Vec::new(),
         hlast: Vec::new(),
     });
 }
@@ -1442,6 +1583,58 @@ mod tests {
         Ok(())
     }
 
+    /// The engine must actually publish telemetry, not just own a struct.
+    ///
+    /// `PlanOptimizer::snapshot` and `BubbleTuner::ewma_snapshot` both documented
+    /// themselves as existing "for /metrics" while no such handler and no
+    /// publishing path existed. This asserts the seam end to end: after real
+    /// decode steps, the handle-side snapshot carries this engine's work.
+    #[test]
+    fn engine_publishes_telemetry_for_metrics() -> Result<(), Error> {
+        let dir = tiny_dir("metrics_pub")?;
+        let (handle, join) = spawn_tuned(Model::load_streaming_ecache(&dir, true, 8 << 20)?, 4, false, Some(0))?;
+        // Before any tick, the snapshot is all zeros — the honest answer.
+        assert_eq!(handle.telemetry().steps, 0, "no steps published before the first tick");
+
+        let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+        handle.submit(EngineRequest {
+            prompt: vec![1i32, 5, 9, 2],
+            max_new: 6,
+            sampler: Sampler::new(0.0, 0.9, 1),
+            out: tx,
+            priority: Priority::Normal,
+            class: peregrine_model::TokenClass::Prose,
+        })?;
+        let mut rx = rx;
+        let mut produced = 0usize;
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                EngineOut::Token(_) => produced += 1,
+                EngineOut::Error(e) => return Err(Error::Format(e)),
+            }
+        }
+        let t = handle.telemetry();
+        drop(handle);
+        // The engine thread's join result carries no value and a panic there
+        // would already have failed the test; ignore it explicitly by matching
+        // rather than with `let _ =`, which the audit's [B] section flags.
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+        std::fs::remove_dir_all(&dir)?;
+
+        assert!(produced > 0, "sanity: the request decoded something");
+        assert!(t.steps > 0, "the engine must publish its step count; got {}", t.steps);
+        // Lane timings come from the model, so a non-zero value proves the
+        // publish path reaches `Model`, not just that a counter incremented.
+        assert!(
+            t.lane_last.reduce_us + t.lane_last.io_us + t.lane_last.cpu_us > 0,
+            "published lane timings must be the model's, not a default: {:?}",
+            t.lane_last
+        );
+        Ok(())
+    }
+
     #[test]
     fn speculation_does_not_change_the_served_token_stream() -> Result<(), Error> {
         // **The contract.** Speculation buys wall clock, never different
@@ -1508,23 +1701,99 @@ mod tests {
         Ok(())
     }
 
+    /// The engine half of `COLI_DRAFT_SAMPLED`: a temperature > 0 request must
+    /// actually draft, actually verify, and still serve a complete stream.
+    ///
+    /// Deliberately **not** an equality assertion against unspeculated decode —
+    /// there is no such equality to assert, and writing one would either fail or
+    /// (worse) pass by the drafts never being taken. Rejection sampling draws
+    /// two uniforms per draft where plain decode draws one per token, so the RNG
+    /// stream diverges the moment a draft exists. What must hold is that the
+    /// stream is complete, in-vocabulary, and reproducible from its seed.
     #[test]
-    fn a_sampled_request_never_speculates() -> Result<(), Error> {
+    fn sampled_speculation_serves_a_complete_reproducible_stream() -> Result<(), Error> {
+        let dir = tiny_dir("spec_sampled_engine")?;
+        let prompt = vec![1i32, 5, 9, 2];
+        let n = 8usize;
+
+        let run_engine = |spec: SpecOverride| -> Result<Vec<u32>, Error> {
+            let (handle, join) = spawn_spec(Model::load(&dir)?, 4, false, spec)?;
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: prompt.clone(),
+                max_new: n,
+                // Temperature > 0: the case the default path refuses to draft for.
+                sampler: Sampler::new(0.8, 0.95, 4242),
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            drop(handle);
+            let mut toks = Vec::new();
+            let mut rx = rx;
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Error(e) => return Err(Error::Format(e)),
+                }
+            }
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok(toks)
+        };
+
+        let on = SpecOverride { depth: Some(4), sampled: Some(true) };
+        let got = run_engine(on)?;
+        assert!(!got.is_empty(), "sampled speculation generated nothing");
+        assert!(got.len() <= n, "served {} tokens for max_new {n}", got.len());
+        let vocab = Model::load(&dir)?.cfg.vocab as u32;
+        assert!(got.iter().all(|&t| t < vocab), "a served token is out of vocabulary: {got:?}");
+
+        // Same seed, same knobs, same stream: the accept path must consume the
+        // RNG deterministically, or a seeded request is not reproducible.
+        assert_eq!(run_engine(on)?, got, "sampled speculation is not reproducible from its seed");
+
+        // And the knob is a knob: with it off, the same request takes the
+        // historical one-row path, whose stream differs precisely because the
+        // RNG is consumed differently.
+        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false) })?;
+        assert!(!off.is_empty(), "the unspeculated path generated nothing");
+        assert_ne!(
+            off, got,
+            "sampled speculation must consume the RNG differently from plain decode — \
+             identical streams mean no draft was ever taken and the test proves nothing"
+        );
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_sampled_request_never_speculates_unless_asked_to() -> Result<(), Error> {
         // Accepting on argmax makes speculation *sequence*-identical to greedy
         // decoding. At temperature > 0 it is only distribution-preserving, and
         // quietly changing which tokens a sampled request emits is not a
-        // speedup — it is a different answer. So a sampled request drafts
-        // nothing and takes the historical one-row path, in the same batch as
-        // greedy ones, with no special casing anywhere else.
-        assert_eq!(draft_depth_for(4, true, 0.7, 100), 0, "temperature > 0 must not speculate");
-        assert_eq!(draft_depth_for(4, true, 0.0, 100), 4, "greedy may");
-        assert_eq!(draft_depth_for(4, false, 0.0, 100), 0, "…but not without an MTP head");
-        assert_eq!(draft_depth_for(0, true, 0.0, 100), 0, "…nor with the knob off");
+        // speedup — it is a different answer. So by default a sampled request
+        // drafts nothing and takes the historical one-row path, in the same
+        // batch as greedy ones, with no special casing anywhere else.
+        assert_eq!(draft_depth_for(4, true, 0.7, 100, false), 0, "temperature > 0 must not speculate");
+        assert_eq!(draft_depth_for(4, true, 0.0, 100, false), 4, "greedy may");
+        assert_eq!(draft_depth_for(4, false, 0.0, 100, false), 0, "…but not without an MTP head");
+        assert_eq!(draft_depth_for(0, true, 0.0, 100, false), 0, "…nor with the knob off");
         // Never draft past what the request can still emit: a draft accepted
         // beyond `max_new` is work done to produce a token that is discarded.
-        assert_eq!(draft_depth_for(4, true, 0.0, 3), 2, "budget of 3 leaves room for 2 drafts");
-        assert_eq!(draft_depth_for(4, true, 0.0, 1), 0, "the last token needs no draft");
-        assert_eq!(draft_depth_for(4, true, 0.0, 0), 0);
+        assert_eq!(draft_depth_for(4, true, 0.0, 3, false), 2, "budget of 3 leaves room for 2 drafts");
+        assert_eq!(draft_depth_for(4, true, 0.0, 1, false), 0, "the last token needs no draft");
+        assert_eq!(draft_depth_for(4, true, 0.0, 0, false), 0);
+
+        // `COLI_DRAFT_SAMPLED` opens the temperature > 0 path — and only that
+        // one. Every other reason to refuse still refuses, so the knob cannot
+        // become a way to draft without an MTP head or past the token budget.
+        assert_eq!(draft_depth_for(4, true, 0.7, 100, true), 4, "sampled speculation is opt-in, not impossible");
+        assert_eq!(draft_depth_for(4, false, 0.7, 100, true), 0, "…still needs an MTP head");
+        assert_eq!(draft_depth_for(0, true, 0.7, 100, true), 0, "…still needs COLI_DRAFT");
+        assert_eq!(draft_depth_for(4, true, 0.7, 3, true), 2, "…still respects the budget");
         Ok(())
     }
 
