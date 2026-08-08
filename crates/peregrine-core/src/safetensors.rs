@@ -65,6 +65,41 @@ impl SafeTensors {
     /// Read exactly `buf.len()` bytes at `off` from shard `file_idx` through the
     /// io_uring reactor. The single choke point for every disk read here.
     fn read_at(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> Result<(), Error> {
+        // O_DIRECT trunk load (`COLI_DIRECT_LOAD=1`), when this shard has a
+        // working direct fd.
+        //
+        // This is the consumer `region_direct`'s doc has named since it was
+        // written — "the block alignment O_DIRECT requires is applied by the
+        // reader (`Reactor::read_direct_many`)" — while `read_direct_many` had
+        // no caller outside its own test. The streaming lane uses the *other*
+        // direct entry point (`read_direct_aligned`, which returns owned aligned
+        // buffers); this one copies into a caller's buffer, which is exactly the
+        // shape a loader reading into `out` needs, and is why the two exist.
+        //
+        // Worth having because the trunk is read **once**. Every byte of it that
+        // lands in the page cache afterwards is a byte the warm expert cache
+        // cannot use, on a box where that cache is the thing under pressure —
+        // which is the problem `COLI_FADVISE_DROP` attacks after the fact and
+        // O_DIRECT avoids entirely. Off by default: it is the model-load path,
+        // and a fallback that silently produced different bytes would be the
+        // worst possible failure, so the gate is explicit and the fallback is a
+        // plain retry on the buffered fd.
+        if direct_load_enabled() {
+            if let Some(dfd) = self.direct_files.get(file_idx).and_then(|f| f.as_ref()) {
+                let mut req = [peregrine_io::ReadReq { fd: dfd.as_raw_fd(), offset: off, buf, tag: 0 }];
+                let outcome = self.reactor.lock().read_direct_many(&mut req);
+                match outcome {
+                    Ok(res) if res.first().copied().unwrap_or(-1) >= 0 => return Ok(()),
+                    // Any direct failure falls through to the buffered path
+                    // below, which reads the same bytes from the same offsets.
+                    Ok(_) => peregrine_io::note_advisory_err(
+                        "O_DIRECT trunk read returned an error code (using buffered)",
+                        &"short or failed direct read",
+                    ),
+                    Err(e) => peregrine_io::note_advisory_err("O_DIRECT trunk read (using buffered)", &e),
+                }
+            }
+        }
         let fd = self.files[file_idx].as_raw_fd();
         // parking_lot mutex does not poison, so the lock never fails
         self.reactor
@@ -72,6 +107,19 @@ impl SafeTensors {
             .read_exact(fd, off, buf)
             .ctx(|| format!("{}: io_uring read @ {off}", self.paths[file_idx].display()))
     }
+}
+
+/// Whether the trunk load reads through O_DIRECT (`COLI_DIRECT_LOAD=1`).
+///
+/// Separate from `COLI_DIRECT`, which selects the *streaming expert* lane. They
+/// are different reads with different economics: experts are re-read constantly
+/// and want the page cache bypassed to stop evicting the warm cache; the trunk
+/// is read once at load and wants the same thing for a different reason. Fusing
+/// them under one variable would make it impossible to A/B either.
+fn direct_load_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("COLI_DIRECT_LOAD").as_deref(), Ok("1") | Ok("true")))
 }
 
 impl SafeTensors {

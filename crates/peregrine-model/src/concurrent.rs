@@ -214,6 +214,35 @@ struct GPlan {
     xg: Vec<f32>,
 }
 
+/// Fuse the layer-level gate-weighted accumulation for GPU-resident experts
+/// onto the device (`COLI_CUDA_FUSED_REDUCE`). Default **off**.
+///
+/// `expert_group` already fuses gate/up/silu/down, but returns `Σrows × hidden`
+/// floats for the host to accumulate. Reducing on the device sends `s_n × hidden`
+/// instead — at a saturated batch that is the expert-per-row factor, ~5× on the
+/// measured GLM-5.2 unions at B=16, and exactly 1× at B=1.
+///
+/// **Opt-in because it moves the GPU arm's low bits**, not because it is
+/// unfinished. GPU experts accumulate among themselves before meeting the CPU
+/// lane's contributions rather than interleaving with them in `pos` order, and
+/// `f32 +=` is not associative. It stays *stable* — the device reduce is CSR-
+/// ordered with no atomics — so a given configuration reproduces itself; it
+/// simply is not the same sum the host reduce computes. Every bit-identity
+/// anchor in the suite holds with the knob unset.
+fn fused_reduce_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("COLI_CUDA_FUSED_REDUCE").ok().as_deref(), Some("1") | Some("true")))
+}
+
+/// What a lane hands the collector.
+enum LaneMsg {
+    /// One expert's output, keyed by its batch-union position.
+    Slot(usize, EOut),
+    /// The GPU lane's device-reduced `[s_n, hidden]` partial, covering every
+    /// GPU-resident expert of this layer at once. At most one per forward.
+    GpuPartial(Vec<f32>),
+}
+
 /// A computed expert result, tagged with its batch-union position for the
 /// deterministic ordered reduce.
 struct EOut {
@@ -584,6 +613,100 @@ fn rebuild(t: &TPlan, wb: Bytes, sb: Bytes) -> QtWeight {
 /// faster). With a GPU tier, GPU-resident experts compute in f32 on the device
 /// concurrently — those experts' values differ from the CPU int4 path (higher
 /// precision), documented in [`crate::gpu`].
+/// A pluggable MoE expert-dispatch implementation.
+///
+/// **Exists because `peregrine-sched` cannot be called directly.** That crate
+/// depends on `peregrine-model` (`peregrine-sched/Cargo.toml`), so a
+/// `peregrine-model → peregrine-sched` dependency is a cycle and Cargo rejects
+/// it for normal dependencies. The dependency has to be inverted: this crate
+/// declares the shape, `peregrine-sched` implements it, and a *binary* — which
+/// may depend on both — installs the implementation.
+///
+/// Selecting an alternative engine is an operator decision with real cost
+/// (`peregrine-sched`'s `moe_streamed` is the two-lane ancestor: no GPU lane, no
+/// warm cache, no prefetch), which is why nothing installs one by default.
+pub trait MoeEngine: Send + Sync {
+    /// Same contract as [`moe_forward_concurrent`]: `[s_n, hidden]` output for
+    /// this layer's routed experts plus the shared expert.
+    fn moe_forward(&self, ctx: &ForwardCtx, call: MoeCall) -> Result<Vec<f32>, Error>;
+
+    /// Short name for reporting, e.g. `"sched"`. Read by [`moe_engine_name`] so
+    /// `/metrics` can say which implementation is *dispatching* rather than
+    /// which one the environment asked for — the two diverge whenever an
+    /// install fails, which is exactly when an operator needs to be told.
+    fn name(&self) -> &'static str;
+}
+
+/// One layer's MoE inputs, bundled.
+///
+/// `moe_forward_concurrent` already sits at clippy's seven-argument limit, and a
+/// trait method's `&self` puts it one over — so this exists partly for that. It
+/// is the better shape regardless: five of the six travel together everywhere
+/// and an engine implementation reads them by name instead of by position.
+pub struct MoeCall<'a> {
+    pub layer: usize,
+    pub x: &'a [f32],
+    pub router_w: &'a [f32],
+    pub router_bias: &'a [f32],
+    pub shared: Option<&'a Mlp>,
+    pub s_n: usize,
+}
+
+static MOE_ENGINE: std::sync::OnceLock<Box<dyn MoeEngine>> = std::sync::OnceLock::new();
+
+/// Install the process-wide MoE engine. First call wins; later calls are
+/// rejected (returning `false`) rather than silently swapping the dispatch path
+/// out from under a forward already in flight.
+///
+/// Called by the binaries when `COLI_MOE_ENGINE` selects a non-default engine.
+pub fn install_moe_engine(engine: Box<dyn MoeEngine>) -> bool {
+    MOE_ENGINE.set(engine).is_ok()
+}
+
+/// Whether an alternative engine is installed.
+///
+/// The binaries call this **after** their install attempt, because
+/// [`install_moe_engine`] returning `true` and the dispatch path actually
+/// changing are different facts: the `OnceLock` is process-global and first-call-
+/// wins, so a second installer (a test harness, a library embedding the engine)
+/// silently loses. Reporting the env var instead would print "engine = sched"
+/// for a process dispatching through [`moe_forward_concurrent`].
+pub fn moe_engine_installed() -> bool {
+    MOE_ENGINE.get().is_some()
+}
+
+/// The name of the engine [`moe_forward_dispatch`] will actually route through:
+/// the installed engine's own [`MoeEngine::name`], or `"concurrent"` for the
+/// built-in three-lane path. Reported on `GET /metrics`.
+pub fn moe_engine_name() -> &'static str {
+    match MOE_ENGINE.get() {
+        Some(engine) => engine.name(),
+        None => "concurrent",
+    }
+}
+
+/// The MoE dispatch entry point every forward goes through.
+///
+/// Routes to an installed [`MoeEngine`] when one exists, else to the default
+/// three-lane [`moe_forward_concurrent`]. With nothing installed this is one
+/// `OnceLock` load per sparse layer and the path is unchanged.
+pub fn moe_forward_dispatch(
+    ctx: &ForwardCtx,
+    layer: usize,
+    x: &[f32],
+    router_w: &[f32],
+    router_bias: &[f32],
+    shared: Option<&Mlp>,
+    s_n: usize,
+) -> Result<Vec<f32>, Error> {
+    match MOE_ENGINE.get() {
+        Some(engine) => {
+            engine.moe_forward(ctx, MoeCall { layer, x, router_w, router_bias, shared, s_n })
+        }
+        None => moe_forward_concurrent(ctx, layer, x, router_w, router_bias, shared, s_n),
+    }
+}
+
 pub fn moe_forward_concurrent(
     ctx: &ForwardCtx,
     layer: usize,
@@ -716,8 +839,14 @@ pub fn moe_forward_concurrent(
     // channel with no copy (== peregrine_io::ExpertSlab).
     type Bytes3 = [(Bytes, Bytes); 3];
     let (job_tx, job_rx) = crossbeam_channel::bounded::<(usize, Bytes3)>(workers.max(1) * 2);
-    // result: (pos, computed expert) from any lane → main reducer
-    let (res_tx, res_rx) = crossbeam_channel::bounded::<Result<(usize, EOut), Error>>(workers.max(1) * 2);
+    // result: one computed expert keyed by `pos`, or — under
+    // `COLI_CUDA_FUSED_REDUCE` — the GPU lane's single pre-accumulated
+    // `[s_n, hidden]` partial standing in for all of its experts at once.
+    let (res_tx, res_rx) = crossbeam_channel::bounded::<Result<LaneMsg, Error>>(workers.max(1) * 2);
+    // Whether the GPU lane reduces on the device. Resolved once here rather than
+    // per lane so the collector's expected message count and the lane's
+    // behaviour cannot disagree.
+    let fused_reduce = gpu.is_some() && !gplans.is_empty() && fused_reduce_enabled();
 
     let completed = AtomicUsize::new(0);
     // Shared cursor the I/O rings atomically claim expert-batches from (lock-free
@@ -739,7 +868,10 @@ pub fn moe_forward_concurrent(
     let heat_ref = ctx.heat;
     let admit_min_heat = cache_admit_min_heat();
 
-    let results: Result<Vec<Option<EOut>>, Error> = std::thread::scope(|scope| {
+    // `(per-expert slots, the GPU lane's device-reduced partial)`. The partial is
+    // `None` unless `COLI_CUDA_FUSED_REDUCE` is on and the layer had GPU experts.
+    type LaneResults = (Vec<Option<EOut>>, Option<Vec<f32>>);
+    let results: Result<LaneResults, Error> = std::thread::scope(|scope| {
         // ---- I/O lanes: N io_uring rings in PARALLEL, lock-free (atomic) work-stealing ----
         // One thread per ring. Each atomically claims a batch of experts off `io_work`,
         // serves warm-tier hits immediately, and streams the misses through *its own*
@@ -825,25 +957,45 @@ pub fn moe_forward_concurrent(
                 scope.spawn(move || {
                     let jobs: Vec<(usize, Vec<f32>)> = gplans_ref.iter().map(|p| (p.e, p.xg.clone())).collect();
                     let t_gpu = std::time::Instant::now();
-                    let result = g.compute(layer, &jobs, hidden);
+                    // Fused: the device folds every GPU expert into one
+                    // `[s_n, hidden]` partial, so `dst`/`weights` describe the
+                    // gathered rows in the same flattened order `jobs` builds
+                    // them — plan by plan, rows within a plan in plan order.
+                    let fused = if fused_reduce {
+                        let dst: Vec<usize> = gplans_ref.iter().flat_map(|p| p.rows.iter().copied()).collect();
+                        let rw: Vec<f32> = gplans_ref.iter().flat_map(|p| p.rw.iter().copied()).collect();
+                        Some(g.compute_reduced(layer, &jobs, hidden, &dst, &rw, s_n))
+                    } else {
+                        None
+                    };
+                    let plain = if fused.is_none() { Some(g.compute(layer, &jobs, hidden)) } else { None };
                     if let Some(t) = timings_ref {
                         t.add_gpu(t_gpu.elapsed().as_micros() as u64);
                     }
-                    match result {
-                        Ok(hs) => {
+                    let sent = match (fused, plain) {
+                        (Some(Ok(partial)), _) => {
+                            // One message for the whole lane: every GPU expert's
+                            // contribution is already inside it.
+                            completed_ref.fetch_add(gplans_ref.len(), Ordering::Relaxed);
+                            res_tx.send(Ok(LaneMsg::GpuPartial(partial)))
+                        }
+                        (_, Some(Ok(hs))) => {
+                            let mut last = Ok(());
                             for (gp, h) in gplans_ref.iter().zip(hs) {
                                 completed_ref.fetch_add(1, Ordering::Relaxed);
                                 let out = EOut { rows: gp.rows.clone(), rw: gp.rw.clone(), h };
-                                if res_tx.send(Ok((gp.pos, out))).is_err() {
+                                last = res_tx.send(Ok(LaneMsg::Slot(gp.pos, out)));
+                                if last.is_err() {
                                     break;
                                 }
                             }
+                            last
                         }
-                        Err(e) => {
-                            if res_tx.send(Err(e)).is_err() {
-                                peregrine_io::note_advisory_err("gpu lane error forward", &"collector already gone");
-                            }
-                        }
+                        (Some(Err(e)), _) | (_, Some(Err(e))) => res_tx.send(Err(e)),
+                        (None, None) => Ok(()), // unreachable: exactly one of the two ran
+                    };
+                    if sent.is_err() {
+                        peregrine_io::note_advisory_err("gpu lane error forward", &"collector already gone");
                     }
                 });
             }
@@ -887,7 +1039,7 @@ pub fn moe_forward_concurrent(
                     }
                     completed_ref.fetch_add(1, Ordering::Relaxed);
                     let out = EOut { rows: plan.rows.clone(), rw: plan.rw.clone(), h };
-                    if res_tx.send(Ok((plan.pos, out))).is_err() {
+                    if res_tx.send(Ok(LaneMsg::Slot(plan.pos, out))).is_err() {
                         break;
                     }
                 }
@@ -902,6 +1054,17 @@ pub fn moe_forward_concurrent(
 
         let mut slots: Vec<Option<EOut>> = (0..n).map(|_| None).collect();
         let mut got = 0usize;
+        // Under the fused reduce the GPU lane sends **one** message covering all
+        // of its experts, so the collector expects that many fewer slots plus
+        // exactly one partial. Deriving both from the same `fused_reduce` flag
+        // the lane read is what keeps "how many messages are coming" from being
+        // two independent opinions that can disagree and hang the forward.
+        let gpu_slots = if fused_reduce { gplans_ref.len() } else { 0 };
+        let want_slots = n - gpu_slots;
+        let mut gpu_partial: Option<Vec<f32>> = None;
+        let complete = |got: usize, partial: &Option<Vec<f32>>| {
+            got == want_slots && (!fused_reduce || partial.is_some())
+        };
         // A lane error must NOT return straight out of this closure: `res_rx`
         // lives in the caller's frame, so leaving it undrained lets the still-
         // running lanes fill the bounded result channel and block forever in
@@ -912,7 +1075,7 @@ pub fn moe_forward_concurrent(
         let mut failure: Option<Error> = None;
         loop {
             match res_rx.recv() {
-                Ok(Ok((pos, eo))) => {
+                Ok(Ok(LaneMsg::Slot(pos, eo))) => {
                     // Two results for one position would silently drop an
                     // expert's contribution from the layer output.
                     match slots.get_mut(pos) {
@@ -931,7 +1094,27 @@ pub fn moe_forward_concurrent(
                         }
                     }
                     got += 1;
-                    if got == n {
+                    if complete(got, &gpu_partial) {
+                        break;
+                    }
+                }
+                Ok(Ok(LaneMsg::GpuPartial(p))) => {
+                    // Exactly one is expected; a second would double-count every
+                    // GPU expert's contribution into the layer output.
+                    if gpu_partial.is_some() {
+                        failure = Some(Error::Format("concurrent MoE: duplicate GPU reduce partial".into()));
+                        break;
+                    }
+                    if p.len() != s_n * hidden {
+                        failure = Some(Error::Format(format!(
+                            "concurrent MoE: GPU reduce partial is {} floats, expected {}",
+                            p.len(),
+                            s_n * hidden
+                        )));
+                        break;
+                    }
+                    gpu_partial = Some(p);
+                    if complete(got, &gpu_partial) {
                         break;
                     }
                 }
@@ -941,16 +1124,17 @@ pub fn moe_forward_concurrent(
                 }
                 // channel closed: fine only if every expert already arrived
                 Err(recv_err) => {
-                    if got == n {
+                    if complete(got, &gpu_partial) {
                         break;
                     }
                     // `completed` counts what the lanes finished computing, which
                     // distinguishes "a lane died before computing" from "results
                     // were computed but never delivered".
                     let done = completed_ref.load(Ordering::Relaxed);
+                    let missing_partial = if fused_reduce && gpu_partial.is_none() { " (GPU partial missing)" } else { "" };
                     failure = Some(Error::Format(format!(
-                        "concurrent MoE: io/cpu lane ended early ({got}/{n} experts collected, \
-                         {done} computed): {recv_err}"
+                        "concurrent MoE: io/cpu lane ended early ({got}/{want_slots} experts collected, \
+                         {done} computed){missing_partial}: {recv_err}"
                     )));
                     break;
                 }
@@ -961,20 +1145,82 @@ pub fn moe_forward_concurrent(
             while res_rx.recv().is_ok() {}
             return Err(e);
         }
-        Ok(slots)
+        Ok((slots, gpu_partial))
     });
-    let slots = results?;
+    let (slots, gpu_partial) = results?;
 
     // ---- deterministic reduce: scatter in fixed batch-union order ----
+    //
+    // Per-row parallel scatter, bit-identical to the historical serial loop:
+    // `f32 +=` is not associative, so changing the order experts contribute to a
+    // shared `out[s * hidden + d]` would change the result bits. The contract
+    // (`moe_forward_parallel_matches_serial` in `mlp.rs`) is that **per row**
+    // experts accumulate in batch-union (`pos`) order, so each row's sum is
+    // bit-identical to the serial loop; rows are independent, so scattering rows
+    // in parallel is bit-identical too. That is the only ordering the bit-identity
+    // anchors actually pin, and this is the only ordering this code uses.
+    //
+    // The shape that made this safe to lift: each `EOut` carries its own rows
+    // (always ascending `s`, first matching `kk`) so the per-row contribution
+    // lists are built by walking `slots` in `pos` order and pushing each expert's
+    // contribution into the row it claims. Then the `out[s * hidden..]` slot is
+    // written from exactly one `par_rows_mut` worker, with no inter-worker aliasing.
     let t_reduce = std::time::Instant::now();
     let mut out = vec![0f32; s_n * hidden];
-    for eo in slots.into_iter().flatten() {
+    // `row_contribs[s]` = ordered list of `(slice_of_hidden, weight)` in batch-union
+    // order. `Box<[&f32]>` would be ideal but we need owned slices to ship across
+    // the pool boundary; `&[f32]` inside the closure captures by reference, which
+    // is the shape `par_rows_mut` was already designed around.
+    let mut row_contribs: Vec<Vec<(&[f32], f32)>> = (0..s_n).map(|_| Vec::new()).collect();
+    for eo in slots.iter().flatten() {
         for (ri, (&s, &wgt)) in eo.rows.iter().zip(&eo.rw).enumerate() {
-            let dst = &mut out[s * hidden..s * hidden + hidden];
             let src = &eo.h[ri * hidden..ri * hidden + hidden];
-            for d in 0..hidden {
-                dst[d] += wgt * src[d];
+            if let Some(slot) = row_contribs.get_mut(s) {
+                slot.push((src, wgt));
             }
+        }
+    }
+    // Note: `par_rows_mut` accepts a closure Fn(usize, &mut [f32]) and runs each row
+    // on a pool worker. The `+ Sync` bound on the closure is what lets the
+    // contribution lists be borrowed across workers safely (read-only access).
+    if s_n >= peregrine_par::PAR_ROWS_MIN {
+        // borrowed once across workers — the closure reads `row_contribs[s]`
+        let contribs: &[Vec<(&[f32], f32)>] = &row_contribs;
+        peregrine_par::par_rows_mut(
+            &mut out,
+            hidden,
+            s_n,
+            peregrine_par::PAR_ROWS_MIN,
+            |s, dst| {
+                for &(src, wgt) in contribs[s].iter() {
+                    for d in 0..hidden {
+                        dst[d] += wgt * src[d];
+                    }
+                }
+            },
+        );
+    } else {
+        for s in 0..s_n {
+            let dst = &mut out[s * hidden..s * hidden + hidden];
+            for &(src, wgt) in row_contribs[s].iter() {
+                for d in 0..hidden {
+                    dst[d] += wgt * src[d];
+                }
+            }
+        }
+    }
+    drop(row_contribs);
+    // Drop the actual `EOut` slab ownership (the slices above were references
+    // into `eo.h`; we still need `slots` for nothing else, so free it now).
+    drop(slots);
+    // The device-reduced GPU partial, added in a **fixed position** — after
+    // every CPU contribution, in its own pass — rather than wherever the lane
+    // happened to finish. Arrival order must not reach the arithmetic: that
+    // would make the output depend on machine timing, which is the one thing no
+    // adaptive path in this engine is allowed to do.
+    if let Some(p) = gpu_partial {
+        for (o, v) in out.iter_mut().zip(&p) {
+            *o += v;
         }
     }
     if let Some(sh) = shared {

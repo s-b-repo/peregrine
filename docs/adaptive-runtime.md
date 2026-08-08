@@ -117,10 +117,28 @@ Details in [Serving](serving.md).
 
 `peregrine_io::PerfCounter` is a real `perf_event_open(2)` LLC-miss counter
 (thread-following, user-space-only, hand-declared `PERF_ATTR_SIZE_VER0` attr
-layout). `telemetry::open_l3_miss_counter` gates it on `COLI_PERF_COUNTERS=1` — **though nothing currently calls it, so the knob is inert;** 
-every constructor degrades to `None` when the kernel refuses (containers,
+layout). `telemetry::open_l3_miss_counter` gates it on `COLI_PERF_COUNTERS=1`. It **is**
+wired: `peregrine-engine`'s `serve` opens it on the decode thread (`main.rs`) and
+prints the total at shutdown. Opening it there is deliberate —
+`perf_event_open(2)` follows the *calling* thread, so the figure covers attention
+and the deterministic reduce, **not** the io_uring workers or the `peregrine-par`
+pool. A whole-process number needs one counter per thread, and presenting this
+one as that is how a number stops meaning anything.
+Every constructor degrades to `None` when the kernel refuses (containers,
 `perf_event_paranoid ≥ 3`, no PMU) — the counter is an optimization input,
 never a dependency.
+
+`COLI_PERF_PREFETCH_FEEDBACK=1` additionally lets the per-forward miss delta
+steer the prefetch distance (rising misses widen it), which is the consumer this
+page and `telemetry.rs` described for months before it existed. It is a
+**second** opt-in on top of `COLI_PERF_COUNTERS`, because a measurement becoming
+a control loop should require saying so. **The direction is a hypothesis.** The
+counter follows the decode thread, so it cannot see the workers that stream and
+compute experts; a rising miss rate there most plausibly tracks a growing KV
+cache, which prefetch breadth does not address. The control law
+(`model.rs::llc_trend` — seeding holds, ±10 % dead band) is pure and unit-tested
+precisely because a live-counter test would pass by not running on any host that
+refuses the syscall.
 
 ## Knob reference
 

@@ -153,8 +153,12 @@ crates/
                      mem hints (hugepages, NUMA pinning), topology probe, perf counters,
                      aligned slab pool
   peregrine-cuda     FFI to cuda/backend_cuda.cu (feature = "cuda")
-  peregrine-sched    two-lane streaming ancestor — NOT linked by any crate;
-                     the live 3-lane path is peregrine-model/concurrent.rs
+  peregrine-sched    two-lane streaming ancestor — NOT linked by any crate, but
+                     kept as the cross-engine correctness oracle: its
+                     streamed_matches_the_production_concurrent_path runs
+                     moe_streamed and the live moe_forward_concurrent over the
+                     same container bytes. The live 3-lane path is
+                     peregrine-model/concurrent.rs
   peregrine-par      persistent scoped worker pool, bit-identical to serial (std-only)
   peregrine-engine   binary `peregrine`: stdio serve protocol, demo, bench, automaton
   peregrine-serve    binary `peregrine-serve`: OpenAI HTTP server + continuous batching
