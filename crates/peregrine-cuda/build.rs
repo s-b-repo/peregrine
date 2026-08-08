@@ -23,7 +23,21 @@ fn main() {
     let obj = format!("{out}/backend_cuda.o");
     let nvcc = format!("{cuda_home}/bin/nvcc");
 
-    let compiled = std::process::Command::new(&nvcc)
+    // "no toolkit here" and "the kernel source does not compile" are different
+    // facts and must not produce the same outcome. Collapsing them — which this
+    // script did until 2026-08-06, by mapping both onto one `cargo:warning` and
+    // a success exit — means a `.cu` syntax error is indistinguishable from a
+    // CPU-only host, on a host that *has* nvcc. Nothing greps build warnings, so
+    // every edit to `backend_cuda.cu` went unverified and the build stayed green.
+    // Absent toolkit stays a warning (a pure-CPU host must still build the
+    // workspace); a toolkit that is present and rejects the source is a hard
+    // failure, because on that host it is a real compile error.
+    if !std::path::Path::new(&nvcc).exists() {
+        println!("cargo:warning=nvcc not found at {nvcc}; CUDA backend NOT linked (build on an NVIDIA host with CUDA installed, or set CUDA_HOME)");
+        return;
+    }
+
+    let status = std::process::Command::new(&nvcc)
         .args([
             "-O3",
             "-std=c++17",
@@ -35,17 +49,23 @@ fn main() {
             "-o",
             &obj,
         ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .status();
 
-    if !compiled {
-        println!("cargo:warning=nvcc unavailable or failed; CUDA backend NOT linked (build on an NVIDIA host with CUDA installed)");
-        return;
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => panic!("{nvcc} failed to compile {src} ({s}) — this host has a CUDA toolkit, so this is a compile error in the kernel source, not a missing toolchain"),
+        Err(e) => panic!("{nvcc} exists but could not be executed: {e}"),
     }
 
     let lib = format!("{out}/libcoli_cuda_backend.a");
-    let _ = std::process::Command::new("ar").args(["crus", &lib, &obj]).status();
+    // Same reasoning one step down: a failed `ar` leaves no archive, and the
+    // link below would then fail with undefined symbols naming the kernels
+    // rather than the archiver that never ran.
+    match std::process::Command::new("ar").args(["crus", &lib, &obj]).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => panic!("ar crus {lib} failed ({s})"),
+        Err(e) => panic!("could not run ar to archive {obj}: {e}"),
+    }
     println!("cargo:rustc-link-search=native={out}");
     println!("cargo:rustc-link-lib=static=coli_cuda_backend");
     // cudart lives in `lib64` on standard installs and `targets/<triple>/lib`
