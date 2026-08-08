@@ -1,0 +1,8 @@
+peregrine: [ram] avail 31.1 GB | resident 10.9 + KV 0.7 + stream 3.8 + slack 1.2 + cache 4.3 -> peak 20.9 GB
+peregrine: O_DIRECT streaming enabled
+[CUDA] device 0: NVIDIA GeForce RTX 3060, 12.5 GB VRAM, sm_86
+peregrine: GPU tier holds 58 experts in VRAM (cold)
+peregrine bench: loaded 78 layers, vocab 154880, in 22.7s
+    [ecache] disk_reads this batch: 1623
+    [ecache] disk_reads this batch: 4155
+    [ecache] disk_reads this batch: 8464

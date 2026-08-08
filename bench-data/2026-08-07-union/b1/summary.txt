@@ -1,0 +1,36 @@
+== baseline.1: target/release/peregrine batch=1 steps=2 extra=[]
+   rc=0
+  batch   steps   tokens    seconds     agg tok/s   tok/s   per-seq tok/s
+      1       2        2      48.20         0.041      0.041          0.0415
+       [ecache] disk_reads this batch: 1188
+   [gate] routed=1200 below_0.5%=1.0% below_1%=1.3% below_2%=2.8% below_5%=14.3%
+   [union] selections=1200 distinct=1200 calls=150 share=1.000x
+   [union] all-low-gate reads=16/1200 (1.3%) — the ceiling on per-token precision selection under batch union
+   wall_s 61.44
+   peak_rss_gb 14.33
+   major_faults 5
+
+== spec.1: target/release/peregrine batch=1 steps=2 extra=[--draft 4]
+   rc=0
+  batch   steps   tokens    seconds     agg tok/s   tok/s   per-seq tok/s
+      1       2        2      81.62         0.025      0.025          0.0245
+       [ecache] disk_reads this batch: 2695
+   [gate] routed=3632 below_0.5%=0.4% below_1%=0.6% below_2%=1.8% below_5%=11.8%
+   [union] selections=3632 distinct=2758 calls=154 share=1.317x
+   [union] all-low-gate reads=15/2758 (0.5%) — the ceiling on per-token precision selection under batch union
+   wall_s 95.18
+   peak_rss_gb 14.05
+   major_faults 0
+
+== lookahead_batch.1: target/release/peregrine batch=1 steps=2 extra=[]
+   rc=0
+  batch   steps   tokens    seconds     agg tok/s   tok/s   per-seq tok/s
+      1       2        2      38.15         0.052      0.052          0.0524
+       [ecache] disk_reads this batch: 1098
+   [gate] routed=1200 below_0.5%=1.0% below_1%=1.3% below_2%=2.8% below_5%=14.3%
+   [union] selections=1200 distinct=1200 calls=150 share=1.000x
+   [union] all-low-gate reads=16/1200 (1.3%) — the ceiling on per-token precision selection under batch union
+   wall_s 49.97
+   peak_rss_gb 14.46
+   major_faults 0
+
