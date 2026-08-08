@@ -124,6 +124,56 @@ pub fn pcie_link_by_bdf(_bdf: &str) -> Option<PcieLink> {
     None
 }
 
+/// Every display-class PCI device with readable link info, as
+/// `(bdf, PcieLink)` in sysfs enumeration order.
+///
+/// This is what gives [`pcie_link_by_bdf`] a caller. The roadmap has listed
+/// "runtime topology discovery (PCIe / NVLink / NUMA)" as shipped since the
+/// probe was written, but nothing ever asked it anything — the function existed
+/// and no code path could tell you the answer. The GPU lane is the one consumer
+/// that cares: an x16 card negotiated down to x4 is the difference between
+/// `COLI_PCIE_BUDGET_MB` being a sensible cap and being the bottleneck, and
+/// that is invisible without this.
+///
+/// Class `0x03xxxx` is the PCI "display controller" base class, which covers
+/// VGA-compatible (`0x0300`), XGA, 3D and "other display" — matching on the
+/// base class rather than on vendor 0x10DE keeps it honest about AMD and Intel
+/// devices instead of silently reporting only NVIDIA.
+#[cfg(target_os = "linux")]
+pub fn gpu_pcie_links() -> Vec<(String, PcieLink)> {
+    let mut out: Vec<(String, PcieLink)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") else {
+        return out;
+    };
+    let mut bdfs: Vec<String> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        let Some(class) = read_sysfs_opt(&path.join("class")) else { continue };
+        // "0x030000\n" — base class is the first byte after the 0x.
+        if !class.trim().starts_with("0x03") {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            bdfs.push(name.to_string());
+        }
+    }
+    // Deterministic order: sysfs `read_dir` is not sorted, and a banner whose
+    // lines reorder between runs is a diff nobody can read.
+    bdfs.sort();
+    for bdf in bdfs {
+        if let Some(link) = pcie_link_by_bdf(&bdf) {
+            out.push((bdf, link));
+        }
+    }
+    out
+}
+
+/// No sysfs, no PCI enumeration.
+#[cfg(not(target_os = "linux"))]
+pub fn gpu_pcie_links() -> Vec<(String, PcieLink)> {
+    Vec::new()
+}
+
 /// Read a sysfs file, treating "not present" as a normal absence and reporting
 /// any other failure (permissions, EIO) through the advisory channel instead of
 /// silently reading as absent.

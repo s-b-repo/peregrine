@@ -82,8 +82,19 @@ older prose: `slab.rs` states outright that the outer `Mutex<Reactor>` already
 serializes access, so a lock-free swap here would be dead weight.)
 `checkout_tagged` / `checkin_tagged` return and verify a generation-tagged
 `SlabHandle { gen }` so a straggler speculative load cannot write into a recycled
-slab — **but nothing calls them**. The live path is the untagged
-`checkout`/`checkin`, so that protection is implemented and not in effect. Expert reads are
+slab. **Wired 2026-08-06** — the O_DIRECT landing path (`ring.rs`, the sole
+production call site) now checks out and returns tagged handles.
+
+Two things had to be fixed before wiring, not after. The check asserted
+`handle.gen < self.gen`, which **every** handle the pool ever issued satisfies,
+because `gen` only increases — so the double-return it advertised could not be
+detected, and wiring it first would merely have made an unfireable check
+reachable. The pool now tracks the generations actually *outstanding*, and a
+handle absent from that set — returned twice, or issued by a different pool — is
+rejected with its buffer dropped rather than pushed onto the free-list, where it
+would let two holders write the same allocation. And the check was a
+`debug_assert!`, compiled out of exactly the build where a late completion can
+happen; it now runs in release. Expert reads are
 zero-copy into the weight: the landing region is a `peregrine_io::Bytes` the
 streamed `QtWeight` moves in, and kernels read it via `Deref<[u8]>`.
 
@@ -94,9 +105,10 @@ budgeted warm RAM cache (`COLI_ECACHE_GB`) with Bloom-filter miss shortcut,
 transparent zstd, negative TTL, heat-gated admission and idle recompression.
 
 Eviction picks the lowest `(priority, recency)` — priority-weighted LRU
-(`warmcache.rs::evict_to_budget`). The LFRU scoring in `tier.rs`
-(`(heat << 8) | recency`) is **not** wired to it; see
-[prefetch & caching](prefetch-and-caching.md#tiering--gpu-residency).
+(`warmcache.rs::evict_to_budget`) — unless `COLI_CACHE_LFRU=1`, which replaces
+the recency component with `tier::lfru_score` (`(heat << 8) | recency`) while
+leaving priority as the primary key. Default off and bit-for-bit the historical
+tuple; see [prefetch & caching](prefetch-and-caching.md#tiering--gpu-residency).
 
 ## Compression (`peregrine-core/src/compress.rs`)
 

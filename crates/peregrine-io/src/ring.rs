@@ -104,7 +104,7 @@ pub fn pread_many_threaded(reqs: &mut [ReadReq], threads: usize) -> Vec<i64> {
 #[cfg(target_os = "linux")]
 mod uring {
     use super::ReadReq;
-    use crate::slab::{align_down, align_up, AlignedBuf, Bytes, SlabPool, ALIGN};
+    use crate::slab::{align_down, align_up, AlignedBuf, Bytes, SlabHandle, SlabPool, ALIGN};
     use io_uring::{opcode, squeue, types, IoUring};
     use std::io;
     use std::os::unix::io::RawFd;
@@ -169,7 +169,7 @@ mod uring {
                     crate::note_advisory_err("io_uring COOP_TASKRUN setup (using plain ring)", &e);
                     IoUring::new(entries)
                 })?;
-            Ok(Reactor {
+            let mut r = Reactor {
                 ring,
                 cap: entries as usize,
                 force_async: true,
@@ -177,7 +177,17 @@ mod uring {
                 registered: Vec::new(),
                 registered_bufs: Vec::new(),
                 slab: SlabPool::new(ALIGN, 1),
-            })
+            };
+            // `COLI_FORCE_ASYNC=0` runs reads inline instead of handing them to
+            // io-wq. Default stays on — a cold read that completes inline
+            // serializes the submitter, which is the whole reason the flag is
+            // forced — but on a device where completion is fast enough (a warm
+            // page cache, or a very low-latency NVMe) the io-wq bounce is pure
+            // overhead, and until now there was no way to find out.
+            if matches!(std::env::var("COLI_FORCE_ASYNC").as_deref(), Ok("0") | Ok("false")) {
+                r.set_force_async(false);
+            }
+            Ok(r)
         }
 
         /// Submission-queue-full rejections since the last call (swap-reset).
@@ -275,6 +285,16 @@ mod uring {
 
         /// Toggle forced `IOSQE_ASYNC` (default on: cold buffered reads run on
         /// io-wq instead of inline, so the submitter never serializes).
+        ///
+        /// Driven by `COLI_FORCE_ASYNC=0` at [`Reactor::new`]. The escape hatch
+        /// matters on a device fast enough that inline completion beats an io-wq
+        /// hand-off — an NVMe with a warm page cache can be exactly that, and
+        /// forcing async then adds a thread bounce per read for nothing.
+        ///
+        /// Advertised in the env tables, deliberately. The audit's own headline
+        /// example is `COLI_REGBUF`: a knob documented as live that no code read.
+        /// A setter with no reader is the same defect facing the other way, and
+        /// the fix for both is that the variable and the code agree.
         pub fn set_force_async(&mut self, on: bool) {
             self.force_async = on;
         }
@@ -752,12 +772,21 @@ mod uring {
 
                 // an aligned landing buffer: pooled (normal) or a one-off if the pool
                 // buffer is too small (misconfigured) / momentarily exhausted.
-                let (mut ab, pooled) = match self.slab.checkout(a_len) {
-                    Some(b) => (b, true),
+                //
+                // Generation-tagged: the pool records this checkout as outstanding
+                // and rejects a second return of the same tag, which is the
+                // protection `docs/io-and-storage.md` described as active while
+                // the untagged pair was the only thing on this path. The handle is
+                // split into `(buf, gen)` rather than held whole only because the
+                // read body below borrows the buffer directly; that is sound here
+                // because the buffer cannot escape this loop iteration — it is
+                // returned unconditionally before `outcome?` can propagate.
+                let (mut ab, gen) = match self.slab.checkout_tagged(a_len) {
+                    Some(h) => (h.buf, Some(h.gen)),
                     None => (
                         AlignedBuf::with_capacity(a_len)
                             .ok_or_else(|| io::Error::other("aligned alloc failed"))?,
-                        false,
+                        None,
                     ),
                 };
 
@@ -803,8 +832,8 @@ mod uring {
                     Ok(())
                 })();
 
-                if pooled {
-                    self.slab.checkin(ab);
+                if let Some(g) = gen {
+                    self.slab.checkin_tagged(SlabHandle { buf: ab, gen: g });
                 }
                 outcome?;
                 results[j] = want as i64;

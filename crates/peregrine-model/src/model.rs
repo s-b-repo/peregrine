@@ -17,7 +17,7 @@ use crate::attention::{
     LayerKv, RowLayout,
 };
 use crate::dsa::IndexerWeights;
-use crate::concurrent::{default_workers, experts_per_batch, moe_forward_concurrent, ForwardCtx};
+use crate::concurrent::{default_workers, experts_per_batch, moe_forward_dispatch, ForwardCtx};
 use crate::gpu::{GpuTier, HeatTable};
 use crate::math::rmsnorm;
 use crate::mlp::{moe_forward, Mlp, MoeCfg};
@@ -141,6 +141,19 @@ pub struct Model {
     /// Optional adaptive controller: when present, it overrides the warm-tier breadth
     /// each forward from observed prefetch used/wasted rates. `None` = static policy.
     prefetch_tuner: Option<PrefetchTuner>,
+    /// LLC-miss counter for the decode thread, handed over by the binary that
+    /// opened it (`perf_event_open` follows the *calling* thread, so the model
+    /// cannot open its own — it is constructed on whichever thread loaded it).
+    /// `None` unless `COLI_PERF_COUNTERS=1` and the kernel allowed it.
+    perf_llc: Option<peregrine_io::PerfCounter>,
+    /// Previous cumulative reading, so each forward sees a delta. Primed at
+    /// attach time: without that the first delta is the whole counter and reads
+    /// as an enormous spike.
+    perf_llc_last: u64,
+    /// EWMA (α = 0.3, matching [`PrefetchTuner`]) of the per-forward miss delta.
+    /// `0.0` means "no sample yet", which is why the first observation seeds
+    /// rather than blends.
+    perf_llc_ewma: f32,
     /// Background prefetch lane: warms the next token's predicted experts into
     /// `ecache` on its own ring, off the critical path. `Some` alongside `ecache`.
     prefetch: Option<PrefetchPool>,
@@ -364,6 +377,65 @@ pub fn accept_run(rows: &[f32], vocab: usize, drafts: &[i32]) -> (usize, i32) {
         k += 1;
     }
     let next = row(k).map_or(0, |r| crate::sample::argmax(r) as i32);
+    (k, next)
+}
+
+/// Accept a draft run against a **sampled** target distribution — the
+/// temperature > 0 twin of [`accept_run`], and the production caller of
+/// [`crate::speculative_sample`].
+///
+/// `rows` is `[1 + drafts.len(), vocab]` exactly as in [`accept_run`], and
+/// `draft_q[k]` is the distribution draft `k` was actually drawn from
+/// ([`Model::mtp_draft_sampled`]). Returns how many drafts were accepted and the
+/// token to emit after them.
+///
+/// **The emitted sequence is not the one an unspeculated sampled request would
+/// have produced, and cannot be.** `accept_run`'s guarantee is *sequence*
+/// identity with greedy decoding; this one's is only *distributional* identity
+/// with sampling at the request's temperature — the tokens differ, the
+/// distribution does not. Rejection sampling also draws two uniforms per draft
+/// where plain decode draws one per token, so the RNG stream advances
+/// differently: a seeded request is reproducible against itself, not against the
+/// same seed with `COLI_DRAFT` unset. That is why this path is opt-in.
+///
+/// On rejection the resampled token **ends the run**: rows past a rejected
+/// position were computed conditioned on a token that is no longer being
+/// emitted, so nothing there is valid to accept.
+pub fn accept_run_sampled(
+    rows: &[f32],
+    vocab: usize,
+    drafts: &[i32],
+    draft_q: &[Vec<f32>],
+    sampler: &mut Sampler,
+) -> (usize, i32) {
+    let row = |k: usize| rows.get(k * vocab..(k + 1) * vocab);
+    let mut k = 0usize;
+    while k < drafts.len() {
+        // A missing row or a missing/short `q` is a shape fault, not a
+        // rejection: fall through to sampling row `k` normally, which is what
+        // this round would have emitted with no speculation at all. Guessing a
+        // uniform `q` instead would feed `speculative_sample` a ratio computed
+        // against a distribution nothing was drawn from.
+        let (Some(r), Some(q)) = (row(k), draft_q.get(k)) else { break };
+        let drafted = match usize::try_from(drafts[k]).ok().filter(|&d| d < vocab && d < q.len()) {
+            Some(d) => d,
+            None => break, // out-of-vocab draft: cannot be scored, so reject it
+        };
+        let p = sampler.distribution(r).to_vec();
+        let (u_accept, u_resample) = (sampler.uniform(), sampler.uniform());
+        let emitted = crate::speculative_sample(&p, q, drafted, u_accept, u_resample);
+        if emitted != drafted {
+            // Rejected: the residual sample replaces the draft and terminates
+            // the run. (`speculative_sample` only resamples when `p/q < 1`, and
+            // the residual `(p-q)+` is then zero at `drafted` — so this compare
+            // is a faithful "was it accepted", not an approximation of one.)
+            return (k, emitted as i32);
+        }
+        k += 1;
+    }
+    // Every draft accepted (or the run stopped on a shape fault): the bonus
+    // token comes from the row past the accepted run, sampled normally.
+    let next = row(k).map_or(0, |r| sampler.pick(r, -1) as i32);
     (k, next)
 }
 
@@ -752,6 +824,21 @@ fn router_lookahead_width() -> usize {
     *N.get_or_init(|| env_usize("COLI_ROUTER_LOOKAHEAD_N", 6))
 }
 
+/// Whether the router look-ahead is allowed to fire on a **batched** decode step
+/// (B > 1), in addition to the historical B == 1 case. `COLI_ROUTER_LOOKAHEAD_BATCH`
+/// (default `1` = on). The look-ahead issues advisory prefetch reads during the
+/// inter-layer attention window; on a batched step the potential union grows with
+/// `s_n`, so the window's `width` is a budget — never `width × s_n` — capped by
+/// [`LookaheadCtx::rank`] dedupe. Off ⇒ the historical behaviour (decode-only,
+/// B == 1). The total `width` (not `width × s_n`) bounds the prefetch stream's IO
+/// depth, matched against the disk's idle window — the same constraint WASTE
+/// measured at B == 1, applied to one cross-row union.
+fn router_lookahead_batch() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_ROUTER_LOOKAHEAD_BATCH").as_deref(), Ok("0") | Ok("false")))
+}
+
 /// The arms the predictor scoreboard compares, in the order the forward loop stashes
 /// them. See [`predict_eval_init`].
 const PREDICT_EVAL_ARMS: [&str; 3] = ["router-lookahead", "predictor", "prev-token"];
@@ -829,6 +916,60 @@ fn prefetch_tuner_init() -> Option<PrefetchTuner> {
         return None;
     }
     Some(PrefetchTuner::new(env_usize("COLI_PREFETCH_DIST", 4), env_usize("COLI_PREFETCH_DIST_MAX", 16)))
+}
+
+/// Whether the LLC-miss counter additionally *steers* the prefetch tuner, rather
+/// than only being reported (`COLI_PERF_PREFETCH_FEEDBACK=1`).
+///
+/// **Deliberately a second gate, not folded into `COLI_PERF_COUNTERS`.** The
+/// counter is a measurement; this is a control loop driven by it, and the two
+/// deserve separate consent. `todo.md` §10 argues the case against ever wiring
+/// this — "what a miss rate *should* change is unmeasured, and wiring a governor
+/// to an unvalidated signal is how a knob becomes load-bearing by accident" —
+/// while the shortlist carries "hardware-counter-driven scheduler feedback" as an
+/// open item and `telemetry.rs` documents the consumer as if it existed. Both are
+/// now true statements: the consumer exists, and it is off unless asked for twice.
+///
+/// **The direction is a hypothesis and is not measured.** `telemetry.rs` specifies
+/// "rising misses → widen prefetch distance", which is what this implements, but
+/// the counter follows the decode thread — attention, the router matmul and the
+/// deterministic reduce — and *not* the io_uring workers or the `peregrine-par`
+/// pool that stream and compute experts. A rising miss rate there most plausibly
+/// tracks a growing KV cache or batch, which widening the prefetch breadth does
+/// nothing about and may worsen. Validating it means showing that enabling this
+/// moves `[prefetch] used/wasted/accuracy` favourably at constant disk reads; if
+/// that cannot be shown, the honest end state is to delete the loop and keep the
+/// reporting, not to leave a knob nobody can justify.
+fn perf_prefetch_feedback() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("COLI_PERF_PREFETCH_FEEDBACK").as_deref(), Ok("1") | Ok("true")))
+}
+
+/// One LLC-miss observation's verdict on the prefetch distance:
+/// `1` widen, `-1` narrow, `0` hold.
+///
+/// Pure, so the dead band and the seeding rule are testable **without a PMU**.
+/// `perf_event_open` is refused on most VMs, in containers, and at
+/// `perf_event_paranoid >= 3`, so a test that needed a live counter would
+/// silently pass by not running — which is how an untested controller ends up
+/// looking tested.
+///
+/// `prev_ewma <= 0.0` is the seeding observation (no trend yet) and holds. The
+/// ±10% band exists because a thread-following counter on a contended desktop
+/// moves several percent between identical forwards; nudging on every wobble
+/// makes the distance a random walk rather than a controller.
+fn llc_trend(prev_ewma: f32, delta: f32) -> i8 {
+    if prev_ewma <= 0.0 {
+        return 0;
+    }
+    if delta > prev_ewma * 1.1 {
+        1
+    } else if delta < prev_ewma * 0.9 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// Whether predictive eviction is active: after each forward, resident experts the
@@ -1252,7 +1393,19 @@ impl LookaheadCtx<'_> {
         // the first `width` that would cost a read. Past rank `k` the ranking's
         // precision has fallen far enough that the candidates are not worth the scan.
         let scan = width.max(self.cfg.topk.max(0) as usize);
-        let ranks = router_ranks_for(l, self.cfg, x, scan);
+        let d = self.cfg.hidden as usize;
+        // s_n inferred from `x.len()`: a single-row path emits the historical narrow
+        // ranking; a multi-row path takes the **union** of per-row rankings. The union
+        // is the right call for a batched-decode look-ahead because every row whose
+        // routing wants an expert that is not yet warm will pay a disk miss — so a
+        // union-bounded `width` is exactly the set the prefetch lane has to keep warm
+        // to clear the next layer's misses in the next step's gap.
+        let s_n = (x.len() / d).max(1);
+        let ranks = if s_n == 1 {
+            router_ranks_for(l, self.cfg, x, scan)
+        } else {
+            router_ranks_for_batch(l, self.cfg, x, s_n, scan)
+        };
         let mut out = Vec::with_capacity(width.min(ranks.len()));
         let cache = self.cache.lock();
         for e in ranks {
@@ -1289,6 +1442,43 @@ fn router_ranks_for(l: &LayerW, cfg: &Cfg, x: &[f32], n: usize) -> Vec<i32> {
     // and no union to take.
     let nrm = rmsnorm_rows(x, &l.post_ln, 1, d, cfg.eps);
     crate::router::route_ranks(&nrm, &l.router, &l.router_bias, d, cfg.n_experts as usize, n)
+}
+
+/// Like [`router_ranks_for`] but ranks *every row* of an `[s_n, d]` hidden batch and
+/// returns the deduplicated union in row-major order (row 0's picks, then row 1's
+/// new picks, …). Past-the-batch prefetch is the only multi-row caller: the
+/// authoritative router still runs at layer `L+1` and decides, so the cross-row
+/// union's job is to capture whichever row's routing is about to cost a disk read.
+///
+/// `per_row` bounds each row's rank list (router top-`k` is the natural value); the
+/// caller truncates the final union to its own `width` budget. Bounded dedupe with a
+/// linear scan keeps order deterministic — never a hash — so the prefetch stream is
+/// reproducible and the [R] reachability audit and `COLI_PREDICT_EVAL` see a fixed
+/// issuance order.
+fn router_ranks_for_batch(l: &LayerW, cfg: &Cfg, x: &[f32], s_n: usize, per_row: usize) -> Vec<i32> {
+    let d = cfg.hidden as usize;
+    if s_n == 0 || x.len() < s_n * d || per_row == 0 {
+        return Vec::new();
+    }
+    let nrm = rmsnorm_rows(x, &l.post_ln, s_n, d, cfg.eps);
+    let mut out: Vec<i32> = Vec::with_capacity(s_n * per_row.min(cfg.n_experts as usize));
+    for s in 0..s_n {
+        let row = &nrm[s * d..s * d + d];
+        // Per-row route_ranks redirects into the same kernel path the single-row
+        // look-ahead uses, so the rankings are bit-for-bit the router's own order for
+        // that row — no side table, no approximation. A row that degenerates to
+        // all-NaN contributes nothing, exactly as the single-row path does.
+        let ranks = crate::router::route_ranks(row, &l.router, &l.router_bias, d, cfg.n_experts as usize, per_row);
+        for e in ranks {
+            if e < 0 {
+                continue;
+            }
+            if !out.contains(&e) {
+                out.push(e);
+            }
+        }
+    }
+    out
 }
 
 /// Settle layer `li`'s outstanding prediction against what it actually routed, then
@@ -1587,7 +1777,7 @@ fn forward_layer(
     let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
     let ffn: Vec<f32> = if l.sparse {
         if ctx.stream_experts {
-            moe_forward_concurrent(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
+            moe_forward_dispatch(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
         } else {
             moe_forward(&nrm2, &l.router, &l.router_bias, &l.experts, l.shared.as_ref(), MoeCfg { s_n, hidden: d, k: cfg.topk as usize, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale })
         }
@@ -1630,7 +1820,7 @@ fn forward_layer_batched(
     let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
     let ffn: Vec<f32> = if l.sparse {
         if ctx.stream_experts {
-            moe_forward_concurrent(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
+            moe_forward_dispatch(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
         } else {
             moe_forward(&nrm2, &l.router, &l.router_bias, &l.experts, l.shared.as_ref(), MoeCfg { s_n, hidden: d, k: cfg.topk as usize, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale })
         }
@@ -1938,6 +2128,9 @@ impl Model {
             predict_eval: predict_eval_init(model_topk),
             prefetch_policy: PrefetchPolicy::from_env(),
             prefetch_tuner: prefetch_tuner_init(),
+            perf_llc: None,
+            perf_llc_last: 0,
+            perf_llc_ewma: 0.0,
             prefetch,
             gpu,
             mtp,
@@ -1974,6 +2167,12 @@ impl Model {
         // starts warm on the last session's routing patterns. Correctness-neutral;
         // missing/stale files are silently ignored.
         model.try_load_route_stats(dir);
+        // This host's WMMA tuning table, if a previous run on this machine wrote
+        // one. A no-op unless `COLI_CUDA_AUTOTUNE=1`; a table from another GPU
+        // is not rejected because it cannot be detected, which is precisely why
+        // it re-explores every shape before trusting a restored winner
+        // (`WmmaTuner::select`).
+        model.try_load_kernel_tuning(dir);
         // Storage-tier seed: prefetch-warm the offline-planned RAM tier so the
         // co-firing communities the planner placed in RAM are resident before
         // the first token. Best-effort; bounded; `COLI_TIER_SEED=0` disables.
@@ -2186,14 +2385,23 @@ impl Model {
         let n_experts = self.cfg.n_experts as usize;
         let first_dense = self.cfg.first_dense as usize;
         let n_layers = self.cfg.n_layers as usize;
-        let hist = hist.lock();
-        let mut cache = cache.lock();
-        for layer in first_dense..n_layers {
-            for (e, score) in self.predictor.predict_layer(layer, &hist) {
-                let h = heat.as_ref().and_then(|c| c.get(layer * n_experts + e as usize).copied()).unwrap_or(0);
-                cache.set_priority((layer as u32, e), pack_prio(score, h));
+        // Build the whole protection set under the *history* lock only, then
+        // apply it in one short cache-lock hold. Previously both locks were held
+        // across all 78 layers × K predictions; the cache lock is contended by
+        // the prefetch lane and by every streamed read, so that window cost more
+        // than the work inside it.
+        let entries: Vec<((u32, u32), u32)> = {
+            let hist = hist.lock();
+            let mut v = Vec::new();
+            for layer in first_dense..n_layers {
+                for (e, score) in self.predictor.predict_layer(layer, &hist) {
+                    let h = heat.as_ref().and_then(|c| c.get(layer * n_experts + e as usize).copied()).unwrap_or(0);
+                    v.push(((layer as u32, e), pack_prio(score, h)));
+                }
             }
-        }
+            v
+        };
+        cache.lock().set_protected(&entries);
     }
 
     /// Whole-forward next-token prefetch: emit every sparse layer's prediction in one
@@ -2543,6 +2751,14 @@ impl Model {
     fn publish_lane_timings(&self) {
         let sample = self.lane_timings.snapshot_and_reset();
         *self.last_lane.lock() = sample;
+        // Advance the heat table's recency clock exactly once per forward. This
+        // is the per-forward tick every other adaptive structure already hangs
+        // off, which is why it lives here rather than beside the per-layer heat
+        // bump: ticking there would run 78× a token and saturate `lfru_score`'s
+        // 255-step recency window within three tokens.
+        if let Some(heat) = &self.heat {
+            heat.tick();
+        }
         // One implementation of the per-forward tick: `PlanOptimizer` folds the
         // sample into the bubble tuner and steps the I/O tuner on its period.
         // (It was previously a second, divergent copy of this policy that no
@@ -2556,10 +2772,14 @@ impl Model {
                 prefetch_wasted: c.prefetch_wasted,
             }
         });
-        let telemetry = {
+        let mut telemetry = {
             let mut bubble = self.bubble.lock();
             self.plan_optimizer.lock().tick(&mut bubble, &self.io_tuner, sample, 10_000, cache_counters)
         };
+        // Routing entropy is computed per forward and, until now, had no way
+        // out of the model: `routing_entropy_ewma()` said "for telemetry
+        // scrapes" and no telemetry structure carried it.
+        telemetry.entropy_ewma = self.routing_entropy_ewma();
         *self.last_telemetry.lock() = telemetry;
         // Sensor governors: thermal / power / bandwidth, all writing the one
         // effective-worker knob with shrink-wins arbitration.
@@ -2866,6 +3086,18 @@ impl Model {
         *self.last_lane.lock()
     }
 
+    /// The bubble tuner's **smoothed** per-lane times, as opposed to
+    /// [`Self::last_lane_timings`]'s single most recent forward.
+    ///
+    /// Both are worth scraping and they answer different questions: the raw
+    /// snapshot shows what the last token cost, the EWMA shows which lane is
+    /// structurally dominating — which is the one the balancer acts on. The EWMA
+    /// carries no `reduce_us`/`cpu_bytes` (the tuner does not smooth them), so
+    /// those read 0 here by construction rather than by accident.
+    pub fn lane_ewma(&self) -> crate::lane::LaneTimings {
+        self.bubble.lock().ewma_snapshot()
+    }
+
     /// Current published bubble bias — the pipeline lane the tuner thinks is
     /// dominating. `Bias::Balanced` before the tuner has enough samples.
     pub fn lane_bias(&self) -> crate::lane::Bias {
@@ -2900,6 +3132,20 @@ impl Model {
     /// `<dir>/route_stats.json`. Overwrites any existing file. Best-effort — a
     /// missing history or non-writable dir returns `Ok(())` without an error, so
     /// callers can invoke this from shutdown paths without special-casing.
+    /// Restore `<dir>/kernel_tuning.json` into the GPU tier's autotuner.
+    ///
+    /// Best-effort and silent on every failure: this file only ever changes
+    /// which of three equally-correct kernel instantiations runs, so a missing,
+    /// truncated or foreign-GPU table costs an exploration round and nothing
+    /// else. Surfacing it as an error would make a performance hint able to fail
+    /// a model load.
+    fn try_load_kernel_tuning(&self, dir: &std::path::Path) {
+        let Some(gpu) = self.gpu.as_ref() else { return };
+        let Ok(bytes) = std::fs::read(dir.join("kernel_tuning.json")) else { return };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
+        gpu.restore_tuning(&v);
+    }
+
     pub fn save_route_stats(&self, dir: &std::path::Path) -> Result<(), Error> {
         if !route_stats_persist_enabled() {
             return Ok(());
@@ -2930,6 +3176,21 @@ impl Model {
         // continues to run with in-memory-only history.
         if let Err(e) = peregrine_core::write_atomic(&dir.join("route_stats.json"), &bytes) {
             peregrine_io::note_advisory_err("persist route_stats.json", &e);
+        }
+        // The WMMA tuning table is a *separate* file, not a field of the one
+        // above: it describes this host's GPU, while `route_stats.json`
+        // describes the workload. Copying a checkpoint directory between
+        // machines should carry the routing history and leave the kernel timings
+        // behind, and one file cannot do both.
+        if let Some(tuning) = self.gpu.as_ref().and_then(|g| g.tuning_json()) {
+            match serde_json::to_vec(&tuning) {
+                Ok(tb) => {
+                    if let Err(e) = peregrine_core::write_atomic(&dir.join("kernel_tuning.json"), &tb) {
+                        peregrine_io::note_advisory_err("persist kernel_tuning.json", &e);
+                    }
+                }
+                Err(e) => peregrine_io::note_advisory_err("serialize kernel_tuning.json", &e),
+            }
         }
         Ok(())
     }
@@ -3034,6 +3295,45 @@ impl Model {
         self.predictor = predictor;
     }
 
+    /// Apply `COLI_PREDICT_SOURCE` if it names a predictor this model can build.
+    ///
+    /// Load already picks the strongest source the *artifacts* support (automaton
+    /// → macro → momentum), so this exists to force a **weaker** one — which is
+    /// exactly what an A/B needs. `COLI_PREDICT_EVAL` scores the arms against the
+    /// routing that actually happened; without a way to select the arm in
+    /// production, that scoreboard could only ever grade a choice nobody could
+    /// change.
+    ///
+    /// - `momentum` — recency-weighted vote, no offline artifact.
+    /// - `phase-aware` — wraps the current source with a phase-shift boost.
+    ///
+    /// Anything else (including `automaton`/`macro`) is left alone: those need
+    /// artifacts that may not exist, and silently degrading to momentum while
+    /// reporting the requested name is worse than ignoring the request.
+    /// Returns what it applied, for the startup report.
+    pub fn apply_predictor_override(&mut self) -> Option<&'static str> {
+        let var = std::env::var("COLI_PREDICT_SOURCE");
+        match var.as_deref() {
+            Ok("momentum") => {
+                self.set_predictor(PredictSource::Momentum(crate::predict::Momentum::default()));
+                Some("momentum")
+            }
+            Ok("phase-aware") => {
+                let inner = std::mem::replace(
+                    &mut self.predictor,
+                    PredictSource::Momentum(crate::predict::Momentum::default()),
+                );
+                self.set_predictor(PredictSource::PhaseAware {
+                    inner: Box::new(inner),
+                    threshold_bp: 6000,
+                    boost: 2,
+                });
+                Some("phase-aware")
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the prefetch predictor is the transition automaton (introspection/tests).
     pub fn predictor_is_automaton(&self) -> bool {
         matches!(self.predictor, PredictSource::Automaton { .. })
@@ -3049,6 +3349,40 @@ impl Model {
     /// Enable the adaptive prefetch-distance controller (bypasses `COLI_PREFETCH_TUNE`).
     /// It re-tunes the warm-tier breadth each forward within `[1, d_max]` from observed
     /// prefetch used/wasted rates, starting at `initial`.
+    /// Hand the model the decode thread's LLC-miss counter.
+    ///
+    /// The binary opens it, not the model: `perf_event_open(2)` counts the thread
+    /// that called it (`pid = 0`), and a `Model` is constructed on whichever
+    /// thread loaded the checkpoint — which is not necessarily, and for the
+    /// batched server definitely not, the thread that decodes. Opening it here
+    /// would silently measure a thread that does no inference.
+    ///
+    /// Priming the baseline matters: `read()` is cumulative since open, so
+    /// without this the first per-forward delta is the entire counter and would
+    /// register as a miss spike that never happened.
+    pub fn attach_perf_counter(&mut self, counter: peregrine_io::PerfCounter) {
+        self.perf_llc_last = counter.read().unwrap_or(0);
+        self.perf_llc = Some(counter);
+    }
+
+    /// Cumulative LLC misses on the decode thread since [`Self::attach_perf_counter`],
+    /// or `None` when no counter is attached or the read failed.
+    pub fn llc_misses(&self) -> Option<u64> {
+        self.perf_llc.as_ref().and_then(|c| c.read())
+    }
+
+    /// This forward's LLC-miss delta, advancing the baseline. `None` when no
+    /// counter is attached or the kernel read failed.
+    fn llc_delta(&mut self) -> Option<u64> {
+        let now = self.perf_llc.as_ref().and_then(|c| c.read())?;
+        let last = self.perf_llc_last;
+        self.perf_llc_last = now;
+        // `saturating_sub` rather than a subtraction: a counter can be reset by
+        // something outside this process, and a wrapped delta would read as a
+        // colossal spike and slam the tuner to its ceiling.
+        Some(now.saturating_sub(last))
+    }
+
     pub fn enable_prefetch_tuner(&mut self, initial: usize, d_max: usize) {
         self.prefetch_tuner = Some(PrefetchTuner::new(initial, d_max));
     }
@@ -3157,6 +3491,13 @@ impl Model {
             // defaulting it off. There is also no window to fill there: a chunk
             // layer's readers are busy continuously, so a speculative read does not
             // move a read into idle time, it moves it in front of another read.
+            //
+            // Multi-row look-ahead here would mean prefill-chunk prefetch — the WASTE
+            // negative. The **batched decode** multi-row path is `forward_rows_inner`
+            // (which has `owner` separating per-sequence rows from a prefetch-chunk),
+            // and that is the one the new multi-row look-ahead lives in. Keep this gate
+            // the historical shape (single-row decode-only) so chunk-prefill stays
+            // measured-neutral.
             let la_width = if router_lookahead() && s_n == 1 { router_lookahead_width() } else { 0 };
             // Built independently of `pfc`, not from it: the two are separate
             // features with separate knobs, and one asks the routing history while
@@ -3216,6 +3557,32 @@ impl Model {
             });
             if let (Some(t), Some((used, wasted))) = (self.prefetch_tuner.as_mut(), obs) {
                 t.observe(used, wasted);
+            }
+        }
+        // Hardware-counter feedback (`COLI_PERF_PREFETCH_FEEDBACK=1`): the
+        // consumer `telemetry.rs` has documented since the counter landed —
+        // "feed `PerfCounter::read` deltas into the prefetch tuner: rising
+        // misses → widen prefetch distance". See `perf_prefetch_feedback` for
+        // why this is a second opt-in and why the *direction* is a hypothesis
+        // rather than a measurement.
+        //
+        // A ±10% dead band, because the raw per-forward delta is noisy: a
+        // counter that follows one thread on a contended desktop moves several
+        // percent between identical forwards, and nudging on every wobble makes
+        // the distance a random walk rather than a controller.
+        if perf_prefetch_feedback() {
+            if let Some(delta) = self.llc_delta() {
+                let d = delta as f32;
+                let prev = self.perf_llc_ewma;
+                self.perf_llc_ewma = if prev == 0.0 { d } else { 0.7 * prev + 0.3 * d };
+                let step = llc_trend(prev, d);
+                if let Some(t) = self.prefetch_tuner.as_mut() {
+                    match step {
+                        1 => t.nudge_up(),
+                        -1 => t.nudge_down(),
+                        _ => {}
+                    }
+                }
             }
         }
         // Entropy-adaptive breadth: dispersed routing widens the prefetch
@@ -3548,10 +3915,23 @@ impl Model {
         // Router look-ahead, on the same decode-only rule as `forward_hidden`. B == 1
         // *is* a decode step — the serving engine reaching this path with one live
         // sequence is the ordinary single-stream shape — so it gets the window. B > 1
-        // does not: the batch routes a union over B rows, which grows the speculative
-        // set while the boundary it has to fit in stays the same, and that is the
-        // regime WASTE measured as a net loss on their chunk path.
-        let la_width = if router_lookahead() && s_n == 1 { router_lookahead_width() } else { 0 };
+        // historically did not. The multi-row enablement here fires only for a
+        // **true batched decode** step — one row per sequence, no multi-row verify
+        // batch (which is a server-side chunk-by-another-name). Detected by
+        // `owner.len() == distinct owners`, which is exactly the relationship a
+        // decode step has and a verify batch ($1 + \gamma$ rows per sequence) does
+        // not. Gated on [`router_lookahead_batch`] so the recall / precision
+        // trade-off is measurable (`COLI_PREDICT_EVAL=1`) and a default can be set
+        // from numbers rather than conjecture.
+        let batched_decode = s_n > 0 && {
+            let mut seen = std::collections::HashSet::with_capacity(seqs.len());
+            owner.iter().all(|&o| seen.insert(o)) && seen.len() == s_n
+        };
+        let la_width = if router_lookahead() && (s_n == 1 || (batched_decode && router_lookahead_batch())) {
+            router_lookahead_width()
+        } else {
+            0
+        };
         let la = (la_width > 0).then(|| self.lookahead_ctx()).flatten();
         let layers: &[LayerW] = &self.layers;
         for (li, l) in layers.iter().enumerate() {
@@ -3572,11 +3952,14 @@ impl Model {
     /// forwards (`&mut self`); the batch engine invokes it periodically so residency
     /// adapts to the workload without a rewrite.
     pub fn reheat(&mut self) -> Result<(), Error> {
-        let Some(counts) = self.heat.as_ref().map(|h| h.snapshot()) else {
+        // Frequency, recency and clock read together: `COLI_GPU_TIER_SWAP=lfru`
+        // scores the first two against the third, and three separate reads would
+        // let a generation age its stamps against a clock from another forward.
+        let Some((counts, last, clock)) = self.heat.as_ref().map(|h| h.snapshot_all()) else {
             return Ok(());
         };
         if let Some(gpu) = self.gpu.as_mut() {
-            gpu.reheat(&self.st, &self.cfg, &counts)?;
+            gpu.reheat(&self.st, &self.cfg, &crate::gpu::HeatView { counts: &counts, last: &last, clock })?;
         }
         // Runtime expert replication: warm the top-K hottest resident experts
         // into the CPU warm cache too, so a bias shift toward CPU never pays
@@ -3664,6 +4047,57 @@ impl Model {
     /// sequences draft, and a `&mut` here would have serialised them behind the
     /// one borrow.
     pub fn mtp_draft(&self, next_tok: i32, g_draft: usize, hlast: &[f32]) -> Result<Vec<i32>, Error> {
+        self.mtp_draft_with(next_tok, g_draft, hlast, |lo| crate::sample::argmax(lo) as i32)
+    }
+
+    /// Draft `g_draft` tokens **sampled from `sampler`'s own distribution**,
+    /// returning each draft alongside the distribution `q` it was drawn from.
+    ///
+    /// The sampled twin of [`Self::mtp_draft`], and the half of `COLI_DRAFT_SAMPLED`
+    /// that makes the other half correct. [`crate::speculative_sample`] proves
+    /// its output is distributed exactly as the target `p` **given that the
+    /// draft was drawn from the `q` it is handed** — so a draft picked by argmax
+    /// and described by a softmax would break the guarantee while looking
+    /// entirely reasonable. `pick_with_distribution` draws and describes in one
+    /// call precisely so the two cannot come apart.
+    ///
+    /// **Cost, stated because it is not obvious**: `q` is dense over the
+    /// vocabulary, so a depth-`g` draft holds `g * vocab` floats per sequence
+    /// between ticks — ~2.4 MB per sequence at GLM-5.2's vocab and `g = 4`. The
+    /// nucleus zeroes most of it; a sparse form would trade that for a second
+    /// representation of the same distribution, and getting *those* out of sync
+    /// is the failure this function exists to prevent.
+    pub fn mtp_draft_sampled(
+        &self,
+        next_tok: i32,
+        g_draft: usize,
+        hlast: &[f32],
+        sampler: &mut Sampler,
+    ) -> Result<(Vec<i32>, Vec<Vec<f32>>), Error> {
+        let mut qs: Vec<Vec<f32>> = Vec::with_capacity(g_draft);
+        let drafts = self.mtp_draft_with(next_tok, g_draft, hlast, |lo| {
+            let (t, q) = sampler.pick_with_distribution(lo);
+            qs.push(q);
+            t as i32
+        })?;
+        Ok((drafts, qs))
+    }
+
+    /// The shared body of [`Self::mtp_draft`] and [`Self::mtp_draft_sampled`],
+    /// parameterized only by how a draft token is chosen from its logits.
+    ///
+    /// One body, because the *rest* of the draft — the MTP layer, the local KV,
+    /// the hidden that feeds the next step — must be identical between the two.
+    /// Two copies would let the greedy and sampled paths drift, and the drift
+    /// would appear as an acceptance rate quietly falling rather than as a test
+    /// failing.
+    fn mtp_draft_with(
+        &self,
+        next_tok: i32,
+        g_draft: usize,
+        hlast: &[f32],
+        mut pick: impl FnMut(&[f32]) -> i32,
+    ) -> Result<Vec<i32>, Error> {
         let d = self.cfg.hidden as usize;
         let eps = self.cfg.eps;
         let vocab = self.cfg.vocab as usize;
@@ -3720,7 +4154,7 @@ impl Model {
             forward_layer(&mtp.layer, n_layers, &mut kv, &ctx, &mut hx, 1, g)?;
             let row = rmsnorm_rows(&hx, &mtp.mtp_norm, 1, d, eps);
             let logit = lm_head.apply_vec(&row, 1);
-            let t2 = crate::sample::argmax(&logit) as i32;
+            let t2 = pick(&logit);
             draft.push(t2);
             tok = t2;
             h = hx; // next hidden = this MTP layer's output
@@ -3839,6 +4273,96 @@ mod tests {
         }
         build_tiny_model(&d)?;
         Ok(d)
+    }
+
+    /// `accept_run_sampled` must emit the request's own distribution.
+    ///
+    /// Model-free on purpose: this is the *rule*, and the rule is what has to be
+    /// right. The engine's job is only to hand it `q` from the same draw that
+    /// produced the draft, which `mtp_draft_sampled` guarantees structurally.
+    ///
+    /// Measured on the **first emitted token of the run**, because that is the
+    /// token the accept decision produces: `draft[0]` when accepted, the
+    /// residual draw when not (`batch.rs` builds `run = draft[..k] ++ next`).
+    /// Every verify row carries the same target logits, so the reference
+    /// distribution is exactly `Sampler::distribution` over them.
+    #[test]
+    fn sampled_speculation_emits_the_requests_own_distribution() {
+        const VOCAB: usize = 6;
+        const G: usize = 3;
+        const N: usize = 40_000;
+        // Target and proposal are deliberately different distributions — a
+        // proposal that already matched the target would make this test pass
+        // for a rule that ignored `q` entirely.
+        let target = [2.0f32, 0.5, -1.0, 1.25, 0.0, -0.5];
+        let proposal = [-1.0f32, 1.5, 2.0, -0.5, 0.75, 0.25];
+
+        let mut reference = Sampler::new(0.9, 1.0, 12345);
+        let p_ref: Vec<f32> = reference.distribution(&target).to_vec();
+        let q_ref: Vec<f32> = Sampler::new(0.9, 1.0, 1).distribution(&proposal).to_vec();
+        let tv: f64 = p_ref.iter().zip(&q_ref).map(|(a, b)| (*a as f64 - *b as f64).abs()).sum::<f64>() / 2.0;
+        assert!(tv > 0.3, "proposal must actually differ from target, TV = {tv:.3}");
+
+        // `rows` repeats the target: row k judges draft k, and a bonus draw past
+        // the accepted run comes from the same distribution, so the emitted
+        // first token is p-distributed whichever branch it took.
+        let rows: Vec<f32> = (0..G + 1).flat_map(|_| target.iter().copied()).collect();
+
+        let mut sampler = Sampler::new(0.9, 1.0, 0xC0FFEE);
+        let mut drafter = Sampler::new(0.9, 1.0, 0xDECAF);
+        let mut hist = [0u32; VOCAB];
+        let mut accepted_total = 0usize;
+        for _ in 0..N {
+            let mut drafts = Vec::with_capacity(G);
+            let mut qs = Vec::with_capacity(G);
+            for _ in 0..G {
+                let (t, q) = drafter.pick_with_distribution(&proposal);
+                drafts.push(t as i32);
+                qs.push(q);
+            }
+            let (k, next) = accept_run_sampled(&rows, VOCAB, &drafts, &qs, &mut sampler);
+            accepted_total += k;
+            let first = if k > 0 { drafts[0] } else { next };
+            hist[first as usize] += 1;
+        }
+        for (i, &p) in p_ref.iter().enumerate() {
+            let freq = hist[i] as f64 / N as f64;
+            assert!(
+                (freq - p as f64).abs() < 0.015,
+                "token {i}: emitted {freq:.4} vs target {p:.4} — speculation changed the output distribution"
+            );
+        }
+        // A rule that rejected everything would also pass the histogram check
+        // (the bonus draw is p-distributed), and would be a speedup of zero.
+        // With a mismatched proposal some drafts must still land.
+        assert!(accepted_total > 0, "no draft was ever accepted — speculation bought nothing");
+    }
+
+    /// A malformed round must fall back to plain sampling, not to a guess.
+    #[test]
+    fn a_missing_or_out_of_vocab_draft_distribution_stops_the_run() {
+        const VOCAB: usize = 4;
+        let target = [1.0f32, 0.0, 0.0, 0.0];
+        let rows: Vec<f32> = (0..3).flat_map(|_| target.iter().copied()).collect();
+        let q: Vec<f32> = Sampler::new(1.0, 1.0, 1).distribution(&target).to_vec();
+
+        // Two drafts, one `q`: the second cannot be scored against anything, so
+        // the run must stop rather than invent a distribution for it.
+        let mut s = Sampler::new(1.0, 1.0, 7);
+        let (k, _) = accept_run_sampled(&rows, VOCAB, &[0, 0], std::slice::from_ref(&q), &mut s);
+        assert!(k <= 1, "a draft with no recorded q must not be accepted: k = {k}");
+
+        // An out-of-vocabulary draft id cannot index `p`/`q` — reject, never index.
+        let mut s = Sampler::new(1.0, 1.0, 7);
+        let (k, next) = accept_run_sampled(&rows, VOCAB, &[99], &[q], &mut s);
+        assert_eq!(k, 0, "an out-of-vocab draft is not acceptable");
+        assert!((next as usize) < VOCAB, "the replacement token must be in vocabulary");
+
+        // No drafts at all is the historical single-token step.
+        let mut s = Sampler::new(1.0, 1.0, 7);
+        let (k, next) = accept_run_sampled(&rows, VOCAB, &[], &[], &mut s);
+        assert_eq!(k, 0);
+        assert!((next as usize) < VOCAB);
     }
 
     #[test]
@@ -4002,6 +4526,20 @@ mod tests {
             t.lane
         );
         assert!(t.cache_hit_rate.is_some(), "a warm cache exists, so its hit rate is reported");
+        // Routing entropy must reach the telemetry snapshot, not just the model.
+        // Before this field existed, `routing_entropy_ewma()` documented itself
+        // "for telemetry scrapes" and no telemetry structure carried it, so the
+        // value was computed every forward and readable by nothing.
+        assert_eq!(
+            t.entropy_ewma,
+            m.routing_entropy_ewma(),
+            "telemetry must carry the model's routing entropy, not a default"
+        );
+        assert!(
+            t.entropy_ewma > 0.0,
+            "a forward that routed experts has non-zero routing entropy; got {}",
+            t.entropy_ewma
+        );
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -4262,6 +4800,32 @@ mod tests {
         assert!(streamed > 0, "warm tier must stream experts (got {streamed})");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    /// The LLC-miss control law, which cannot be exercised end to end here:
+    /// `perf_event_open` is refused on most VMs and CI, so the live-counter path
+    /// would pass by never running.
+    #[test]
+    fn llc_trend_holds_while_seeding_and_inside_the_dead_band() {
+        // No trend yet — the first observation records and must not steer, or the
+        // counter's whole accumulated history reads as a one-forward spike.
+        assert_eq!(llc_trend(0.0, 1_000_000.0), 0, "seeding observation must not steer");
+        assert_eq!(llc_trend(-1.0, 1_000_000.0), 0, "a negative EWMA is not a trend either");
+        // Inside ±10% is noise on a thread-following counter, not signal.
+        assert_eq!(llc_trend(1000.0, 1000.0), 0);
+        assert_eq!(llc_trend(1000.0, 1099.0), 0, "just inside the upper band");
+        assert_eq!(llc_trend(1000.0, 901.0), 0, "just inside the lower band");
+    }
+
+    #[test]
+    fn llc_trend_widens_on_rising_misses_and_narrows_on_falling() {
+        // The direction `telemetry.rs` documents. Pinned here so the loop cannot
+        // be silently inverted by a later edit — it is a hypothesis about the
+        // signal, and an untested hypothesis is indistinguishable from a typo.
+        assert_eq!(llc_trend(1000.0, 1101.0), 1, "rising misses widen");
+        assert_eq!(llc_trend(1000.0, 5000.0), 1);
+        assert_eq!(llc_trend(1000.0, 899.0), -1, "falling misses narrow");
+        assert_eq!(llc_trend(1000.0, 0.0), -1);
     }
 
     #[test]
