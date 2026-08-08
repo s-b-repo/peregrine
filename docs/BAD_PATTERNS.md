@@ -159,6 +159,16 @@ It exists because five instances shipped, and every one was found by hand:
 | `COLI_PERF_COUNTERS` → `open_l3_miss_counter` | ✅ twice in `todo.md`, plus `DESIGN.md`, `README.md`, `docs/configuration.md`, `docs/io-and-storage.md`, `docs/adaptive-runtime.md` — "consumers feed `PerfCounter::read` deltas into the prefetch tuner" | that consumer does not exist; nothing calls the opener |
 | `SlabPool::checkout_tagged` / `checkin_tagged` | ✅ in `todo.md` as recycling-by-generation; `docs/io-and-storage.md` describes the safety property as active | untagged `checkout`/`checkin` are used (7 and 5 sites); the generation-tagged variants that stop a straggler write into a recycled slab have zero callers, including tests |
 
+*The "Reality" column records the state **at discovery** and is deliberately not
+rewritten — this table is the audit's evidence, not a status board. Resolutions
+are tracked in `todo.md`. As of 2026-08-06: `solve_residency_sized`,
+`Placement::GpuSpill`, `COLI_REGBUF` and `COLI_PERF_COUNTERS` are wired (the
+perf counter is opened on the decode thread in `peregrine-engine`'s `serve` and
+read at shutdown). Note the counter's row overstates what was fixed: the opener
+now has a caller, but the **documented consumer** — miss deltas steering the
+prefetch tuner — is a separate piece of work, and a row can be half-resolved
+without the list saying so.*
+
 **The audit could not see its own headline example, until 2026-08-02.** It
 recorded one definition site per name (`defs.setdefault`) and excluded exactly
 that line from the reference scan. A symbol declared twice — the
@@ -185,7 +195,7 @@ the signal rather than the count.
 |---|---|---|
 | **LFRU eviction** (`tier.rs`) | six doc sites + two ✅ roadmap entries; `todo.md` specifically said "**not** plain LRU" | zero callers anywhere. The live policy is `warmcache.rs::evict_to_budget` — priority-weighted LRU. Heat never enters the victim score |
 | **DSA sparse attention** (`dsa.rs`, `mla_attention_dsa`) | `DESIGN.md` M5, `model-format.md` "auto-detected", vs-colibrì feature table | `Indexer` is never constructed and nothing appends a key, so the path cannot run even if something called it |
-| **`peregrine-sched`** | `README.md` status table: ✅, "`moe_streamed` overlaps io_uring streaming ∥ CPU compute" | **no crate depends on it.** Production MoE is `peregrine-model/concurrent.rs`. It is not used as an oracle either — no test compares the two |
+| **`peregrine-sched`** | `README.md` status table: ✅, "`moe_streamed` overlaps io_uring streaming ∥ CPU compute" | **no crate depends on it.** Production MoE is `peregrine-model/concurrent.rs`. It is not used as an oracle either — no test compares the two *(resolved 2026-08-06: `streamed_matches_the_production_concurrent_path` now compares them over the same container bytes; still no dependents, which is now the point rather than the defect)* |
 | **MTP speculative decode** | vs-colibrì: "MTP head wired" | `generate_speculative` has no caller in either binary; there is no `--draft` flag or `DRAFT` knob |
 
 All four doc sets are now corrected. The code is left in place: deleting a
@@ -240,9 +250,30 @@ swallows; the ignored-closure form `…or_else(|_e|` *is* gated).
 
 ## Current status
 
-`--strict` is green: **P=0, B=0, U=0, C=0, Q=0, I=0** (informational: L=16
-let-else sites, R=50 unreferenced `pub fn`s; 55 files; `peregrine-token` excluded
-as vendored). Of the R list, five entries were confirmed as genuine unreachable
+`--strict` is green: **P=0, B=0, U=0, C=0, Q=0, I=0** (informational: L=23
+let-else sites, R=21 unreferenced `pub fn`s; 62 files; `peregrine-token` excluded
+as vendored).
+
+*These counts had drifted — this block read `L=16, R=50, 55 files` while the gate
+reported `L=23, R=21, 62 files`, which is the same failure the gate exists to
+catch, one level up: a status line nobody re-ran. Regenerate it from
+`scripts/audit-bad-patterns.sh --strict` rather than editing the numbers by hand.
+The gate also reads the **working tree**, not the index, so "green" is a property
+of what is checked out — a green HEAD says nothing about a dirty tree, and a
+2026-08-08 session proved it by regressing all five strict sections to
+`P=9, B=18, C=2` without touching a committed line.*
+
+**All ten first-party crates now carry
+`#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`** —
+`peregrine-tools` was the last holdout and qualified all along, so adopting it
+was a ratchet rather than a cleanup. Note each binary target is its own crate
+root, so that crate carries the attribute five times. Integration tests under
+`crates/*/tests/` are separate crates again and inherit **no** crate-root
+attribute, so `clippy.toml`'s `allow-expect-in-tests = false` is unenforced
+there and has to be kept by hand; the audit does not scan them either
+(`*/src/*` only).
+
+Of the R list, five entries were confirmed as genuine unreachable
 features and are catalogued in [R] above; the rest are library API the binaries
 do not happen to call. Two of the five — the `perf_event_open` counter and the
 slab pool's generation tagging — were downgraded from ✅ to 🟡 in `todo.md` when
