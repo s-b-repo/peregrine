@@ -16,6 +16,12 @@ cuda = ["peregrine-model/cuda"]
 
 [dependencies]
 peregrine-model = { path = "../peregrine-model" }
+# Alternative MoE engine, installed only when COLI_MOE_ENGINE selects it.
+# engine -> sched -> model is acyclic; model -> sched would not be.
+peregrine-sched = { path = "../peregrine-sched" }
 peregrine-core = { path = "../peregrine-core" }
 peregrine-tools = { path = "../peregrine-tools" }
+# `flip-rate` measures a lossy container against its source on real text, and
+# random token ids are not real text — see the subcommand's note.
+peregrine-token = { path = "../peregrine-token" }
 serde_json.workspace = true
