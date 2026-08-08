@@ -1,0 +1,2 @@
+be3ba8b todo.md: settle the "can we match colibri's disk read" question in writing
+built 2026-08-03T21:56:09+02:00

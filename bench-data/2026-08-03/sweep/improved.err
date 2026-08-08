@@ -1,0 +1,6 @@
+peregrine: [ram] avail 32.6 GB | resident 10.9 + KV 0.7 + stream 3.8 + slack 1.2 + cache 4.3 -> peak 20.9 GB
+peregrine: O_DIRECT streaming enabled
+peregrine bench: loaded 78 layers, vocab 154880, in 12.2s
+    [ecache] disk_reads this batch: 1645
+    [ecache] disk_reads this batch: 3900
+    [ecache] disk_reads this batch: 7922

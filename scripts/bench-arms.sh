@@ -16,6 +16,12 @@ BIN_GPU=${BIN_GPU:-target/cuda/release/peregrine}
 BATCHES=${BATCHES:-"1 4 16"}
 STEPS=${COLI_BENCH_STEPS:-3}
 ECACHE=${COLI_ECACHE_GB:-4}
+# Draft depth γ for the speculative arms (`spec`, `spec_gpu`). 4 is the floor of
+# the production stack's guidance (GLM-5.2 reports 2.76 accepted per round at γ=4
+# — already 82 % of that configuration's 1+γ ceiling). The default keeps the eight
+# other knobs' published numbers unchanged when an operator chooses to leave
+# speculation off.
+DRAFT=${COLI_DRAFT:-4}
 
 OUT=${1:?usage: bench-arms.sh <out-dir> [arm ...]}
 shift
@@ -55,6 +61,57 @@ arm_env() {
         # caller's `|| exit 1` would kill the whole sweep — keep it an if.
         if [ "$1" = gpu ]; then echo "COLI_GPU=1"; fi
         ;;
+    # The speculative arm: the same knob bundle as `improved`, plus the MTP draft
+    # depth. `bench --draft $DRAFT` enables batched verify — every step drafts γ
+    # tokens per sequence, then verifies B·(1+γ) rows in one forward, sharing one
+    # expert-read union per step. Off when the checkpoint has no MTP head; the
+    # bench harness refuses loudly rather than silently decoding non-speculatively.
+    # Bit-identical to greedy per-token decode by construction (`accept_run` is the
+    # one definition). Compares **directly** to `improved`: |spec| − |improved| is
+    # the speculation speedup. `tok/s` in the table is verified tokens, `agg
+    # tok/s` is forward-issued tokens (the two diverge with the accept length).
+    spec)
+        echo "COLI_DIRECT=1"
+        echo "COLI_IO_TUNE=1"
+        echo "COLI_LANE_BALANCE=1"
+        echo "COLI_SHAPE_SPECIALIZE=1"
+        echo "COLI_HYPER_SCHED=1"
+        echo "COLI_PREFETCH_TUNE=1"
+        echo "COLI_ENTROPY_ADAPT=1"
+        echo "COLI_REPLICATE_K=8"
+        echo "COLI_DRAFT=$DRAFT"       # MTP speculative batched verify
+        ;;
+    spec_gpu)
+        echo "COLI_DIRECT=1"
+        echo "COLI_IO_TUNE=1"
+        echo "COLI_LANE_BALANCE=1"
+        echo "COLI_SHAPE_SPECIALIZE=1"
+        echo "COLI_HYPER_SCHED=1"
+        echo "COLI_PREFETCH_TUNE=1"
+        echo "COLI_ENTROPY_ADAPT=1"
+        echo "COLI_REPLICATE_K=8"
+        echo "COLI_DRAFT=$DRAFT"
+        echo "COLI_GPU=1"
+        ;;
+    # The batched router look-ahead arm: prefetch the cross-row union of the next
+    # layer's top experts (gated by `COLI_ROUTER_LOOKAHEAD_BATCH`). `width` is the
+    # per-step IO budget (never `width × s_n`), deduped so the prefetch depth
+    # matches disk's idle window. Recall against the next layer's actual routed
+    # set is what `COLI_PREDICT_EVAL=1` measures here; bit-identical either way
+    # because the authoritative router still decides.
+    lookahead_batch)
+        echo "COLI_DIRECT=1"
+        echo "COLI_IO_TUNE=1"
+        echo "COLI_LANE_BALANCE=1"
+        echo "COLI_SHAPE_SPECIALIZE=1"
+        echo "COLI_HYPER_SCHED=1"
+        echo "COLI_PREFETCH_TUNE=1"
+        echo "COLI_ENTROPY_ADAPT=1"
+        echo "COLI_REPLICATE_K=8"
+        echo "COLI_ROUTER_LOOKAHEAD_BATCH=1"   # on by default; explicit for measurement
+        echo "COLI_PREDICT_EVAL=1"             # recall/precision scoreboard
+        echo "COLI_PREDICT_EVAL_N=8"           # 8 arms × s_n batched recall
+        ;;
     *)
         echo "unknown arm: $1" >&2
         return 1
@@ -62,9 +119,22 @@ arm_env() {
     esac
 }
 
+# Extra `peregrine bench` positional args per arm. Used by the speculative arms to
+# pass `--draft N` (parsed by the bench loop's own `draft_depth`). `--` compounds the
+# splitter to word-splitting; otherwise the literal `--draft N` is one identity token
+# to bash.
+arm_bench_extra() {
+    case "$1" in
+    spec | spec_gpu) echo "--draft $DRAFT" ;;
+    *) echo "" ;;
+    esac
+}
+
 for arm in $ARMS; do
     bin=$BIN_CPU
-    [ "$arm" = gpu ] && bin=$BIN_GPU
+    case "$arm" in
+        gpu | spec_gpu) bin=$BIN_GPU ;;
+    esac
     if [ ! -x "$bin" ]; then
         echo "== arm $arm SKIPPED: no binary at $bin" | tee -a "$OUT/summary.txt"
         continue
@@ -72,8 +142,9 @@ for arm in $ARMS; do
 
     env_lines=$( { base_env; arm_env "$arm"; } ) || exit 1
     printf '%s\n' "$env_lines" >"$OUT/$arm.env"
+    extra=$(arm_bench_extra "$arm")
 
-    echo "== arm $arm: $bin  batches=[$BATCHES] steps=$STEPS" | tee -a "$OUT/summary.txt"
+    echo "== arm $arm: $bin  batches=[$BATCHES] steps=$STEPS extra=[$extra]" | tee -a "$OUT/summary.txt"
     # Run under a memory-capped cgroup so a runaway arm is killed in its own
     # scope instead of letting the global OOM killer pick a victim elsewhere on
     # the box (this machine also hosts a VM). MEMMAX= disables the cap.
@@ -83,7 +154,7 @@ for arm in $ARMS; do
     fi
     # shellcheck disable=SC2046  # word splitting is how we turn lines into env args
     env $(printf '%s ' $env_lines) "${cap[@]}" \
-        scripts/runstat.py "$OUT/$arm.stat" "$bin" bench $BATCHES \
+        scripts/runstat.py "$OUT/$arm.stat" "$bin" bench $BATCHES $extra \
         >"$OUT/$arm.out" 2>"$OUT/$arm.err"
     rc=$?
 
