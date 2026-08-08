@@ -29,7 +29,10 @@ typedef struct ColiCudaGraph ColiCudaGraph;
 /* Devices are CUDA ordinals, not positions in the input list. */
 COLI_CUDA_DLLEXPORT int coli_cuda_init(const int *devices, int count);
 COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
+/* contexts THIS PROCESS initialized — the set you may address */
 COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
+/* devices the DRIVER reports, before/without init — "does this host have a GPU" */
+COLI_CUDA_DLLEXPORT int coli_cuda_probe_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
 /* device < 0 returns aggregate statistics for all configured devices. */
@@ -74,6 +77,37 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            ColiCudaTensor *const *downs,
                            const int *rows, int count,
                            float *y, const float *x);
+
+/* Same dispatch with an explicit WMMA fragment shape for the W4A16 Tensor Core
+ * arm (COLI_CUDA_TC_W4A16). Legal fp16 shapes are 16x16x16, 32x8x16 and 8x32x16;
+ * 0/0/0 or anything else means "the 16x16x16 default", which is what
+ * coli_cuda_expert_group passes. `WmmaTuner` measures per (D, I, count, rows)
+ * shape and selects. Fragment shapes are compile-time in WMMA, so this selects
+ * among instantiations rather than parameterizing one.
+ *
+ * `arm_out` (may be NULL) reports which kernel arm ran: 0 = int4 Tensor Core,
+ * 1 = W4A16 Tensor Core (the only one the tile reaches), 2 = packed-W4,
+ * 3 = generic. A tuner needs it to know whether its tile was consulted at all. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_tiled(ColiCudaTensor *const *gates,
+                           ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs,
+                           const int *rows, int count,
+                           float *y, const float *x,
+                           int tile_m, int tile_n, int tile_k,
+                           int *arm_out);
+
+/* Same dispatch, with the layer-level gate-weighted reduce fused on the device.
+ * `out` is [s_n, D] instead of [sum(rows), D]: output row `s` accumulates the
+ * y-rows listed in row_idx[row_ptr[s] .. row_ptr[s+1]], each scaled by rw[].
+ * CSR, ascending, no atomics — so the sum order is fixed by the caller's layout
+ * and the result is identical run to run. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_reduce(ColiCudaTensor *const *gates,
+                           ColiCudaTensor *const *ups,
+                           ColiCudaTensor *const *downs,
+                           const int *rows, int count,
+                           const int *row_ptr, const int *row_idx,
+                           const float *rw, int s_n,
+                           float *out, const float *x);
 
 /* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,
@@ -148,6 +182,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_graph_begin(int device);
 COLI_CUDA_DLLEXPORT int coli_cuda_graph_end(int device, ColiCudaGraph **out);
 COLI_CUDA_DLLEXPORT int coli_cuda_graph_launch(ColiCudaGraph *g);
 COLI_CUDA_DLLEXPORT void coli_cuda_graph_free(ColiCudaGraph *g);
+
+/* Expert-group graph cache (COLI_CUDA_GRAPH=1): coli_cuda_expert_group captures
+ * its launch sequence per shape and replays it. `uncacheable` counts calls that
+ * fell through to the eager path with the knob on (the W4A16 arm, profiling, or
+ * synchronous staging) — replays at zero with uncacheable high means the knob
+ * is enabled and buying nothing. */
+COLI_CUDA_DLLEXPORT void coli_cuda_graph_cache_stats(uint64_t *captures, uint64_t *replays,
+                                       uint64_t *invalidations, uint64_t *uncacheable);
 
 #ifdef __cplusplus
 }

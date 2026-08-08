@@ -172,12 +172,18 @@ Record flip rates next to the byte savings. A halved working set at an
 unacceptable flip rate is not a win, and the point of measuring is to be able to
 say which it is.
 
-## 4. The CUDA lane — never exercised
+## 4. The CUDA lane
 
-No GPU has ever run this code.
+**This section said "no GPU has ever run this code" until 2026-08-06. That was
+already false when written** — `benchmarks.md` §GPU lane records a measured run
+(1.09×, 62 residents, `[CUDA] device 0: NVIDIA GeForce RTX 3060, 12.5 GB VRAM,
+sm_86`). The dev box has `nvcc` (CUDA 13.3) and one RTX 3060, and all six
+`peregrine-cuda` tests pass on it, graph capture and replay included. What the
+box does *not* have is a **second** GPU, a second host, or a GDS driver stack —
+that is the real boundary, and it is narrower than this section claimed.
 
 ```bash
-cargo test -p peregrine-cuda --features cuda      # incl. graph capture/replay
+CARGO_TARGET_DIR=target/cuda cargo test -p peregrine-cuda --features cuda   # incl. graph capture/replay
 scripts/bench-arms.sh out/gpu-$(date +%F) gpu
 ```
 
@@ -188,8 +194,82 @@ Two specifics worth checking beyond "does it run":
   bytes. The VRAM knapsack sizes residents from a *single* `bytes_per_expert`, so
   an int3 container with `COLI_GPU_INT4=1` may plan N experts and upload 8N worth.
   Expect eviction thrash or CUDA OOM; confirm before trusting a GPU int3 run.
-- **`build.rs` succeeds without `nvcc`**, so nothing in this repo has ever
-  syntax-checked the `.cu` file against a real toolchain.
+- **`build.rs` used to succeed whether `nvcc` was missing *or* the `.cu` failed
+  to compile** — one `cargo:warning` and a success exit for both, and nothing
+  greps build warnings, so a broken kernel edit left the build green. Fixed
+  2026-08-06: an absent toolkit is still a warning (a CPU-only host must build
+  the workspace), but a toolkit that is present and rejects the source now fails
+  the build. On this box that means every `.cu` edit is compiled for real.
+
+### 4a. FIRST: is the CUDA driver even usable? (2026-08-08)
+
+**Check this before anything else in §4, because failure here is silent.** The
+kernel module and the userspace CUDA driver library can be different versions
+after an upgrade without a reboot, and `init(&[0])` then returns 0 — so every
+GPU-gated test returns early and the suite reports `ok`. A green run is not
+evidence a kernel executed.
+
+```bash
+nvidia-smi -L                      # "Failed to initialize NVML: Driver/library version mismatch" ⇒ reboot
+cat /proc/driver/nvidia/version    # kernel module version
+# Positive check, because the negative one is what lies:
+CARGO_TARGET_DIR=target/cuda cargo test -p peregrine-cuda --features cuda -- --nocapture 2>&1 \
+  | grep -c "device discovery"     # any hits ⇒ NO device; every GPU test skipped
+```
+
+This was the state on 2026-08-08 (module 610.43.02, library 610.57). **The box
+was rebooted at 14:08 that day and it is now clear** — both sides 610.57.04,
+`nvidia-smi` reports the RTX 3060 12 GB, and the GPU-gated tests execute (17
+passing in `peregrine-cuda`). The check stays first in this section because the
+failure mode recurs on every driver upgrade, and because the run that first
+executed those tests found a test asserting a premise it had destroyed and a real
+arm-reporting bug — see `todo.md` §0. §4b below is still unmeasured: that run was
+a *correctness* pass, not a throughput one.
+
+### 4b. The three 2026-08-08 GPU knobs
+
+All three are opt-in and all three are unmeasured. Run each arm for **200 s+ and
+take medians** — the box's OSX-KVM VM plus a VNC helper swing ~50 s runs by ±45 %.
+
+```bash
+# Graph cache: the claim is fewer launches, so kernel time must stay FLAT while
+# wall clock drops. Check /metrics, not just the clock.
+for g in 0 1; do COLI_CUDA_GRAPH=$g scripts/bench-measure.sh out/graph-$g; done
+curl -s localhost:8080/metrics | jq '.gpu | {graph_captures,graph_replays,graph_invalidations,graph_uncacheable}'
+```
+
+- `graph_replays` **at or near zero while `graph_captures` tracks `calls`** means
+  the launch-shape key is churning: the knob is capturing on every call and is
+  strictly slower than not having it. Report that; do not ship a knob that never
+  hits.
+- `graph_invalidations` climbing steadily means residency or batch size is still
+  moving, so graphs are being discarded as fast as they are made.
+- `graph_uncacheable` high means the calls are taking the W4A16 arm or
+  `COLI_CUDA_PROFILE` is set — the knob is on and inert.
+
+```bash
+# Fused reduce: a BYTE win, and batch-size dependent by construction. B=1 cannot
+# show it — measure D2H at both, one batch size per fresh process.
+for b in 1 16; do
+  for f in 0 1; do
+    COLI_CUDA_FUSED_REDUCE=$f COLI_CUDA_PROFILE=1 \
+      scripts/bench-measure.sh out/reduce-b$b-f$f
+  done
+done
+```
+
+Expect `d2h_ms` to fall by roughly the expert-per-row factor at B=16 (~5× on the
+measured GLM-5.2 unions) and by **nothing** at B=1. A B=1-only run cannot
+distinguish "it worked" from "the regime had no win". Also confirm token values:
+this knob changes the GPU arm's low bits by design, so check it against
+`prediction_flip_rate`, not against a bit-identity anchor.
+
+```bash
+# WMMA autotune: needs the W4A16 arm to actually engage (compute ≥ 7.0 AND every
+# group clearing COLI_CUDA_TC_W4A16_MIN rows), or it records nothing at all.
+COLI_CUDA_TC_W4A16=1 COLI_CUDA_AUTOTUNE=1 scripts/bench-measure.sh out/autotune
+jq '.rows | length' <model_dir>/kernel_tuning.json   # 0 rows ⇒ the arm never ran
+```
 
 ## 5. Decode throughput and peak RSS
 

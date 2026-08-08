@@ -21,6 +21,8 @@ use peregrine_core::Error;
 
 #[cfg(feature = "cuda")]
 mod ffi {
+    //! Declarations only — every signature here mirrors one in `backend_cuda.h`.
+
     use std::os::raw::{c_int, c_void};
 
     /// Opaque device tensor handle — the host never dereferences it.
@@ -39,6 +41,7 @@ mod ffi {
         pub fn coli_cuda_init(devices: *const c_int, count: c_int) -> c_int;
         pub fn coli_cuda_shutdown();
         pub fn coli_cuda_device_count() -> c_int;
+        pub fn coli_cuda_probe_device_count() -> c_int;
         pub fn coli_cuda_mem_info(device: c_int, free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
         pub fn coli_cuda_tensor_upload(
             tensor: *mut *mut ColiCudaTensor,
@@ -71,10 +74,56 @@ mod ffi {
         pub fn coli_cuda_graph_end(device: c_int, out: *mut *mut ColiCudaGraph) -> c_int;
         pub fn coli_cuda_graph_launch(g: *mut ColiCudaGraph) -> c_int;
         pub fn coli_cuda_graph_free(g: *mut ColiCudaGraph);
+        pub fn coli_cuda_expert_group_tiled(
+            gates: *const *mut ColiCudaTensor,
+            ups: *const *mut ColiCudaTensor,
+            downs: *const *mut ColiCudaTensor,
+            rows: *const c_int,
+            count: c_int,
+            y: *mut f32,
+            x: *const f32,
+            tile_m: c_int,
+            tile_n: c_int,
+            tile_k: c_int,
+            arm_out: *mut c_int,
+        ) -> c_int;
+        pub fn coli_cuda_expert_group_reduce(
+            gates: *const *mut ColiCudaTensor,
+            ups: *const *mut ColiCudaTensor,
+            downs: *const *mut ColiCudaTensor,
+            rows: *const c_int,
+            count: c_int,
+            row_ptr: *const c_int,
+            row_idx: *const c_int,
+            rw: *const f32,
+            s_n: c_int,
+            out: *mut f32,
+            x: *const f32,
+        ) -> c_int;
+        pub fn coli_cuda_graph_cache_stats(
+            captures: *mut u64,
+            replays: *mut u64,
+            invalidations: *mut u64,
+            uncacheable: *mut u64,
+        );
     }
 
-    // Device-pointer pipe primitives — currently exercised only by the graph
-    // capture test; un-gate when the resident decode path (full A8) issues them.
+    // Device-pointer pipe primitives — exercised by the graph-capture tests.
+    //
+    // Every one of these runs on `ctx->stream` (see the ordering note above
+    // `coli_cuda_pipe_rmsnorm` in the `.cu`) — which is what makes them
+    // capturable, and, more urgently, what makes a chain of them ordered at all:
+    // that stream is `cudaStreamNonBlocking`, so an op on the default stream is
+    // not synchronized against the rest of the chain.
+    //
+    // **Still `#[cfg(test)]`, deliberately.** Un-gating so a plain
+    // `cargo check --features cuda` type-checks them against the header is
+    // worth doing — but only *with* the production caller. `mod ffi` is private,
+    // so a `pub fn` in it with no caller is dead code, and un-gating on its own
+    // trades one gate for nine `never used` warnings against a repo whose stated
+    // bar is zero. `#[allow(dead_code)]` is not the escape: the bad-patterns
+    // audit's `[C]` section treats lint suppression as a strict failure, which is
+    // the correct call. Un-gate when the device-resident forward issues them.
     #[cfg(test)]
     extern "C" {
         pub fn coli_cuda_pipe_alloc(device: c_int, bytes: usize) -> *mut c_void;
@@ -83,6 +132,15 @@ mod ffi {
         pub fn coli_cuda_pipe_download(device: c_int, src: *const c_void, dst: *mut c_void, bytes: usize) -> c_int;
         pub fn coli_cuda_pipe_silu_mul(device: c_int, gate_dev: *mut f32, up_dev: *const f32, n: usize) -> c_int;
         pub fn coli_cuda_pipe_add(device: c_int, x_dev: *mut f32, t_dev: *const f32, n: usize) -> c_int;
+        pub fn coli_cuda_pipe_rmsnorm(
+            device: c_int,
+            y_dev: *mut f32,
+            x_dev: *const f32,
+            w_dev: *const f32,
+            s: c_int,
+            d: c_int,
+            eps: f32,
+        ) -> c_int;
     }
 }
 
@@ -111,9 +169,33 @@ pub fn device_count() -> i32 {
     }
 }
 
+/// Devices the CUDA **driver** reports, without initializing any of them.
+///
+/// Distinct from [`device_count`], which counts the contexts *this process*
+/// built. Use this one to decide whether to call [`init`]; use that one to know
+/// which device indices are addressable afterwards.
+pub fn probe_device_count() -> i32 {
+    #[cfg(feature = "cuda")]
+    {
+        unsafe { ffi::coli_cuda_probe_device_count() as i32 }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
 /// Whether the GPU lane can run on this host.
+///
+/// **This was `device_count() > 0` until 2026-08-07, which made it false on a
+/// working GPU.** `device_count` reports initialized contexts, so the answer was
+/// 0 until `init` had already run — circular for anything trying to decide
+/// *whether* to init, and it reported "unavailable" on an RTX 3060 that the
+/// test suite was simultaneously driving. The defect was invisible because the
+/// function had no caller outside tests; wiring it into the startup banner is
+/// what surfaced it.
 pub fn is_available() -> bool {
-    device_count() > 0
+    probe_device_count() > 0
 }
 
 /// Human-readable backend status for startup logging.
@@ -336,6 +418,73 @@ fn free_tensor(t: *mut ffi::ColiCudaTensor) {
 /// full expert SwiGLU runs on the GPU. Returns `y` `[Σrows, hidden]` f32.
 #[cfg(feature = "cuda")]
 pub fn expert_group(experts: &[&GpuExpert], rows: &[i32], x: &[f32], hidden: usize) -> Result<Vec<f32>, Error> {
+    // Through the untiled C entry, not `expert_group_tiled(.., None)`. The two
+    // are the same code path on the C side, and routing everything through the
+    // tiled one would be tidier — but it would also leave the default,
+    // overwhelmingly common call reaching the kernels via an argument list that
+    // only the autotuner exercises. Keeping the historical entry point in use
+    // means the untuned path is the one that has always been running.
+    expert_group_dispatch(experts, rows, x, hidden, None, None)
+}
+
+/// Which kernel arm an `expert_group` call took.
+///
+/// Reported rather than re-derived: only [`GroupArm::W4A16`] consults the tile,
+/// so a tuner that guessed the arm from the same environment variables the
+/// backend reads would be a second copy of that decision — and a tuner recording
+/// a "winning tile" from a run that never took the tiled arm is recording noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupArm {
+    /// int4 Tensor Core (`COLI_CUDA_TC_INT4`). One legal WMMA shape, 8×8×32.
+    Int4Tc,
+    /// fp16 Tensor Core (`COLI_CUDA_TC_W4A16`) — **the only tile-sensitive arm**.
+    W4A16,
+    /// Packed-W4 scalar kernels.
+    PackedW4,
+    /// Generic per-format scalar kernels.
+    Generic,
+}
+
+impl GroupArm {
+    /// Gated with its only caller (`expert_group_tiled`): the enum is public and
+    /// useful to match on either way, but nothing decodes a C arm code in a
+    /// build with no C side, and an ungated private helper warns there.
+    #[cfg(feature = "cuda")]
+    fn from_c(v: i32) -> GroupArm {
+        match v {
+            0 => GroupArm::Int4Tc,
+            1 => GroupArm::W4A16,
+            2 => GroupArm::PackedW4,
+            _ => GroupArm::Generic,
+        }
+    }
+}
+
+/// [`expert_group`] with an explicit WMMA fragment shape for the W4A16 Tensor
+/// Core arm, returning the output **and the arm that produced it**. `None` is
+/// the 16×16×16 default, and is what `expert_group` passes.
+#[cfg(feature = "cuda")]
+pub fn expert_group_tiled(
+    experts: &[&GpuExpert],
+    rows: &[i32],
+    x: &[f32],
+    hidden: usize,
+    tile: Option<(u16, u16, u16)>,
+) -> Result<(Vec<f32>, GroupArm), Error> {
+    let mut arm: c_int = -1;
+    let y = expert_group_dispatch(experts, rows, x, hidden, tile, Some(&mut arm))?;
+    Ok((y, GroupArm::from_c(arm as i32)))
+}
+
+#[cfg(feature = "cuda")]
+fn expert_group_dispatch(
+    experts: &[&GpuExpert],
+    rows: &[i32],
+    x: &[f32],
+    hidden: usize,
+    tile: Option<(u16, u16, u16)>,
+    arm_out: Option<&mut c_int>,
+) -> Result<Vec<f32>, Error> {
     if experts.len() != rows.len() {
         return Err(Error::Format("expert_group: experts/rows length mismatch".into()));
     }
@@ -350,24 +499,182 @@ pub fn expert_group(experts: &[&GpuExpert], rows: &[i32], x: &[f32], hidden: usi
     let ups: Vec<*mut ffi::ColiCudaTensor> = experts.iter().map(|e| e.up).collect();
     let downs: Vec<*mut ffi::ColiCudaTensor> = experts.iter().map(|e| e.down).collect();
     let mut y = vec![0f32; total * hidden];
-    // SAFETY: gates/ups/downs each hold `count` valid handles; `rows` has `count`
-    // entries; `x` has Σrows*hidden f32 and `y` the same length. The call blocks
-    // until the kernels finish (internal stream sync) and returns 1 on success.
-    let ok = unsafe {
-        ffi::coli_cuda_expert_group(
-            gates.as_ptr(),
-            ups.as_ptr(),
-            downs.as_ptr(),
-            rows.as_ptr(),
-            experts.len() as c_int,
-            y.as_mut_ptr(),
-            x.as_ptr(),
-        )
+    // SAFETY (both arms): gates/ups/downs each hold `count` valid handles; `rows`
+    // has `count` entries; `x` has Σrows*hidden f32 and `y` the same length. The
+    // call blocks until the kernels finish (internal stream sync) and returns 1.
+    // Which C entry, keyed on whether the caller wants the arm reported — NOT on
+    // whether it named a tile.
+    //
+    // The untiled entry has no `arm_out` parameter, so it cannot answer that
+    // question: `arm` stays at its `-1` sentinel, which `GroupArm::from_c` maps
+    // to `Generic`. Keying this match on `tile` alone (as it did until
+    // 2026-08-08) therefore made `expert_group_tiled(.., None)` report `Generic`
+    // no matter which arm ran — and `None` is exactly what `gpu.rs` passes when
+    // the tuner selects an int4 tile, so the int4-arm observation its `match arm`
+    // deliberately keeps was dropped every time, and dropped permanently once
+    // `Int4Tc` became the recorded best for a shape.
+    //
+    // `{0,0,0}` is the C side's "default tile", so asking for the arm costs
+    // nothing beyond an argument list. `expert_group` passes both `None`s and so
+    // still reaches the kernels the historical way; see its own note.
+    let ok = match (tile, arm_out) {
+        (None, None) => unsafe {
+            ffi::coli_cuda_expert_group(
+                gates.as_ptr(),
+                ups.as_ptr(),
+                downs.as_ptr(),
+                rows.as_ptr(),
+                experts.len() as c_int,
+                y.as_mut_ptr(),
+                x.as_ptr(),
+            )
+        },
+        (tile, arm_out) => unsafe {
+            let (tm, tn, tk) = tile.unwrap_or((0, 0, 0));
+            ffi::coli_cuda_expert_group_tiled(
+                gates.as_ptr(),
+                ups.as_ptr(),
+                downs.as_ptr(),
+                rows.as_ptr(),
+                experts.len() as c_int,
+                y.as_mut_ptr(),
+                x.as_ptr(),
+                tm as c_int,
+                tn as c_int,
+                tk as c_int,
+                arm_out.map_or(std::ptr::null_mut(), |a| a as *mut c_int),
+            )
+        },
     };
     if ok == 1 {
         Ok(y)
     } else {
         Err(Error::Format("cuda expert_group failed".into()))
+    }
+}
+
+/// The CSR layout [`expert_group_reduce`] accumulates through, built once from
+/// a per-y-row destination and weight.
+///
+/// Split out and made public so the *ordering* — the thing that fixes the
+/// result bit-for-bit — is testable without a GPU. [`Self::build`] is the only
+/// place that decides it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReduceLayout {
+    /// `[s_n + 1]`, ascending; `row_ptr[s_n] == total`.
+    pub row_ptr: Vec<i32>,
+    /// `[total]`, the y-row indices contributing to each output row, **ascending
+    /// within each row** — which is what makes the device sum deterministic.
+    pub row_idx: Vec<i32>,
+}
+
+impl ReduceLayout {
+    /// Build the CSR from `dst[k]` = which output row y-row `k` contributes to.
+    ///
+    /// A counting sort, not a sort-by-key: it visits `k` in ascending order and
+    /// appends, so each output row's contribution list comes out ascending in
+    /// `k` — and `k` is batch-union (`pos`) order, so the device sums experts in
+    /// the same order the host reduce does. Getting this wrong would not fail
+    /// anything; it would just quietly change the low bits.
+    ///
+    /// `None` when any `dst` is out of range, rather than dropping the row: a
+    /// silently discarded contribution is a token computed from fewer experts
+    /// than the router selected.
+    pub fn build(dst: &[usize], s_n: usize) -> Option<ReduceLayout> {
+        if dst.iter().any(|&s| s >= s_n) {
+            return None;
+        }
+        let mut counts = vec![0i32; s_n + 1];
+        for &s in dst {
+            counts[s + 1] += 1;
+        }
+        for s in 0..s_n {
+            counts[s + 1] += counts[s];
+        }
+        let row_ptr = counts.clone();
+        let mut fill = counts;
+        let mut row_idx = vec![0i32; dst.len()];
+        for (k, &s) in dst.iter().enumerate() {
+            let at = fill[s] as usize;
+            row_idx[at] = i32::try_from(k).ok()?;
+            fill[s] += 1;
+        }
+        Some(ReduceLayout { row_ptr, row_idx })
+    }
+}
+
+/// [`expert_group`] with the layer-level gate-weighted reduce fused on the
+/// device: returns `[s_n, hidden]` instead of `[Σrows, hidden]`.
+///
+/// `dst[k]` is the batch row y-row `k` contributes to and `rw[k]` its router
+/// weight. The D2H shrinks from `Σrows` rows to `s_n` — at a saturated batch
+/// that is the expert-per-row factor, ~5× on the measured GLM-5.2 unions at
+/// B=16, and exactly 1× at B=1, which is why this is a knob and not a default.
+///
+/// **The summation order changes** relative to running the host reduce over the
+/// same experts (GPU contributions now accumulate among themselves before
+/// meeting the CPU lane's), so this is not bit-identical to
+/// [`expert_group`] plus a host reduce. It *is* stable run to run — see
+/// `grouped_reduce` in the `.cu` for why there are no atomics.
+#[cfg(feature = "cuda")]
+pub fn expert_group_reduce(
+    experts: &[&GpuExpert],
+    rows: &[i32],
+    x: &[f32],
+    hidden: usize,
+    layout: &ReduceLayout,
+    rw: &[f32],
+    s_n: usize,
+) -> Result<Vec<f32>, Error> {
+    if experts.len() != rows.len() {
+        return Err(Error::Format("expert_group_reduce: experts/rows length mismatch".into()));
+    }
+    if rows.iter().any(|&r| r < 0) {
+        return Err(Error::Format("expert_group_reduce: negative row count".into()));
+    }
+    let total: usize = rows.iter().map(|&r| r as usize).sum();
+    if x.len() != total * hidden {
+        return Err(Error::Format("expert_group_reduce: x length != sum(rows)*hidden".into()));
+    }
+    // Every one of these would index out of bounds inside the kernel, where the
+    // failure is a wrong number or a fault rather than an error return.
+    if rw.len() != total || layout.row_idx.len() != total {
+        return Err(Error::Format("expert_group_reduce: weights/row_idx length != sum(rows)".into()));
+    }
+    if s_n == 0 || layout.row_ptr.len() != s_n + 1 {
+        return Err(Error::Format("expert_group_reduce: row_ptr length != s_n + 1".into()));
+    }
+    if layout.row_ptr.last() != Some(&(total as i32)) || layout.row_ptr.first() != Some(&0) {
+        return Err(Error::Format("expert_group_reduce: row_ptr does not span [0, sum(rows)]".into()));
+    }
+    if layout.row_idx.iter().any(|&k| k < 0 || k as usize >= total) {
+        return Err(Error::Format("expert_group_reduce: row_idx out of range".into()));
+    }
+    let gates: Vec<*mut ffi::ColiCudaTensor> = experts.iter().map(|e| e.gate).collect();
+    let ups: Vec<*mut ffi::ColiCudaTensor> = experts.iter().map(|e| e.up).collect();
+    let downs: Vec<*mut ffi::ColiCudaTensor> = experts.iter().map(|e| e.down).collect();
+    let mut out = vec![0f32; s_n * hidden];
+    // SAFETY: lengths are all checked above against `total`/`s_n`; the call
+    // blocks until the kernels finish and returns 1 on success.
+    let ok = unsafe {
+        ffi::coli_cuda_expert_group_reduce(
+            gates.as_ptr(),
+            ups.as_ptr(),
+            downs.as_ptr(),
+            rows.as_ptr(),
+            experts.len() as c_int,
+            layout.row_ptr.as_ptr(),
+            layout.row_idx.as_ptr(),
+            rw.as_ptr(),
+            s_n as c_int,
+            out.as_mut_ptr(),
+            x.as_ptr(),
+        )
+    };
+    if ok == 1 {
+        Ok(out)
+    } else {
+        Err(Error::Format("cuda expert_group_reduce failed".into()))
     }
 }
 
@@ -389,6 +696,44 @@ pub fn group_stats() -> GroupStats {
 #[cfg(not(feature = "cuda"))]
 pub fn group_stats() -> GroupStats {
     GroupStats::default()
+}
+
+/// Cumulative counters for the expert-group graph cache (`COLI_CUDA_GRAPH=1`).
+///
+/// These exist because the cache's failure mode is *silent underperformance*,
+/// not an error. A launch-shape key that churns — a batch whose per-expert row
+/// counts differ every tick, say — captures a new graph on every call and is
+/// strictly slower than the eager path, while every output stays correct and
+/// every test passes. `replays` staying near zero while `captures` tracks
+/// `GroupStats::calls` is what that looks like from outside.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraphCacheStats {
+    /// Launch shapes recorded (one per new shape, or per shape after an
+    /// invalidation).
+    pub captures: u64,
+    /// Calls served by replaying an already-captured graph — the win.
+    pub replays: u64,
+    /// Cached graphs discarded because a scratch buffer was reallocated under
+    /// them. Persistently nonzero means residency or batch size is still moving.
+    pub invalidations: u64,
+    /// Calls that fell through to the eager path with the knob on: the W4A16
+    /// arm, `COLI_CUDA_PROFILE`, or `COLI_CUDA_ASYNC=0`.
+    pub uncacheable: u64,
+}
+
+/// Snapshot the [`GraphCacheStats`]. All zero when the backend is not built.
+#[cfg(feature = "cuda")]
+pub fn graph_cache_stats() -> GraphCacheStats {
+    let (mut captures, mut replays, mut invalidations, mut uncacheable) = (0u64, 0u64, 0u64, 0u64);
+    // SAFETY: four valid, distinct out-pointers; the C call only writes scalars.
+    unsafe {
+        ffi::coli_cuda_graph_cache_stats(&mut captures, &mut replays, &mut invalidations, &mut uncacheable);
+    }
+    GraphCacheStats { captures, replays, invalidations, uncacheable }
+}
+#[cfg(not(feature = "cuda"))]
+pub fn graph_cache_stats() -> GraphCacheStats {
+    GraphCacheStats::default()
 }
 
 /// A captured + instantiated CUDA graph of a device's managed stream. Capture a
@@ -571,6 +916,261 @@ mod gpu_tests {
         Ok(())
     }
 
+    /// What `key` is set to right now, if anything.
+    ///
+    /// A function rather than `std::env::var(key).ok()` at each call site: as a
+    /// tail expression the `.ok()` is a conversion, whereas `let p = ….ok();` is
+    /// the shape the bad-patterns audit flags as a discarded `Result` — and the
+    /// audit is right to be blunt about it, so the fix is one place that reads
+    /// unambiguously rather than three that each need arguing about.
+    fn env_snapshot(key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+
+    /// Set `key` for the duration of a closure and restore it after, so one
+    /// test's knob never leaks into the next. Safe against the other GPU tests
+    /// because every one of them holds `gpu_guard()`.
+    fn with_env<T>(key: &str, val: &str, f: impl FnOnce() -> T) -> T {
+        let prev = env_snapshot(key);
+        std::env::set_var(key, val);
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        out
+    }
+
+    /// [`with_env`] specialized to the graph knob, which most of these tests
+    /// toggle.
+    fn with_graph_knob<T>(on: bool, f: impl FnOnce() -> T) -> T {
+        with_env("COLI_CUDA_GRAPH", if on { "1" } else { "0" }, f)
+    }
+
+    /// One int4 expert with reproducible weights, for the graph-cache tests.
+    fn int4_expert(seed: u64, hidden: usize, inter: usize) -> Result<GpuExpert, Error> {
+        let mut r = Lcg(seed);
+        let gatef: Vec<f32> = (0..inter * hidden).map(|_| r.f() * 0.1).collect();
+        let upf: Vec<f32> = (0..inter * hidden).map(|_| r.f() * 0.1).collect();
+        let downf: Vec<f32> = (0..hidden * inter).map(|_| r.f() * 0.1).collect();
+        let (gq, gs) = quant_i4(&gatef, inter, hidden);
+        let (uq, us) = quant_i4(&upf, inter, hidden);
+        let (dq, ds) = quant_i4(&downf, hidden, inter);
+        GpuExpert::upload_int4(0, (&gq, &gs), (&uq, &us), (&dq, &ds), hidden, inter)
+    }
+
+    #[test]
+    fn graph_cached_expert_group_matches_eager() -> Result<(), Error> {
+        // The cache replays the *same* kernels with the *same* arguments in the
+        // *same* order, so it must be bit-identical to eager — not merely close.
+        // A tolerance here would hide precisely the bug this is guarding: a
+        // replay reading a scratch buffer that has moved.
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let (hidden, inter, n) = (64usize, 32usize, 2usize);
+        let e = int4_expert(0x9001, hidden, inter)?;
+        let mut r = Lcg(0x51DE);
+        let x: Vec<f32> = (0..n * hidden).map(|_| r.f()).collect();
+
+        let eager = with_graph_knob(false, || expert_group(&[&e], &[n as i32], &x, hidden))?;
+        // First graphed call captures; the second must replay the same graph.
+        let before = graph_cache_stats();
+        let captured = with_graph_knob(true, || expert_group(&[&e], &[n as i32], &x, hidden))?;
+        let replayed = with_graph_knob(true, || expert_group(&[&e], &[n as i32], &x, hidden))?;
+        let after = graph_cache_stats();
+
+        assert_eq!(eager, captured, "the captured graph must reproduce the eager result exactly");
+        assert_eq!(eager, replayed, "a replay must reproduce the eager result exactly");
+        assert!(after.captures > before.captures, "the first graphed call must capture");
+        assert!(
+            after.replays > before.replays,
+            "the second call at the same shape must REPLAY, not re-capture — a shape key that \
+             churns makes this feature slower than not having it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_grown_scratch_buffer_invalidates_cached_graphs() -> Result<(), Error> {
+        // **The one silent failure in this design.** `reserve` frees before it
+        // reallocates, so a larger call moves `ctx->x`/`ctx->y` and every graph
+        // captured against the old addresses is left pointing at freed VRAM.
+        // Nothing errors: the allocator hands those pages out again and the
+        // replay reads whatever landed there.
+        //
+        // Small shape (captures) → large shape (forces the realloc) → small
+        // shape again (must NOT replay the stale graph).
+        //
+        // **The order below is load-bearing, and this test had it wrong from the
+        // day it was written until 2026-08-08.** `reserve` is grow-only, so
+        // taking the large shape's eager reference *first* sized the scratch for
+        // it; the graphed large call then found `*cap >= bytes`, returned without
+        // freeing anything, `note_realloc` never ran, the generation never moved
+        // and the invalidation this asserts never happened. It went unnoticed
+        // because the GPU was unavailable on the dev box, so the whole test
+        // self-skipped and reported `ok`. The large reference is therefore taken
+        // *after* the graphed sequence: eager recomputes from the weights and
+        // the input either way, so when it runs cannot change what it returns.
+        //
+        // `BIG_ROWS` also dominates every other shape in this module (the next
+        // largest is 96×64), so no earlier test in the process can have already
+        // satisfied the reservation and quietly re-break the premise.
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        const BIG_ROWS: i32 = 1024;
+        let (hidden, inter) = (64usize, 32usize);
+        let e = int4_expert(0x9002, hidden, inter)?;
+        let mut r = Lcg(0x6120);
+        let small: Vec<f32> = (0..hidden).map(|_| r.f()).collect();
+        let big: Vec<f32> = (0..BIG_ROWS as usize * hidden).map(|_| r.f()).collect();
+
+        // Sizes the scratch for exactly one row, which is what the capture below
+        // wants: a reservation already satisfied, so it records against a
+        // generation that is not about to move under it.
+        let want_small = with_graph_knob(false, || expert_group(&[&e], &[1], &small, hidden))?;
+
+        let before = graph_cache_stats();
+        with_graph_knob(true, || expert_group(&[&e], &[1], &small, hidden))?; // capture at gen G
+        let got_big = with_graph_knob(true, || expert_group(&[&e], &[BIG_ROWS], &big, hidden))?; // reallocs → gen G+1
+        let got_small = with_graph_knob(true, || expert_group(&[&e], &[1], &small, hidden))?;
+        let after = graph_cache_stats();
+
+        // Only now — see the ordering note above.
+        let want_big = with_graph_knob(false, || expert_group(&[&e], &[BIG_ROWS], &big, hidden))?;
+
+        assert_eq!(want_big, got_big, "the growing call must be correct");
+        assert_eq!(
+            want_small, got_small,
+            "the small shape's cached graph was captured before the scratch moved — replaying it \
+             reads freed VRAM, and the generation guard is what stops that"
+        );
+        assert!(
+            after.invalidations > before.invalidations,
+            "growing the scratch must invalidate the graph captured under the old generation — if \
+             this fails, check the premise before the guard: something must have sized the scratch \
+             for {BIG_ROWS} rows before the graphed sequence ran, in which case no reallocation \
+             happened and there was nothing to invalidate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_replayed_graph_picks_up_new_expert_weights() -> Result<(), Error> {
+        // The point of caching by *shape*: one graph serves every residency
+        // generation at that shape. That only works because the descriptor
+        // upload is inside the graph and sources from a pinned buffer the host
+        // rewrites between replays. If the descriptors were baked as kernel
+        // arguments instead, this test would return expert A's answer for
+        // expert B — correct-looking numbers for the wrong weights.
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let (hidden, inter, n) = (64usize, 32usize, 2usize);
+        let a = int4_expert(0xA1, hidden, inter)?;
+        let b = int4_expert(0xB2, hidden, inter)?;
+        let mut r = Lcg(0xD1FF);
+        let x: Vec<f32> = (0..n * hidden).map(|_| r.f()).collect();
+
+        let want_a = with_graph_knob(false, || expert_group(&[&a], &[n as i32], &x, hidden))?;
+        let want_b = with_graph_knob(false, || expert_group(&[&b], &[n as i32], &x, hidden))?;
+        assert_ne!(want_a, want_b, "the two experts must actually differ or this proves nothing");
+
+        let got_a = with_graph_knob(true, || expert_group(&[&a], &[n as i32], &x, hidden))?;
+        let got_b = with_graph_knob(true, || expert_group(&[&b], &[n as i32], &x, hidden))?;
+        assert_eq!(want_a, got_a);
+        assert_eq!(want_b, got_b, "a replay at the same shape must use the CURRENT descriptors");
+        Ok(())
+    }
+
+    #[test]
+    fn the_w4a16_arm_is_never_graph_cached() -> Result<(), Error> {
+        // That arm passes device weight pointers as kernel arguments, so a
+        // captured graph is bound to the expert set it was recorded with — the
+        // exact bug the test above rules out for the other arms. It must fall
+        // through to the eager path and say so in the counters, rather than
+        // capture a graph that is wrong the moment residency changes.
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let (hidden, inter, n) = (64usize, 32usize, 24usize); // ≥ the 16-row W4A16 floor
+        let e = int4_expert(0x9004, hidden, inter)?;
+        let mut r = Lcg(0x16A1);
+        let x: Vec<f32> = (0..n * hidden).map(|_| r.f()).collect();
+
+        let (before, got, after) = with_env("COLI_CUDA_TC_W4A16", "1", || {
+            let before = graph_cache_stats();
+            let got = with_graph_knob(true, || expert_group(&[&e], &[n as i32], &x, hidden));
+            (before, got, graph_cache_stats())
+        });
+        got?;
+
+        assert_eq!(after.captures, before.captures, "the W4A16 arm must not be captured");
+        assert!(
+            after.uncacheable > before.uncacheable,
+            "a call skipped with the knob on must be counted, or 'the cache is doing nothing' \
+             is indistinguishable from 'the cache is working'"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_w4a16_tile_instantiation_agrees_with_the_default() -> Result<(), Error> {
+        // `COLI_W4A16_TILES` emits three template instantiations and the
+        // dispatch picks one by runtime triple. Until 2026-08-08 only 16×16×16
+        // had ever executed — the other two were known to *compile*, which for a
+        // templated kernel proves the fragment shapes are legal and nothing
+        // else. A shape that is legal can still index its tile wrong, and the
+        // dispatch's silent fallback to 16×16×16 means a triple that never
+        // matches produces plausible output forever.
+        //
+        // So: assert each triple reaches the W4A16 arm, and that all three agree
+        // with the default. They accumulate in a different order, so this is a
+        // tolerance check rather than the bit-identity the graph tests use.
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let (hidden, inter, n) = (64usize, 64usize, 32usize); // ≥ the 16-row W4A16 floor
+        let e = int4_expert(0x9005, hidden, inter)?;
+        let mut r = Lcg(0x7113);
+        let x: Vec<f32> = (0..n * hidden).map(|_| r.f()).collect();
+
+        let out = with_env("COLI_CUDA_TC_W4A16", "1", || {
+            let run = |tile: Option<(u16, u16, u16)>| {
+                with_graph_knob(false, || expert_group_tiled(&[&e], &[n as i32], &x, hidden, tile))
+            };
+            [None, Some((16, 16, 16)), Some((32, 8, 16)), Some((8, 32, 16))].map(run)
+        });
+
+        let mut got = Vec::new();
+        for o in out {
+            got.push(o?);
+        }
+        let (want, want_arm) = &got[0];
+        assert_eq!(*want_arm, GroupArm::W4A16, "the tile only means anything on the W4A16 arm");
+        for (i, (y, arm)) in got.iter().enumerate().skip(1) {
+            assert_eq!(*arm, GroupArm::W4A16, "tile {i} did not reach the W4A16 arm");
+            assert_eq!(y.len(), want.len());
+            let worst = y
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst < 2e-2,
+                "tile {i} disagrees with 16×16×16 by {worst} — a legal fragment shape that \
+                 computes the wrong thing, which compiling it could never have caught"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn graph_capture_replays_silu_mul() -> Result<(), Error> {
         // Capture a real device kernel (pipe_silu_mul on the managed stream) into a
@@ -638,6 +1238,108 @@ mod gpu_tests {
         Ok(())
     }
 
+    /// Pins the stream fix, and does it *deterministically* rather than by
+    /// hoping to observe a race.
+    ///
+    /// `cudaStreamBeginCapture` records `ctx->stream`. An op launched on any
+    /// other stream is not an error and not a warning — it simply is not in the
+    /// graph. Until 2026-08-07 `pipe_rmsnorm` launched on the **default** stream,
+    /// so capturing it and replaying produced a graph that quietly skipped the
+    /// normalization: the eager pass during capture still ran it (which is why a
+    /// naive "capture then check the buffer" test would have passed), but the
+    /// *replay* would not.
+    ///
+    /// So this captures rmsnorm→silu_mul, then replays onto **freshly uploaded
+    /// input** and requires the composite result. With the op on the wrong
+    /// stream, the replay leaves the normalization undone and the values are
+    /// wrong by the norm factor.
+    ///
+    /// The same fix is what makes the chain *ordered*: `ctx->stream` is
+    /// `cudaStreamNonBlocking`, so a default-stream kernel is not synchronized
+    /// against it at all, and `silu_mul` could read what `rmsnorm` had not
+    /// finished writing.
+    #[test]
+    fn graph_capture_records_ops_only_from_the_context_stream() -> Result<(), Error> {
+        use std::os::raw::c_void;
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let d = 256usize; // one row, so rmsnorm is over the whole buffer
+        let mut r = Lcg(0x511E);
+        let x: Vec<f32> = (0..d).map(|_| r.f()).collect();
+        let w: Vec<f32> = (0..d).map(|_| r.f() * 0.5 + 1.0).collect();
+        let up: Vec<f32> = (0..d).map(|_| r.f()).collect();
+        let eps = 1e-6f32;
+
+        // Reference: rmsnorm(x) * w, then silu(.) * up — the composite the graph
+        // must reproduce on replay.
+        let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / d as f32;
+        let inv = 1.0 / (ms + eps).sqrt();
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let want: Vec<f32> = (0..d).map(|k| silu(x[k] * inv * w[k]) * up[k]).collect();
+
+        let nb = d * 4;
+        // SAFETY: four d-float device buffers on device 0.
+        let (x_dev, w_dev, y_dev, u_dev) = unsafe {
+            (
+                ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32,
+                ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32,
+                ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32,
+                ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32,
+            )
+        };
+        assert!(
+            !x_dev.is_null() && !w_dev.is_null() && !y_dev.is_null() && !u_dev.is_null(),
+            "device alloc"
+        );
+        let upload = |dst: *mut f32, src: &[f32]| {
+            // SAFETY: `dst` has `nb` bytes; `src` has `d` f32.
+            unsafe { ffi::coli_cuda_pipe_upload(0, dst as *mut c_void, src.as_ptr() as *const c_void, nb) };
+        };
+        upload(x_dev, &x);
+        upload(w_dev, &w);
+        upload(u_dev, &up);
+
+        let graph = capture(0, || {
+            // SAFETY: y = rmsnorm(x) * w over one row of `d`, then y = silu(y)*up.
+            let a = unsafe { ffi::coli_cuda_pipe_rmsnorm(0, y_dev, x_dev, w_dev, 1, d as c_int, eps) };
+            let b = unsafe { ffi::coli_cuda_pipe_silu_mul(0, y_dev, u_dev, d) };
+            if a == 1 && b == 1 {
+                Ok(())
+            } else {
+                Err(Error::Format("rmsnorm capture".into()))
+            }
+        })?;
+
+        // Scribble over `y_dev` so a replay that skips the rmsnorm cannot pass on
+        // leftovers from the eager pass that ran during capture.
+        let poison = vec![-7.0f32; d];
+        upload(y_dev, &poison);
+
+        graph.launch()?;
+        let mut out = vec![0f32; d];
+        // SAFETY: `y_dev` has `nb` bytes; `out` has `d` f32.
+        unsafe { ffi::coli_cuda_pipe_download(0, y_dev as *const c_void, out.as_mut_ptr() as *mut c_void, nb) };
+        for k in 0..d {
+            let tol = 1e-4 * want[k].abs().max(1.0);
+            assert!(
+                (out[k] - want[k]).abs() < tol,
+                "k={k} got={} want={} — a replayed graph missing its rmsnorm means the op was on the wrong stream",
+                out[k],
+                want[k]
+            );
+        }
+        // SAFETY: all four came from pipe_alloc; free is null-safe.
+        unsafe {
+            ffi::coli_cuda_pipe_free(0, x_dev as *mut c_void);
+            ffi::coli_cuda_pipe_free(0, w_dev as *mut c_void);
+            ffi::coli_cuda_pipe_free(0, y_dev as *mut c_void);
+            ffi::coli_cuda_pipe_free(0, u_dev as *mut c_void);
+        }
+        Ok(())
+    }
+
     #[test]
     fn graph_capture_multi_kernel() -> Result<(), Error> {
         // A real decode step is many kernels; capture TWO dependent ops (silu_mul
@@ -699,6 +1401,81 @@ mod gpu_tests {
             ffi::coli_cuda_pipe_free(0, g_dev as *mut c_void);
             ffi::coli_cuda_pipe_free(0, u_dev as *mut c_void);
             ffi::coli_cuda_pipe_free(0, b_dev as *mut c_void);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_reduce_matches_the_host_reduce() -> Result<(), Error> {
+        // Two experts, both contributing to both batch rows — the shape the
+        // fusion exists for (`total` = 4 y-rows collapsing to `s_n` = 2).
+        // Compared against the host reduce over `expert_group`'s own output, so
+        // this checks the *reduce*, not the SwiGLU (which its own tests cover).
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let (hidden, inter, s_n) = (64usize, 32usize, 2usize);
+        let a = int4_expert(0xF1, hidden, inter)?;
+        let b = int4_expert(0xF2, hidden, inter)?;
+        let mut r = Lcg(0xFEED);
+        let batch: Vec<f32> = (0..s_n * hidden).map(|_| r.f()).collect();
+
+        // y-row k: (expert 0 -> row 0), (expert 0 -> row 1), (expert 1 -> row 0),
+        // (expert 1 -> row 1). Gathered inputs repeat the batch rows accordingly.
+        let dst = [0usize, 1, 0, 1];
+        let rw = [0.25f32, 0.5, 0.75, 1.5];
+        let mut x = Vec::new();
+        for &s in &dst {
+            x.extend_from_slice(&batch[s * hidden..s * hidden + hidden]);
+        }
+
+        let y = expert_group(&[&a, &b], &[2, 2], &x, hidden)?;
+        let mut want = vec![0f32; s_n * hidden];
+        for (k, (&s, &w)) in dst.iter().zip(&rw).enumerate() {
+            for d in 0..hidden {
+                want[s * hidden + d] += w * y[k * hidden + d];
+            }
+        }
+
+        let layout = ReduceLayout::build(&dst, s_n).ok_or_else(|| Error::Format("layout".into()))?;
+        let got = expert_group_reduce(&[&a, &b], &[2, 2], &x, hidden, &layout, &rw, s_n)?;
+        assert_eq!(got.len(), s_n * hidden);
+        for k in 0..got.len() {
+            let tol = 1e-4 * want[k].abs().max(1.0);
+            assert!((got[k] - want[k]).abs() < tol, "k={k} fused={} host={}", got[k], want[k]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_reduce_is_bit_stable_across_repeats() -> Result<(), Error> {
+        // **The test an atomic scatter fails.** `f32 +=` is not associative, so
+        // a reduce that let threads race would return a slightly different
+        // vector each run — and every tolerance-based test above would still
+        // pass. Identical bits, three times, is the only assertion that catches
+        // it, and it is the property the engine's reproducibility rests on.
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let (hidden, inter, s_n) = (64usize, 32usize, 3usize);
+        let experts: Vec<GpuExpert> =
+            (0..4).map(|i| int4_expert(0x700 + i, hidden, inter)).collect::<Result<_, Error>>()?;
+        let refs: Vec<&GpuExpert> = experts.iter().collect();
+        let mut r = Lcg(0x5EED);
+        // Every expert contributes to every batch row: maximal contention, which
+        // is exactly where an atomic implementation would diverge.
+        let dst: Vec<usize> = (0..4 * s_n).map(|k| k % s_n).collect();
+        let rw: Vec<f32> = (0..dst.len()).map(|_| r.f().abs() + 0.1).collect();
+        let x: Vec<f32> = (0..dst.len() * hidden).map(|_| r.f()).collect();
+        let rows = vec![s_n as i32; 4];
+        let layout = ReduceLayout::build(&dst, s_n).ok_or_else(|| Error::Format("layout".into()))?;
+
+        let first = expert_group_reduce(&refs, &rows, &x, hidden, &layout, &rw, s_n)?;
+        for attempt in 1..3 {
+            let again = expert_group_reduce(&refs, &rows, &x, hidden, &layout, &rw, s_n)?;
+            assert_eq!(first, again, "run {attempt} differs bit-for-bit — the reduce is not ordered");
         }
         Ok(())
     }
@@ -796,5 +1573,57 @@ mod tests {
             assert!(device_count() >= 0);
             assert!(!status().is_empty());
         }
+    }
+
+    /// The fused reduce's *ordering* is what fixes its result, and ordering is
+    /// decided entirely on the host. These run on any box, including one with
+    /// no GPU — which matters, because every test that exercises the kernel
+    /// skips itself without a device.
+    #[test]
+    fn reduce_layout_lists_contributions_in_ascending_y_row_order() -> Result<(), &'static str> {
+        // Interleaved destinations: three y-rows for batch row 0, two for row 1.
+        // Ascending order within each list is not incidental — `k` is
+        // batch-union (`pos`) order, so it is the order the host reduce sums in.
+        let l = ReduceLayout::build(&[0, 1, 0, 1, 0], 2).ok_or("build rejected a valid layout")?;
+        assert_eq!(l.row_ptr, vec![0, 3, 5]);
+        assert_eq!(l.row_idx, vec![0, 2, 4, 1, 3]);
+        for s in 0..2 {
+            let (lo, hi) = (l.row_ptr[s] as usize, l.row_ptr[s + 1] as usize);
+            assert!(l.row_idx[lo..hi].windows(2).all(|w| w[0] < w[1]), "row {s} is not ascending");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reduce_layout_covers_every_contribution_exactly_once() -> Result<(), &'static str> {
+        // A CSR that dropped or duplicated a y-row would compute a token from
+        // the wrong set of experts — and would still produce plausible numbers.
+        let dst = [2usize, 0, 2, 1, 1, 2, 0];
+        let l = ReduceLayout::build(&dst, 3).ok_or("build rejected a valid layout")?;
+        let mut seen: Vec<i32> = l.row_idx.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..dst.len() as i32).collect::<Vec<_>>());
+        assert_eq!(l.row_ptr.last().copied(), Some(dst.len() as i32));
+        for (s, expected) in [(0usize, 2), (1, 2), (2, 3)] {
+            let (lo, hi) = (l.row_ptr[s] as usize, l.row_ptr[s + 1] as usize);
+            assert_eq!(hi - lo, expected, "batch row {s} contribution count");
+            assert!(l.row_idx[lo..hi].iter().all(|&k| dst[k as usize] == s));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reduce_layout_refuses_an_out_of_range_destination() -> Result<(), &'static str> {
+        // Refuse, never drop: a discarded contribution is a token computed from
+        // fewer experts than the router chose, and nothing downstream can see it.
+        assert_eq!(ReduceLayout::build(&[0, 5], 2), None);
+        // An empty batch of contributions is legal — every row is simply zero.
+        // `.ok_or(..)?`, not `.unwrap_or_default()`: the default IS an empty
+        // layout, so the old form asserted the same thing whether `build`
+        // returned the empty layout or refused outright.
+        let empty = ReduceLayout::build(&[], 2).ok_or("an empty batch is legal")?;
+        assert_eq!(empty.row_ptr, vec![0, 0, 0]);
+        assert!(empty.row_idx.is_empty());
+        Ok(())
     }
 }

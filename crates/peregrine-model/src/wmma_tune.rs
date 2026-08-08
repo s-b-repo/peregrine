@@ -4,11 +4,18 @@
 //! the winning tile configuration. Persists as `<model_dir>/kernel_tuning.json`
 //! so a repeat run skips the exploration phase.
 //!
-//! This is the Rust-side substrate; the actual CUDA dispatch still gates on
-//! the `COLI_CUDA_TC_*` env knobs. When [`WmmaTuner::best_for`] returns a
-//! recommendation, the dispatcher can override those knobs on a per-shape
-//! basis. Bit-identical to the fixed-tile path (WMMA fragment sizes only
-//! affect performance).
+//! Wired into `GpuTier::compute` behind `COLI_CUDA_AUTOTUNE=1`, which is a
+//! *second* opt-in on top of `COLI_CUDA_TC_W4A16` — the tile reaches only that
+//! Tensor Core arm, so tuning on a run that never takes it would be recording
+//! noise as a winner.
+//!
+//! **The bit-identity claim this file used to make is not one this workspace can
+//! support.** It said "WMMA fragment sizes only affect performance". All three
+//! legal fp16 shapes share `K = 16` and the same k-loop, so the per-element sum
+//! order is *expected* to be identical — but that is an argument about hardware
+//! reduction order, not a measurement, and nothing here has executed on a GPU to
+//! check it. Treat the tuner as a knob that may move low bits until a run on
+//! real hardware says otherwise.
 
 use std::collections::HashMap;
 
@@ -23,24 +30,53 @@ pub struct KernelShape {
     pub max_rows: u16, // max rows in any expert
 }
 
-/// A tile configuration. Two flavors so far — W4A16 (gate/up) and INT4 TC
-/// (down). Expand as the CUDA backend gains more templated variants.
+/// A tile configuration. Two flavors — W4A16 (gate/up/down fp16 Tensor Core)
+/// and INT4 TC.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum TileConfig {
-    /// `(M, N, K)` for the W4A16 path. Only the pairs the C++ backend accepts
-    /// are valid (16×16×16 today; 32×32×16 after templating).
+    /// `(M, N, K)` for the W4A16 path. Exactly three are legal — see
+    /// [`TileConfig::W4A16_LEGAL`] — because those are the fp16 WMMA fragment
+    /// shapes the hardware defines; anything else the backend rejects back to
+    /// the default rather than launching a kernel that cannot exist.
     W4A16 { m: u16, n: u16, k: u16 },
-    /// `(M, N, K)` for the INT4 TC path (8×8×32 default; 16×16×32 after
-    /// templating).
+    /// `(M, N, K)` for the INT4 TC path. **One legal shape**, 8×8×32: that is
+    /// the only `experimental::precision::s4` fragment WMMA defines, so this
+    /// variant records which kernel ran rather than offering a choice. It earns
+    /// its place by keeping the tuning table honest — an int4 measurement and a
+    /// W4A16 measurement at the same `KernelShape` are not comparable, and
+    /// without the tag they would share a row and the faster *arm* would look
+    /// like the faster *tile*.
     Int4Tc { m: u16, n: u16, k: u16 },
 }
 
 impl TileConfig {
+    /// Every fp16 WMMA fragment shape the hardware defines. The tuner explores
+    /// exactly these; the CUDA side instantiates exactly these.
+    pub const W4A16_LEGAL: [TileConfig; 3] = [
+        TileConfig::W4A16 { m: 16, n: 16, k: 16 },
+        TileConfig::W4A16 { m: 32, n: 8, k: 16 },
+        TileConfig::W4A16 { m: 8, n: 32, k: 16 },
+    ];
+
+    /// The historical shape, and what an unmeasured run executes.
     pub fn default_w4a16() -> TileConfig {
         TileConfig::W4A16 { m: 16, n: 16, k: 16 }
     }
+
+    /// The only legal int4 Tensor Core fragment; see the variant's note.
     pub fn default_int4tc() -> TileConfig {
         TileConfig::Int4Tc { m: 8, n: 8, k: 32 }
+    }
+
+    /// `(m, n, k)` for the CUDA dispatch, or `None` for a config the W4A16 arm
+    /// cannot take — an int4 tile, or a shape outside [`Self::W4A16_LEGAL`].
+    /// Returning `None` rather than the numbers is what stops a stale
+    /// `kernel_tuning.json` from selecting a kernel that was never compiled.
+    pub fn w4a16_dims(self) -> Option<(u16, u16, u16)> {
+        match self {
+            TileConfig::W4A16 { m, n, k } if Self::W4A16_LEGAL.contains(&self) => Some((m, n, k)),
+            _ => None,
+        }
     }
 }
 
@@ -84,6 +120,24 @@ impl WmmaTuner {
     /// The current best-known tile for a shape (or `None` if never observed).
     pub fn best_for(&self, shape: KernelShape) -> Option<TileConfig> {
         self.best.get(&shape).copied()
+    }
+
+    /// The tile to run next for `shape`: explore first, then exploit.
+    ///
+    /// Any legal shape with no measurement yet is returned before
+    /// [`Self::best_for`] is consulted, so every candidate is tried once before
+    /// one is declared the winner. Without that a restored table would pin
+    /// whatever the previous session happened to try first — and a table
+    /// restored from `kernel_tuning.json` carries `best` but not the per-tile
+    /// EWMAs, so this also re-explores after a restart rather than trusting a
+    /// winner it cannot re-derive.
+    pub fn select(&self, shape: KernelShape) -> TileConfig {
+        for t in TileConfig::W4A16_LEGAL {
+            if !self.ewma_us.contains_key(&(shape, t)) {
+                return t;
+            }
+        }
+        self.best_for(shape).unwrap_or_else(TileConfig::default_w4a16)
     }
 
     /// Serialize the table (deterministic ordering).
@@ -171,6 +225,59 @@ mod tests {
             t.observe(shape, b, 200.0);
         }
         assert_eq!(t.best_for(shape), Some(a));
+    }
+
+    #[test]
+    fn select_explores_every_legal_tile_before_exploiting_one() {
+        // Without the explore phase a restored table pins whatever the previous
+        // session happened to measure first, and the alternatives are never
+        // tried again — the tuner would converge on the tile it started with
+        // and report it as a winner.
+        let mut t = WmmaTuner::new();
+        let shape = KernelShape { d: 5120, i: 1536, count: 6, max_rows: 1 };
+        let mut seen = Vec::new();
+        for _ in 0..TileConfig::W4A16_LEGAL.len() {
+            let tile = t.select(shape);
+            assert!(!seen.contains(&tile), "select repeated {tile:?} before trying the rest");
+            seen.push(tile);
+            // Later tiles are slower, so the first one must win at the end.
+            t.observe(shape, tile, 100.0 + 10.0 * seen.len() as f32);
+        }
+        assert_eq!(seen.len(), TileConfig::W4A16_LEGAL.len(), "every legal tile must be explored");
+        for _ in 0..4 {
+            assert_eq!(t.select(shape), seen[0], "after exploring, select must exploit the winner");
+        }
+    }
+
+    #[test]
+    fn select_is_the_default_tile_for_an_untouched_shape_once_explored() {
+        // A shape whose only measurement is on an *illegal* tile must not
+        // "win" — otherwise a hand-edited or version-skewed table selects a
+        // kernel instantiation that does not exist.
+        let mut t = WmmaTuner::new();
+        let shape = KernelShape { d: 64, i: 32, count: 1, max_rows: 1 };
+        t.observe(shape, TileConfig::W4A16 { m: 64, n: 64, k: 16 }, 1.0);
+        // Exploration still runs (the illegal tile is not one of the legal
+        // three), and every legal tile is offered before anything is exploited.
+        assert!(TileConfig::W4A16_LEGAL.contains(&t.select(shape)));
+    }
+
+    #[test]
+    fn only_the_three_hardware_fragment_shapes_reach_the_dispatch() {
+        // `w4a16_dims` is the gate between a persisted table and a kernel
+        // launch. A shape the backend never instantiated must come back `None`
+        // and fall to the default, not be passed through as three integers.
+        for t in TileConfig::W4A16_LEGAL {
+            assert!(t.w4a16_dims().is_some(), "{t:?} is legal and must dispatch");
+        }
+        assert_eq!(TileConfig::default_w4a16().w4a16_dims(), Some((16, 16, 16)));
+        assert_eq!(TileConfig::W4A16 { m: 64, n: 64, k: 16 }.w4a16_dims(), None, "not a WMMA shape");
+        assert_eq!(TileConfig::W4A16 { m: 16, n: 16, k: 32 }.w4a16_dims(), None, "K=32 is not fp16 WMMA");
+        assert_eq!(
+            TileConfig::default_int4tc().w4a16_dims(),
+            None,
+            "an int4 tile must never be handed to the fp16 arm"
+        );
     }
 
     #[test]
