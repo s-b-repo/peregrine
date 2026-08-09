@@ -38,10 +38,13 @@ Thumbs.db
 
 # Not peregrine. These live in this checkout for no better reason than that it
 # was the shell's working directory at the time, and they are ignored rather
-# than committed: `docs/polly/` is a separate Palworld mod project (it also
-# carries personal identifiers, so never `git add -f` it), and the two
-# screencast files are desktop/PipeWire debugging with nothing to do with an
-# inference engine.
+# than committed: the two screencast files are desktop/PipeWire debugging with
+# nothing to do with an inference engine.
+#
+# `docs/polly/` — a separate Palworld mod project — **moved to `~/polly/` on
+# 2026-08-09**. The rule below is kept deliberately even though the path no
+# longer exists: that tree carries personal identifiers, so if anything ever
+# recreates it here, it must not become committable. Never `git add -f` it.
 /docs/polly/
 /vesktop-screencast-bug-report.md
 /scripts/portal-screencast-test.py
