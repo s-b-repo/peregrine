@@ -96,15 +96,54 @@ the band costs the band roughly one member per pass, and with ~50 such layers
 against a 28-layer band, most of it is gone before the pass ends.
 
 The band is not stable because nothing prevents doomed admissions. **The policy
-that should work is admission control** — refuse to cache experts above a layer
-threshold at all, so the band is never displaced — and that is an `insert_inner`
-change, not a victim-order one. Recorded rather than attempted: it is a different
-mechanism from the one this arm tested, and it deserves its own measurement.
+that should work is admission control** — refuse to cache experts above the
+resident band at all.
+
+### Admission control: implemented, and the diagnosis was still wrong
+
+`insert_inner` now refuses an admission from above the band once the cache is
+full. It demonstrably works — a unit test offers 17 consecutive above-band layers
+and the band comes out untouched, where before each one cost it a slot.
+
+**End to end it changed nothing: 70 hits against 71.**
+
+| 4.29 GB, prefetch off, protect off | hits | disk_reads | decode_s |
+|---|---:|---:|---:|
+| pure LRU | 0 | 9944 | 379 |
+| sweep, eviction only | 71 | 9873 | 350 |
+| sweep + admission control | 70 | 9874 | **275** |
+
+So band erosion by *above-band* admissions was not what capped the hit rate. The
+remaining mechanism is one level in: **within-band admissions cannibalise the
+band too.** A miss at layer 3 is admitted (3 is inside the band, so admission
+control permits it) and evicts the highest band member — layer 27 — which this
+same sweep has not reached yet. By the time the pass gets there, the top third of
+the band is gone. Only the lowest layers survive to be reused, which is the right
+order of magnitude for 70.
+
+Fixing *that* means not replacing band members at all — pinning the band and
+letting misses pass straight through. Whether that is right depends on a number
+this repo does not have: the 33.55 % overlap is **consecutive-token**, and a
+frozen band is only worth pinning if overlap holds at distance 2, 3, … 7. That
+measurement is `route-stats`-shaped and cheap, and it should come before any more
+policy work.
+
+The one thing that did move is wall time: **350 s → 275 s (−21 %)** at equal
+hits, from not doing the insert-and-evict churn for slabs that were going to be
+discarded. Single runs, so treat the size with the usual caution, but the
+direction is monotone across all three arms (379 → 350 → 275).
 
 Keep the result in proportion. The two larger effects here are still
 `COLI_PREFETCH_PROTECT=0` (564 → 945 at 12.88 GB) and clearing the working-set
 threshold (0 → 945). Sweep eviction is a third-order fix for the sub-threshold
 case, and at 0.7 % it does not rescue a cache that is simply too small.
+
+**What to take from the two failed predictions.** Both were mechanically sound
+and both were wrong about magnitude, in the same direction: I reasoned from the
+policy to an expected hit count without accounting for what the *rest* of the
+sweep does to the cache in between. `COLI_CACHE_SWEEP` ships **off** for that
+reason — it is a measured 0 → 70 with a −21 % wall-time side effect, not the 8×
+the arithmetic promised, and the arithmetic was mine.
 
 ## Prefetch, at 8 tokens and the default budget
 
