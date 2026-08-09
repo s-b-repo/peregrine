@@ -204,19 +204,70 @@ struct TPlan {
     gs: usize,
 }
 
-/// One routed expert, fully resolved once at load: its three tensor plans, which
-/// carry the on-disk regions *and* the quantized format and group size — the
-/// "type" a request needs.
+/// One contiguous on-disk span covering several adjacent regions at once.
+#[derive(Clone, Copy)]
+struct Extent {
+    fd: RawFd,
+    /// O_DIRECT twin for `fd`, when every merged region had one.
+    fd_direct: Option<RawFd>,
+    off: u64,
+    len: usize,
+}
+
+/// One routed expert, fully resolved once at load: its three tensor plans — which
+/// carry the on-disk regions *and* the quantized format and group size, the
+/// "type" a request needs — plus the merged extents that let six reads become two.
 ///
-/// The merged extents that let six reads become two are deliberately not here
-/// yet: splitting one merged buffer back into three region views needs a
-/// refcounted sub-slice that [`peregrine_io::Bytes`] does not currently have, so
-/// they land with the coalesced read path rather than sitting unused.
+/// Measured on the GLM-5.2 container: an expert's three weight regions form one
+/// contiguous run (18,874,368 bytes at int4, 37,748,736 on the int8 MTP layer)
+/// and its three `.qs` scales form another, for all but the ~0.45 % that straddle
+/// a shard boundary. Those keep `None` and read their six regions as before.
 #[derive(Clone, Copy)]
 struct ExpertEntry {
     /// gate, up, down — in the order the read path expects them, which is **not**
-    /// the order they sit on disk (that is alphabetical: down, gate, up).
+    /// the order they sit on disk (that is alphabetical: down, gate, up). Every
+    /// split of a merged extent must therefore be computed from each plan's own
+    /// offset, never from position in this array.
     plans: [TPlan; 3],
+    w_run: Option<Extent>,
+    s_run: Option<Extent>,
+}
+
+/// Merge one expert's three weight (or three scale) regions into a single extent
+/// when they are adjacent on one fd. Returns `None` the moment the run breaks —
+/// a different shard, a gap, or an overlap — so a straddling expert falls back to
+/// the unmerged six regions rather than reading the wrong bytes.
+fn merge_run(plans: &[TPlan; 3], weights: bool) -> Option<Extent> {
+    let part = |t: &TPlan| {
+        if weights {
+            (t.w_fd, t.w_fd_direct, t.w_off, t.w_len)
+        } else {
+            (t.s_fd, t.s_fd_direct, t.s_off, t.s_len)
+        }
+    };
+    let mut r: [(RawFd, Option<RawFd>, u64, usize); 3] = [part(&plans[0]), part(&plans[1]), part(&plans[2])];
+    r.sort_by_key(|&(fd, _, off, _)| (fd, off));
+    let (fd, fd_direct, off, _) = r[0];
+    let mut end = off;
+    for &(f, fd_d, o, l) in r.iter() {
+        // Same shard, exactly abutting, and agreeing about the O_DIRECT twin — a
+        // merged read issues against one fd, so a region whose twin differs
+        // cannot be folded in.
+        if f != fd || o != end || fd_d != fd_direct {
+            return None;
+        }
+        end = o.checked_add(l as u64)?;
+    }
+    Some(Extent { fd, fd_direct, off, len: usize::try_from(end.checked_sub(off)?).ok()? })
+}
+
+/// Whether to coalesce an expert's adjacent regions into one read per run.
+/// `COLI_EXPERT_MERGE=0` reverts to six reads per expert without reverting the
+/// expert map, so the two can be A/B'd against a bit-identity assertion.
+fn expert_merge_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_EXPERT_MERGE").as_deref(), Ok("0")))
 }
 
 /// Load-time map from `(layer, expert)` to its resolved tensor plans.
@@ -270,7 +321,8 @@ impl ExpertIndex {
                     (Ok(g), Ok(u), Ok(d)) => [g, u, d],
                     _ => continue,
                 };
-                entries[layer * n_experts + e] = Some(ExpertEntry { plans });
+                entries[layer * n_experts + e] =
+                    Some(ExpertEntry { w_run: merge_run(&plans, true), s_run: merge_run(&plans, false), plans });
             }
         }
         ExpertIndex { n_experts, entries }
@@ -288,28 +340,97 @@ impl ExpertIndex {
     pub fn resolved(&self) -> usize {
         self.entries.iter().filter(|e| e.is_some()).count()
     }
+
+    /// How many resolved experts can be read as two extents instead of six
+    /// regions. Reported by the census so the layout claim is checkable.
+    pub fn mergeable(&self) -> usize {
+        self.entries.iter().flatten().filter(|e| e.w_run.is_some() && e.s_run.is_some()).count()
+    }
 }
 
-/// Resolve one expert's three tensor plans, preferring the load-time index and
-/// falling back to deriving them when the index has no entry.
-fn plans_for(
+/// Resolve one expert, preferring the load-time index and falling back to
+/// deriving it when the index has no entry.
+fn entry_for(
     index: Option<&ExpertIndex>,
     st: &SafeTensors,
     cfg: &Cfg,
     layer: usize,
     expert: usize,
-) -> Result<[TPlan; 3], Error> {
+) -> Result<ExpertEntry, Error> {
     if let Some(e) = index.and_then(|ix| ix.get(layer, expert)) {
-        return Ok(e.plans);
+        return Ok(*e);
     }
     let hidden = cfg.hidden as usize;
     let mi = cfg.moe_inter as usize;
     let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{expert}.{t}");
-    Ok([
+    let plans = [
         tplan(st, &p("gate_proj.weight"), mi, hidden)?,
         tplan(st, &p("up_proj.weight"), mi, hidden)?,
         tplan(st, &p("down_proj.weight"), hidden, mi)?,
-    ])
+    ];
+    Ok(ExpertEntry { w_run: merge_run(&plans, true), s_run: merge_run(&plans, false), plans })
+}
+
+/// The `(fd, offset, len)` regions to read for one expert, and how many there are.
+///
+/// Two when both runs merged and merging is on, six otherwise. The caller must
+/// pair this with [`pack_slab_from`], which re-splits whatever shape comes back.
+fn expert_regions(e: &ExpertEntry, direct: bool) -> Vec<(RawFd, u64, usize)> {
+    let pick = |fd: RawFd, twin: Option<RawFd>| if direct { twin.unwrap_or(fd) } else { fd };
+    if expert_merge_enabled() {
+        if let (Some(w), Some(s)) = (e.w_run, e.s_run) {
+            // Scales first: they sit at the front of the shard, so this issues in
+            // ascending offset order.
+            return vec![
+                (pick(s.fd, s.fd_direct), s.off, s.len),
+                (pick(w.fd, w.fd_direct), w.off, w.len),
+            ];
+        }
+    }
+    let mut out = Vec::with_capacity(6);
+    for t in e.plans.iter() {
+        out.push((pick(t.w_fd, t.w_fd_direct), t.w_off, t.w_len));
+        out.push((pick(t.s_fd, t.s_fd_direct), t.s_off, t.s_len));
+    }
+    out
+}
+
+/// Rebuild an [`peregrine_io::ExpertSlab`] from whatever [`expert_regions`] asked
+/// for: either the six unmerged regions in order, or two coalesced extents that
+/// get carved into six refcounted windows.
+///
+/// The carve is computed from each plan's **own** offset relative to the extent
+/// base, never from its position in `plans` — on disk the three projections sit
+/// in alphabetical order (down, gate, up), and after an `apply_layout` rewrite
+/// they can sit in any order at all. All three are same-sized int4 blobs, so a
+/// positional split would load gate's bytes into down's matrix and still produce
+/// plausible-looking activations.
+fn pack_slab_from(e: &ExpertEntry, mut got: Vec<Bytes>) -> Result<peregrine_io::ExpertSlab, Error> {
+    if got.len() == 6 {
+        return pack_slab(got);
+    }
+    let (Some(w), Some(s)) = (e.w_run, e.s_run) else {
+        return Err(Error::Format(format!("expert read returned {} regions with no merged extents", got.len())));
+    };
+    if got.len() != 2 {
+        return Err(Error::Format(format!("expert read returned wrong region count: {} (want 2 or 6)", got.len())));
+    }
+    let w_arc = got.pop().ok_or_else(|| Error::Format("merged weight extent missing".into()))?.into_arc();
+    let s_arc = got.pop().ok_or_else(|| Error::Format("merged scale extent missing".into()))?.into_arc();
+    let carve = |arc: &std::sync::Arc<[u8]>, base: u64, off: u64, len: usize, what: &str| {
+        let head = off
+            .checked_sub(base)
+            .and_then(|h| usize::try_from(h).ok())
+            .ok_or_else(|| Error::Format(format!("{what} region lies before its extent")))?;
+        Bytes::view(arc, head, len)
+            .ok_or_else(|| Error::Format(format!("{what} region [{head}, {head}+{len}) escapes its extent")))
+    };
+    let mut regions: Vec<Bytes> = Vec::with_capacity(6);
+    for t in e.plans.iter() {
+        regions.push(carve(&w_arc, w.off, t.w_off, t.w_len, "weight")?);
+        regions.push(carve(&s_arc, s.off, t.s_off, t.s_len, "scale")?);
+    }
+    pack_slab(regions)
 }
 
 /// One expert's streaming+compute plan: which rows route to it (+ gate weights),
@@ -321,9 +442,8 @@ struct EPlan {
     expert: usize,
     rows: Vec<usize>,
     rw: Vec<f32>,
-    gate: TPlan,
-    up: TPlan,
-    down: TPlan,
+    /// Where this expert's bytes are and what format they are, resolved once.
+    entry: ExpertEntry,
 }
 
 /// One GPU-resident expert's plan: its position, routed rows/weights, expert id,
@@ -573,19 +693,9 @@ fn pack_slab(six: Vec<Bytes>) -> Result<peregrine_io::ExpertSlab, Error> {
 /// a **single batched submit**. Zero-copy on the O_DIRECT lane (see [`read_regions`]);
 /// byte-identical to six `read_exact`s either way, so the streamed output stays
 /// bit-identical to the resident path.
-fn read_expert(r: &mut Reactor, gate: &TPlan, up: &TPlan, down: &TPlan, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
-    // pick the weight/scale fd for a tensor: O_DIRECT twin when `direct`, else buffered.
-    let wfd = |t: &TPlan| if direct { t.w_fd_direct.unwrap_or(t.w_fd) } else { t.w_fd };
-    let sfd = |t: &TPlan| if direct { t.s_fd_direct.unwrap_or(t.s_fd) } else { t.s_fd };
-    let regions = [
-        (wfd(gate), gate.w_off, gate.w_len),
-        (sfd(gate), gate.s_off, gate.s_len),
-        (wfd(up), up.w_off, up.w_len),
-        (sfd(up), up.s_off, up.s_len),
-        (wfd(down), down.w_off, down.w_len),
-        (sfd(down), down.s_off, down.s_len),
-    ];
-    pack_slab(read_regions(r, &regions, direct)?)
+fn read_expert(r: &mut Reactor, e: &ExpertEntry, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
+    let regions = expert_regions(e, direct);
+    pack_slab_from(e, read_regions(r, &regions, direct)?)
 }
 
 /// How many experts' reads to submit to the ring at once. 6 regions/expert, so
@@ -645,17 +755,15 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
     // one (fd, offset, len) per region, in gate/up/down × (weight, scale) order. In
     // direct mode use the O_DIRECT twin fd (falling back per-region if a twin is
     // somehow missing); the reader applies the block alignment.
+    // Two regions per expert when its runs coalesced, six when they did not, so
+    // the flat list is no longer uniformly `6 * n` — `counts` records how many
+    // each expert contributed so the results can be re-split.
     let mut regions: Vec<(RawFd, u64, usize)> = Vec::with_capacity(6 * n);
+    let mut counts: Vec<usize> = Vec::with_capacity(n);
     for p in plans {
-        for t in [&p.gate, &p.up, &p.down] {
-            let (wfd, sfd) = if direct {
-                (t.w_fd_direct.unwrap_or(t.w_fd), t.s_fd_direct.unwrap_or(t.s_fd))
-            } else {
-                (t.w_fd, t.s_fd)
-            };
-            regions.push((wfd, t.w_off, t.w_len));
-            regions.push((sfd, t.s_off, t.s_len));
-        }
+        let r = expert_regions(&p.entry, direct);
+        counts.push(r.len());
+        regions.extend_from_slice(&r);
     }
     // Buffered path: hint the kernel to start readahead on every region before the
     // batched read. The advice fires from the same ring in one submit, so it costs
@@ -684,9 +792,9 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
     };
     let mut bytes = bytes.into_iter();
     let mut slabs: Vec<peregrine_io::ExpertSlab> = Vec::with_capacity(n);
-    for _ in 0..n {
-        let six: Vec<Bytes> = bytes.by_ref().take(6).collect();
-        slabs.push(pack_slab(six)?);
+    for (p, &k) in plans.iter().zip(counts.iter()) {
+        let got: Vec<Bytes> = bytes.by_ref().take(k).collect();
+        slabs.push(pack_slab_from(&p.entry, got)?);
     }
     // Optional page-cache release for long-running RSS-bounded workloads. Only
     // useful when the warm cache is off / cold — a hit would otherwise re-read the
@@ -946,21 +1054,37 @@ pub fn moe_forward_concurrent(
             }
             gplans.push(GPlan { pos: this_pos, e, rows, rw, xg });
         } else {
-            let [gate, up, down] = plans_for(ctx.expert_index, st, cfg, layer, e)?;
-            plans.push(EPlan { pos: this_pos, expert: e, rows, rw, gate, up, down });
+            let entry = entry_for(ctx.expert_index, st, cfg, layer, e)?;
+            plans.push(EPlan { pos: this_pos, expert: e, rows, rw, entry });
         }
     }
     let n = pos;
 
-    // Apply the layout schedule: reorder the streamed `EPlan`s by the schedule's
-    // rank of each expert. This changes only the io_uring submit order — the
-    // deterministic reduce uses `pos` (batch-union index) as its scatter key, so
-    // outputs stay bit-identical. Experts not in the schedule keep their
-    // original ordering, appended at the end. No-op when there is no schedule.
-    if let Some(sched) = ctx.layout_schedule {
+    // Order the streamed `EPlan`s so the batched submit issues ascending-offset
+    // reads. This changes only the io_uring submit order — the deterministic
+    // reduce uses `pos` (batch-union index) as its scatter key, so outputs stay
+    // bit-identical either way.
+    //
+    // Sort on the **real** `(fd, offset)` when the expert map has resolved them.
+    // `schedule.json`'s rank is a routing-community order that only coincides with
+    // disk order after a `peregrine-layout-reorg --apply` rewrite — and that tool
+    // is single-shard only, so it cannot run on a sharded container at all. This
+    // sort claimed to issue "contiguous-offset reads first" while sorting by
+    // community until 2026-08-09; on the GLM-5.2 checkpoint, whose tensors sit in
+    // lexicographic name order (expert 14 between 139 and 140), the two orders are
+    // unrelated. The schedule stays as the fallback for the case where no map was
+    // built, which is the only case where its proxy is the best available signal.
+    if ctx.expert_index.is_some() {
+        plans.sort_by_key(|p| {
+            let t = &p.entry.plans[0];
+            (p.entry.w_run.map_or(t.w_fd, |r| r.fd), p.entry.w_run.map_or(t.w_off, |r| r.off))
+        });
+    } else if let Some(sched) = ctx.layout_schedule {
         if let Some(row) = sched.get(layer) {
             let rank: std::collections::HashMap<u32, usize> =
                 row.iter().enumerate().map(|(i, &e)| (e, i)).collect();
+            // Experts absent from the schedule keep their original relative order,
+            // appended at the end.
             plans.sort_by_key(|p| rank.get(&(p.expert as u32)).copied().unwrap_or(usize::MAX));
         }
     }
@@ -1171,9 +1295,9 @@ pub fn moe_forward_concurrent(
                     let [(gw, gs), (uw, us), (dw, ds)] = bytes;
                     let t_cpu = std::time::Instant::now();
                     let mlp = Mlp {
-                        gate: rebuild(&plan.gate, gw, gs),
-                        up: rebuild(&plan.up, uw, us),
-                        down: rebuild(&plan.down, dw, ds),
+                        gate: rebuild(&plan.entry.plans[0], gw, gs),
+                        up: rebuild(&plan.entry.plans[1], uw, us),
+                        down: rebuild(&plan.entry.plans[2], dw, ds),
                     };
                     let nr = plan.rows.len();
                     let mut xg = vec![0f32; nr * hidden];
@@ -1410,7 +1534,7 @@ pub fn moe_forward_concurrent(
 /// [`prefetch_read`] on the prefetch lane's own ring.
 pub struct PrefetchItem {
     key: (u32, u32),
-    plans: [TPlan; 3],
+    entry: ExpertEntry,
 }
 
 impl PrefetchItem {
@@ -1431,15 +1555,15 @@ pub fn prefetch_item(
     layer: usize,
     expert: usize,
 ) -> Result<PrefetchItem, Error> {
-    let plans = plans_for(index, st, cfg, layer, expert)?;
-    Ok(PrefetchItem { key: (layer as u32, expert as u32), plans })
+    let entry = entry_for(index, st, cfg, layer, expert)?;
+    Ok(PrefetchItem { key: (layer as u32, expert as u32), entry })
 }
 
 /// Stream one prefetch item's six regions through `reactor` into an owned slab
 /// (one batched submit) — the exact bytes the I/O lane would read, so a later hit
 /// is bit-identical.
 pub fn prefetch_read(reactor: &mut Reactor, item: &PrefetchItem, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
-    read_expert(reactor, &item.plans[0], &item.plans[1], &item.plans[2], direct)
+    read_expert(reactor, &item.entry, direct)
 }
 
 /// One expert queued for a page-cache *hint* (`fadvise(WILLNEED)`): its six
@@ -1447,12 +1571,13 @@ pub fn prefetch_read(reactor: &mut Reactor, item: &PrefetchItem, direct: bool) -
 /// low-confidence multi-path predictions, where a full prefetch isn't worth the
 /// bandwidth but a cheap page-cache hint may still help a later miss.
 pub struct HintItem {
-    regions: [(RawFd, u64, usize); 6],
+    regions: Vec<(RawFd, u64, usize)>,
 }
 
 impl HintItem {
-    /// The six `(fd, offset, len)` regions (gate/up/down × weight+scale) to hint.
-    pub fn regions(&self) -> &[(RawFd, u64, usize); 6] {
+    /// The `(fd, offset, len)` regions to hint: two when the expert's runs
+    /// coalesced, six otherwise.
+    pub fn regions(&self) -> &[(RawFd, u64, usize)] {
         &self.regions
     }
 }
@@ -1467,16 +1592,9 @@ pub fn prefetch_hint_item(
     layer: usize,
     expert: usize,
 ) -> Result<HintItem, Error> {
-    let [gate, up, down] = plans_for(index, st, cfg, layer, expert)?;
-    let regions = [
-        (gate.w_fd, gate.w_off, gate.w_len),
-        (gate.s_fd, gate.s_off, gate.s_len),
-        (up.w_fd, up.w_off, up.w_len),
-        (up.s_fd, up.s_off, up.s_len),
-        (down.w_fd, down.w_off, down.w_len),
-        (down.s_fd, down.s_off, down.s_len),
-    ];
-    Ok(HintItem { regions })
+    let entry = entry_for(index, st, cfg, layer, expert)?;
+    // `direct: false` — this is the buffered-fd list by construction.
+    Ok(HintItem { regions: expert_regions(&entry, false) })
 }
 
 #[cfg(test)]
@@ -1547,8 +1665,8 @@ mod tests {
         let index = ExpertIndex::build(&st, &cfg);
         let layer = cfg.first_dense as usize;
 
-        let with = plans_for(Some(&index), &st, &cfg, layer, 0)?;
-        let without = plans_for(None, &st, &cfg, layer, 0)?;
+        let with = entry_for(Some(&index), &st, &cfg, layer, 0)?.plans;
+        let without = entry_for(None, &st, &cfg, layer, 0)?.plans;
         for (a, b) in with.iter().zip(without.iter()) {
             assert_eq!((a.w_fd, a.w_off, a.w_len), (b.w_fd, b.w_off, b.w_len));
             assert_eq!((a.s_fd, a.s_off, a.s_len), (b.s_fd, b.s_off, b.s_len));
@@ -1596,7 +1714,11 @@ mod tests {
             i: 1,
             gs: 0,
         };
-        let (gate, up, down) = (tp(0, 1), tp(2, 3), tp(4, 5));
+        let plans = [tp(0, 1), tp(2, 3), tp(4, 5)];
+        // Weights and scales alternate in this fixture, so neither run is
+        // contiguous and the expert deliberately takes the six-region path.
+        let entry = ExpertEntry { w_run: merge_run(&plans, true), s_run: merge_run(&plans, false), plans };
+        assert!(entry.w_run.is_none() && entry.s_run.is_none(), "interleaved fixture must not coalesce");
 
         let mut reactor = match Reactor::new(16) {
             Ok(r) => r,
@@ -1606,7 +1728,7 @@ mod tests {
                 return Ok(());
             }
         };
-        let slab = read_expert(&mut reactor, &gate, &up, &down, false)?;
+        let slab = read_expert(&mut reactor, &entry, false)?;
         // slab regions are `Bytes`; compare their exposed byte slices to the source
         assert_eq!(&slab[0].0[..], &regions[0][..]);
         assert_eq!(&slab[0].1[..], &regions[1][..]);
@@ -1614,6 +1736,85 @@ mod tests {
         assert_eq!(&slab[1].1[..], &regions[3][..]);
         assert_eq!(&slab[2].0[..], &regions[4][..]);
         assert_eq!(&slab[2].1[..], &regions[5][..]);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// A coalesced read must be split by each tensor's own offset, not by its
+    /// position. This fixture reproduces the real container's layout — the three
+    /// `.qs` scales pooled first, then the three weights, both groups in
+    /// **alphabetical** order (down, gate, up) rather than the gate/up/down order
+    /// the slab wants — so a positional split silently loads gate's bytes into
+    /// down's matrix. Every region carries distinct content so that swap fails
+    /// here instead of turning into plausible-looking activations.
+    #[test]
+    fn coalesced_read_splits_by_offset_not_position() -> Result<(), Error> {
+        let path = std::env::temp_dir().join(format!("peregrine_merge_{}", std::process::id()));
+        // disk order: ds, gs, us, dw, gw, uw — scales pooled at the front.
+        let regions: [Vec<u8>; 6] = [
+            vec![0xD5; 24], // down scale
+            vec![0x65; 8],  // gate scale
+            vec![0x55; 8],  // up scale
+            vec![0xDD; 96], // down weight
+            vec![0x66; 96], // gate weight
+            vec![0x5A; 96], // up weight
+        ];
+        let mut f = std::fs::File::create(&path)?;
+        let mut offs = [0u64; 6];
+        let mut cur = 0u64;
+        for (i, r) in regions.iter().enumerate() {
+            offs[i] = cur;
+            f.write_all(r)?;
+            cur += r.len() as u64;
+        }
+        f.sync_all()?;
+        let rf = std::fs::File::open(&path)?;
+        let fd = rf.as_raw_fd();
+        let tp = |wi: usize, si: usize| TPlan {
+            w_fd: fd,
+            w_off: offs[wi],
+            w_len: regions[wi].len(),
+            s_fd: fd,
+            s_off: offs[si],
+            s_len: regions[si].len(),
+            w_fd_direct: None,
+            s_fd_direct: None,
+            fmt: QuantFmt::Int4,
+            o: 1,
+            i: 1,
+            gs: 0,
+        };
+        // gate, up, down — pointing at their scattered-on-disk homes.
+        let plans = [tp(4, 1), tp(5, 2), tp(3, 0)];
+        let entry = ExpertEntry { w_run: merge_run(&plans, true), s_run: merge_run(&plans, false), plans };
+        let w = entry.w_run.ok_or_else(|| Error::Format("weights should coalesce".into()))?;
+        let s = entry.s_run.ok_or_else(|| Error::Format("scales should coalesce".into()))?;
+        assert_eq!((w.off, w.len), (offs[3], 96 * 3));
+        assert_eq!((s.off, s.len), (offs[0], 24 + 8 + 8));
+        assert_eq!(expert_regions(&entry, false).len(), 2, "coalesced expert must issue two reads");
+
+        let mut reactor = match Reactor::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let slab = read_expert(&mut reactor, &entry, false)?;
+        // gate/up/down, each paired with its own scale — the split has to undo
+        // the alphabetical on-disk ordering.
+        assert_eq!(&slab[0].0[..], &regions[4][..], "gate weight");
+        assert_eq!(&slab[0].1[..], &regions[1][..], "gate scale");
+        assert_eq!(&slab[1].0[..], &regions[5][..], "up weight");
+        assert_eq!(&slab[1].1[..], &regions[2][..], "up scale");
+        assert_eq!(&slab[2].0[..], &regions[3][..], "down weight");
+        assert_eq!(&slab[2].1[..], &regions[0][..], "down scale");
+
+        // The six views tile their two extents exactly, so the cache budgets a
+        // coalesced expert at its real size rather than treble-counting it.
+        let total: usize = slab.iter().map(|(w, s)| w.footprint() + s.footprint()).sum();
+        assert_eq!(total, w.len + s.len);
         std::fs::remove_file(&path)?;
         Ok(())
     }

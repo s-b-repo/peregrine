@@ -632,6 +632,27 @@ impl WarmCache {
     }
 
     fn insert_inner(&mut self, key: (u32, u32), data: ExpertSlab, from_prefetch: bool) {
+        // Sweep-mode admission control, and the eviction rule does not work without
+        // it. Evicting the highest layer does not stop a high layer being
+        // *admitted*: the newcomer is exempt from its own admission's eviction
+        // (`keep`), so it displaces a band member and is then evicted by the next
+        // insert — the band pays a slot for a slab nobody will read. Measured, that
+        // is most of the band gone before a pass ends, and why victim order alone
+        // moved the hit count from 0 to only 71.
+        //
+        // Refusing an admission from above the resident band is what keeps the band
+        // still. Correctness-neutral: a slab that is not cached is re-read from
+        // disk, which is exactly what a miss already does.
+        //
+        // Only once full — while there is room, admitting in sweep order *is* how
+        // the band gets built, from layer 0 upward.
+        if self.sweep
+            && self.used >= self.budget
+            && !self.map.contains_key(&key)
+            && self.map.keys().map(|k| k.0).max().is_some_and(|top| key.0 > top)
+        {
+            return;
+        }
         self.clock += 1;
         let now = self.clock;
         // Share once on admission: every later hit is a refcount bump instead of
@@ -1135,24 +1156,70 @@ mod tests {
         // can actually reuse. If this ever agrees with the test above, the knob
         // has stopped being a knob.
         //
-        // The trailing `(5, 0)` is not a leak: `evict_to_budget` exempts the
-        // just-inserted key from its own admission (`keep`), so the newest slot
-        // always survives one round and is evicted by the *next* insert. Steady
-        // state over a real sweep is therefore "low band, plus wherever the
-        // cursor is" — which is exactly right, since the cursor's layer is the
-        // one being consumed.
+        // The band comes out **whole**, layers 0..3, because admission control
+        // turns layers 4 and 5 away rather than letting them in to displace a band
+        // member and be evicted a moment later. Before that check existed this same
+        // sequence left `(5, 0)` resident and `(3, 0)` gone — the newcomer is exempt
+        // from its own admission's eviction, so each doomed insert still cost the
+        // band one slot on the way through.
         let resident = sweep_then_evict(true);
-        assert_eq!(resident, vec![(0, 0), (1, 0), (2, 0), (5, 0)]);
-        for keep in [(0, 0), (1, 0), (2, 0)] {
-            assert!(resident.contains(&keep), "sweep must retain the leading band, missing {keep:?}");
-        }
-        for gone in [(3, 0), (4, 0)] {
-            assert!(!resident.contains(&gone), "sweep evicts from the top down, {gone:?} should be gone");
+        assert_eq!(resident, vec![(0, 0), (1, 0), (2, 0), (3, 0)]);
+        for gone in [(4, 0), (5, 0)] {
+            assert!(!resident.contains(&gone), "{gone:?} is above the band and must never be admitted");
         }
         // The whole point, stated against the paired test: LRU keeps 2..5 and
         // discards layer 0; sweep keeps layer 0.
         assert!(!sweep_then_evict(false).contains(&(0, 0)));
         assert!(resident.contains(&(0, 0)));
+    }
+
+    #[test]
+    fn sweep_refuses_admissions_from_above_the_band() {
+        // The band has to survive the rest of the pass, and it only does if slabs
+        // from above it are never admitted. Fill to capacity with layers 0..3, then
+        // offer layers 4..20 the way a real sweep would: every one must bounce, and
+        // the band must be untouched afterwards.
+        let mut c = WarmCache::new(4 * 36).with_sweep(true);
+        for layer in 0..4u32 {
+            c.insert((layer, 0), slab(10, 2));
+        }
+        let band: Vec<(u32, u32)> = {
+            let mut v: Vec<_> = c.map.keys().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(band, vec![(0, 0), (1, 0), (2, 0), (3, 0)], "band built from layer 0 up");
+
+        for layer in 4..21u32 {
+            c.insert((layer, 0), slab(10, 2));
+            assert!(!c.contains((layer, 0)), "layer {layer} is above the band and must not be admitted");
+        }
+        let after: Vec<(u32, u32)> = {
+            let mut v: Vec<_> = c.map.keys().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(after, band, "17 doomed admissions must not have cost the band a single slot");
+
+        // A *lower* layer still gets in — the band tracks the sweep's start, it is
+        // not frozen. It displaces the top of the band, which is the whole point.
+        c.insert((0, 7), slab(10, 2));
+        assert!(c.contains((0, 7)), "a layer inside the band is still admitted");
+        assert!(!c.contains((3, 0)), "…by displacing the highest band member");
+    }
+
+    #[test]
+    fn sweep_admission_control_is_off_without_the_gate() {
+        // The paired opposite: same sequence, gate off, and every high layer lands.
+        // If this ever starts refusing, the knob has leaked into the default.
+        let mut c = WarmCache::new(4 * 36).with_sweep(false);
+        for layer in 0..4u32 {
+            c.insert((layer, 0), slab(10, 2));
+        }
+        for layer in 4..8u32 {
+            c.insert((layer, 0), slab(10, 2));
+            assert!(c.contains((layer, 0)), "plain LRU admits everything, including layer {layer}");
+        }
     }
 
     #[test]

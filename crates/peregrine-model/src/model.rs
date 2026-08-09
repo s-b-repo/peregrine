@@ -605,17 +605,32 @@ fn io_rings() -> usize {
         .min(16)
 }
 
-/// Capacity for the O_DIRECT aligned slab pool: the largest routed-expert region on
-/// disk plus alignment slack (the 4096-aligned superset of a region can exceed it by
-/// up to two blocks). Scans the safetensors index; a safe default if none found.
+/// Capacity for the O_DIRECT aligned slab pool: the largest single **read** the
+/// streaming lane will issue for a routed expert, plus alignment slack (the
+/// 4096-aligned superset of a region can exceed it by up to two blocks).
+///
+/// That is the largest *extent*, not the largest tensor. When an expert's three
+/// weight regions are contiguous — which they are for ~99.5 % of this container —
+/// the lane coalesces them into one read, so sizing this per tensor under-counts
+/// threefold (18.9 MB read against a 6.3 MB pool at int4, and 37.7 MB against
+/// 12.6 MB on the int8 MTP layer). A too-small pool is not a correctness problem
+/// on the O_DIRECT path, which falls back to a one-off allocation, but it does
+/// feed `stream_transient_reserve` → `ram::project_load`, and under-projecting
+/// the streaming reserve is how a run gets OOM-killed with no warning.
 fn max_expert_region_bytes(st: &SafeTensors) -> usize {
-    let max = st
-        .tensors()
-        .iter()
-        .filter(|t| t.name.contains(".mlp.experts."))
-        .map(|t| t.nbytes as usize)
-        .max()
-        .unwrap_or(32 << 20);
+    use std::collections::HashMap;
+    // Per (expert, is_scale): the summed bytes of that group, which is the extent
+    // length whenever the group is contiguous. Experts differ in size across
+    // layers on a precision-tiered container, so this maxes over all of them.
+    let mut runs: HashMap<(&str, bool), usize> = HashMap::new();
+    for t in st.tensors() {
+        let Some((head, rest)) = t.name.split_once(".mlp.experts.") else { continue };
+        let Some((eid, _)) = rest.split_once('.') else { continue };
+        let key_end = head.len() + ".mlp.experts.".len() + eid.len();
+        let Some(key) = t.name.get(..key_end) else { continue };
+        *runs.entry((key, t.name.ends_with(".qs"))).or_insert(0) += t.nbytes.max(0) as usize;
+    }
+    let max = runs.into_values().max().unwrap_or(32 << 20);
     max + 2 * peregrine_io::ALIGN
 }
 
