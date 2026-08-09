@@ -105,6 +105,12 @@ pub struct ForwardCtx<'a> {
     /// hyperedge components grouped into the same io-batch claim window.
     /// Bit-identical — only submission/claim order changes.
     pub affinity: Option<&'a AffinityHints>,
+    /// Load-time `(layer, expert)` → plans/extents map. When present, expert
+    /// lookup is a bounds-checked index instead of re-deriving the tensor
+    /// locations and quantized format per request. `None` falls back to
+    /// [`tplan`], which is what every path did before the index existed —
+    /// same bytes either way.
+    pub expert_index: Option<&'a ExpertIndex>,
 }
 
 /// Per-layer co-activation ordering hints, rebuilt periodically by the model
@@ -198,6 +204,114 @@ struct TPlan {
     gs: usize,
 }
 
+/// One routed expert, fully resolved once at load: its three tensor plans, which
+/// carry the on-disk regions *and* the quantized format and group size — the
+/// "type" a request needs.
+///
+/// The merged extents that let six reads become two are deliberately not here
+/// yet: splitting one merged buffer back into three region views needs a
+/// refcounted sub-slice that [`peregrine_io::Bytes`] does not currently have, so
+/// they land with the coalesced read path rather than sitting unused.
+#[derive(Clone, Copy)]
+struct ExpertEntry {
+    /// gate, up, down — in the order the read path expects them, which is **not**
+    /// the order they sit on disk (that is alphabetical: down, gate, up).
+    plans: [TPlan; 3],
+}
+
+/// Load-time map from `(layer, expert)` to its resolved tensor plans.
+///
+/// This replaces re-deriving both on every request. [`tplan`] costs four
+/// `format!` allocations, a [`QtInfo::detect`] (which re-infers the quantized
+/// format from byte counts, group-size probe loop included) and ~7 hash probes,
+/// and was paid per expert, per sparse layer, per forward, at all three call
+/// sites — the demand path, [`prefetch_item`] and [`prefetch_hint_item`].
+///
+/// Dense `Vec` indexed `layer * n_experts + expert` — the same flattening
+/// `heat_counts` already uses — so a lookup is a bounds check rather than a hash.
+/// Entries are `None` for dense layers and for any expert whose tensors do not
+/// resolve; both fall back to the original [`tplan`] path, so an unusual
+/// container behaves exactly as it did before this existed.
+pub struct ExpertIndex {
+    n_experts: usize,
+    entries: Vec<Option<ExpertEntry>>,
+}
+
+impl ExpertIndex {
+    /// Resolve every routed expert once, up front.
+    ///
+    /// Best-effort by design: an expert whose tensors are missing or unquantized
+    /// stores `None` instead of failing the load, because the caller falls back
+    /// to [`tplan`] and would raise the identical error there. Building it here
+    /// must not turn a container that used to run into one that will not load.
+    pub fn build(st: &SafeTensors, cfg: &Cfg) -> ExpertIndex {
+        let n_experts = cfg.n_experts.max(0) as usize;
+        let n_layers = cfg.n_layers.max(0) as usize;
+        let first_dense = cfg.first_dense.clamp(0, cfg.n_layers) as usize;
+        let hidden = cfg.hidden as usize;
+        let mi = cfg.moe_inter as usize;
+        // `n_layers + 1` rows, and the loop is inclusive of `n_layers`: the MTP
+        // head sits at layer index `cfg.n_layers` and carries a full set of
+        // routed experts. On this container those 256 are stored at **int8**
+        // while every other sparse layer is int4, so an exclusive bound would
+        // leave the one layer whose format differs unindexed — exactly the case
+        // the map exists to get right. (`HeatTable` has the off-by-one this
+        // avoids: it is sized `n_layers × n_experts`, so the MTP layer's experts
+        // have never accumulated heat.)
+        let mut entries = vec![None; (n_layers + 1).saturating_mul(n_experts)];
+        for layer in first_dense..=n_layers {
+            for e in 0..n_experts {
+                let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
+                let plans = match (
+                    tplan(st, &p("gate_proj.weight"), mi, hidden),
+                    tplan(st, &p("up_proj.weight"), mi, hidden),
+                    tplan(st, &p("down_proj.weight"), hidden, mi),
+                ) {
+                    (Ok(g), Ok(u), Ok(d)) => [g, u, d],
+                    _ => continue,
+                };
+                entries[layer * n_experts + e] = Some(ExpertEntry { plans });
+            }
+        }
+        ExpertIndex { n_experts, entries }
+    }
+
+    /// The resolved entry for one expert, or `None` if it was not indexed.
+    fn get(&self, layer: usize, expert: usize) -> Option<&ExpertEntry> {
+        if expert >= self.n_experts {
+            return None;
+        }
+        self.entries.get(layer.checked_mul(self.n_experts)?.checked_add(expert)?)?.as_ref()
+    }
+
+    /// How many experts resolved — the denominator for the index-agreement test.
+    pub fn resolved(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_some()).count()
+    }
+}
+
+/// Resolve one expert's three tensor plans, preferring the load-time index and
+/// falling back to deriving them when the index has no entry.
+fn plans_for(
+    index: Option<&ExpertIndex>,
+    st: &SafeTensors,
+    cfg: &Cfg,
+    layer: usize,
+    expert: usize,
+) -> Result<[TPlan; 3], Error> {
+    if let Some(e) = index.and_then(|ix| ix.get(layer, expert)) {
+        return Ok(e.plans);
+    }
+    let hidden = cfg.hidden as usize;
+    let mi = cfg.moe_inter as usize;
+    let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{expert}.{t}");
+    Ok([
+        tplan(st, &p("gate_proj.weight"), mi, hidden)?,
+        tplan(st, &p("up_proj.weight"), mi, hidden)?,
+        tplan(st, &p("down_proj.weight"), hidden, mi)?,
+    ])
+}
+
 /// One expert's streaming+compute plan: which rows route to it (+ gate weights),
 /// where its gate/up/down tensors live on disk, and its batch-union position
 /// (`pos`) for the deterministic ordered reduce (GPU-resident experts take the
@@ -263,6 +377,27 @@ fn tplan(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<TPlan, Erro
     let info = QtInfo::detect(st, name, o as i64, i as i64);
     let fmt = QuantFmt::from_qt(info.fmt)
         .ok_or_else(|| Error::Format(format!("{name}: unquantized (F32) has no compute path")))?;
+    // Refuse any tensor whose on-disk bytes are not the bytes the kernel expects.
+    // `tplan` is the single funnel for *streamed* expert regions, and the
+    // streaming path reads raw extents — only `SafeTensors::read_raw` un-permutes
+    // a `kblock` tiling or inflates zstd. A `kblock` expert therefore used to be
+    // handed to the kernel permuted, with no conversion and no error: wrong
+    // numbers that still look like plausible activations. Resident loading is
+    // unaffected (it goes through `read_raw`), and `has_compressed_tensors`
+    // already forces a compressed container resident, so this is a guard against
+    // the combination reaching the streaming lane rather than a new restriction.
+    if let Some((kind, gs)) = st.find(name).and_then(|t| t.layout.as_ref()) {
+        return Err(Error::Format(format!(
+            "{name}: on-disk layout '{kind}' (group {gs}) cannot be streamed — the streaming lane \
+             reads raw extents and would not un-permute it; load this container resident instead"
+        )));
+    }
+    if st.compression(name) != peregrine_core::Compression::None {
+        return Err(Error::Format(format!(
+            "{name}: compressed tensors cannot be streamed — the streaming lane reads raw extents; \
+             load this container resident instead"
+        )));
+    }
     let (w_fd, w_off, w_len) = st.region(name).ok_or_else(|| Error::Format(format!("missing tensor {name}")))?;
     let sname = format!("{name}.qs");
     let (s_fd, s_off, s_len) = st.region(&sname).ok_or_else(|| Error::Format(format!("missing tensor {sname}")))?;
@@ -735,7 +870,9 @@ pub fn moe_forward_concurrent(
         return Err(Error::Format("streaming mode without io_uring reactors".into()));
     }
     let hidden = cfg.hidden as usize;
-    let (e_n, mi, k) = (cfg.n_experts as usize, cfg.moe_inter as usize, cfg.topk as usize);
+    // `moe_inter` is no longer read here: the expert map (or `plans_for`'s
+    // fallback) owns the tensor shapes now.
+    let (e_n, k) = (cfg.n_experts as usize, cfg.topk as usize);
     let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale, min_share: crate::router::route_min_share() });
 
     // Partition the batch-union into GPU-resident (compute on device) and disk
@@ -809,16 +946,8 @@ pub fn moe_forward_concurrent(
             }
             gplans.push(GPlan { pos: this_pos, e, rows, rw, xg });
         } else {
-            let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
-            plans.push(EPlan {
-                pos: this_pos,
-                expert: e,
-                rows,
-                rw,
-                gate: tplan(st, &p("gate_proj.weight"), mi, hidden)?,
-                up: tplan(st, &p("up_proj.weight"), mi, hidden)?,
-                down: tplan(st, &p("down_proj.weight"), hidden, mi)?,
-            });
+            let [gate, up, down] = plans_for(ctx.expert_index, st, cfg, layer, e)?;
+            plans.push(EPlan { pos: this_pos, expert: e, rows, rw, gate, up, down });
         }
     }
     let n = pos;
@@ -1292,15 +1421,18 @@ impl PrefetchItem {
 }
 
 /// Build the streaming plan for one routed expert (gate/up/down), for the prefetch
-/// lane. Mirrors the disk-plan construction in [`moe_forward_concurrent`].
-pub fn prefetch_item(st: &SafeTensors, cfg: &Cfg, layer: usize, expert: usize) -> Result<PrefetchItem, Error> {
-    let hidden = cfg.hidden as usize;
-    let mi = cfg.moe_inter as usize;
-    let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{expert}.{t}");
-    let gate = tplan(st, &p("gate_proj.weight"), mi, hidden)?;
-    let up = tplan(st, &p("up_proj.weight"), mi, hidden)?;
-    let down = tplan(st, &p("down_proj.weight"), hidden, mi)?;
-    Ok(PrefetchItem { key: (layer as u32, expert as u32), plans: [gate, up, down] })
+/// lane. Mirrors the disk-plan construction in [`moe_forward_concurrent`], including
+/// its use of the load-time [`ExpertIndex`] — the two must agree, or a prefetched
+/// slab would not be the one a later demand read expects.
+pub fn prefetch_item(
+    index: Option<&ExpertIndex>,
+    st: &SafeTensors,
+    cfg: &Cfg,
+    layer: usize,
+    expert: usize,
+) -> Result<PrefetchItem, Error> {
+    let plans = plans_for(index, st, cfg, layer, expert)?;
+    Ok(PrefetchItem { key: (layer as u32, expert as u32), plans })
 }
 
 /// Stream one prefetch item's six regions through `reactor` into an owned slab
@@ -1328,13 +1460,14 @@ impl HintItem {
 /// Build a [`HintItem`] for one expert's six regions. Uses the **buffered** fds:
 /// `fadvise` only populates the page cache, so it's a no-op for O_DIRECT reads and
 /// the caller gates hints off under direct I/O.
-pub fn prefetch_hint_item(st: &SafeTensors, cfg: &Cfg, layer: usize, expert: usize) -> Result<HintItem, Error> {
-    let hidden = cfg.hidden as usize;
-    let mi = cfg.moe_inter as usize;
-    let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{expert}.{t}");
-    let gate = tplan(st, &p("gate_proj.weight"), mi, hidden)?;
-    let up = tplan(st, &p("up_proj.weight"), mi, hidden)?;
-    let down = tplan(st, &p("down_proj.weight"), hidden, mi)?;
+pub fn prefetch_hint_item(
+    index: Option<&ExpertIndex>,
+    st: &SafeTensors,
+    cfg: &Cfg,
+    layer: usize,
+    expert: usize,
+) -> Result<HintItem, Error> {
+    let [gate, up, down] = plans_for(index, st, cfg, layer, expert)?;
     let regions = [
         (gate.w_fd, gate.w_off, gate.w_len),
         (gate.s_fd, gate.s_off, gate.s_len),
@@ -1352,6 +1485,81 @@ mod tests {
     use crate::weight::QuantFmt;
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
+
+    /// A fresh tiny-model checkpoint on disk. Mirrors `model.rs`'s `tmp_model_dir`:
+    /// this crate has no `tempfile` dependency, and the tests are per-process.
+    fn tmp_expert_index_dir(tag: &str) -> Result<std::path::PathBuf, Error> {
+        let d = std::env::temp_dir().join(format!("peregrine_expert_index_{}_{}", std::process::id(), tag));
+        if d.exists() {
+            std::fs::remove_dir_all(&d).map_err(Error::Io)?;
+        }
+        crate::testkit::build_tiny_model(&d)?;
+        Ok(d)
+    }
+
+    /// The index is only safe if it resolves an expert to exactly what deriving it
+    /// per request would have. Field for field, every expert — this is the whole
+    /// correctness argument for replacing `tplan` with a lookup, and it is what
+    /// catches a transposition slip like `down_proj` being `(hidden, mi)` while
+    /// gate/up are `(mi, hidden)`.
+    #[test]
+    fn expert_index_agrees_with_deriving_per_request() -> Result<(), Error> {
+        let dir = tmp_expert_index_dir("agree")?;
+        let st = SafeTensors::open(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+        let index = ExpertIndex::build(&st, &cfg);
+        assert!(index.resolved() > 0, "fixture indexed no experts at all");
+
+        let hidden = cfg.hidden as usize;
+        let mi = cfg.moe_inter as usize;
+        let mut checked = 0usize;
+        for layer in (cfg.first_dense as usize)..=(cfg.n_layers as usize) {
+            for e in 0..(cfg.n_experts as usize) {
+                let Some(entry) = index.get(layer, e) else { continue };
+                let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
+                let want = [
+                    tplan(&st, &p("gate_proj.weight"), mi, hidden)?,
+                    tplan(&st, &p("up_proj.weight"), mi, hidden)?,
+                    tplan(&st, &p("down_proj.weight"), hidden, mi)?,
+                ];
+                for (got, want) in entry.plans.iter().zip(want.iter()) {
+                    assert_eq!((got.w_fd, got.w_off, got.w_len), (want.w_fd, want.w_off, want.w_len));
+                    assert_eq!((got.s_fd, got.s_off, got.s_len), (want.s_fd, want.s_off, want.s_len));
+                    assert_eq!((got.w_fd_direct, got.s_fd_direct), (want.w_fd_direct, want.s_fd_direct));
+                    // The shape/format half — the "correct type" the request needs.
+                    assert_eq!((got.fmt, got.o, got.i, got.gs), (want.fmt, want.o, want.i, want.gs));
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, index.resolved(), "walked a different set than the index holds");
+        Ok(())
+    }
+
+    /// A `None` entry must be indistinguishable from never having had an index:
+    /// `plans_for` falls back to deriving, so an unusual container behaves exactly
+    /// as it did before the map existed.
+    #[test]
+    fn absent_index_entry_falls_back_to_deriving() -> Result<(), Error> {
+        let dir = tmp_expert_index_dir("fallback")?;
+        let st = SafeTensors::open(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+        let index = ExpertIndex::build(&st, &cfg);
+        let layer = cfg.first_dense as usize;
+
+        let with = plans_for(Some(&index), &st, &cfg, layer, 0)?;
+        let without = plans_for(None, &st, &cfg, layer, 0)?;
+        for (a, b) in with.iter().zip(without.iter()) {
+            assert_eq!((a.w_fd, a.w_off, a.w_len), (b.w_fd, b.w_off, b.w_len));
+            assert_eq!((a.s_fd, a.s_off, a.s_len), (b.s_fd, b.s_off, b.s_len));
+            assert_eq!((a.fmt, a.o, a.i, a.gs), (b.fmt, b.o, b.i, b.gs));
+        }
+        // Out of range on either axis resolves to `None` rather than panicking or
+        // reading a neighbouring expert's row.
+        assert!(index.get(layer, cfg.n_experts as usize).is_none());
+        assert!(index.get(cfg.n_layers as usize + 1, 0).is_none());
+        Ok(())
+    }
 
     #[test]
     fn read_expert_batched_bytes_identical() -> Result<(), Error> {

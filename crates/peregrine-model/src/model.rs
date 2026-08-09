@@ -107,6 +107,11 @@ pub struct Model {
     direct: bool,
     /// Retained safetensors index (keeps shard fds open) for streaming reads.
     st: SafeTensors,
+    /// Load-time `(layer, expert)` → tensor-plan/extent map for the streaming
+    /// path. `Some` only when experts stream; a resident model never reads it.
+    /// Removes the per-request re-derivation of both an expert's on-disk
+    /// location and its quantized format.
+    expert_index: Option<crate::concurrent::ExpertIndex>,
     /// The concurrent MoE lane's **pool of io_uring rings** (streaming mode only) —
     /// one per I/O worker thread so N expert reads run in parallel. Separate from
     /// `st`'s ring. Empty when experts are resident. Size via `COLI_IO_RINGS`.
@@ -1287,6 +1292,9 @@ struct PrefetchCtx<'a> {
     gpu: Option<&'a GpuTier>,
     st: &'a SafeTensors,
     cfg: &'a Cfg,
+    /// The model's load-time expert map, so a speculative read resolves its
+    /// regions exactly the way the demand path will.
+    expert_index: Option<&'a crate::concurrent::ExpertIndex>,
     /// Multi-path tiering: the top `warm_paths` ranked candidates per layer are fully
     /// streamed (tier 1); the next `hint_paths` get a page-cache `fadvise` hint (tier 2).
     warm_paths: usize,
@@ -1330,13 +1338,13 @@ impl PrefetchCtx<'_> {
                     continue; // computed on the GPU lane, never streamed
                 }
                 if rank < self.warm_paths {
-                    match crate::concurrent::prefetch_item(self.st, self.cfg, layer, e as usize) {
+                    match crate::concurrent::prefetch_item(self.expert_index, self.st, self.cfg, layer, e as usize) {
                         Ok(item) => warms.push(item),
                         // speculative: the real forward will stream this expert normally
                         Err(e) => peregrine_io::note_advisory_err("prefetch item resolve", &e),
                     }
                 } else if rank < hint_cutoff && !self.direct {
-                    match crate::concurrent::prefetch_hint_item(self.st, self.cfg, layer, e as usize) {
+                    match crate::concurrent::prefetch_hint_item(self.expert_index, self.st, self.cfg, layer, e as usize) {
                         Ok(item) => hints.push(item),
                         Err(e) => peregrine_io::note_advisory_err("prefetch hint resolve", &e),
                     }
@@ -1372,6 +1380,9 @@ struct LookaheadCtx<'a> {
     gpu: Option<&'a GpuTier>,
     st: &'a SafeTensors,
     cfg: &'a Cfg,
+    /// Same load-time expert map [`PrefetchCtx`] carries; `None` falls back to
+    /// re-deriving plans per request, which is what this path did before.
+    expert_index: Option<&'a crate::concurrent::ExpertIndex>,
 }
 
 impl LookaheadCtx<'_> {
@@ -1407,7 +1418,7 @@ impl LookaheadCtx<'_> {
         let mut warms = Vec::new();
         for e in self.rank(l, next, x, width) {
             let Ok(eu) = usize::try_from(e) else { continue };
-            match crate::concurrent::prefetch_item(self.st, self.cfg, next, eu) {
+            match crate::concurrent::prefetch_item(self.expert_index, self.st, self.cfg, next, eu) {
                 Ok(item) => warms.push(item),
                 Err(err) => peregrine_io::note_advisory_err("lookahead item resolve", &err),
             }
@@ -2141,7 +2152,12 @@ impl Model {
         };
         // Heat accumulator for dynamic VRAM residency — only useful (and only built)
         // when there is a GPU tier to migrate hot experts into.
-        let heat = gpu.as_ref().map(|_| HeatTable::new(cfg.n_layers as usize, cfg.n_experts as usize));
+        // `n_layers + 1` rows: the MTP head sits at layer index `cfg.n_layers` and
+        // routes a full set of experts. Sized `n_layers` until 2026-08-09, and
+        // `bump` drops out-of-range silently, so that layer's experts could never
+        // accumulate heat — the LFRU eviction score and the VRAM reheat ranking
+        // both read this table, and both were blind to one layer's worth.
+        let heat = gpu.as_ref().map(|_| HeatTable::new(cfg.n_layers as usize + 1, cfg.n_experts as usize));
 
         // Optional MTP head (checkpoints converted with --mtp): a full layer at
         // index n_layers plus the embed/hidden projection and norms.
@@ -2160,6 +2176,12 @@ impl Model {
 
         let model_n_layers = cfg.n_layers as usize; // read before `cfg` moves into the struct
         let model_topk = cfg.topk.max(1) as usize; // likewise
+        // Resolve every routed expert's location and quantized format once, while
+        // `st` and `cfg` are still borrowable. Only worth it when experts stream:
+        // a resident model never consults it. See `ExpertIndex` for why this is
+        // not done lazily per request.
+        let expert_index =
+            if stream_experts { Some(crate::concurrent::ExpertIndex::build(&st, &cfg)) } else { None };
         let mut model = Model {
             route_hist_epoch: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -2174,6 +2196,7 @@ impl Model {
             stream_experts,
             direct,
             st,
+            expert_index,
             io_reactors,
             workers,
             ecache,
@@ -2326,7 +2349,7 @@ impl Model {
             else {
                 continue;
             };
-            match crate::concurrent::prefetch_item(&self.st, &self.cfg, l as usize, e as usize) {
+            match crate::concurrent::prefetch_item(self.expert_index.as_ref(), &self.st, &self.cfg, l as usize, e as usize) {
                 Ok(item) => items.push(item),
                 // seed warming is speculative; a bad tier entry is skipped
                 Err(e) => peregrine_io::note_advisory_err("tier-seed prefetch resolve", &e),
@@ -2389,6 +2412,7 @@ impl Model {
                 gpu: self.gpu.as_ref(),
                 st: &self.st,
                 cfg: &self.cfg,
+                expert_index: self.expert_index.as_ref(),
                 warm_paths: policy.warm_paths,
                 hint_paths: policy.hint_paths,
                 direct: self.direct,
@@ -2412,6 +2436,7 @@ impl Model {
                 gpu: self.gpu.as_ref(),
                 st: &self.st,
                 cfg: &self.cfg,
+                expert_index: self.expert_index.as_ref(),
             }),
             _ => None,
         }
@@ -2627,6 +2652,7 @@ impl Model {
             gpu: self.gpu.as_ref(),
             st: &self.st,
             cfg: &self.cfg,
+            expert_index: self.expert_index.as_ref(),
             warm_paths: policy.warm_paths,
             hint_paths: policy.hint_paths,
             direct: self.direct,
@@ -2688,7 +2714,7 @@ impl Model {
                 if c.contains(key) {
                     continue;
                 }
-                match crate::concurrent::prefetch_item(&self.st, &self.cfg, layer, e) {
+                match crate::concurrent::prefetch_item(self.expert_index.as_ref(), &self.st, &self.cfg, layer, e) {
                     Ok(item) => items.push(item),
                     Err(e) => peregrine_io::note_advisory_err("warm-list prefetch resolve", &e),
                 }
@@ -3522,7 +3548,7 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, lane_timings, layout_schedule, absorb, dsa, ..
+                cfg, layers, kv, st, expert_index, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, lane_timings, layout_schedule, absorb, dsa, ..
             } = self;
             let ctx = ForwardCtx {
                 st,
@@ -3543,6 +3569,7 @@ impl Model {
                 heat_counts: heat_snapshot.as_deref(),
                 layout_schedule: layout_schedule.as_deref(),
                 affinity: Some(aff.as_ref()),
+                expert_index: expert_index.as_ref(),
             };
             // Layer look-ahead: a shared prefetch view over the same field borrows, so
             // each layer's next-token prefetch is emitted the moment that layer
@@ -3558,6 +3585,7 @@ impl Model {
                     gpu: gpu.as_ref(),
                     st,
                     cfg,
+                    expert_index: expert_index.as_ref(),
                     warm_paths: policy.warm_paths,
                     hint_paths: policy.hint_paths,
                     direct: *direct,
@@ -3592,7 +3620,14 @@ impl Model {
             // as well, which is not what that knob says it does.
             let la = match (la_width > 0, prefetch.as_ref(), ecache.as_ref()) {
                 (true, Some(pool), Some(ec)) => {
-                    Some(LookaheadCtx { prefetch: pool.lane(0), cache: ec, gpu: gpu.as_ref(), st, cfg })
+                    Some(LookaheadCtx {
+                        prefetch: pool.lane(0),
+                        cache: ec,
+                        gpu: gpu.as_ref(),
+                        st,
+                        cfg,
+                        expert_index: None,
+                    })
                 }
                 _ => None,
             };
@@ -3740,6 +3775,7 @@ impl Model {
             heat_counts: None,
             layout_schedule: self.layout_schedule.as_deref(),
             affinity: None,
+            expert_index: self.expert_index.as_ref(),
         }
     }
 
@@ -3997,6 +4033,7 @@ impl Model {
             heat_counts: heat_snapshot.as_deref(),
             layout_schedule: self.layout_schedule.as_deref(),
             affinity: Some(aff.as_ref()),
+            expert_index: self.expert_index.as_ref(),
         };
         // Router look-ahead, on the same decode-only rule as `forward_hidden`. B == 1
         // *is* a decode step — the serving engine reaching this path with one live
@@ -4212,6 +4249,7 @@ impl Model {
             heat_counts: None,
             layout_schedule: None, // drafts benefit less from disk-order tuning
             affinity: None,
+            expert_index: None,
         };
         let mut kv = LayerKv::new(kvl, qkr);
         let mut h = hlast.to_vec(); // pre-final-norm hidden

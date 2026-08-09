@@ -1391,7 +1391,17 @@ mod real {
     /// were int4. Under-planning wastes VRAM; over-planning silently truncates
     /// the tier, so the conservative answer is the right one.
     fn experts_are_per_row_int4(st: &SafeTensors, cfg: &Cfg) -> bool {
-        expert_is_per_row_int4(st, cfg, cfg.first_dense as usize, 0)
+        // Every sparse layer, including the MTP head at `cfg.n_layers`, and not
+        // just one expert of one layer. A single probe of (first_dense, 0) answers
+        // for a uniform container but reports "all int4" on a per-layer-tiered one
+        // — the GLM-5.2 checkpoint stores the MTP layer's 256 experts at int8 and
+        // the rest at int4, so the probe said yes and the operator never saw the
+        // "not per-row int4" notice that explains an 8x-larger VRAM plan. Expert 0
+        // still stands in for its layer: precision is chosen per layer by
+        // `peregrine-requantize`, and `solve_residency_sized` asks per expert
+        // anyway when it actually sizes the tier.
+        ((cfg.first_dense as usize)..=(cfg.n_layers as usize))
+            .all(|layer| expert_is_per_row_int4(st, cfg, layer, 0))
     }
 
     /// Whether **this** expert stores all three projections as per-row int4, i.e.

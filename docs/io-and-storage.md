@@ -18,9 +18,16 @@ batched-submit / io-wq-worker-cap ownership the design needs.
 - **Registered buffers**: `register_read_buffers()` + `IORING_OP_READ_FIXED`
   are implemented and tested, but **not reachable from the streaming path** —
   nothing calls them outside tests, and `COLI_REGBUF` is read by no code.
-- **Batched submits**: `read_many()` / `read_experts_batched()` merge
-  contiguous regions before submit; the streaming lane keeps
-  `COLI_IO_BATCH` experts × 6 regions ≈ 96 reads in flight per ring.
+- **Batched submits**: `read_many()` / `read_experts_batched()` issue **one SQE
+  per region** in a single deep submit; the streaming lane keeps `COLI_IO_BATCH`
+  experts × 6 regions ≈ 96 reads in flight per ring. They do **not** coalesce
+  adjacent regions — this said "merge contiguous regions before submit" until
+  2026-08-09, describing an optimization no code performed. Any merging is the
+  kernel's and the device's, not ours. It is worth doing: on the GLM-5.2
+  container an expert's three weight regions are one contiguous 18,874,368-byte
+  run and its three `.qs` scales are another, so six SQEs could be two. What
+  blocks it is that splitting one merged buffer back into three regions needs a
+  refcounted sub-slice `Bytes` does not have yet.
 - **fadvise integration**: `POSIX_FADV_WILLNEED` batched before main-path
   reads (`COLI_FADVISE_MAIN`, default on); optional `POSIX_FADV_DONTNEED`
   after each streamed read for RSS-bounded runs (`COLI_FADVISE_DROP`).

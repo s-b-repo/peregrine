@@ -241,6 +241,24 @@ pub struct WarmCache {
     /// `COLI_CACHE_LFRU=1`; off = the historical `(prio, used)` tuple, unchanged
     /// bit for bit. Fixed at construction.
     lfru: bool,
+    /// Evict the **highest layer** first instead of the least-recently-used slot,
+    /// so the cache converges on a stable low-layer band. `COLI_CACHE_SWEEP=1`;
+    /// off = the historical tuple, unchanged. Fixed at construction.
+    ///
+    /// Exists because recency is the *worst* available signal for this access
+    /// pattern. Expert reads are a deterministic front-to-back layer sweep with no
+    /// intra-pass reuse, and `used` is a logical access ordinal that advances in
+    /// layer order (~624 ticks per token), so at the end of a pass the
+    /// minimum-`used` resident slot is by construction the earliest-layer expert —
+    /// exactly what layer 0 of the next token asks for first. LRU here does not
+    /// merely fail to help; it evicts precisely what is needed next.
+    ///
+    /// Measured on a real GLM-5.2 container at 227 slots against a 600-expert
+    /// working set: pure LRU returned **0 hits in 9944 lookups** with the cache
+    /// 100 % full throughout. Above the threshold (681 slots) the previous pass
+    /// fits entirely, there is no complement to retain, and LRU is fine — which is
+    /// why this is a knob and not a replacement.
+    sweep: bool,
     /// Hits served since the last frequency decay. `tier::decay` halves every
     /// slot's `heat` when this crosses [`LFRU_DECAY_HITS`], so the score tracks
     /// *recent* popularity rather than a lifetime total — without it, a slot that
@@ -265,8 +283,10 @@ impl WarmCache {
             .unwrap_or(0);
         let compress = matches!(std::env::var("COLI_CACHE_COMPRESS").as_deref(), Ok("1") | Ok("true"));
         let lfru = matches!(std::env::var("COLI_CACHE_LFRU").as_deref(), Ok("1") | Ok("true"));
+        let sweep = matches!(std::env::var("COLI_CACHE_SWEEP").as_deref(), Ok("1") | Ok("true"));
         WarmCache {
             lfru,
+            sweep,
             hits_since_decay: 0,
             budget: budget_bytes,
             used: 0,
@@ -306,6 +326,14 @@ impl WarmCache {
     /// policy for every other test running beside it.
     pub fn with_lfru(mut self, on: bool) -> WarmCache {
         self.lfru = on;
+        self
+    }
+
+    /// Override the `COLI_CACHE_SWEEP` gate, for the same reason as
+    /// [`Self::with_lfru`]: the env is process-global and the test binary is
+    /// threaded.
+    pub fn with_sweep(mut self, on: bool) -> WarmCache {
+        self.sweep = on;
         self
     }
 
@@ -781,18 +809,38 @@ impl WarmCache {
             // mechanism (`COLI_PREFETCH_PROTECT`) and LFRU reorders within a
             // class rather than overriding it. Both arms are `(u32, u64)`, so the
             // default arm is the historical tuple untouched.
+            // Under `COLI_CACHE_SWEEP` the second component inverts the **layer**,
+            // so the highest-layer slot is the victim and the cache converges on a
+            // stable low-layer band instead of the trailing edge of the last pass.
+            // The layer was always available here — it is the first half of the
+            // key — and was simply discarded by the closure until 2026-08-10.
+            //
+            // The third component is not decoration. `min_by_key` returns the
+            // first minimum in `HashMap` iteration order, which is unspecified;
+            // under LRU that never bites because `used` is unique per slot, but a
+            // layer-keyed score ties across all 8 experts of a layer and would
+            // otherwise pick a hash-order-dependent victim. `used` breaks it
+            // deterministically, and the historical arms pass 0 so their tuple is
+            // ordered exactly as before.
             let lfru = self.lfru;
+            let sweep = self.sweep;
             let clock = self.clock as u32;
             let victim = self
                 .map
                 .iter()
                 .filter(|(k, _)| Some(**k) != keep)
-                .min_by_key(|(_, s)| {
+                .min_by_key(|(k, s)| {
                     // `used` and `clock` are u64 counters truncated to u32 here;
                     // `lfru_score` takes their wrapping difference, which is the
                     // true age for any age below 2^32 — i.e. always.
-                    let rank = if lfru { crate::tier::lfru_score(s.heat, s.used as u32, clock) } else { s.used };
-                    (s.prio, rank)
+                    let (rank, tie) = if sweep {
+                        ((u32::MAX - k.0) as u64, s.used)
+                    } else if lfru {
+                        (crate::tier::lfru_score(s.heat, s.used as u32, clock), 0)
+                    } else {
+                        (s.used, 0)
+                    };
+                    (s.prio, rank, tie)
                 })
                 .map(|(k, _)| *k);
             let Some(vk) = victim else { break };
@@ -1052,6 +1100,80 @@ mod tests {
         assert!(!c.contains((0, 0)));
         assert_eq!(c.prefetch_used, 1);
         assert_eq!(c.prefetch_wasted, 0);
+    }
+
+    /// Drive a front-to-back layer sweep bigger than the budget, then force one
+    /// eviction and see who dies. Paired with the test below — same sequence,
+    /// opposite victim — because that is the only thing that proves the knob is a
+    /// knob.
+    fn sweep_then_evict(sweep: bool) -> Vec<(u32, u32)> {
+        // Budget fits 4 slabs; the sweep is 6 layers, so 2 must go.
+        let mut c = WarmCache::new(4 * 36).with_sweep(sweep);
+        for layer in 0..6u32 {
+            c.insert((layer, 0), slab(10, 2));
+        }
+        let mut resident: Vec<(u32, u32)> = c.map.keys().copied().collect();
+        resident.sort_unstable();
+        resident
+    }
+
+    #[test]
+    fn lru_evicts_the_earliest_layer_which_is_what_the_next_sweep_needs_first() {
+        // The pathology, pinned. `used` is a logical access ordinal that advances
+        // in layer order, so the least-recently-used slot at the end of a pass is
+        // layer 0 — precisely what the next token asks for first. LRU keeps the
+        // tail and throws away the head.
+        let resident = sweep_then_evict(false);
+        assert_eq!(resident, vec![(2, 0), (3, 0), (4, 0), (5, 0)], "LRU retains the trailing layers");
+        assert!(!resident.contains(&(0, 0)), "…and evicts layer 0, the next sweep's first lookup");
+    }
+
+    #[test]
+    fn sweep_keeps_the_low_layer_band_the_next_pass_starts_on() {
+        // Same sequence, opposite outcome: the highest layers are the victims, so
+        // what survives is a band from layer 0 — the only subset a cyclic sweep
+        // can actually reuse. If this ever agrees with the test above, the knob
+        // has stopped being a knob.
+        //
+        // The trailing `(5, 0)` is not a leak: `evict_to_budget` exempts the
+        // just-inserted key from its own admission (`keep`), so the newest slot
+        // always survives one round and is evicted by the *next* insert. Steady
+        // state over a real sweep is therefore "low band, plus wherever the
+        // cursor is" — which is exactly right, since the cursor's layer is the
+        // one being consumed.
+        let resident = sweep_then_evict(true);
+        assert_eq!(resident, vec![(0, 0), (1, 0), (2, 0), (5, 0)]);
+        for keep in [(0, 0), (1, 0), (2, 0)] {
+            assert!(resident.contains(&keep), "sweep must retain the leading band, missing {keep:?}");
+        }
+        for gone in [(3, 0), (4, 0)] {
+            assert!(!resident.contains(&gone), "sweep evicts from the top down, {gone:?} should be gone");
+        }
+        // The whole point, stated against the paired test: LRU keeps 2..5 and
+        // discards layer 0; sweep keeps layer 0.
+        assert!(!sweep_then_evict(false).contains(&(0, 0)));
+        assert!(resident.contains(&(0, 0)));
+    }
+
+    #[test]
+    fn sweep_eviction_is_deterministic_across_experts_of_one_layer() {
+        // All 8 experts of a layer tie on the layer term, and `min_by_key` returns
+        // the first minimum in unspecified `HashMap` order — so without the
+        // `used` tie-break the victim would depend on hash iteration. Same input,
+        // same survivors, every time.
+        let run = || {
+            let mut c = WarmCache::new(4 * 36).with_sweep(true);
+            for e in 0..6u32 {
+                c.insert((7, e), slab(10, 2)); // one layer, six experts
+            }
+            let mut r: Vec<(u32, u32)> = c.map.keys().copied().collect();
+            r.sort_unstable();
+            r
+        };
+        let first = run();
+        for _ in 0..8 {
+            assert_eq!(run(), first, "victim selection must not depend on HashMap order");
+        }
     }
 
     #[test]
