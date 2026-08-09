@@ -112,6 +112,13 @@ pub struct Model {
     /// Removes the per-request re-derivation of both an expert's on-disk
     /// location and its quantized format.
     expert_index: Option<crate::concurrent::ExpertIndex>,
+    /// Bytes one token's routing touches (0 when experts are resident). The
+    /// threshold that decides whether capacity or policy binds this deployment.
+    expert_per_token_bytes: u64,
+    /// Whether predictive eviction protection is active, resolved once at load
+    /// from the budget against `expert_per_token_bytes` — the mechanism helps
+    /// below that threshold and hurts above it. See `prefetch_protect_default`.
+    prefetch_protect: bool,
     /// The concurrent MoE lane's **pool of io_uring rings** (streaming mode only) —
     /// one per I/O worker thread so N expert reads run in parallel. Separate from
     /// `st`'s ring. Empty when experts are resident. Size via `COLI_IO_RINGS`.
@@ -188,6 +195,16 @@ pub struct Model {
     last_telemetry: Mutex<crate::telemetry::RuntimeTelemetry>,
     /// Last snapshot of per-forward per-lane wall time, for `/metrics` scrapes.
     last_lane: Mutex<crate::lane::LaneTimings>,
+    /// Run-lifetime lane totals, and the number of forwards folded into them.
+    ///
+    /// Separate from `lane_timings` because that one is *reset* every forward by
+    /// [`Self::publish_lane_timings`] — it exists to feed the tuner a per-forward
+    /// sample, so by construction it can never answer "where did this run's time
+    /// go". The four lane counters were being collected and consumed only by an
+    /// adaptive controller, with no way out to an operator; this is the way out.
+    /// Cheap: four atomics bumped once per forward, not per layer.
+    lane_totals: Arc<crate::lane::LaneTimingsAccum>,
+    lane_forwards: std::sync::atomic::AtomicU64,
     /// Adaptive io_uring worker-cap tuner. Consumes per-forward `io_us` from
     /// [`Self::publish_lane_timings`] and — when `COLI_IO_TUNE` is on — applies
     /// the recommended `(bounded, unbounded)` cap to every reactor between
@@ -1032,12 +1049,74 @@ fn llc_trend(prev_ewma: f32, delta: f32) -> i8 {
 }
 
 /// Whether predictive eviction is active: after each forward, resident experts the
-/// predictor expects to be reused are protected from eviction. On by default (it only
-/// reorders eviction victims, never output); disable with `COLI_PREFETCH_PROTECT=0`.
-fn prefetch_protect() -> bool {
+/// predictor expects to be reused are protected from eviction. It only reorders
+/// eviction victims, never output.
+///
+/// **The default is decided by the cache budget, because this mechanism has
+/// opposite signs either side of one token's working set.** Measured at 8 decode
+/// tokens on the GLM-5.2 container:
+///
+/// | budget | slots vs one pass | protect on | pure LRU |
+/// |---|---|---|---|
+/// | 4.29 GB | 227 (38 %) | **193** | 0 |
+/// | 12.88 GB | 681 (113 %) | 564 | **945** |
+///
+/// Below the threshold a front-to-back layer sweep drives plain recency to
+/// *exactly zero* hits — the minimum-`used` resident slot at the end of a pass is
+/// by construction the earliest-layer expert, which is what the next token asks
+/// for first — and feeding `pack_prio` into the victim key is the only thing
+/// keeping the count off the floor. Above it the cache can hold a pass unaided
+/// and the same priority ordering costs 40 % of the hits and 381 extra reads.
+///
+/// So: on when the budget cannot clear a pass, off when it can. `COLI_PREFETCH_PROTECT`
+/// still forces either way; this only picks the default, which was unconditionally
+/// on until 2026-08-09 with nothing tracking which side a deployment sat on.
+fn prefetch_protect_default(budget_bytes: usize, per_token_bytes: u64) -> bool {
+    match std::env::var("COLI_PREFETCH_PROTECT").as_deref() {
+        Ok("0") | Ok("false") => false,
+        Ok("1") | Ok("true") => true,
+        // An unknown value, or no working-set figure (resident mode, or an
+        // unindexed container), keeps the historical always-on behaviour.
+        _ => per_token_bytes == 0 || (budget_bytes as u64) < per_token_bytes,
+    }
+}
+
+/// Whether speculative reads are still earning their bandwidth.
+///
+/// Measured at 8 decode tokens on the GLM-5.2 container: **4034 speculative reads
+/// bought 3 hits** — 0.3 % — for **+41 % wall time**. At that yield the prefetch
+/// lane is pure contention for a disk the demand path is already saturating, and
+/// it was the demand path that produced 183 of the 196 hits. Prefetch is worth
+/// having when the predictor is right often enough to fill an idle window; it is
+/// not worth having unconditionally.
+///
+/// Once `COLI_PREFETCH_MIN_READS` speculative reads have been issued (default
+/// 512 — a decode token's worth), keep issuing only if at least
+/// `COLI_PREFETCH_MIN_YIELD` percent of them were used (default 2). Setting the
+/// yield to 0 disables the guard and restores the unconditional behaviour.
+///
+/// **One-way**: once the guard trips, `issued` stops growing, so the ratio is
+/// frozen and the lane stays off for the process. That is deliberate — a lane
+/// that re-enables itself would re-pay the wall-time cost to re-learn the same
+/// answer — but it does mean the sample has to be big enough to trust, which is
+/// what `min_reads` is for.
+///
+/// Correctness-neutral, like everything else in this subsystem: not issuing a
+/// speculative read only means the demand path streams that expert itself.
+fn prefetch_pays(issued: u64, used: u64) -> bool {
     use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("COLI_PREFETCH_PROTECT").as_deref(), Ok("0") | Ok("false")))
+    static MIN_READS: OnceLock<u64> = OnceLock::new();
+    static MIN_YIELD: OnceLock<u64> = OnceLock::new();
+    let min_reads = *MIN_READS
+        .get_or_init(|| std::env::var("COLI_PREFETCH_MIN_READS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512));
+    let min_yield = *MIN_YIELD
+        .get_or_init(|| std::env::var("COLI_PREFETCH_MIN_YIELD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2));
+    if min_yield == 0 || issued < min_reads {
+        return true;
+    }
+    // Integer form of `100 * used / issued >= min_yield`, so no float rounding
+    // decides whether the lane lives.
+    used.saturating_mul(100) >= issued.saturating_mul(min_yield)
 }
 
 /// Pack an eviction-protection score: predictor likelihood in the high bits, routing
@@ -1330,6 +1409,15 @@ impl PrefetchCtx<'_> {
     fn emit_layer(&self, layer: usize) {
         if layer < self.cfg.first_dense as usize {
             return; // dense layer — no routed experts
+        }
+        // Stop speculating once the measured yield says it is not paying for
+        // itself. Checked before the predictor runs, so a dead lane costs a lock
+        // and two loads rather than a ranking pass.
+        {
+            let c = self.cache.lock();
+            if !prefetch_pays(c.prefetch_reads, c.prefetch_used) {
+                return;
+            }
         }
         let candidates = {
             let hist = self.hist.lock();
@@ -2110,7 +2198,10 @@ impl Model {
         // Warm tier: bound the RAM cache to an explicit budget (tests) or, when
         // unset, `COLI_ECACHE_GB` / an auto fraction of MemAvailable. Only built
         // when experts stream from disk and the budget is non-zero.
-        let ecache = {
+        // The granted budget escapes the block as well as the cache: whether it
+        // clears one token's working set is what decides the `prefetch_protect`
+        // default below.
+        let (ecache, granted_ecache_budget) = {
             let requested = force_ecache.unwrap_or_else(ecache_budget_bytes);
             // Cap the warm cache so it + the streaming lanes' transient landing/compute
             // buffers + a safety margin fit in available RAM (already net of the
@@ -2134,11 +2225,9 @@ impl Model {
             } else {
                 requested
             };
-            if stream_experts && budget > 0 {
-                Some(Arc::new(Mutex::new(WarmCache::new(budget))))
-            } else {
-                None
-            }
+            let cache =
+                if stream_experts && budget > 0 { Some(Arc::new(Mutex::new(WarmCache::new(budget)))) } else { None };
+            (cache, budget)
         };
         // Prefetch lane: a background worker warming the next token's predicted
         // experts into the shared cache via its own ring. Spawned only when the
@@ -2197,6 +2286,25 @@ impl Model {
         // not done lazily per request.
         let expert_index =
             if stream_experts { Some(crate::concurrent::ExpertIndex::build(&st, &cfg)) } else { None };
+        // One token's routed working set, and therefore which of capacity or
+        // policy binds on this deployment. Reported because an operator cannot
+        // otherwise tell which side of the threshold they are on, and the two
+        // sides want opposite settings.
+        let expert_per_token_bytes = expert_index.as_ref().map_or(0, |ix| ix.per_token_bytes(&cfg));
+        let prefetch_protect = prefetch_protect_default(granted_ecache_budget, expert_per_token_bytes);
+        if expert_per_token_bytes > 0 {
+            let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
+            let ratio = 100.0 * granted_ecache_budget as f64 / expert_per_token_bytes as f64;
+            let holds = (granted_ecache_budget as u64) >= expert_per_token_bytes;
+            eprintln!(
+                "peregrine: [workingset] one token routes {:.2} GB of experts against a {:.2} GB cache \
+                 ({ratio:.0}% of a pass) — {}; prefetch-protect {}",
+                gb(expert_per_token_bytes),
+                gb(granted_ecache_budget as u64),
+                if holds { "recency alone can hold a pass" } else { "no eviction order can hold a pass" },
+                if prefetch_protect { "on" } else { "off" },
+            );
+        }
         let mut model = Model {
             route_hist_epoch: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -2212,6 +2320,8 @@ impl Model {
             direct,
             st,
             expert_index,
+            expert_per_token_bytes,
+            prefetch_protect,
             io_reactors,
             workers,
             ecache,
@@ -2228,6 +2338,8 @@ impl Model {
             mtp,
             heat,
             lane_timings: Arc::new(crate::lane::LaneTimingsAccum::new()),
+            lane_totals: Arc::new(crate::lane::LaneTimingsAccum::new()),
+            lane_forwards: std::sync::atomic::AtomicU64::new(0),
             bubble: Mutex::new(crate::lane::BubbleTuner::new(0.3, 1.5, 3)),
             plan_optimizer: Mutex::new(crate::telemetry::PlanOptimizer::new()),
             last_telemetry: Mutex::new(crate::telemetry::RuntimeTelemetry::default()),
@@ -2526,6 +2638,20 @@ impl Model {
     /// `(hits, misses, disk_reads)` from the warm tier, or `None` when not
     /// streaming with a cache. For introspection/tests — the cache never affects
     /// output, only how many expert reads actually hit the disk.
+    /// Run-lifetime per-lane totals and the forward count they cover.
+    ///
+    /// **The sums are across concurrent lanes, so they exceed wall clock when the
+    /// pipeline is working.** That is the point: `(io+cpu+gpu+reduce) / wall` is
+    /// the overlap actually achieved, and a ratio near 1.0 means the lanes are
+    /// running one after another — the thing a concurrent scheduler exists to
+    /// prevent, and which nothing in this engine could previously report.
+    pub fn lane_totals(&self) -> (crate::lane::LaneTimings, u64) {
+        (
+            self.lane_totals.snapshot(),
+            self.lane_forwards.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     pub fn ecache_stats(&self) -> Option<(u64, u64, u64)> {
         self.ecache.as_ref().map(|c| {
             let c = c.lock();
@@ -2552,6 +2678,28 @@ impl Model {
 
     /// Low-confidence experts the prefetch lane hinted to the page cache via
     /// `fadvise` (multi-path tier 2).
+    /// `(resolved, mergeable)` from the load-time expert map: how many routed
+    /// experts were indexed, and how many of those read as two coalesced extents
+    /// rather than six regions. `None` when experts are resident (no map built).
+    ///
+    /// Reported at shutdown because the coalescing win is entirely a property of
+    /// *this* container's layout — a rewritten or straddling checkpoint can drop
+    /// the mergeable count without anything else changing.
+    pub fn expert_map_stats(&self) -> Option<(usize, usize)> {
+        self.expert_index.as_ref().map(|ix| (ix.resolved(), ix.mergeable()))
+    }
+
+    /// Bytes one token's routing touches, and whether predictive eviction
+    /// protection ended up on. `None` when experts are resident.
+    ///
+    /// Read this next to the hit rate: below one token's working set a sweep
+    /// drives plain recency to zero hits and the number says nothing about the
+    /// policy; above it, recency works unaided. The two regimes want opposite
+    /// settings, so a hit rate quoted without this is not interpretable.
+    pub fn expert_working_set(&self) -> Option<(u64, bool)> {
+        (self.expert_per_token_bytes > 0).then_some((self.expert_per_token_bytes, self.prefetch_protect))
+    }
+
     pub fn ecache_fadvise_hints(&self) -> Option<u64> {
         self.ecache.as_ref().map(|c| c.lock().fadvise_hints)
     }
@@ -2675,7 +2823,7 @@ impl Model {
         for layer in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
             ctx.emit_layer(layer);
         }
-        if prefetch_protect() {
+        if self.prefetch_protect {
             self.protect_from(hist);
         }
     }
@@ -2871,6 +3019,16 @@ impl Model {
     fn publish_lane_timings(&self) {
         let sample = self.lane_timings.snapshot_and_reset();
         *self.last_lane.lock() = sample;
+        // Fold into the run-lifetime totals before the sample is handed to the
+        // tuner, so the operator-visible report and the controller see the same
+        // numbers rather than two independently-derived ones.
+        self.lane_totals.add_io(sample.io_us);
+        self.lane_totals.add_cpu(sample.cpu_us);
+        self.lane_totals.add_gpu(sample.gpu_us);
+        self.lane_totals.add_reduce(sample.reduce_us);
+        self.lane_totals.add_cpu_bytes(sample.cpu_bytes);
+        self.lane_totals.add_lane_wall(sample.lane_wall_us);
+        self.lane_forwards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Advance the heat table's recency clock exactly once per forward. This
         // is the per-forward tick every other adaptive structure already hangs
         // off, which is why it lives here rather than beside the per-layer heat
@@ -3680,7 +3838,7 @@ impl Model {
             self.enqueue_prefetch();
         }
         // Predictive eviction: protect the experts we expect to reuse next.
-        if prefetch_protect() {
+        if self.prefetch_protect {
             self.update_cache_protection();
         }
         // Feed the adaptive controller this forward's prefetch effectiveness so it can
@@ -4404,6 +4562,40 @@ mod tests {
     use crate::sample::argmax;
     use crate::testkit::build_tiny_model;
     use std::path::PathBuf;
+
+    /// The protect default has to flip at one token's working set, because the
+    /// mechanism measured +193 hits below that line and −381 above it. Pinning
+    /// both directions, since a default that is merely "on" was the bug.
+    #[test]
+    fn protect_default_follows_the_working_set_threshold() {
+        // These are the two measured arms: 4.29 GB and 12.88 GB against a pass of
+        // ~11.8 GB.
+        let pass = 11_800_000_000u64;
+        assert!(prefetch_protect_default(4_290_000_000, pass), "below a pass: protect is the only thing off zero");
+        assert!(!prefetch_protect_default(12_880_000_000, pass), "above a pass: protect costs 40% of the hits");
+        // Exactly at the threshold the cache can hold a pass, so recency suffices.
+        assert!(!prefetch_protect_default(pass as usize, pass));
+        // No working-set figure (resident mode, unindexed container) keeps the
+        // historical always-on behaviour rather than guessing.
+        assert!(prefetch_protect_default(4_290_000_000, 0));
+    }
+
+    /// The prefetch lane must switch itself off at the yield that was measured to
+    /// cost +41 % wall time.
+    #[test]
+    fn prefetch_guard_trips_on_the_measured_yield() {
+        // Under the sample floor, always keep speculating — an early window is
+        // not evidence.
+        assert!(prefetch_pays(100, 0));
+        // The measured case: 4034 speculative reads bought 3 hits.
+        assert!(!prefetch_pays(4034, 3), "0.3% yield must stop the lane");
+        // A lane that is actually earning stays on.
+        assert!(prefetch_pays(1000, 25), "2.5% yield clears the 2% floor");
+        // And the boundary is inclusive, so a lane sitting exactly at the floor
+        // is not killed by rounding.
+        assert!(prefetch_pays(1000, 20));
+        assert!(!prefetch_pays(1000, 19));
+    }
 
     fn tmp_model_dir(tag: &str) -> Result<PathBuf, peregrine_core::Error> {
         let d = std::env::temp_dir().join(format!("peregrine_model_{}_{}", std::process::id(), tag));

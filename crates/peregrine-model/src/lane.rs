@@ -24,6 +24,14 @@ pub struct LaneTimings {
     /// regions of every streamed expert). With `cpu_us` this yields the
     /// effective CPU-lane bandwidth the memory-bandwidth governor watches.
     pub cpu_bytes: u64,
+    /// **Wall** time inside the concurrent MoE lane, summed over the forward's
+    /// layers. The other fields are summed over *threads*, so on their own they
+    /// cannot say whether a lane was saturated or idle: `io_us` of 17 s could be
+    /// four rings busy for 4.3 s or one ring busy for 17 s. Against this, they
+    /// can — `io_us / (rings × lane_wall_us)` is the I/O lane's duty cycle, and
+    /// `lane_wall_us` against the forward's own wall clock is how much of a token
+    /// is even spent in the MoE lane rather than in attention and the router.
+    pub lane_wall_us: u64,
 }
 
 /// Atomic accumulator so several scoped threads can bump without a lock. The
@@ -36,6 +44,7 @@ pub struct LaneTimingsAccum {
     gpu_us: AtomicU64,
     reduce_us: AtomicU64,
     cpu_bytes: AtomicU64,
+    lane_wall_us: AtomicU64,
 }
 
 impl Default for LaneTimingsAccum {
@@ -46,6 +55,7 @@ impl Default for LaneTimingsAccum {
             gpu_us: AtomicU64::new(0),
             reduce_us: AtomicU64::new(0),
             cpu_bytes: AtomicU64::new(0),
+            lane_wall_us: AtomicU64::new(0),
         }
     }
 }
@@ -76,6 +86,12 @@ impl LaneTimingsAccum {
         self.cpu_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Wall time of one concurrent-MoE call. The denominator that turns the
+    /// thread-summed lane counters into duty cycles.
+    pub fn add_lane_wall(&self, us: u64) {
+        self.lane_wall_us.fetch_add(us, Ordering::Relaxed);
+    }
+
     /// Take the current sums and reset the accumulator. Called once per forward.
     pub fn snapshot_and_reset(&self) -> LaneTimings {
         LaneTimings {
@@ -84,6 +100,7 @@ impl LaneTimingsAccum {
             gpu_us: self.gpu_us.swap(0, Ordering::Relaxed),
             reduce_us: self.reduce_us.swap(0, Ordering::Relaxed),
             cpu_bytes: self.cpu_bytes.swap(0, Ordering::Relaxed),
+            lane_wall_us: self.lane_wall_us.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -95,6 +112,7 @@ impl LaneTimingsAccum {
             gpu_us: self.gpu_us.load(Ordering::Relaxed),
             reduce_us: self.reduce_us.load(Ordering::Relaxed),
             cpu_bytes: self.cpu_bytes.load(Ordering::Relaxed),
+            lane_wall_us: self.lane_wall_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -218,6 +236,7 @@ impl BubbleTuner {
             gpu_us: self.ewma_gpu as u64,
             reduce_us: 0,
             cpu_bytes: 0,
+            lane_wall_us: 0,
         }
     }
 }
@@ -303,7 +322,7 @@ mod tests {
         a.add_gpu(300);
         a.add_reduce(50);
         let s = a.snapshot_and_reset();
-        assert_eq!(s, LaneTimings { io_us: 1000, cpu_us: 500, gpu_us: 300, reduce_us: 50, cpu_bytes: 0 });
+        assert_eq!(s, LaneTimings { io_us: 1000, cpu_us: 500, gpu_us: 300, reduce_us: 50, cpu_bytes: 0, lane_wall_us: 0 });
         let z = a.snapshot();
         assert_eq!(z, LaneTimings::default(), "reset zeros the accumulator");
     }
@@ -312,7 +331,7 @@ mod tests {
     fn tuner_reports_cpu_bias_after_k_consecutive() {
         let mut t = BubbleTuner::new(0.5, 1.5, 3);
         for _ in 0..4 {
-            t.observe(LaneTimings { io_us: 200, cpu_us: 1000, gpu_us: 100, reduce_us: 0, cpu_bytes: 0 });
+            t.observe(LaneTimings { io_us: 200, cpu_us: 1000, gpu_us: 100, reduce_us: 0, cpu_bytes: 0, ..Default::default() });
         }
         assert_eq!(t.bias(), Bias::TowardCpu);
     }
@@ -324,9 +343,9 @@ mod tests {
         for i in 0..10u32 {
             let big = 1000 + i as u64;
             let obs = if i.is_multiple_of(2) {
-                LaneTimings { io_us: big, cpu_us: 500, gpu_us: 500, reduce_us: 0, cpu_bytes: 0 }
+                LaneTimings { io_us: big, cpu_us: 500, gpu_us: 500, reduce_us: 0, cpu_bytes: 0, ..Default::default() }
             } else {
-                LaneTimings { io_us: 500, cpu_us: big, gpu_us: 500, reduce_us: 0, cpu_bytes: 0 }
+                LaneTimings { io_us: 500, cpu_us: big, gpu_us: 500, reduce_us: 0, cpu_bytes: 0, ..Default::default() }
             };
             t.observe(obs);
         }
@@ -363,13 +382,13 @@ mod tests {
         // A bias published from a burst must not stay in force forever when the
         // workload turns noisy and no streak ever completes again.
         let mut t = BubbleTuner::new(0.5, 1.5, 2);
-        let cpu_heavy = LaneTimings { io_us: 1, cpu_us: 1000, gpu_us: 1, reduce_us: 0, cpu_bytes: 0 };
+        let cpu_heavy = LaneTimings { io_us: 1, cpu_us: 1000, gpu_us: 1, reduce_us: 0, cpu_bytes: 0, ..Default::default() };
         for _ in 0..4 {
             t.observe(cpu_heavy);
         }
         assert_eq!(t.bias(), Bias::TowardCpu, "a sustained burst publishes a bias");
         // Now alternate so no lane ever wins k in a row.
-        let io_heavy = LaneTimings { io_us: 1000, cpu_us: 1, gpu_us: 1, reduce_us: 0, cpu_bytes: 0 };
+        let io_heavy = LaneTimings { io_us: 1000, cpu_us: 1, gpu_us: 1, reduce_us: 0, cpu_bytes: 0, ..Default::default() };
         let mut saw_balanced = false;
         for i in 0..32 {
             t.observe(if i % 2 == 0 { io_heavy } else { cpu_heavy });
@@ -387,11 +406,11 @@ mod tests {
         // the divide-by-zero guard used to report Balanced even though the CPU
         // lane was 100% of the time.
         let mut t = BubbleTuner::new(1.0, 1.5, 1);
-        let only_cpu = LaneTimings { io_us: 0, cpu_us: 500, gpu_us: 0, reduce_us: 0, cpu_bytes: 0 };
+        let only_cpu = LaneTimings { io_us: 0, cpu_us: 500, gpu_us: 0, reduce_us: 0, cpu_bytes: 0, ..Default::default() };
         assert_eq!(t.observe(only_cpu), Bias::TowardCpu);
         // All lanes idle is genuinely balanced.
         let mut t2 = BubbleTuner::new(1.0, 1.5, 1);
-        let idle = LaneTimings { io_us: 0, cpu_us: 0, gpu_us: 0, reduce_us: 0, cpu_bytes: 0 };
+        let idle = LaneTimings { io_us: 0, cpu_us: 0, gpu_us: 0, reduce_us: 0, cpu_bytes: 0, ..Default::default() };
         assert_eq!(t2.observe(idle), Bias::Balanced);
     }
 }
