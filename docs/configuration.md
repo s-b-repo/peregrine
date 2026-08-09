@@ -43,13 +43,35 @@ unmodified configuration before you rely on it:
 
 | Var | Default | Effect |
 |---|---|---|
-| `COLI_MODEL` | unset | model directory (serve mode; wins over the positional arg; the only source for `bench`) |
+| `COLI_MODEL` | unset | model directory (serve mode; wins over the positional arg; the only source for `bench`). The directory may carry a `model_paths.json` — see below |
 | `COLI_STREAM` | auto | `1`/`0` force/disable expert streaming (auto-decided from available RAM vs model size) |
 | `COLI_RSS_GUARD_GB` | projected peak | RSS ceiling the runtime guard enforces — [note](#coli_rss_guard_gb) |
 | `COLI_RAM_OVERCOMMIT` | off | skip the pre-load RAM check — [note](#coli_ram_overcommit) |
 | `COLI_DIRECT_LOAD` | off | read the resident trunk through O_DIRECT at load (`peregrine-core/src/safetensors.rs`) |
 | `COLI_DEBUG` | off | surface advisory (non-fatal) failures on stderr |
 | `COLI_NO_ARENA_CAP` | off | skip the automatic `M_ARENA_MAX=2` malloc-arena cap (also skipped if `MALLOC_ARENA_MAX` is set) |
+
+### `model_paths.json` — a model split across several drives
+
+A model directory may carry a `model_paths.json`:
+
+```json
+{"paths": ["/srv/modelstripe/GLM-5.2-r3", "/srv/model600p/GLM-5.2-r3"]}
+```
+
+The loader then indexes `*.safetensors` from the primary directory **and** every
+listed directory (relative entries resolve against the primary). This is how a
+checkpoint split across drives is served without a symlink farm: the primary dir
+holds `config.json`, the tokenizer, and this file; each drive holds its own
+folder of shards. Pair it with `peregrine-reshard`, which groups each sparse
+layer's experts by device so every layer reads from all drives at once.
+
+Two rules keep it deterministic: shards sort by **file name** regardless of
+which directory they live in (so the tensor order is placement-independent),
+and a file name present in two directories is a hard error — the loader will
+not guess which copy to serve. A listed directory that is missing or not
+mounted fails the load immediately with the path named, rather than serving a
+silently incomplete model.
 
 ### `COLI_RSS_GUARD_GB`
 
