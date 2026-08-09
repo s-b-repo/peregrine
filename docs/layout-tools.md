@@ -123,7 +123,7 @@ drops the least salient, renumbers the survivors, and gathers the router's rows
 to match.
 
 ```bash
-peregrine dump-routes "$COLI_MODEL" > routes.json     # trace the workload you serve
+peregrine dump-routes "$COLI_MODEL" routes.json 512 --text corpus.txt  # trace the workload you serve
 peregrine-prune "$COLI_MODEL" --trace routes.json --dry-run
 peregrine-prune "$COLI_MODEL" /path/glm52_pruned25 --trace routes.json
 ```

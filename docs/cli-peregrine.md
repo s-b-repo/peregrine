@@ -53,12 +53,23 @@ corpus (default length 256), and writes the expert-transition FSA to
 `<model-dir>/automaton.json` (config-tagged; auto-loaded on the next
 `Model::load`). See [Prefetch & prediction](prefetch-and-caching.md).
 
-### `dump-routes <model-dir> <out.json> [corpus-len]`
+### `dump-routes <model-dir> <out.json> [corpus-len] [--text FILE]`
 
-Streams the same synthetic corpus and writes the raw per-forward routing trace
-to `<out.json>` (any path). The trace is a bare nested array
-`[forward][layer][expert-id]` — the input format of
-[`peregrine-layout-reorg`](layout-tools.md).
+Writes the raw per-forward routing trace to `<out.json>` (any path). The trace is
+a bare nested array `[forward][layer][expert-id]` — the input format of
+[`peregrine-layout-reorg`](layout-tools.md) and of
+[`route-stats`](#route-stats-routesjson-n_experts).
+
+**Pass `--text` for anything that reads the trace as a statement about routing.**
+Without it the corpus is uniform-random token ids, and random ids route randomly:
+`route-stats` over such a trace reports consecutive-token overlap at the
+independence null *however the router behaves*, which reads as proof that
+prefetch has nothing to predict when it is only proof that the corpus was noise.
+`--text` encodes a real file with the tokenizer that travels with the container,
+truncated to `corpus-len`. The subcommand warns loudly when it is absent.
+
+Layout tools are less sensitive to this — they want co-occurrence over whatever
+workload you serve — but they are not *insensitive*, and the same flag applies.
 
 ### `galactic <model-dir> [corpus-len]`
 

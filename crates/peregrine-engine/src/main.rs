@@ -251,16 +251,45 @@ fn run() -> Result<(), Error> {
             eprintln!("compiled execution plan ({}) → {dir}/plan.json", parts.join(" + "));
             Ok(())
         }
-        // `dump-routes <model-dir> <out.json> [corpus-len]`: write the raw per-forward
-        // routing trace (for offline inspection / custom automaton building).
+        // `dump-routes <model-dir> <out.json> [corpus-len] [--text FILE]`: write the raw
+        // per-forward routing trace (for offline inspection / custom automaton building,
+        // and as the input to `route-stats`).
         Some("dump-routes") => {
-            let dir = args.get(2).ok_or_else(|| Error::Format("usage: peregrine dump-routes <model-dir> <out.json> [corpus-len]".into()))?;
-            let out = args.get(3).ok_or_else(|| Error::Format("usage: peregrine dump-routes <model-dir> <out.json> [corpus-len]".into()))?;
-            let len = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(256);
+            let usage = || {
+                Error::Format(
+                    "usage: peregrine dump-routes <model-dir> <out.json> [corpus-len] [--text FILE]".into(),
+                )
+            };
+            let dir = args.get(2).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
+            let out = args.get(3).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
+            let len = args.get(4).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(256);
+            let text = flag_value(&args, "--text");
             let mut model = Model::load_streaming(Path::new(dir), true)?;
-            let corpus = synth_corpus(model.cfg.vocab as usize, len);
+            let corpus = match &text {
+                Some(path) => encode_text_corpus(dir, path, len, "dump-routes")?,
+                None => {
+                    // Deliberately loud, and more consequential than it looks. The
+                    // headline consumer of this trace is `route-stats`, which asks
+                    // whether consecutive tokens route to overlapping experts —
+                    // i.e. whether prefetch has anything to predict. Uniform-random
+                    // token ids have no reason to route with temporal structure, so
+                    // the overlap will sit at the independence null *however the
+                    // router behaves*, and the trace will look like proof that
+                    // prediction is hopeless when it is only proof that the corpus
+                    // was noise. `flip-rate` learned this and grew `--text`; this
+                    // subcommand had not.
+                    eprintln!(
+                        "peregrine: dump-routes has no --text, so it is tracing a SYNTHETIC \
+                         corpus of uniform-random token ids. Do NOT read `route-stats` over \
+                         this trace as a statement about the router: random ids route \
+                         randomly, so overlap will match the independence null by \
+                         construction. Pass --text <file> for a number about this model."
+                    );
+                    synth_corpus(model.cfg.vocab as usize, len)
+                }
+            };
             let n = model.dump_routes_to(&corpus, Path::new(out))?;
-            eprintln!("wrote {n} forwards of routing trace to {out}");
+            eprintln!("wrote {n} forwards of routing trace to {out} ({} tokens)", corpus.len());
             Ok(())
         }
         // `route-stats <routes.json> [n_experts]`: read a trace written by
@@ -307,23 +336,9 @@ fn run() -> Result<(), Error> {
                 .unwrap_or(256);
 
             let toks = match &text {
-                Some(path) => {
-                    let raw = std::fs::read_to_string(Path::new(path))
-                        .map_err(|e| Error::Format(format!("flip-rate: read {path}: {e}")))?;
-                    // The tokenizer travels with the source container, so the
-                    // ids are the ones that container was converted from.
-                    let tj = Path::new(src).join("tokenizer.json");
-                    let json = std::fs::read(&tj).map_err(|e| {
-                        Error::Format(format!("flip-rate: --text needs {}: {e}", tj.display()))
-                    })?;
-                    let mut tk = peregrine_token::GigaTokenizer::from_hf_json_bytes(&json)
-                        .map_err(|e| Error::Format(format!("flip-rate: tokenizer: {e}")))?;
-                    let ids: Vec<i32> = tk.encode(&raw).iter().map(|&i| i as i32).collect();
-                    if ids.is_empty() {
-                        return Err(Error::Format("flip-rate: --text encoded to no tokens".into()));
-                    }
-                    ids.into_iter().take(n_tokens).collect::<Vec<i32>>()
-                }
+                // The tokenizer comes from the *source* container: the ids must be
+                // the ones that container was converted from.
+                Some(path) => encode_text_corpus(src, path, n_tokens, "flip-rate")?,
                 None => {
                     // Deliberately loud. A flip rate over uniform-random ids
                     // measures how two containers disagree on inputs the model
@@ -435,6 +450,33 @@ fn run() -> Result<(), Error> {
 /// do not justify pulling one in.
 fn flag_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// Encode a text file into token ids with the tokenizer that travels with the
+/// container at `dir`, truncated to `n_tokens`. `who` prefixes the errors.
+///
+/// Shared by `flip-rate` and `dump-routes` because both measure something whose
+/// answer depends on the input being real text, and the two had drifted: a flip
+/// rate over uniform-random ids compares two containers on inputs the model was
+/// never trained to see, and a routing trace over uniform-random ids has no
+/// reason to carry the temporal structure `route-stats` exists to look for.
+/// `flip-rate` grew a `--text` for this in 2026-08; `dump-routes` did not, and
+/// every `route-stats` number taken from a synthetic trace measured the corpus.
+fn encode_text_corpus(dir: &str, path: &str, n_tokens: usize, who: &str) -> Result<Vec<i32>, Error> {
+    let raw = std::fs::read_to_string(Path::new(path))
+        .map_err(|e| Error::Format(format!("{who}: read {path}: {e}")))?;
+    // The tokenizer travels with the container, so the ids are the ones that
+    // container was converted from.
+    let tj = Path::new(dir).join("tokenizer.json");
+    let json =
+        std::fs::read(&tj).map_err(|e| Error::Format(format!("{who}: --text needs {}: {e}", tj.display())))?;
+    let mut tk = peregrine_token::GigaTokenizer::from_hf_json_bytes(&json)
+        .map_err(|e| Error::Format(format!("{who}: tokenizer: {e}")))?;
+    let ids: Vec<i32> = tk.encode(&raw).iter().map(|&i| i as i32).collect();
+    if ids.is_empty() {
+        return Err(Error::Format(format!("{who}: --text encoded to no tokens")));
+    }
+    Ok(ids.into_iter().take(n_tokens).collect())
 }
 
 fn synth_corpus(vocab: usize, n: usize) -> Vec<i32> {
@@ -606,6 +648,17 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                              fadvise={fadv} verify_mismatch={vm}",
                             used + wasted
                         );
+                        // The unclassified slabs as bytes: how much of the budget
+                        // speculation is holding rather than how often it guessed
+                        // right. This is what competes with demand data.
+                        if let Some((sb, slots, budget)) = model.ecache_speculative_resident() {
+                            let share = if budget > 0 { 100.0 * sb as f64 / budget as f64 } else { 0.0 };
+                            eprintln!(
+                                "[prefetch] resident-unused: {slots} slots, {:.2} GB of {:.2} GB budget ({share:.1}%)",
+                                sb as f64 / 1e9,
+                                budget as f64 / 1e9
+                            );
+                        }
                         // Compression only reports when COLI_CACHE_COMPRESS is on.
                         // Printing the achieved ratio keeps the feature honest: the
                         // payload is packed int4 nibbles, so ~1.2x is the ceiling and

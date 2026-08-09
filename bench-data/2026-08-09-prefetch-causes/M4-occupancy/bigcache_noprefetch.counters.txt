@@ -1,0 +1,5 @@
+arm=bigcache_noprefetch load_s=14 decode_s=382
+[ecache] hits=5 misses=6339 disk_reads=6339 prefetch_reads=0 hit_rate=0.1%
+[ecache] resident: 681 slots, 12.88 GB of 12.88 GB budget (100.0% full)
+[prefetch] used=0 wasted=0 unclassified=0 accuracy=0.0% (of 0 classified) yield=0.0% (of 0 issued) fadvise=0 verify_mismatch=0
+[prefetch] resident-unused: 0 slots, 0.00 GB of 12.88 GB budget (0.0%)

@@ -363,6 +363,14 @@ impl WarmCache {
         self.budget
     }
 
+    /// Bytes currently occupied by resident slabs. Pairs with [`Self::len`] and
+    /// [`Self::budget`] to say whether a low hit rate is an eviction problem (cache
+    /// full) or an admission problem (cache empty) — a distinction the hit/miss
+    /// counters cannot make.
+    pub fn used_bytes(&self) -> usize {
+        self.used
+    }
+
     /// Lower the byte budget and evict down to it, returning bytes freed.
     ///
     /// The RSS guard's hands. A projection made before load is an estimate —
@@ -529,6 +537,25 @@ impl WarmCache {
     /// Prefetch reads attributed to `layer` so far.
     pub fn prefetch_reads_for_layer(&self, layer: u32) -> u64 {
         self.prefetch_reads_by_layer.get(layer as usize).copied().unwrap_or(0)
+    }
+
+    /// Bytes currently held by slabs the prefetch lane warmed and nothing has hit
+    /// yet, and how many slots that is: the speculative footprint, *right now*.
+    ///
+    /// Every other prefetch statistic here is a lifetime **count**, and the two that
+    /// look like an outcome — `prefetch_used`/`prefetch_wasted` — only classify a
+    /// slab when it is hit or evicted. A slab that is still resident is in neither,
+    /// so on the first serving-path measurement 335 of 412 speculative reads were
+    /// unaccounted, and that unaccounted portion is exactly the one occupying budget
+    /// that demand data could have used. This is the number that says how much of
+    /// the cache speculation is holding, as opposed to how often it guessed right.
+    ///
+    /// O(n) over resident slots, so call it at shutdown or in a test, not per read.
+    pub fn speculative_resident(&self) -> (usize, u64) {
+        self.map
+            .values()
+            .filter(|s| s.from_prefetch && !s.ever_hit)
+            .fold((0usize, 0u64), |(b, n), s| (b + s.bytes, n + 1))
     }
 
     /// Record one low-confidence expert hinted to the page cache via `fadvise`.
@@ -1025,6 +1052,32 @@ mod tests {
         assert!(!c.contains((0, 0)));
         assert_eq!(c.prefetch_used, 1);
         assert_eq!(c.prefetch_wasted, 0);
+    }
+
+    #[test]
+    fn speculative_resident_reports_what_used_and_wasted_cannot() {
+        // The gap this exists to close: a prefetched slab that has been neither hit
+        // nor evicted is counted by *neither* `prefetch_used` nor `prefetch_wasted`,
+        // so the pair can read as a clean 0/0 while speculation holds the budget.
+        let mut c = WarmCache::new(1 << 20);
+        c.insert_prefetched((0, 0), slab(10, 2));
+        c.insert_prefetched((0, 1), slab(10, 2));
+        c.insert((0, 2), slab(10, 2)); // demand-loaded — never speculative
+        assert_eq!((c.prefetch_used, c.prefetch_wasted), (0, 0), "nothing hit, nothing evicted");
+        let (bytes, slots) = c.speculative_resident();
+        assert_eq!(slots, 2, "both prefetched slabs are resident and unused");
+        assert!(bytes > 0 && bytes < c.budget());
+
+        // A hit reclassifies one: it is no longer speculative footprint.
+        assert!(c.get((0, 0)).is_some());
+        let (bytes_after, slots_after) = c.speculative_resident();
+        assert_eq!(slots_after, 1);
+        assert!(bytes_after < bytes, "hitting a slab removes it from the unused footprint");
+
+        // A cache with no prefetch at all reports nothing.
+        let mut d = WarmCache::new(1 << 20);
+        d.insert((0, 0), slab(10, 2));
+        assert_eq!(d.speculative_resident(), (0, 0));
     }
 
     #[test]

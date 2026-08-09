@@ -44,7 +44,12 @@ headline findings:
   in §5.2, and `peregrine route-stats`).
 - This independently corroborates two of colibrì's own findings: its **PILOT** cross-layer prefetch
   is "neutral" on a disk-saturated box, and its **MTP** speculative decoding is a *net loss* on MoE
-  decode — both symptoms of the same high routing entropy.
+  decode. **The shared explanation is not high routing entropy** — that was the reading until
+  2026-08-09, when `route-stats` was finally run on a real-text GLM-5.2 trace and put
+  consecutive-token overlap at **33.55 % against a 3.12 % independence null**
+  ([`bench-data/2026-08-09-prefetch-causes`](../bench-data/2026-08-09-prefetch-causes/M2-routing-structure.md)).
+  Routing is strongly predictable; what both findings share is that a disk-saturated box has nowhere
+  to put the bytes a correct prediction fetches. One token's routed set is ~11.3 GB.
 - **peregrine's architectural advantage (the concurrent 3-lane scheduler) is real but *latent* on
   this hardware**: it pays off only under full/partial expert *residency* (multi-GPU or large RAM),
   which is exactly where colibrì reports **6.84 tok/s on 6× RTX 5090**. On a single RTX 3060 (12 GB),

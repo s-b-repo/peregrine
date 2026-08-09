@@ -1,0 +1,4 @@
+arm=protect_off load_s=22 decode_s=286
+[ecache] hits=9 misses=6335 disk_reads=6335 prefetch_reads=401 hit_rate=0.1%
+[prefetch] used=9 wasted=41 unclassified=351 accuracy=18.0% (of 50 classified) yield=2.2% (of 401 issued) fadvise=0 verify_mismatch=0
+[prefetch] resident-unused: 29 slots, 0.55 GB of 4.29 GB budget (12.8%)
