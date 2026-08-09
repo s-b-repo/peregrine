@@ -32,6 +32,14 @@ pub struct LaneTimings {
     /// `lane_wall_us` against the forward's own wall clock is how much of a token
     /// is even spent in the MoE lane rather than in attention and the router.
     pub lane_wall_us: u64,
+    /// Time I/O threads spent **acquiring the warm-cache mutex** (probe and
+    /// insert), summed over threads like `io_us`. This is the evidence counter
+    /// for cache-lock contention: the lock is taken per expert by every ring,
+    /// and once the cache runs full each miss-insert also pays an O(residents)
+    /// victim scan inside it. Decides whether a sharded cache is warranted —
+    /// per the measurement discipline, contention gets a number before it gets
+    /// a fix.
+    pub cache_wait_us: u64,
 }
 
 /// Atomic accumulator so several scoped threads can bump without a lock. The
@@ -45,6 +53,7 @@ pub struct LaneTimingsAccum {
     reduce_us: AtomicU64,
     cpu_bytes: AtomicU64,
     lane_wall_us: AtomicU64,
+    cache_wait_us: AtomicU64,
 }
 
 impl Default for LaneTimingsAccum {
@@ -56,6 +65,7 @@ impl Default for LaneTimingsAccum {
             reduce_us: AtomicU64::new(0),
             cpu_bytes: AtomicU64::new(0),
             lane_wall_us: AtomicU64::new(0),
+            cache_wait_us: AtomicU64::new(0),
         }
     }
 }
@@ -92,6 +102,12 @@ impl LaneTimingsAccum {
         self.lane_wall_us.fetch_add(us, Ordering::Relaxed);
     }
 
+    /// Time an I/O thread spent acquiring the warm-cache mutex (see
+    /// [`LaneTimings::cache_wait_us`]).
+    pub fn add_cache_wait(&self, us: u64) {
+        self.cache_wait_us.fetch_add(us, Ordering::Relaxed);
+    }
+
     /// Take the current sums and reset the accumulator. Called once per forward.
     pub fn snapshot_and_reset(&self) -> LaneTimings {
         LaneTimings {
@@ -101,6 +117,7 @@ impl LaneTimingsAccum {
             reduce_us: self.reduce_us.swap(0, Ordering::Relaxed),
             cpu_bytes: self.cpu_bytes.swap(0, Ordering::Relaxed),
             lane_wall_us: self.lane_wall_us.swap(0, Ordering::Relaxed),
+            cache_wait_us: self.cache_wait_us.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -113,6 +130,7 @@ impl LaneTimingsAccum {
             reduce_us: self.reduce_us.load(Ordering::Relaxed),
             cpu_bytes: self.cpu_bytes.load(Ordering::Relaxed),
             lane_wall_us: self.lane_wall_us.load(Ordering::Relaxed),
+            cache_wait_us: self.cache_wait_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -237,6 +255,7 @@ impl BubbleTuner {
             reduce_us: 0,
             cpu_bytes: 0,
             lane_wall_us: 0,
+            cache_wait_us: 0,
         }
     }
 }
@@ -322,7 +341,7 @@ mod tests {
         a.add_gpu(300);
         a.add_reduce(50);
         let s = a.snapshot_and_reset();
-        assert_eq!(s, LaneTimings { io_us: 1000, cpu_us: 500, gpu_us: 300, reduce_us: 50, cpu_bytes: 0, lane_wall_us: 0 });
+        assert_eq!(s, LaneTimings { io_us: 1000, cpu_us: 500, gpu_us: 300, reduce_us: 50, cpu_bytes: 0, lane_wall_us: 0, cache_wait_us: 0 });
         let z = a.snapshot();
         assert_eq!(z, LaneTimings::default(), "reset zeros the accumulator");
     }

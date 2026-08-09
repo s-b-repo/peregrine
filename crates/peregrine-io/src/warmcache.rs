@@ -11,6 +11,8 @@
 //! cache").
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::Bytes;
 
@@ -127,25 +129,51 @@ struct Slot {
     heat: u32,
 }
 
-/// Small Bloom filter over currently-resident `(layer, expert)` keys. Two hash
-/// positions per key, 2048 bits (256 bytes). Optimizes the miss path — if the
-/// bloom returns "definitely not present" we skip the HashMap probe. False
-/// positives fall through to the HashMap so correctness is unchanged.
+/// Lock-free residency hint over currently-resident `(layer, expert)` keys: a
+/// **counting filter** of 65,536 atomic byte counters, two hash positions per
+/// key, shared as an `Arc` so the I/O lanes can answer "definitely absent"
+/// without touching the cache mutex at all.
 ///
-/// Rebuilt after each eviction batch (via [`Bloom::rebuild`]) so we don't have
-/// to track per-slot removal (a counting Bloom would double the space).
-struct Bloom {
-    bits: [u64; 32],
+/// This replaces the old in-lock 2048-bit Bloom, which had two structural
+/// costs: at ~700 resident slots its false-positive rate was ~24 % (so the
+/// "fast" path degraded to the map probe anyway), and being a plain bitmap it
+/// had to be **rebuilt from the whole resident set after every eviction
+/// batch** — an O(slots) scan under the same mutex four I/O rings contend on,
+/// on every miss-insert once the cache runs full (which on this workload is
+/// always). Counters decrement on evict instead, so nothing is ever rebuilt.
+///
+/// Concurrency contract, and why every race is byte-safe:
+/// - increments happen while the inserting thread holds the cache mutex, but
+///   *readers don't take it*. A reader that sees "absent" for a key another
+///   thread is concurrently inserting simply streams the expert from disk —
+///   the same bytes the cache would have served. One redundant read, never a
+///   wrong one.
+/// - a false "present" (collision or concurrent removal) falls through to the
+///   locked exact map, which is the truth.
+/// - a counter that reaches 255 becomes **sticky**: with 65,536 slots against
+///   a few thousand residents no honest count gets near 255, but if it ever
+///   did, decrementing a saturated counter could manufacture a false "absent"
+///   for a still-resident key — a correctness-neutral but silent extra read.
+///   Sticky-at-255 degrades to "always probe", which is merely the old cost.
+pub struct ResidencyHint {
+    counts: Box<[AtomicU8]>,
+    /// Misses the I/O lane resolved lock-free ("definitely absent", stream it).
+    /// Folded into miss totals by [`WarmCache::hit_rate`]/stat readers.
+    pub fast_misses: AtomicU64,
 }
 
-impl Bloom {
-    const N_BITS: u32 = 32 * 64; // 2048
+impl ResidencyHint {
+    const N_SLOTS: u32 = 65_536;
 
-    fn new() -> Bloom {
-        Bloom { bits: [0; 32] }
+    fn new() -> Arc<ResidencyHint> {
+        ResidencyHint {
+            counts: (0..Self::N_SLOTS).map(|_| AtomicU8::new(0)).collect(),
+            fast_misses: AtomicU64::new(0),
+        }
+        .into()
     }
 
-    fn hashes(key: (u32, u32)) -> (u32, u32) {
+    fn hashes(key: (u32, u32)) -> (usize, usize) {
         // Two independent, cheap non-cryptographic hashes derived by FNV-like
         // mixing. Sufficient for a hint at this scale.
         let mut a = 0x811c9dc5u32;
@@ -160,26 +188,53 @@ impl Bloom {
         b ^= key.0.rotate_left(7);
         b = b.wrapping_mul(0x9e3779b1);
 
-        (a % Self::N_BITS, b % Self::N_BITS)
+        ((a % Self::N_SLOTS) as usize, (b % Self::N_SLOTS) as usize)
     }
 
-    fn add(&mut self, key: (u32, u32)) {
+    fn bump(c: &AtomicU8) {
+        let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            (v < u8::MAX).then(|| v + 1)
+        });
+    }
+
+    fn drop_one(c: &AtomicU8) {
+        // 0 is defensive (an unpaired remove would otherwise wrap to 255);
+        // 255 is the sticky saturation described on the type.
+        let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            (v != 0 && v != u8::MAX).then(|| v - 1)
+        });
+    }
+
+    fn add(&self, key: (u32, u32)) {
         let (h1, h2) = Self::hashes(key);
-        self.bits[(h1 / 64) as usize] |= 1u64 << (h1 % 64);
-        self.bits[(h2 / 64) as usize] |= 1u64 << (h2 % 64);
+        Self::bump(&self.counts[h1]);
+        Self::bump(&self.counts[h2]);
     }
 
-    /// `false` ⇒ definitely absent; `true` ⇒ probably present (fall through to
-    /// the exact map).
-    fn probably_contains(&self, key: (u32, u32)) -> bool {
+    fn remove(&self, key: (u32, u32)) {
         let (h1, h2) = Self::hashes(key);
-        let b1 = self.bits[(h1 / 64) as usize] & (1u64 << (h1 % 64)) != 0;
-        let b2 = self.bits[(h2 / 64) as usize] & (1u64 << (h2 % 64)) != 0;
-        b1 && b2
+        Self::drop_one(&self.counts[h1]);
+        Self::drop_one(&self.counts[h2]);
     }
 
-    fn clear(&mut self) {
-        self.bits = [0; 32];
+    /// `false` ⇒ definitely absent (skip the mutex, stream from disk);
+    /// `true` ⇒ probably present (take the lock and ask the exact map).
+    pub fn might_contain(&self, key: (u32, u32)) -> bool {
+        let (h1, h2) = Self::hashes(key);
+        self.counts[h1].load(Ordering::Relaxed) > 0 && self.counts[h2].load(Ordering::Relaxed) > 0
+    }
+
+    /// Count a lock-free "definitely absent" decision (called by the I/O lane).
+    pub fn note_fast_miss(&self) {
+        self.fast_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        // Only sound when the resident set is known empty (cache clear): a full
+        // reset is the one case where sticky saturation can be forgiven.
+        for c in self.counts.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -189,9 +244,11 @@ pub struct WarmCache {
     used: usize,
     map: HashMap<(u32, u32), Slot>,
     clock: u64,
-    /// Bloom hint over resident keys. Rebuilt on evictions; consulted in the
-    /// miss-fast-path of `contains`/`get`.
-    bloom: Bloom,
+    /// Counting residency filter over resident keys, shared with the I/O lanes
+    /// (see [`ResidencyHint`]). Incremented on admission, decremented on
+    /// removal — never rebuilt. Consulted lock-free by the streaming lane and
+    /// in the miss-fast-path of `contains`/`get`.
+    hint: Arc<ResidencyHint>,
     /// Negative-cache TTL. Slots that haven't been hit in this many `clock`
     /// ticks become eligible for eager eviction ahead of pure LRU order. `0`
     /// disables (default). Set via `COLI_CACHE_NEGATIVE_TTL`.
@@ -292,7 +349,7 @@ impl WarmCache {
             used: 0,
             map: HashMap::new(),
             clock: 0,
-            bloom: Bloom::new(),
+            hint: ResidencyHint::new(),
             negative_ttl: ttl,
             hits: 0,
             misses: 0,
@@ -425,11 +482,18 @@ impl WarmCache {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+    /// Shared handle to the lock-free residency filter, for callers that want
+    /// to answer "definitely absent" without taking the cache mutex (the I/O
+    /// lane's per-plan probe). Clone once per forward, not per probe.
+    pub fn hint(&self) -> Arc<ResidencyHint> {
+        Arc::clone(&self.hint)
+    }
+
     pub fn contains(&self, key: (u32, u32)) -> bool {
-        // Bloom fast-path: a "definitely absent" answer skips the HashMap probe.
+        // Filter fast-path: a "definitely absent" answer skips the HashMap probe.
         // A "probably present" answer falls through to the exact map — false
         // positives are safe (the HashMap gives the true answer).
-        if !self.bloom.probably_contains(key) {
+        if !self.hint.might_contain(key) {
             return false;
         }
         self.map.contains_key(&key)
@@ -441,8 +505,8 @@ impl WarmCache {
     /// because compressed slots materialize their bytes fresh per hit.
     pub fn get(&mut self, key: (u32, u32)) -> Option<ExpertSlab> {
         self.clock += 1;
-        // Bloom fast-miss: skip the HashMap probe entirely on "definitely absent".
-        if !self.bloom.probably_contains(key) {
+        // Filter fast-miss: skip the HashMap probe entirely on "definitely absent".
+        if !self.hint.might_contain(key) {
             self.misses += 1;
             self.bloom_skips += 1;
             return None;
@@ -485,8 +549,8 @@ impl WarmCache {
                 self.decode_failures += 1;
                 if let Some(s) = self.map.remove(&key) {
                     self.used = self.used.saturating_sub(s.bytes);
+                    self.hint.remove(key);
                 }
-                self.rebuild_bloom();
                 self.misses += 1;
                 None
             }
@@ -518,15 +582,6 @@ impl WarmCache {
             if let SlotBytes::Compressed { six, .. } = &mut slot.data {
                 six[0] = vec![0xFF; 8]; // not a valid zstd frame
             }
-        }
-    }
-
-    /// Rebuild the Bloom hint from the current resident set. Called after any
-    /// eviction so the hint stays tight (deletes-invalidate the flat bit array).
-    fn rebuild_bloom(&mut self) {
-        self.bloom.clear();
-        for &key in self.map.keys() {
-            self.bloom.add(key);
         }
     }
 
@@ -601,7 +656,8 @@ impl WarmCache {
     pub fn clear(&mut self) {
         self.map.clear();
         self.used = 0;
-        self.bloom.clear();
+        self.hint.reset();
+        self.hint.fast_misses.store(0, Ordering::Relaxed);
         self.hits = 0;
         self.misses = 0;
         self.disk_reads = 0;
@@ -694,14 +750,12 @@ impl WarmCache {
             }
         }
         if was_new {
-            self.bloom.add(key);
+            self.hint.add(key);
         }
-        let evicted = self.evict_to_budget(Some(key));
-        if evicted {
-            // Slot removals invalidate flat Bloom bits — rebuild from the current
-            // resident set. Cheap: ≤ 32 words × slot count.
-            self.rebuild_bloom();
-        }
+        // Removals decrement the counting filter inline (`evict_to_budget`), so
+        // there is no longer a rebuild pass here — the old flat Bloom cost an
+        // O(residents) rescan under this mutex on every full-cache admission.
+        self.evict_to_budget(Some(key));
     }
 
     /// Set one resident slot's eviction-protection score (no-op if not resident).
@@ -806,6 +860,7 @@ impl WarmCache {
                 }
                 if let Some(s) = self.map.remove(&k) {
                     self.used -= s.bytes;
+                    self.hint.remove(k);
                     if s.from_prefetch && !s.ever_hit {
                         self.prefetch_wasted += 1;
                     }
@@ -867,6 +922,7 @@ impl WarmCache {
             let Some(vk) = victim else { break };
             if let Some(s) = self.map.remove(&vk) {
                 self.used -= s.bytes;
+                self.hint.remove(vk);
                 if s.from_prefetch && !s.ever_hit {
                     self.prefetch_wasted += 1;
                 }
@@ -876,8 +932,16 @@ impl WarmCache {
         removed
     }
 
+    /// Misses across both paths: lookups the mutex-holding `get` resolved plus
+    /// "definitely absent" decisions the I/O lane made lock-free against the
+    /// residency filter. Callers wanting a true miss total must use this, not
+    /// the raw `misses` field, or the fast path's work goes uncounted.
+    pub fn total_misses(&self) -> u64 {
+        self.misses + self.hint.fast_misses.load(Ordering::Relaxed)
+    }
+
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
+        let total = self.hits + self.total_misses();
         if total == 0 {
             0.0
         } else {

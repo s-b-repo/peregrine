@@ -2655,7 +2655,9 @@ impl Model {
     pub fn ecache_stats(&self) -> Option<(u64, u64, u64)> {
         self.ecache.as_ref().map(|c| {
             let c = c.lock();
-            (c.hits, c.misses, c.disk_reads)
+            // total_misses, not the raw field: misses the I/O lane resolved
+            // lock-free against the residency filter live in a separate atomic.
+            (c.hits, c.total_misses(), c.disk_reads)
         })
     }
 
@@ -3028,6 +3030,7 @@ impl Model {
         self.lane_totals.add_reduce(sample.reduce_us);
         self.lane_totals.add_cpu_bytes(sample.cpu_bytes);
         self.lane_totals.add_lane_wall(sample.lane_wall_us);
+        self.lane_totals.add_cache_wait(sample.cache_wait_us);
         self.lane_forwards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Advance the heat table's recency clock exactly once per forward. This
         // is the per-forward tick every other adaptive structure already hangs
@@ -3045,7 +3048,7 @@ impl Model {
             let c = c.lock();
             crate::telemetry::CacheCounters {
                 hits: c.hits,
-                misses: c.misses,
+                misses: c.total_misses(),
                 prefetch_used: c.prefetch_used,
                 prefetch_wasted: c.prefetch_wasted,
             }
