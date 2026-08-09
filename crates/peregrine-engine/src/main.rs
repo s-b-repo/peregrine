@@ -591,7 +591,21 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                         let acc = 100.0 * model.prefetch_accuracy().unwrap_or(0.0);
                         let fadv = model.ecache_fadvise_hints().unwrap_or(0);
                         let vm = model.ecache_verify_mismatch().unwrap_or(0);
-                        eprintln!("[prefetch] used={used} wasted={wasted} accuracy={acc:.1}% fadvise={fadv} verify_mismatch={vm}");
+                        // `accuracy` is `used/(used+wasted)`, and `wasted` is only
+                        // incremented on **eviction** (`warmcache.rs`) — a prefetched
+                        // slab still resident at shutdown is in neither term. So the
+                        // denominator is the classified subset, not what was issued,
+                        // and quoting `accuracy` alone is survivorship-biased: the
+                        // first serving-path run classified 64 of 433 reads. Both
+                        // rates are printed so neither can be read as the other.
+                        let unclassified = pf.saturating_sub(used + wasted);
+                        let yield_pct = if pf > 0 { 100.0 * used as f64 / pf as f64 } else { 0.0 };
+                        eprintln!(
+                            "[prefetch] used={used} wasted={wasted} unclassified={unclassified} \
+                             accuracy={acc:.1}% (of {} classified) yield={yield_pct:.1}% (of {pf} issued) \
+                             fadvise={fadv} verify_mismatch={vm}",
+                            used + wasted
+                        );
                         // Compression only reports when COLI_CACHE_COMPRESS is on.
                         // Printing the achieved ratio keeps the feature honest: the
                         // payload is packed int4 nibbles, so ~1.2x is the ceiling and

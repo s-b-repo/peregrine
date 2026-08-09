@@ -496,9 +496,45 @@ and clippy-clean.
 
 **Bonus (beyond §1):** per-sequence prefetch in the **batched serving engine** with a parallel-async prefetch-lane
 pool (`COLI_PREFETCH_LANES`) — each concurrent stream predicts + prefetches from its own routing history
-(`forward_step_batched` per-sequence `route_log_multi`, `batch.rs` field-split unzip). Plus
+(per-row `route_log_multi`, `batch.rs` field-split unzip). Plus
 **`PredictSource::PhaseAware`** — wraps any inner source and boosts newest-frame vote when Jaccard
 distance between the top two frames exceeds a basis-points threshold.
+
+**Audited 2026-08-08, and the audit found four things this entry had wrong.** All of the above ships and
+is reachable — `batch.rs:854` calls `enqueue_seq_prefetch` in the live decode loop — which is exactly why
+the entry read as settled and was not. (a) **`PhaseAware` was inert.** Production built it with `boost: 2`
+against a newest-frame momentum weight of `depth`; at the default depth 4 a newest-frame expert scored 4+2
+and one that had just dropped out scored 3+2+1 — a *tie*, broken by ascending expert id. Both unit tests
+passed throughout because they build their own source with `boost: 100`, so they proved the mechanism and
+said nothing about the constant. Now derived: `predict::phase_boost(depth)` returns the full momentum scale
+and dominates by construction, pinned by `phase_boost_outranks_every_stale_expert`, which fails at 2.
+(b) **`COLI_PHASE_THRESHOLD` governed nothing** — its only reader was `PhaseTracker`, which has no
+production caller, while the predictor used a hardcoded `6000` bp. Now converted at the boundary and read
+by the predictor (`phase_threshold_bp`). (c) **The lane key was the sequence's index in `active`**, which
+`retain` compacts every tick, so a live stream migrated lanes whenever an earlier one retired. Now a
+monotonic id assigned at admission. (d) The entry named `forward_step_batched`; the serving engine calls
+`forward_rows_batched_hidden` (`batch.rs:818`) and `forward_step_batched` is a 10-line wrapper used by the
+bench and tests. **`COLI_PREFETCH_LANES` still defaults to 1**, so the "parallel-async" pool is a single
+lane unless raised `predict.rs`, `model.rs`, `workload.rs`, `batch.rs`
+
+**Trying to measure the lane default found two more, and neither was in the prefetch code.** The sweep
+itself did not run — see [`bench-data/2026-08-08-serve-prefetch`](bench-data/2026-08-08-serve-prefetch/README.md)
+for the budget that killed it (~50 s/token single-stream on the 358 GB container; 8 concurrent streams
+took >50 min for 4 tokens at load average 27, so a 4-arm × 3-repeat sweep is a multi-day run on a machine
+someone is using). Setting it up is what exposed the rest. (e) **`peregrine-serve` never applied
+`COLI_PREDICT_SOURCE`** — `apply_predictor_override` was called only by the stdio binary, so `PhaseAware`
+was unreachable from the batched engine, i.e. from the only path that has per-sequence prefetch and
+therefore the only place it was meant to matter. (f) **The server never joined its engine thread.** The
+join handle was bound as `_engine_join` and dropped, so the process exited while the thread still owned
+the `Model` and `Model::drop` never ran — which silently cost **`route_stats.json` persistence on the HTTP
+path entirely** (`COLI_ROUTE_STATS_PERSIST` worked only in the stdio binary) on top of the shutdown
+counters. Now joined with a 30 s bound, because the engine exits when both request senders drop and those
+live in an `Arc` a detached SSE task can still hold; a server that will not exit is a worse trade than a
+lost counter. The `[ecache]`/`[prefetch]` lines are now reported from the engine thread, which is the only
+thing that owns the model — **the first numbers ever seen from the serving path**:
+`hits=14 misses=3510 disk_reads=3510 prefetch_reads=433 hit_rate=0.4%` and
+`used=14 wasted=50 accuracy=21.9%` on one 2-token request. Too small to conclude from, and consistent with
+§5.2's plateau finding at this capacity ratio `peregrine-serve/src/main.rs`, `batch.rs`
 
 - [x] ✅ **Router look-ahead** (2026-08-03) — every predictor above is a statistic over the router's *past answers*; this one asks the router. At the end of layer `L`, apply layer `L+1`'s own `post_ln` + router to layer `L`'s output and prefetch that ranking's top `COLI_ROUTER_LOOKAHEAD_N` (default 6) — one extra `E×D` matvec against resident weights, no artifact, no format change, works on the first token of a cold process where every history-based predictor is still empty. Correctness-neutral: the authoritative router still runs at `L+1` and still decides, pinned by `router_lookahead_cannot_move_a_token` (streamed decode bit-identical to resident). **Decode only** — WASTE built the prefill-chunk version and measured bytes read +6.9 % with flat wall clock, because a chunk layer's speculative records are exactly what eviction takes first and its readers are never idle. Speculative reads stay out of `misses`. `model.rs::LookaheadCtx`, `router.rs::route_ranks`; `COLI_ROUTER_LOOKAHEAD` _(★★★★★ · Medium)_
 - [x] ✅ **Predictor scoreboard** (2026-08-03) — `COLI_PREDICT_EVAL=1` scores the router look-ahead, the configured `PredictSource` and a previous-token baseline against the routing that actually happened, and prints recall + precision-by-rank at shutdown (`[predict-eval]`). Built because the §1 spine is entirely correctness-neutral, which means **no test can catch a predictor that has degraded to noise** — it costs throughput silently. Pure and unit-tested (`predeval.rs`); an arm that abstains is counted as silent rather than wrong, and recall counts distinct coverage so a degenerate arm cannot report >1. **This is the open question against every other item in this section**: WASTE measured held-out co-occurrence at 29.0 % recall@16 against "reuse the previous token's set" at 29.5 %, i.e. no better than the baseline the cache already exploits for free. Whether `automaton.json` / `macrostates.json` beat it *here* is now measurable and unmeasured `predeval.rs`, `model.rs::score_and_stash`
@@ -543,6 +579,8 @@ code that never runs cannot be wrong — it can only mislead.*
 - [x] ✅ **`peregrine-sched` is now the correctness oracle** (2026-08-06) — no crate depends on it and production MoE is `concurrent.rs::moe_forward_concurrent`, so a second implementation of the same computation was a second thing to keep correct with nothing checking it. `streamed_matches_the_production_concurrent_path` closes that: it builds a `testkit` container, runs the **production** path over it through a real `ForwardCtx`, and points this crate's `DiskQt`s at **the same container bytes** via `SafeTensors::region` — the same triples `concurrent.rs`'s private `tplan` builds from — so the two engines read one file rather than two. Both entry points take the router weights as arguments, so routing is identical by construction and only the expert path is under test. Tolerance, not bits: the lanes accumulate in different orders and `f32 +=` is not associative; bit-identity is asserted *within* each engine, never across them. Guarded against passing vacuously by requiring the reference output to be non-zero, and verified to bite (a 1.5× `routed_scale` on one side fails it). The crate's own `concurrent_matches_sequential` — which compares against the *resident* reference, not the concurrent path, and whose name said otherwise (`docs/testing-and-quality.md` flagged it) — is renamed `streamed_matches_the_resident_reference` `peregrine-sched/src/lib.rs`
 - [x] ✅ **MTP speculative decode — wired in both binaries** — `generate_speculative` was unreachable from either. The stdio server takes `--draft N` / `COLI_DRAFT`, and the batched HTTP engine speculates per sequence with all sequences' `1 + γ` rows in *one* forward, so B sequences share one routed-expert union — B separate speculative decodes would stream B unions off the disk that is already the bottleneck. Greedy requests only (argmax acceptance is sequence-identical; temperature > 0 is merely distribution-preserving), drafts capped by the remaining `max_new`, and speculated rows recorded into a scratch history so a rejected draft never warms experts for a token that never existed. **colibrì's "net loss" figure was taken at depth 2**, where 2.46 accepted is already 82% of that configuration's ceiling of 3 — which is why the default guidance is 4–6, and why the reason to wire it was never completeness
 
+- [ ] 🟡 **`PhaseTracker` (`workload.rs`) — a fifth, found 2026-08-08, and deliberately left unwired.** Nothing in the engine constructs one; the live phase signal is `PredictSource::PhaseAware`, which compares the newest two frames per prediction and holds no state. The cost was not zero while it sat there: `COLI_PHASE_THRESHOLD` was documented with a default of 0.6 and **`PhaseTracker` was its only reader**, so the knob the docs offered governed nothing, and the predictor that *should* have obeyed it used a hardcoded `6000` bp. That half is fixed — the threshold is now converted at the boundary and read by the predictor — so what remains unreachable is the struct, not the setting. **Kept rather than deleted because it is not a duplicate**: it holds an EWMA of frame-to-frame distance plus `since_change`, i.e. a *window* after a shift, and `PhaseAware` can express no such thing — it re-decides instantaneously at every layer. Whether a window beats the instantaneous check is precisely what `COLI_PREDICT_EVAL` exists to answer, and until it does, wiring this would be a guess with a control loop attached — the failure mode §3c's own note warns about, facing the other way. The reason is recorded at the definition `workload.rs`
+
 ## 3c. Dead-code sweep (2026-08-07, extended 2026-08-08)
 
 *User mandate: "don't allow any dead code — wire it", and "don't delete, use
@@ -581,6 +619,23 @@ was meant to gate (`probe_device_count` added). The `pipe_*` primitives split
 across two streams with no ordering between them. And `tensor_upload`'s int4
 conversion raced its own consumers. None was reachable, so none was wrong in
 practice — which is exactly why none was found.
+
+**A fourth, found 2026-08-08 by auditing the fix rather than the feature — and this one is
+demonstrated, not reasoned.** The 2026-08-07 pass moved every `pipe_*` *compute* primitive onto
+`ctx->stream` and stopped there. The two **staging** primitives, `pipe_upload` and `pipe_download`, were
+still blocking `cudaMemcpy` on the legacy default stream, which does not synchronize with a
+`cudaStreamNonBlocking` stream — so a download issued after queued kernels could return bytes those
+kernels had not written yet. It was missed for the same reason the original set was: the only callers are
+the graph-capture tests, and they always sync via `graph.launch()` first, so the primitives the pass *did*
+fix were exactly the ones the tests chained. On this box's RTX 3060 the new test
+`a_download_observes_work_already_queued_on_the_context_stream` reads **164 where 200 is correct** against
+the old code — 36 of 200 queued kernels still pending — and passes once both staging ops are issued on
+`ctx->stream` and drained before return. `pipe_peer_copy` got the same treatment, plus a source-side drain,
+because cross-device the producer and consumer sit on two different non-blocking streams.
+**Also corrected here:** this entry says `is_available` "could never gate the `init` it was meant to
+gate". It still does not — `is_available` is banner-only (`peregrine-model/src/lib.rs:104`) and
+`GpuTier::build_with` probes with `init(&[0]) < 1` directly (`gpu.rs:1444`). That is fine behavior, but
+the wiring the sentence implies did not happen `cuda/backend_cuda.cu`, `peregrine-cuda/src/lib.rs`
 
 **Three entries are deliberately not wired, and say so at their definitions.**
 `plan_precision` (wiring it reinstates the 542→67 residency bug

@@ -26,6 +26,23 @@ use tokio::sync::mpsc;
 /// A no-op without a GPU tier, so it is harmless in CPU-only deployments.
 const REHEAT_EVERY: usize = 256;
 
+/// Ticket dispenser for [`SeqState::seq_id`] — the value that picks a sequence's
+/// prefetch lane, and the only thing about a sequence that must not move.
+///
+/// It has to be *stable*, which the obvious candidate is not: `active` is compacted
+/// with `retain` every tick, so a sequence's index into it slides down whenever an
+/// earlier one retires. Keying the lane on that index (as this did until 2026-08-08)
+/// migrated live streams between lanes mid-flight, leaving a sequence's queued reads
+/// split across two io_uring rings with no ordering between them.
+///
+/// The trade-off is deliberate and worth stating: the positional index spread the
+/// *currently active* sequences perfectly across lanes, and a monotonic ticket does
+/// not — ids 0 and 4 collide on lane 0 under four lanes even if lane 2 is idle. That
+/// is the cheaper mistake (a shared warm cache absorbs it), and occupancy-aware
+/// assignment is only worth building if the lane-count measurement says lanes pay.
+/// Wrapping is fine: the pool takes this modulo its width.
+static NEXT_SEQ_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Prompt tokens prefilled per engine step for an admitting sequence. Bounding the
 /// chunk lets active sequences keep decoding while a new long prompt prefills, so a
 /// big admission doesn't stall the batch for its whole prefill. Also the floor for
@@ -198,6 +215,10 @@ struct Prefilling {
     /// `SeqState` when the prefill completes, so the sequence keeps one history
     /// across its whole life instead of starting blank at its first decode.
     hist: Mutex<RouteHistory>,
+    /// Stable prefetch-lane key, from [`NEXT_SEQ_ID`]. Assigned at admission and
+    /// carried into the `SeqState`, for the same reason `hist` is: a fused prefill
+    /// row prefetches too, and it must use the lane the sequence will keep.
+    seq_id: usize,
 }
 
 /// Request priority. Higher priority requests are admitted and drained before
@@ -574,6 +595,9 @@ struct SeqState {
     /// each concurrent stream prefetches from its own routing (not the cross-sequence
     /// union). Wrapped in a `Mutex` because the batched forward records into it.
     hist: Mutex<RouteHistory>,
+    /// Stable prefetch-lane key — see [`NEXT_SEQ_ID`]. Not this sequence's index in
+    /// `active`, which slides when an earlier sequence retires.
+    seq_id: usize,
     pos: usize,
     next_tok: i32,
     sampler: Sampler,
@@ -849,9 +873,10 @@ fn run_tuned(
             }
         }
         // Per-sequence, parallel-async prefetch: warm each stream's predicted next
-        // experts onto its assigned lane (round-robin) while sampling proceeds.
-        for (i, s) in active.iter().enumerate() {
-            model.enqueue_seq_prefetch(&s.hist, i);
+        // experts onto its assigned lane while sampling proceeds. Keyed on the
+        // sequence's own id, not its index here — see [`NEXT_SEQ_ID`].
+        for s in active.iter() {
+            model.enqueue_seq_prefetch(&s.hist, s.seq_id);
         }
 
         // Emit each sequence's confirmed run and decide who continues.
@@ -1042,6 +1067,48 @@ fn run_tuned(
             prefix.used as f64 / (1024.0 * 1024.0)
         );
     }
+    // Warm-tier and prefetch effectiveness. This has to happen *here* — the engine
+    // thread owns the `Model`, so `main` cannot ask it anything after the server
+    // stops, and the model is dropped the moment this function returns.
+    //
+    // The stdio binary has printed these since the feature landed and the HTTP
+    // server never did, so on the serving path — the only path with per-sequence
+    // prefetch, and therefore the only one where prefetch lanes mean anything —
+    // there was no way to see whether prefetch was earning its keep. Deliberately
+    // just the two aggregate lines: the per-layer breakdown, gate stats, look-ahead
+    // and predictor scoreboard the stdio binary also prints are a larger reporting
+    // surface than this needs, and belong in a change of their own.
+    //
+    // Silent without a warm cache (`ecache_stats` is `None`), so a resident-mode
+    // run's output is unchanged.
+    if let Some((h, m, d)) = model.ecache_stats() {
+        let hr = 100.0 * h as f64 / (h + m).max(1) as f64;
+        let pf = model.ecache_prefetch_reads().unwrap_or(0);
+        eprintln!("[ecache] hits={h} misses={m} disk_reads={d} prefetch_reads={pf} hit_rate={hr:.1}%");
+        let (used, wasted) = model.ecache_prefetch_effectiveness().unwrap_or((0, 0));
+        let acc = 100.0 * model.prefetch_accuracy().unwrap_or(0.0);
+        let fadv = model.ecache_fadvise_hints().unwrap_or(0);
+        let vm = model.ecache_verify_mismatch().unwrap_or(0);
+        // `accuracy` is `used/(used+wasted)`, and **`wasted` is only incremented on
+        // eviction** (`warmcache.rs`): a prefetched slab still resident at shutdown
+        // is neither used nor wasted, so it is not in that denominator at all. On the
+        // first serving-path run 433 reads were issued and only 64 were classified,
+        // which makes a bare `accuracy` a survivorship-biased view of a much smaller
+        // effective yield — 21.9% of the classified, 3.2% of the issued. Both are
+        // printed, with the unclassified remainder, so neither can be quoted alone.
+        //
+        // Worth knowing when reading it: `PrefetchTuner` (`COLI_PREFETCH_TUNE`) EWMAs
+        // the same used/wasted pair, so it is steering on the classified slice only.
+        // Whether that biases the tuner is a real question and not answered here.
+        let unclassified = pf.saturating_sub(used + wasted);
+        let yield_pct = if pf > 0 { 100.0 * used as f64 / pf as f64 } else { 0.0 };
+        eprintln!(
+            "[prefetch] used={used} wasted={wasted} unclassified={unclassified} \
+             accuracy={acc:.1}% (of {} classified) yield={yield_pct:.1}% (of {pf} issued) \
+             fadvise={fadv} verify_mismatch={vm}",
+            used + wasted
+        );
+    }
 }
 
 /// Blocking-wait for a request across the two priority channels, biased toward
@@ -1136,6 +1203,7 @@ fn admit_pending(model: &Model, pending: &mut VecDeque<Prefilling>, req: EngineR
         out: req.out,
         max_new: req.max_new,
         hist: Mutex::new(model.new_route_history()),
+        seq_id: NEXT_SEQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
 }
 
@@ -1201,11 +1269,11 @@ fn finish_prefill_chunk(
     prefix: &mut PrefixCache,
 ) {
     let OutputCfg { vocab, stop_ids } = out_cfg;
-    let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist } = p;
+    let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist, seq_id } = p;
     let chunk_len = end - pos;
     if end < prompt.len() {
         // more chunks to go — round-robin with the others
-        pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new, hist });
+        pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new, hist, seq_id });
         return;
     }
     // Prefill complete. Snapshot it before the KV moves into the active set, so
@@ -1230,6 +1298,7 @@ fn finish_prefill_chunk(
     active.push(SeqState {
         seq,
         hist,
+        seq_id,
         pos: prompt.len(),
         next_tok: t0,
         sampler,
@@ -1328,6 +1397,77 @@ mod tests {
             tok = argmax(&lg[..vocab]) as i32;
         }
         Ok(out)
+    }
+
+    #[test]
+    fn a_retiring_sequence_does_not_renumber_the_streams_behind_it() -> Result<(), Error> {
+        // Until 2026-08-08 the prefetch lane was keyed on a sequence's index in
+        // `active`, which the decode loop compacts with `retain` every tick. When a
+        // middle stream retired, every stream behind it slid down one index and so
+        // changed lane mid-flight, leaving its queued reads split across two
+        // io_uring rings with no ordering between them. Prefetch is
+        // correctness-neutral, so nothing failed — the lane key just stopped
+        // meaning what the design said it meant.
+        let dir = tiny_dir("seqid")?;
+        let model = Model::load(&dir)?;
+        let mut pending: VecDeque<Prefilling> = VecDeque::new();
+        let mut prefix = PrefixCache::new(0);
+        let mut keepalive = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            keepalive.push(rx); // hold the receivers so no send sees a dropped client
+            admit_pending(
+                &model,
+                &mut pending,
+                EngineRequest {
+                    prompt: vec![3i32, 7],
+                    max_new: 4,
+                    sampler: Sampler::new(0.0, 0.9, 1),
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                },
+                &mut prefix,
+            );
+        }
+        let ids: Vec<usize> = pending.iter().map(|p| p.seq_id).collect();
+        assert_eq!(ids.len(), 3, "three admissions");
+        assert!(ids[0] < ids[1] && ids[1] < ids[2], "admission order gives increasing ids, got {ids:?}");
+
+        // Promote them the way `finish_prefill_chunk` does — the point is that the
+        // id set at admission is what reaches `active`, not a fresh one.
+        let mut active: Vec<SeqState> = pending
+            .into_iter()
+            .map(|p| SeqState {
+                seq: p.seq,
+                hist: p.hist,
+                seq_id: p.seq_id,
+                pos: 0,
+                next_tok: 1,
+                sampler: p.sampler,
+                out: p.out,
+                produced: 1,
+                max_new: p.max_new,
+                draft: Vec::new(),
+                draft_q: Vec::new(),
+                hlast: Vec::new(),
+            })
+            .collect();
+        assert_eq!(active.iter().map(|s| s.seq_id).collect::<Vec<_>>(), ids, "promotion preserves the id");
+
+        // The middle stream retires, exactly as the decode loop's `retain` does.
+        let keep = [true, false, true];
+        let mut k = keep.iter();
+        active.retain(|_| *k.next().unwrap_or(&true));
+
+        assert_eq!(active.len(), 2, "one retired");
+        assert_eq!(active[0].seq_id, ids[0], "the leader is untouched");
+        // The survivor *did* slide down an index — that is the compaction the old
+        // scheme keyed on — but its lane key is still the one it was admitted with.
+        assert_eq!(active.iter().position(|s| s.seq_id == ids[2]), Some(1), "it slid to index 1");
+        assert_eq!(active[1].seq_id, ids[2], "…and kept its lane across the retire");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]

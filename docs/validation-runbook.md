@@ -508,6 +508,55 @@ the margin over that baseline.
   on a second workload, since the fraction is a property of the routing
   distribution as much as of the weights.
 
+## 9. Does `COLI_PREFETCH_LANES > 1` buy anything?
+
+The prefetch-lane pool ships defaulting to **1**, i.e. the "parallel-async" part
+of the feature is off unless asked for, and nothing has ever measured whether
+raising it pays. This step settles it.
+
+**It cannot be an arm in `bench-arms.sh`.** That harness drives `peregrine bench`
+→ `Model::forward_step_batched`, and the only caller that ever selects a lane
+other than 0 is `Model::enqueue_seq_prefetch`, which lives in `peregrine-serve`'s
+batch loop. A lane sweep run through `bench` measures nothing and returns a clean
+null result — which is worse than no number, because it looks like an answer.
+Hence a separate harness that drives the real server:
+
+```bash
+cargo build --release --bins
+CONCURRENCY=8 MAX_TOKENS=32 REPEATS=3 scripts/bench-serve-lanes.sh bench-data/lanes 1 2 4 8
+```
+
+It starts one server per arm, fires `CONCURRENCY` concurrent completions, and
+reports medians. Two design points worth keeping if you rewrite it: it counts
+`usage.completion_tokens` rather than SSE deltas (a token that only extends a
+multi-byte character emits no delta, so delta-counting undercounts decode work —
+a first attempt measured 0 tokens from two healthy streams), and it runs the arms
+in **rotating order** across repeats because there is no passwordless sudo on the
+dev box to drop the page cache between them.
+
+**Budget this before starting.** Measured on the dev box (RTX 3060, 46 GB RAM,
+358 GB int4 container, `COLI_ECACHE_GB=4`): single-stream decode ran **~50 s per
+token**, and 8 concurrent streams took **>25 min for 4 batched steps** — 8
+distinct prompts route to 8 distinct expert sets, so the per-step union is far
+wider than a single stream's. A 4-arm × 3-repeat × 32-token sweep is therefore
+a multi-day run there, not an afternoon. On a box that can hold more of the
+container resident it is an afternoon. **Do not shrink `MAX_TOKENS` to make it
+fit** — the dev box swings ±45 % on ~50 s runs and only settles to ±3 % past
+200 s, so a short sweep produces numbers that cannot distinguish the arms.
+
+Read `*.counters.txt` alongside the throughput table. More tok/s bought by more
+disk reads is not a win, and lanes are exactly the knob that could buy it that
+way.
+
+- **No separation outside the noise band** → keep the default at 1 and say so in
+  `docs/configuration.md`; the pool costs a thread and an io_uring ring per lane,
+  and an unmeasured default of 4 is a cost with a story attached.
+- **Clear win at some lane count** → change the default, quote the number, and
+  re-check whether the bulk emitters (`tiers.json` seed, `enqueue_expert_replicas`)
+  should spread too. They deliberately sit on lane 0 today *pending this result*;
+  the per-layer emitter and router look-ahead must stay on one lane regardless,
+  since one stream's staggered reads must not overtake each other.
+
 ## What to do with the results
 
 Write them into [benchmarks.md](benchmarks.md). Where a measurement contradicts
