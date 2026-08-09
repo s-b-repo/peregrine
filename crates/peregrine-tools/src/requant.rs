@@ -168,12 +168,27 @@ impl HeatTier {
             .get("heat")
             .and_then(|h| h.as_array())
             .ok_or_else(|| Error::Format("route_stats.json has no `heat` array".into()))?;
-        let heat: Vec<u32> = arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
-        if heat.len() != n_layers * n_experts {
+        let mut heat: Vec<u32> = arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
+        let want = n_layers * n_experts;
+        // The producer is one row longer than the consumer wants. `HeatTable` is
+        // built `n_layers + 1` rows (`model.rs`) because the MTP head sits at
+        // layer index `n_layers` and routes a full set of experts — a 2026-08-09
+        // fix for that head never accumulating heat. The extra row is real data,
+        // but it is not a layer this container requantizes, so drop it.
+        //
+        // Demanding an exact `n_layers * n_experts` made the two permanently
+        // irreconcilable: at GLM-5.2 shapes the table is 79 x 256 = 20 224 and
+        // this asked for 78 x 256 = 19 968, so `--tier-hot-frac` refused every
+        // heat file the engine could produce, however the run was done.
+        if heat.len() == want + n_experts {
+            heat.truncate(want);
+        }
+        if heat.len() != want {
             return Err(Error::Format(format!(
-                "route_stats.json heat is {} entries, expected {} (n_layers {n_layers} x n_experts                  {n_experts}) — a mismatched trace would misalign every layer",
+                "route_stats.json heat is {} entries, expected {want} (n_layers {n_layers} x \
+                 n_experts {n_experts}, or one row more for the MTP head) — a mismatched trace \
+                 would misalign every layer",
                 heat.len(),
-                n_layers * n_experts
             )));
         }
         Ok(heat)
@@ -467,7 +482,19 @@ pub fn plan_sizes(indir: &Path, plan: &Plan) -> Result<Report, Error> {
         match (t.name.contains(&plan.include), expert_dims(&t.name, &cfg)) {
             (true, Some((o, i))) => {
                 rep.tensors_requantized += 1;
-                rep.bytes_out += (plan.target.payload_bytes(o, i) + plan.target.scale_count(o, i) * 4) as u64;
+                // Mirror `requantize`'s per-expert choice exactly (see the
+                // `expert_coords` match there): a tier overrides the uniform
+                // target per expert, and sizing every expert at `plan.target`
+                // ignored that. `--dry-run --tier-hot-frac` therefore reported
+                // the all-cold size whatever the fraction — identical output for
+                // every `--tier-hot-frac`, and a "plan for N GB of free space"
+                // line that under-states a tiered run by the whole difference
+                // between hot and cold for the experts kept hot.
+                let target = match (&plan.tier, expert_coords(&t.name)) {
+                    (Some(tr), Some((layer, expert))) => tr.target_for(layer, expert),
+                    _ => plan.target,
+                };
+                rep.bytes_out += (target.payload_bytes(o, i) + target.scale_count(o, i) * 4) as u64;
             }
             _ => {
                 rep.bytes_out += nbytes;
