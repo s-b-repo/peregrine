@@ -20,23 +20,46 @@ here, every other number in this directory was taken against a crippled device.
 | `dm-0` `max_sectors_kb` | 128 | inherited from the backing device |
 | LUKS **encryption sector size** | **unknown** | needs root |
 
-## The one that is still open
+## Confirmed: the LUKS sector size is 512 bytes
 
-`cryptsetup luksDump` requires root and was not run. The `logical_block_size: 512`
-on the dm device is *suggestive* of a 512-byte LUKS sector but does not establish
-it: that field reports the backing device's logical block size (the NVMe also
-reports 512), and dm-crypt's encryption sector is a separate LUKS2 header field.
-
-To settle it:
-
-```bash
-sudo cryptsetup luksDump /dev/nvme0n1p2 | grep -i sector
+```
+$ sudo cryptsetup luksDump /dev/nvme0n1p2 | grep -i sector
+        sector: 512 [bytes]
 ```
 
-If it reads 512, §1b's recorded ~5× applies and **reformatting the volume at
-`--sector-size 4096` would dominate every other lever in this investigation** —
-including anything in the prefetch code. It is also destructive (a reformat, not a
-tunable), so it is a decision, not a knob.
+So §1b's *precondition* holds. Whether its recorded ~5× applies here is a separate
+question, and the evidence gathered so far is genuinely mixed:
+
+| observation | reading |
+|---|---|
+| `dd bs=1M iflag=direct` through LUKS: **1.5 GB/s** | not obviously crippled |
+| O_DIRECT throughput vs ring count: 0.60 / 0.81 / 0.86 / 0.83 / 0.69 GB/s at 1 / 2 / 4 / 8 / 12 rings | **plateaus at 4 rings and declines** — does not behave like a CPU-bound crypto path, which would keep scaling on 12 threads |
+| CPU during `dd` at 1.5 GB/s | ~4.4 of 12 cores busy, against a 1.9-core desktop baseline → **~2.5 cores net**, i.e. ~1.7 cores per GB/s |
+
+~1.7 cores per GB/s is high for AES-NI (which should do ~1–2 GB/s per core) and is
+the kind of overhead 8× more crypto operations per byte would produce — but it is
+not conclusive, and the non-scaling argues the other way.
+
+**The reformat is not a knob.** `cryptsetup` cannot change sector size in place;
+it means backing up, `luksFormat --sector-size 4096`, and restoring. This volume
+is 878 GB used of 906 GB with 22 GB free and holds the OS, and `/mnt/backup` is a
+696 GB array — smaller than the data. That is a multi-hour, whole-system operation
+with nowhere obvious to stage it.
+
+**Do not reformat on the evidence above.** The measurement that would settle it is
+cheap, read-only, and needs one sudo:
+
+```bash
+sudo dd if=/dev/nvme0n1p2 of=/dev/null bs=1M count=2000 iflag=direct
+```
+
+That reads the *encrypted* partition directly, bypassing dm-crypt entirely.
+Against the 1.5 GB/s measured through the mapper:
+
+- **raw ≈ 1.5–1.7 GB/s** → dm-crypt costs nothing, sector size is irrelevant here,
+  close the item.
+- **raw ≈ 3 GB/s or more** → the crypto layer is halving throughput, and
+  `--sector-size 4096` becomes worth costing out properly.
 
 ## What this rules in
 
