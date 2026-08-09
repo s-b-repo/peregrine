@@ -55,7 +55,7 @@ pub use telemetry::{open_l3_miss_counter, PlanOptimizer, RuntimeTelemetry};
 pub use wmma_tune::{KernelShape, TileConfig, WmmaTuner};
 pub use workload::{classify_str, PhaseTracker, TokenClass};
 pub use predeval::{ArmReport, PredictEval};
-pub use predict::{Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
+pub use predict::{phase_boost, Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 pub use mtp::speculative_sample;
 pub use router::{
     batch_union, gate_share_below, gate_stats_snapshot, route, union_low_gate_snapshot, union_stats_snapshot, Routed,

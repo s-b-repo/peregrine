@@ -974,11 +974,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bench_tokenizer(&dir, file)?;
         return Ok(());
     }
-    let model = Model::load(&dir)?;
+    let mut model = Model::load(&dir)?;
+    // `COLI_PREDICT_SOURCE`: force a specific prefetch predictor. The stdio binary
+    // has always honoured this and the server never did, so the one knob that can
+    // select `PhaseAware` was unreachable from the **batched** engine — which is
+    // precisely where per-sequence prefetch lives, and so the only place the
+    // phase-aware predictor was ever meant to matter. Applied before the model
+    // moves into the engine thread; no thread affinity involved, unlike the perf
+    // counter, which stays with whoever decodes.
+    if let Some(name) = model.apply_predictor_override() {
+        eprintln!("peregrine-serve: prefetch predictor = {name} (COLI_PREDICT_SOURCE)");
+    }
     let tokenizer = TokenBackend::load(&dir).map_err(|e| format!("tokenizer: {e}"))?;
 
     // One engine thread owns the model and continuously batches all requests.
-    let (engine, _engine_join) = batch::spawn(model, args.max_batch)?;
+    let (engine, engine_join) = batch::spawn(model, args.max_batch)?;
 
     let addr = format!("{}:{}", args.host, args.port);
     let state = AppState {
@@ -1007,6 +1017,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("peregrine-serve shutting down");
         })
         .await?;
+
+    // Wait for the engine thread to drain before returning from `main`.
+    //
+    // The join handle was `_engine_join` until 2026-08-08 — held, never joined —
+    // so the process exited while the engine thread was still alive and
+    // `Model::drop` never ran. That silently cost two things the server is
+    // documented to do: **`route_stats.json` is written at Drop**, so the HTTP
+    // server never persisted routing heat or co-activation across sessions
+    // (`COLI_ROUTE_STATS_PERSIST` had no effect here, only in the stdio binary),
+    // and the `[ecache]` / `[prefetch] used/wasted/accuracy` shutdown counters
+    // never printed — which is why a lane-count sweep against this server could
+    // not read the one diagnostic that says whether prefetch is earning its keep.
+    //
+    // Bounded, because the wait is not guaranteed to end: the engine exits when
+    // both request senders drop, and those live in an `Arc<Inner>` that a
+    // detached SSE pump task may still hold — graceful shutdown waits for
+    // connections, not for `tokio::spawn`ed tasks. Losing the counters is a bad
+    // trade for a server that will not exit, so this reports and moves on.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ok = engine_join.join().is_ok();
+        if done_tx.send(ok).is_err() {
+            // `main` hit the timeout below and stopped listening. Expected, not a
+            // fault — but it means the drain finished *after* the deadline, which
+            // is the one case where raising the deadline would have helped.
+            peregrine_core::note_advisory_err(
+                "engine join handoff",
+                &"engine drained after main stopped waiting — consider a longer shutdown deadline",
+            );
+        }
+    });
+    match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(true) => {}
+        Ok(false) => eprintln!("peregrine-serve: batch engine thread panicked"),
+        // Timeout and Disconnected mean different things and get different words:
+        // the first is a slow drain, the second is a watchdog that died before
+        // reporting — which would otherwise look like a clean shutdown.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => eprintln!(
+            "peregrine-serve: batch engine still busy after 30s; \
+             route_stats.json and the [ecache]/[prefetch] counters may be incomplete"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("peregrine-serve: engine join watchdog exited without reporting")
+        }
+    }
     Ok(())
 }
 

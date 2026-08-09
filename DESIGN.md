@@ -156,9 +156,14 @@ correctness-neutral (only latency and residency change, never the reduced values
   shrink/grow. `COLI_ADAPTIVE_WINDOW=N` runs prefill every Nth tick so decode gets more consecutive
   time before yielding.
 - **Phase-aware prefetch** — `PredictSource::PhaseAware` wraps any inner source and, when the
-  Jaccard distance between the newest two frames of `RouteHistory` exceeds `threshold_bp / 10000`,
-  folds a heavy vote on the newest frame's experts. `PhaseTracker` maintains the same EWMA
-  standalone for consumers that want a raw signal (batching engine, etc.).
+  Jaccard distance between the newest two frames of `RouteHistory` exceeds `threshold_bp / 10000`
+  (from `COLI_PHASE_THRESHOLD`), folds a dominating vote on the newest frame's experts. "Dominating"
+  is derived — `predict::phase_boost(depth)` returns the full momentum scale, so a newest-frame
+  expert outranks any expert absent from it by construction rather than by a chosen constant.
+  `PhaseTracker` maintains the same signal as a standalone EWMA plus a post-shift window, and
+  **has no consumer** — this said "batching engine, etc." until 2026-08-08, which was not true of
+  any caller. It is kept, unwired, as the stateful alternative to the instantaneous check; see §3b
+  of `todo.md`.
 - **Workload classification** — `workload::classify_str` buckets a tokenizer-decoded tail into
   `TokenClass::{Prose, Code, Json, Math, Mixed}` from ratios of alnum / punct / digits / brace
   shapes. Wired end-to-end: the HTTP handler classifies the last user message's tail (UTF-8-safe

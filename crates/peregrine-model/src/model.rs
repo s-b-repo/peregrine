@@ -639,6 +639,20 @@ struct PrefetchPool {
 
 impl PrefetchPool {
     /// The lane assigned to work item `i` (round-robin). Never empty.
+    ///
+    /// **Only [`Model::enqueue_seq_prefetch`] passes anything but 0**, and that is a
+    /// policy rather than an oversight. The per-layer emitter and the router
+    /// look-ahead are *staggered ahead of the compute cursor*: layer L's warm should
+    /// land before layer L+1's, and a lane is FIFO only with respect to itself, so
+    /// spreading one stream's emissions across lanes would let a later layer's read
+    /// overtake an earlier one's — the opposite of what look-ahead is for. One
+    /// logical stream therefore belongs on one lane.
+    ///
+    /// The genuinely spreadable callers are the bulk, order-free ones — the
+    /// `tiers.json` seed and `enqueue_expert_replicas` — which enqueue a *set*. They
+    /// stay on lane 0 until the lane-count measurement says lanes pay for themselves
+    /// at all; parallelising a once-per-load warm on the strength of a plausible
+    /// story is how the rest of this file grew knobs nobody measured.
     fn lane(&self, i: usize) -> &PrefetchHandle {
         &self.lanes[i % self.lanes.len()]
     }
@@ -771,6 +785,28 @@ fn route_hist_depth() -> usize {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&d| d >= 1)
             .unwrap_or(4)
+    })
+}
+
+/// Jaccard distance above which [`PredictSource::PhaseAware`] declares a routing phase
+/// shift, in basis points. Tunable via `COLI_PHASE_THRESHOLD` as a fraction in
+/// `[0.0, 1.0]` (default 0.6 → 6000 bp); read once.
+///
+/// The knob is spelled as a fraction because that is what it meant when only
+/// [`crate::PhaseTracker`] read it — and until 2026-08-08 `PhaseTracker` was the *only*
+/// reader, while having no production caller, so the documented default governed
+/// nothing. The live predictor used a hardcoded `6000`. This converts at the boundary
+/// so one env var drives both and the units stay honest on each side.
+fn phase_threshold_bp() -> u32 {
+    use std::sync::OnceLock;
+    static BP: OnceLock<u32> = OnceLock::new();
+    *BP.get_or_init(|| {
+        let frac = std::env::var("COLI_PHASE_THRESHOLD")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| (0.0..=1.0).contains(v))
+            .unwrap_or(0.6);
+        (frac * 10_000.0).round() as u32
     })
 }
 
@@ -3323,10 +3359,17 @@ impl Model {
                     &mut self.predictor,
                     PredictSource::Momentum(crate::predict::Momentum::default()),
                 );
+                // `boost` is derived from the history depth, not picked: at the
+                // `boost: 2` this shipped with, a newest-frame expert merely *tied*
+                // one that had just dropped out (depth-4 momentum scores it 6), so
+                // "trust recency on a phase shift" reduced to a tie broken by
+                // ascending expert id. The unit tests passed throughout because they
+                // build their own source with `boost: 100`. `phase_boost` outranks
+                // the whole momentum scale by construction.
                 self.set_predictor(PredictSource::PhaseAware {
                     inner: Box::new(inner),
-                    threshold_bp: 6000,
-                    boost: 2,
+                    threshold_bp: phase_threshold_bp(),
+                    boost: crate::predict::phase_boost(route_hist_depth()),
                 });
                 Some("phase-aware")
             }

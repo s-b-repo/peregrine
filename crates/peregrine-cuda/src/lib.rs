@@ -1341,6 +1341,75 @@ mod gpu_tests {
     }
 
     #[test]
+    fn a_download_observes_work_already_queued_on_the_context_stream() -> Result<(), Error> {
+        use std::os::raw::c_void;
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        // `pipe_upload`/`pipe_download` were blocking `cudaMemcpy` on the legacy
+        // default stream until 2026-08-08. `ctx->stream` is `cudaStreamNonBlocking`,
+        // so the two were not ordered against each other and a download could return
+        // bytes a queued kernel had not written yet. The 2026-08-07 pass fixed this
+        // for the compute primitives and missed the staging ones; the graph-capture
+        // tests could not catch it because they always sync via `graph.launch()`
+        // before downloading.
+        //
+        // The defect is a race, so this makes the race one-sided instead of relying
+        // on luck: ROUNDS launches over N floats is tens of milliseconds of device
+        // work standing against a ~32 MiB copy. A correctly ordered download waits
+        // for the whole queue and can only observe ROUNDS; an unordered one would
+        // have to beat every launch to report ROUNDS by accident.
+        const N: usize = 8 << 20; // 8 Mi floats = 32 MiB
+        const ROUNDS: usize = 200;
+        let nb = N * 4;
+        // SAFETY: two N-float device buffers on device 0.
+        let (x_dev, t_dev) = unsafe {
+            (ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32, ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32)
+        };
+        assert!(!x_dev.is_null() && !t_dev.is_null(), "device alloc");
+
+        let zero = vec![0f32; N];
+        let one = vec![1f32; N];
+        // SAFETY: both device buffers hold `nb` bytes; both slices hold N f32.
+        let up = unsafe {
+            ffi::coli_cuda_pipe_upload(0, x_dev as *mut c_void, zero.as_ptr() as *const c_void, nb)
+                & ffi::coli_cuda_pipe_upload(0, t_dev as *mut c_void, one.as_ptr() as *const c_void, nb)
+        };
+        assert_eq!(up, 1, "pipe_upload");
+        for _ in 0..ROUNDS {
+            // SAFETY: x += t over N elements, both device-resident, both `nb` bytes.
+            let ok = unsafe { ffi::coli_cuda_pipe_add(0, x_dev, t_dev, N) };
+            assert_eq!(ok, 1, "pipe_add launch");
+        }
+        // Deliberately no `pipe_sync` and no graph launch: the download itself is
+        // what has to carry the ordering.
+        let mut out = vec![f32::NAN; N];
+        // SAFETY: `x_dev` holds `nb` bytes; `out` holds N f32.
+        let ok =
+            unsafe { ffi::coli_cuda_pipe_download(0, x_dev as *const c_void, out.as_mut_ptr() as *mut c_void, nb) };
+        // Scan the whole buffer, not index 0: a copy that lands while the adds are
+        // still running gives a correct prefix and a stale tail.
+        let bad = out.iter().position(|&v| v != ROUNDS as f32).map(|i| (i, out[i]));
+        // SAFETY: both came from pipe_alloc; free is null-safe.
+        unsafe {
+            ffi::coli_cuda_pipe_free(0, x_dev as *mut c_void);
+            ffi::coli_cuda_pipe_free(0, t_dev as *mut c_void);
+        }
+        assert_eq!(ok, 1, "pipe_download");
+        if let Some((i, got)) = bad {
+            // `bad` is Some only where the value already differs, so this always
+            // trips — it is an assert rather than a `panic!` because the repo bars
+            // panicking error handling in tests too (`clippy.toml`).
+            assert_eq!(
+                got, ROUNDS as f32,
+                "out[{i}] — pipe_download returned the buffer before the queued adds finished"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn graph_capture_multi_kernel() -> Result<(), Error> {
         // A real decode step is many kernels; capture TWO dependent ops (silu_mul
         // then add) into one graph and confirm replay == eager for the composite —

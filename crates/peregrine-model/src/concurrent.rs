@@ -58,10 +58,18 @@ pub struct ForwardCtx<'a> {
     /// speculative-draft forwards (so drafts don't pollute the main-stream
     /// prediction) and when prefetch is off.
     pub route_log: Option<&'a Mutex<RouteHistory>>,
-    /// Per-**sequence** routing history for batched decode: `route_log_multi[s]` is
-    /// sequence `s`'s own history (position `s` ↔ sequence `s`), so each concurrent
-    /// stream predicts and prefetches from its *own* routing rather than the weak
-    /// cross-sequence union. `None` on the single-stream path (which uses `route_log`).
+    /// Per-**row** routing history for batched decode: `route_log_multi[r]` receives
+    /// row `r`'s own routed set, so each concurrent stream predicts and prefetches
+    /// from its *own* routing rather than the weak cross-sequence union. `None` on the
+    /// single-stream path (which uses `route_log`).
+    ///
+    /// Indexed by row, **not** by sequence — the two differ whenever a sequence
+    /// contributes more than one row (speculative drafts, a fused prefill chunk), and
+    /// this said "per-sequence" until 2026-08-08 while the write loop below indexed by
+    /// row. Mapping sequences onto rows is the caller's job:
+    /// `peregrine-serve`'s `batch.rs` expands one entry per sequence into `1 + drafts`
+    /// entries, pointing the speculated rows at a scratch history so a rejected draft
+    /// never reaches the predictor. `forward_rows_inner` requires `len() == s_n`.
     pub route_log_multi: Option<&'a [&'a Mutex<RouteHistory>]>,
     /// Stream expert reads via O_DIRECT (bypass the page cache) when the shards
     /// opened O_DIRECT fds. Bytes are identical to the buffered path; only the

@@ -75,10 +75,16 @@ Three governors (`peregrine-io/src/sensors.rs`, stepped from
   `COLI_PREFETCH_TUNE`): normalized Shannon entropy of the routed distribution
   over the K-deep history, EWMA'd per forward — narrow prefetch breadth when
   routing is repetitive, widen when dispersed.
-- **Phase detection** (`workload.rs`): `PhaseTracker` EWMAs frame-to-frame
-  Jaccard distance and flags a shift above `COLI_PHASE_THRESHOLD`
-  (default 0.6). `PredictSource::PhaseAware` folds a heavy vote onto the
-  newest frame's experts during a shift.
+- **Phase detection** (`predict.rs`): `PredictSource::PhaseAware` compares the
+  newest two frames' Jaccard distance against `COLI_PHASE_THRESHOLD`
+  (default 0.6) and, above it, folds a dominating vote onto the newest frame's
+  experts. The weight comes from `predict::phase_boost(depth)`, not a constant:
+  it shipped as a hardcoded `2` until 2026-08-08, which at the default depth
+  only *tied* an expert that had just dropped out, so the shift response was
+  inert while its tests passed on a hand-built `boost: 100`.
+  `PhaseTracker` (`workload.rs`) keeps the stateful form — an EWMA plus a
+  post-shift window — and **has no production caller**; until 2026-08-08 it was
+  also the only reader of `COLI_PHASE_THRESHOLD`, so that knob governed nothing.
 - **Workload classes**: the HTTP handler classifies each request's prompt tail
   (`workload::classify_str` → `Prose | Code | Json | Math | Mixed`) and the
   engine resolves per-class prefetch breadth via

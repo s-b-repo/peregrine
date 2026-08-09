@@ -1397,13 +1397,29 @@ extern "C" void coli_cuda_pipe_free(int device,void *p){
     DeviceContext *ctx=find_ctx(device); if(!p||!select_ctx(ctx)) return;
     cudaFree(p);
 }
+/* The two staging primitives are stream-ordered for exactly the reason the compute
+ * primitives below are, and they were missed by the 2026-08-07 pass that fixed those.
+ *
+ * A blocking `cudaMemcpy` runs on the legacy default stream. `ctx->stream` is
+ * `cudaStreamNonBlocking`, so the default stream does **not** implicitly synchronize
+ * with it: `pipe_silu_mul` (on ctx->stream) followed by `pipe_download` with no
+ * intervening `pipe_sync` is a read-before-write race, and the symmetric case —
+ * uploading into a buffer a still-running kernel is reading — is the same bug facing
+ * the other way. It never fired only because the sole callers are the graph-capture
+ * tests, which sync via `graph.launch()` first. That is precisely why the earlier pass
+ * did not find it: the primitives it *did* fix were the ones those tests chained.
+ *
+ * Issuing on `ctx->stream` and draining it before returning keeps the blocking
+ * contract every caller already assumes while making the ordering real. */
 extern "C" int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes){
-    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
-    return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyHostToDevice),"pipe upload");
+    DeviceContext *ctx=find_ctx(device); if(!dst||!src||!select_ctx(ctx)) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyHostToDevice,ctx->stream),"pipe upload")
+        && cuda_ok(cudaStreamSynchronize(ctx->stream),"pipe upload sync");
 }
 extern "C" int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes){
-    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
-    return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToHost),"pipe download");
+    DeviceContext *ctx=find_ctx(device); if(!dst||!src||!select_ctx(ctx)) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyDeviceToHost,ctx->stream),"pipe download")
+        && cuda_ok(cudaStreamSynchronize(ctx->stream),"pipe download sync");
 }
 /* Every `pipe_*` op below runs on `ctx->stream`. That is not a style choice.
  *
@@ -1521,12 +1537,24 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
     return cuda_ok(cudaGetLastError(),"pipe gemm");
 }
 /* copia diretta scheda->scheda (P2P se disponibile, altrimenti staging driver) */
+/* Same default-stream hazard as pipe_upload/pipe_download, with an extra edge in the
+ * cross-device case: the source's pending writes and the destination's later reads sit
+ * on two different non-blocking streams, so draining one end is not enough. */
 extern "C" int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,
                                         const float *src,size_t bytes){
     if(!dst||!src) return 0;
     if(dst_dev==src_dev){ DeviceContext *c=find_ctx(dst_dev); if(!select_ctx(c)) return 0;
-        return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToDevice),"pipe intra copy"); }
-    return cuda_ok(cudaMemcpyPeer(dst,dst_dev,src,src_dev,bytes),"pipe peer copy");
+        return cuda_ok(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyDeviceToDevice,c->stream),"pipe intra copy")
+            && cuda_ok(cudaStreamSynchronize(c->stream),"pipe intra copy sync"); }
+    DeviceContext *sc=find_ctx(src_dev),*dc=find_ctx(dst_dev);
+    if(!sc||!dc) return 0;
+    /* drain the producer before reading its buffer... */
+    if(!select_ctx(sc)||!cuda_ok(cudaStreamSynchronize(sc->stream),"pipe peer copy src drain")) return 0;
+    /* ...then land the copy on the consumer's stream, so ops the caller queues next
+     * on dst_dev are ordered after it without a device-wide sync. */
+    if(!select_ctx(dc)) return 0;
+    return cuda_ok(cudaMemcpyPeerAsync(dst,dst_dev,src,src_dev,bytes,dc->stream),"pipe peer copy")
+        && cuda_ok(cudaStreamSynchronize(dc->stream),"pipe peer copy sync");
 }
 /* come attention_project_batch_dev ma l'uscita di o_proj RESTA sul device (out_dev). */
 extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiCudaTensor *proj,

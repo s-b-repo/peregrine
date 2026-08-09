@@ -1,0 +1,10 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 8.0 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 28.2 GB | resident 10.9 + KV 0.7 + stream 3.8 + slack 1.4 + cache 4.3 -> peak 21.1 GB
+[tokenizer] gigatoken BPE active, vocab=154856
+peregrine-serve listening on http://127.0.0.1:8133
+peregrine-serve shutting down
+[ecache] hits=10 misses=3514 disk_reads=3514 prefetch_reads=412 hit_rate=0.3%
+[prefetch] used=10 wasted=67 unclassified=335 accuracy=13.0% (of 77 classified) yield=2.4% (of 412 issued) fadvise=0 verify_mismatch=0
