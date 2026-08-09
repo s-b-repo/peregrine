@@ -81,7 +81,13 @@ badly, and would change the meaning of every hit-rate figure in the engine.
     momentum.
   - **PhaseAware** — wraps any inner source; when the Jaccard distance between
     the two newest frames exceeds `COLI_PHASE_THRESHOLD`, folds a heavy vote
-    onto the newest frame (routing phase shift → trust recency).
+    onto the newest frame (routing phase shift → trust recency). "Heavy" is
+    derived, not chosen: `predict::phase_boost(depth)` returns the full momentum
+    scale `depth·(depth+1)/2`, which outranks any expert absent from the newest
+    frame by construction. It shipped as a hardcoded `2` until 2026-08-08 — at
+    depth 4 that merely *tied* an expert that had just dropped out, so the
+    feature did approximately nothing while both its unit tests passed on a
+    hand-built `boost: 100`. Opt-in via `COLI_PREDICT_SOURCE=phase-aware`.
   - **WithMacro** — blends `MacroTable` macro-states: consecutive identical
     top-k sets collapse into dwell-counted states with state→state
     transitions (`macrostates.json`, built by `galactic`).
@@ -103,7 +109,14 @@ badly, and would change the meaning of every hit-rate figure in the engine.
   `_HINT_PATHS_` twins.
 - **Per-sequence prefetch in batched serving** — each concurrent stream
   predicts from its own routing history on a parallel prefetch-lane pool
-  (`COLI_PREFETCH_LANES`).
+  (`COLI_PREFETCH_LANES`, **default 1 — the pool is a single lane unless you
+  raise it**). The lane is keyed on a sequence id assigned at admission, not on
+  the sequence's index in the active set: that index slides down whenever an
+  earlier sequence retires, which until 2026-08-08 migrated live streams between
+  lanes mid-flight and split their queued reads across two rings.
+  `peregrine-serve`'s `batch.rs` is the only caller that uses a lane other than
+  0 — see [`COLI_PREFETCH_LANES`](configuration.md) for why the other emitters
+  deliberately do not.
 - **Verification** — opt-in `COLI_PREFETCH_VERIFY` re-reads and byte-compares
   every speculative load (a `verify_mismatch` counter, never a panic) and logs
   used/wasted/accuracy at shutdown.

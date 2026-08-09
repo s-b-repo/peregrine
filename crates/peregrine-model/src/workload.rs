@@ -85,6 +85,23 @@ pub fn classify_str(tail: &str) -> TokenClass {
 /// frame. Maintains an EWMA of the Jaccard distance between consecutive
 /// frames' top-k sets — an abrupt jump signals a topic/task transition and
 /// prompts the predictor to re-weight recency.
+/// **Deliberately not wired, and this is the note that says so.** Nothing in the
+/// engine constructs a `PhaseTracker`; the live phase signal is
+/// [`crate::PredictSource::PhaseAware`], which compares the newest two frames on each
+/// prediction and needs no state. Inventing a caller to make the reachability metric
+/// agree is the failure mode `docs/BAD_PATTERNS.md` catalogues, so it keeps its own
+/// tests and no production call site.
+///
+/// It is kept rather than deleted because it is not a duplicate: it holds an **EWMA**
+/// of frame-to-frame distance plus `since_change`, i.e. a *window* after a shift, and
+/// `PhaseAware` has neither — it re-decides instantaneously every layer and cannot
+/// express "stay recency-biased for the next N tokens". Whether that window beats the
+/// instantaneous check is an open question `COLI_PREDICT_EVAL` can now answer; until
+/// it does, wiring it would be a guess with a control loop attached.
+///
+/// `COLI_PHASE_THRESHOLD` is shared with `PhaseAware` (see `model.rs`
+/// `phase_threshold_bp`) — until 2026-08-08 this was its *only* reader, so the
+/// documented knob governed nothing at all.
 pub struct PhaseTracker {
     ewma: f32,
     alpha: f32,
@@ -133,13 +150,18 @@ impl PhaseTracker {
         self.ewma
     }
 
+    /// Negative ids are "no route" padding, not experts, and are filtered — the same
+    /// rule `predict::jaccard_distance_bp` follows. The two implementations
+    /// disagreed until 2026-08-08: this one counted `-1` as a set member, so two
+    /// frames that were identical in their *routed* experts but differed in how many
+    /// slots went unfilled read as a partial phase shift.
     fn jaccard_distance(&self, cur: &[i32]) -> f32 {
         let Some(prev) = &self.last_set else { return 0.0 };
         if cur.is_empty() && prev.is_empty() {
             return 0.0;
         }
-        let a: HashSet<i32> = prev.iter().copied().collect();
-        let b: HashSet<i32> = cur.iter().copied().collect();
+        let a: HashSet<i32> = prev.iter().copied().filter(|&x| x >= 0).collect();
+        let b: HashSet<i32> = cur.iter().copied().filter(|&x| x >= 0).collect();
         let inter = a.intersection(&b).count();
         let uni = a.union(&b).count();
         if uni == 0 {
@@ -182,5 +204,18 @@ mod tests {
         let changed = p.observe(&[10, 11, 12]);
         assert!(changed, "disjoint routing set is a phase change");
         assert_eq!(p.since_change(), 0);
+    }
+
+    #[test]
+    fn phase_tracker_ignores_unfilled_route_slots() {
+        // `-1` is an unfilled slot, not an expert. Two frames routing the same
+        // experts are the same phase however many slots went unused, and the
+        // distance must agree with `predict::jaccard_distance_bp`, which has
+        // always filtered them. Before 2026-08-08 this counted `-1` as a member,
+        // so `[1,2,-1]` vs `[1,2]` scored 1/3 of a shift out of nothing.
+        let mut p = PhaseTracker::new();
+        assert!(!p.observe(&[1, 2, -1]));
+        assert!(!p.observe(&[1, 2]));
+        assert_eq!(p.stability(), 0.0, "identical routed sets → zero distance");
     }
 }
