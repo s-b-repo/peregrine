@@ -155,7 +155,10 @@ pub struct Model {
     /// rather than blends.
     perf_llc_ewma: f32,
     /// Background prefetch lane: warms the next token's predicted experts into
-    /// `ecache` on its own ring, off the critical path. `Some` alongside `ecache`.
+    /// `ecache` on its own ring, so its *submissions* never queue behind the
+    /// streaming lane's. Not "off the critical path" in any stronger sense — see
+    /// [`prefetch_worker`] for what the separate ring does and does not buy.
+    /// `Some` alongside `ecache`.
     prefetch: Option<PrefetchPool>,
     /// Optional GPU VRAM expert tier (the 3rd lane). Built only when `COLI_GPU`
     /// is set and the `cuda` backend is available; `None` otherwise.
@@ -1606,8 +1609,23 @@ impl Model {
 }
 
 /// The prefetch lane: stream predicted experts into the shared warm cache on this
-/// lane's *own* ring (no contention with the critical I/O lane). Best-effort — a
-/// failed speculative read is dropped (the real forward will stream it normally).
+/// lane's *own* ring. Best-effort — a failed speculative read is dropped (the real
+/// forward will stream it normally).
+///
+/// **This said "no contention with the critical I/O lane" until 2026-08-09, and that
+/// was only true of io_uring submission.** A separate ring means a speculative read
+/// never queues behind a demand read *in the submission queue*; both rings then feed
+/// one block device, one dm-crypt worker pool and one NVMe queue. On a device whose
+/// reads are CPU-bound on LUKS decryption — this repo's own standing hypothesis — a
+/// speculative read consumes exactly the decrypt cycles a demand read needs. There is
+/// no prioritisation, throttle, backpressure or in-flight cap between the two: the
+/// channel is unbounded, nothing drains or cancels a queued speculation, and this
+/// worker submits **one expert (6 regions) per `submit_and_wait`**, so a backlog of N
+/// items is N sequential round-trips that a demand read cannot jump.
+///
+/// Two smaller couplings, both real: this holds the `WarmCache` mutex across a full
+/// insert-with-eviction (and, under `COLI_CACHE_COMPRESS`, a ~19 MB zstd encode), and
+/// the demand lane probes that same lock on its critical path.
 fn prefetch_worker(
     mut reactor: Reactor,
     cache: Arc<Mutex<WarmCache>>,
@@ -2533,6 +2551,31 @@ impl Model {
         self.ecache.as_ref().map(|c| {
             let c = c.lock();
             (c.prefetch_used, c.prefetch_wasted)
+        })
+    }
+
+    /// `(bytes, slots)` currently held by prefetched slabs nothing has hit, and the
+    /// cache budget for scale. See [`WarmCache::speculative_resident`] — this is how
+    /// much of the cache speculation is *holding*, which `used`/`wasted` cannot say.
+    pub fn ecache_speculative_resident(&self) -> Option<(usize, u64, usize)> {
+        self.ecache.as_ref().map(|c| {
+            let c = c.lock();
+            let (bytes, slots) = c.speculative_resident();
+            (bytes, slots, c.budget())
+        })
+    }
+
+    /// `(slots, used_bytes, budget_bytes)` resident at this moment — how full the
+    /// warm cache actually is.
+    ///
+    /// Reported because a near-zero hit rate has two very different causes that the
+    /// hit/miss counters cannot tell apart: a **full** cache means the working set
+    /// is being evicted before reuse, an **empty** one means admission is not
+    /// happening at all. Guessing which was costing whole measurement runs.
+    pub fn ecache_occupancy(&self) -> Option<(usize, usize, usize)> {
+        self.ecache.as_ref().map(|c| {
+            let c = c.lock();
+            (c.len(), c.used_bytes(), c.budget())
         })
     }
 

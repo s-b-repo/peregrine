@@ -40,12 +40,27 @@ rather than a compromise: 92.2 % precision at rank 1, 81.4 % cumulative at 6,
 — it is roughly five useful reads and one wasted one per layer.
 
 **Those are their numbers, on their model.** Nothing here was adopted on their
-say-so, and nothing above has been reproduced on a peregrine container yet.
-`COLI_PREDICT_EVAL=1` is the instrument that settles it locally: it scores the
-look-ahead, the configured `PredictSource` and a previous-token baseline against
-the routing that actually happened, on the same forward, and prints recall and
-precision-by-rank at shutdown. **Run it before trusting the table above**, and
-before assuming the statistical predictors are still worth their complexity.
+say-so. **One row has now been reproduced on a peregrine container** (2026-08-09,
+`bench-data/2026-08-09-prefetch-causes/`): `peregrine route-stats` over a 24-token
+real-text trace of GLM-5.2 int4 measures consecutive-token overlap at **33.55 %**
+against an independence null of **3.12 %** — 10.7× the null, over ~1 725 layer
+transitions. That is the "previous token's set" row (WASTE: 29.5 %), and it
+reproduces.
+
+The consequence is larger than the row. This repo carried the opposite as an
+*inference* — that routing entropy was high enough to explain the 0.6 % warm-cache
+hit rate, colibrì's neutral PILOT prefetch and MTP's net loss — while flagging in
+`benchmarks.md` that the overlap had never actually been measured. **It has now,
+and the entropy story is wrong**: routing is strongly predictable from the previous
+token, so a low hit rate has to be explained by capacity or policy, not by the
+router.
+
+Still unreproduced: the router-lookahead row (59.0 %), which is the interesting one
+and the only arm that cannot be scored from a trace — `route_ranks` needs the
+hidden state, and a trace records only routed ids. `COLI_PREDICT_EVAL=1` is the
+instrument for it, and **it is currently reachable only from the stdio `GEN` path**
+— there is no hook in `forward_rows_inner`, so neither `peregrine bench` nor
+`peregrine-serve` can produce the number, which is why it never has.
 
 **It cannot change a token.** The authoritative router still runs at layer `L+1`
 and still decides; the look-ahead only starts I/O. `router_lookahead_cannot_move_a_token`
@@ -121,11 +136,66 @@ badly, and would change the meaning of every hit-rate figure in the engine.
   every speculative load (a `verify_mismatch` counter, never a panic) and logs
   used/wasted/accuracy at shutdown.
 
+### Reading the shutdown counters
+
+```
+[ecache]   hits= misses= disk_reads= prefetch_reads= hit_rate=
+[ecache]   resident: N slots, X GB of Y GB budget (Z% full)
+[prefetch] used= wasted= unclassified= accuracy=…(of C classified) yield=…(of R issued)
+[prefetch] resident-unused: N slots, X GB of Y GB budget (Z%)
+```
+
+Four things that are easy to misread, all learned the hard way on 2026-08-09:
+
+- **`accuracy` is not yield.** It is `used/(used+wasted)`, and `wasted` only
+  increments **on eviction** — a prefetched slab still resident is in neither
+  term. Quote `yield` (used per *issued*) alongside it or not at all; on the first
+  serving-path run they read 21.9 % and 3.2 % for the same fetches.
+- **`unclassified` mixes units.** It is `reads − used − wasted`, but
+  `prefetch_reads` counts read *operations* (an expert re-predicted after eviction
+  is read again) while `used`/`wasted` count slot *events*. Treat it as a loose
+  upper bound. `resident-unused` is the unambiguous one.
+- **`resident` tells you which failure you have.** A ~0 % hit rate with the cache
+  **100 % full** is an eviction/ordering problem; the same hit rate with it near
+  empty is an admission problem. Nothing else in the output distinguishes them,
+  and both prior investigations guessed.
+- **Neither line separates the two emitters.** `WarmCache` tracks one
+  `from_prefetch` bool and both `PrefetchCtx::emit_layer` and `LookaheadCtx::emit`
+  feed the same lane, so `used`/`wasted`/`yield` are a blend of the history
+  predictor and the router look-ahead. Isolating them needs
+  `COLI_ROUTER_LOOKAHEAD=0` as its own arm, or per-emitter tagging.
+
+And one about the workload rather than the counters: **`hit_rate` is over all
+lookups, including prefill**, which has no cross-token reuse by construction. A
+short completion on a long prompt is mostly prefill, so its hit rate is capped far
+below what the routing supports — a 12-token prompt with a 2-token completion caps
+at ~3 % however well the cache behaves.
+
 ## The warm RAM cache (`peregrine-io/src/warmcache.rs`)
 
 Budgeted by `COLI_ECACHE_GB` (default: 10 % of available RAM, capped at
 2 GiB). Holds quantized expert bytes verbatim — a hit returns a byte-identical
 slab.
+
+**Size it against one decode token's working set.** That is
+`sparse_layers × topk × bytes_per_expert` — on GLM-5.2 int4, 75 × 8 × 18.9 MB ≈
+**11.3 GB**. Under LRU a slab has to survive a full cycle back to its own layer to
+be reused on the next token, so below that figure cross-token reuse is
+structurally impossible *however good the predictor is*, and above it reuse
+appears immediately. Measured 2026-08-09 on a real container, prefetch off in both
+arms so only the budget differed:
+
+| budget | slots | hit rate | disk reads |
+|---|---:|---:|---:|
+| 4.29 GB | 227 | 1.9 % | 9751 |
+| 12.88 GB | 681 | **5.7 %** | **9380** |
+
+This was the only knob tested in that pass that reduced `disk_reads` at all — for
+comparison, the prefetcher issued ~420 reads to save ~20. Multiply the figure by
+the number of concurrent decode streams whose routed sets do not overlap, and read
+it against the `COLI_ECACHE_GB` row in [configuration](configuration.md): more
+cache is still not monotonically better, because past the point where it competes
+with the resident trunk a hit becomes a page fault.
 
 | Feature | Gate | What it does |
 |---|---|---|

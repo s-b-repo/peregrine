@@ -39,10 +39,14 @@ CPU-streaming decode.
   result — a 10 GB cache against a ~180 GB 16-token working set can hit ~5 %
   at best, however the router behaves. colibrì independently finds its PILOT
   prefetch neutral and MTP a net loss on disk-saturated MoE decode.
-  **Attributing all three to routing entropy is an inference, not a
-  measurement** — the routing overlap has never been measured. Run
-  `peregrine route-stats <routes.json> 256` (and `COLI_UNION_STATS=1` for the
-  live per-step sharing factor) before relying on the entropy story; see the
+  **That entropy attribution was an inference, and it has now been measured
+  and refuted** (2026-08-09, `bench-data/2026-08-09-prefetch-causes/`):
+  `route-stats` over a real-text GLM-5.2 trace puts consecutive-token overlap at
+  **33.55 % against a 3.12 % independence null** — 10.7×, i.e. routing is
+  strongly predictable from the previous token. The low hit rate is therefore a
+  capacity or policy result, not a router result; one token's routed set is
+  ~11.3 GB and the cache was 4 GB, so a slab cannot survive to be reused. Run
+  `COLI_UNION_STATS=1` for the live per-step sharing factor; see the
   correction in [the study](peregrine-vs-colibri.md#52-cache--locality-analysis-peregrine-measured).
 - **The 3-lane scheduler's full advantage is latent** without expert
   residency: colibrì reaches **6.84 tok/s on 6× RTX 5090** (full residency),
@@ -539,10 +543,24 @@ consistency check rather than a null. And the **wall clock disagrees with itself
 (faster at B=1, slower at B=4) on a contended host with 2 steps per run, so read
 the `disk_reads` column and ignore the seconds.
 
-Still absent at B>1: `[predict-eval] recall=` and `[lookahead] issued=`. The
-scoreboard is gated on `s_n == 1` (`model.rs:3517`), and that gate cannot
-distinguish "prefill chunk of `s_n` positions", where recall against a union
-would be meaningless, from "batch of `s_n` sequences each decoding one token",
-where the actual routed set is well defined per row. It correctly suppresses the
-first and incorrectly suppresses the second, which is why the recall number this
-pass was designed to produce still does not exist.
+Absent at **every** B: `[predict-eval] recall=` and `[lookahead] issued=`.
+
+**This was blamed on the `s_n == 1` gate until 2026-08-09, and that explanation is
+wrong** — which matters, because it points at the wrong repair. The gate is in
+`forward_hidden`, and `bench` never executes that function: `run_bench` calls
+`forward_step_batched` → `forward_rows_inner`, and `forward_rows_inner` **has no
+`score_and_stash` call at all**. The only call site in the tree is in
+`forward_hidden`, reached from `Model::generate` and friends. So `bench 1` produces
+no scoreboard either, and no amount of splitting the `s_n == 1` gate would change
+that. `peregrine-serve` is in the same position, and additionally never calls
+`predict_eval_report()`, so it could not print one if it had it.
+
+The scoreboard is reachable **only from the stdio `GEN` protocol**:
+
+```bash
+printf 'GEN 64 1 2 3\nQUIT\n' | COLI_PREDICT_EVAL=1 COLI_PREDICT_EVAL_N=16 peregrine "$COLI_MODEL"
+```
+
+`COLI_PREDICT_EVAL_N=16` makes it comparable with the WASTE recall@16 table; the
+default is the model's topk (8 on GLM-5.2). Getting the number from `bench` or from
+the server needs a hook in `forward_rows_inner`, not a gate change.

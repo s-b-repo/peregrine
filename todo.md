@@ -779,8 +779,14 @@ All of it is CPU-side and needs no hardware this workspace lacks.*
 *Reading fewer or smaller experts, rather than reading them faster. Two independent
 measurements motivate it. The warm cache hits **0.6%** on sustained decode, because a 10 GB
 cache cannot hold a ~180 GB working set — caching cannot win at this capacity ratio whatever
-the router does, and whether a *better predictor* could is unmeasured until `route-stats` runs
-(see the §5.2 correction). And the [2026-08-01 benchmark pass](docs/benchmarks.md#benchmark-pass--2026-08-01-post-improvement-re-measure)
+the router does. **`route-stats` has now run** (2026-08-09, real-text trace,
+[`bench-data/2026-08-09-prefetch-causes`](bench-data/2026-08-09-prefetch-causes/M2-routing-structure.md)),
+and it settles the half that was open the other way: consecutive-token overlap is **33.55%
+against a 3.12% independence null**, so routing is strongly predictable and a *better
+predictor* is not what is missing — the bytes have nowhere to live. One token routes 600
+experts ≈ 11.3 GB, so under LRU a slab must survive a full 11.3 GB cycle to be reused, and
+at a 4 GB cache it cannot. That makes this section's premise stronger, not weaker: the
+reachable 33.55% is real and the engine captures ~0.4% of it. And the [2026-08-01 benchmark pass](docs/benchmarks.md#benchmark-pass--2026-08-01-post-improvement-re-measure)
 measured nine §1–§11 knobs together — `COLI_DIRECT` `COLI_REGBUF` `COLI_IO_TUNE`
 `COLI_LANE_BALANCE` `COLI_SHAPE_SPECIALIZE` `COLI_HYPER_SCHED` `COLI_PREFETCH_TUNE`
 `COLI_ENTROPY_ADAPT` `COLI_REPLICATE_K=8` — at **1.004× baseline**, with **byte-identical

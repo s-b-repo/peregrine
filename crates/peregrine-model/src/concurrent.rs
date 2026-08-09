@@ -941,8 +941,18 @@ pub fn moe_forward_concurrent(
                             // reuse (routing heat ≥ threshold). Heat is bumped after
                             // the reduce, so a first-ever routing reads 0 here —
                             // threshold 1 = "cache from the second routing on".
+                            //
+                            // **No heat table means the gate cannot be evaluated, so it
+                            // does not apply.** It used to be `is_some_and`, i.e. "no
+                            // table → admit nothing": `heat` is `Some` only when a GPU
+                            // tier exists (`model.rs`), so on any CPU-only run setting
+                            // this knob to 1 silently turned the demand path's cache
+                            // admission off entirely — while the prefetch lane, which
+                            // has no such gate, went on admitting everything. A knob
+                            // documented as "filter one-off experts" instead inverted
+                            // which lane owned the cache.
                             let admit = admit_min_heat == 0
-                                || heat_ref.is_some_and(|h| h.get(layer, expert) >= admit_min_heat);
+                                || heat_ref.is_none_or(|h| h.get(layer, expert) >= admit_min_heat);
                             let mut c = c.lock();
                             c.note_disk_read(layer as u32);
                             if admit {
