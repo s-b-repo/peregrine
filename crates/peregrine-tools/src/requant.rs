@@ -42,7 +42,6 @@ use peregrine_core::config::Cfg;
 use peregrine_core::qt::QtInfo;
 use peregrine_core::safetensors::SafeTensors;
 use peregrine_core::{Context, Error};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Target precision for the tensors a plan selects.
@@ -372,48 +371,30 @@ impl ShardWriter {
 
     /// Write the buffered pieces as one shard. A no-op when nothing is pending,
     /// so calling it at the end is always safe.
+    ///
+    /// Header construction and the fsync-then-rename commit live in
+    /// [`crate::stwrite`] (shared with `peregrine-reshard`); this writer's own
+    /// job is only the buffering and the shard-budget roll.
     pub fn flush(&mut self) -> Result<(), Error> {
         if self.pending.is_empty() {
             return Ok(());
         }
         let path = self.shard_path(self.index);
-        let mut header = serde_json::Map::new();
-        if !self.meta.is_empty() {
-            let mut m = serde_json::Map::new();
-            for (k, v) in &self.meta {
-                m.insert(k.clone(), serde_json::Value::String(v.clone()));
-            }
-            header.insert("__metadata__".into(), serde_json::Value::Object(m));
-        }
-        let mut cursor: i64 = 0;
-        for p in &self.pending {
-            let start = cursor;
-            let end = start + p.bytes.len() as i64;
-            let mut entry = serde_json::Map::new();
-            entry.insert("dtype".into(), serde_json::Value::String(p.dtype.to_string()));
-            entry.insert("shape".into(), serde_json::json!(p.shape));
-            entry.insert("data_offsets".into(), serde_json::json!([start, end]));
-            header.insert(p.name.clone(), serde_json::Value::Object(entry));
-            cursor = end;
-        }
-        let hdr = serde_json::to_vec(&serde_json::Value::Object(header))
-            .map_err(|e| Error::Format(format!("serialize shard header: {e}")))?;
-        std::fs::create_dir_all(&self.dir).ctx(|| format!("create {}", self.dir.display()))?;
-        let tmp = path.with_extension("safetensors.part");
-        {
-            let f = std::fs::File::create(&tmp).ctx(|| format!("create {}", tmp.display()))?;
-            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-            w.write_all(&(hdr.len() as u64).to_le_bytes()).ctx(|| "write header length".to_string())?;
-            w.write_all(&hdr).ctx(|| "write header".to_string())?;
-            for p in &self.pending {
-                w.write_all(&p.bytes).ctx(|| format!("write payload for '{}'", p.name))?;
-            }
-            let f = w.into_inner().map_err(|e| Error::Format(format!("flush shard: {e}")))?;
-            // Durability before the rename: a shard that exists must be complete,
-            // because the resume path treats existence as "already done".
-            f.sync_all().ctx(|| format!("fsync {}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, &path).ctx(|| format!("commit {}", path.display()))?;
+        let pieces: Vec<crate::stwrite::PieceMeta> = self
+            .pending
+            .iter()
+            .map(|p| crate::stwrite::PieceMeta {
+                name: p.name.clone(),
+                dtype: p.dtype.to_string(),
+                shape: p.shape.clone(),
+                nbytes: p.bytes.len() as u64,
+                extra: Vec::new(),
+            })
+            .collect();
+        let pending = &self.pending;
+        crate::stwrite::write_streaming(&path, &self.meta, &pieces, |i, w| {
+            w.write_all(&pending[i].bytes).ctx(|| format!("write payload for '{}'", pending[i].name))
+        })?;
         self.written.push(path);
         self.pending.clear();
         self.pending_bytes = 0;
@@ -683,7 +664,13 @@ fn expert_dims(name: &str, cfg: &Cfg) -> Option<(usize, usize)> {
 
 /// `(layer, expert)` from a routed-expert tensor name, e.g.
 /// `model.layers.7.mlp.experts.42.gate_proj.weight` -> `(7, 42)`.
-fn expert_coords(name: &str) -> Option<(usize, usize)> {
+///
+/// Public because `peregrine-reshard` must classify tensors with *exactly* the
+/// same parse the engine's `ExpertIndex` uses — two implementations of "is this
+/// a routed expert?" would eventually disagree on some name and misplace it.
+/// Note `.mlp.shared_experts.` does not contain the `.mlp.experts.` needle, so
+/// shared experts stay trunk here just as they are skipped there.
+pub fn expert_coords(name: &str) -> Option<(usize, usize)> {
     let layer = name.split("model.layers.").nth(1)?.split('.').next()?.parse().ok()?;
     let expert = name.split(".mlp.experts.").nth(1)?.split('.').next()?.parse().ok()?;
     Some((layer, expert))
