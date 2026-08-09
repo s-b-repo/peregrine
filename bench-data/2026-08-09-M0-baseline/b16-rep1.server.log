@@ -1,0 +1,9 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 5.0 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 28.3 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.4 + cache 2.1 -> peak 26.6 GB
+peregrine: [workingset] one token routes 10.85 GB of experts against a 1.60 GB cache (15% of a pass) — no eviction order can hold a pass; prefetch-protect on
+[tokenizer] gigatoken BPE active, vocab=154856
+peregrine-serve listening on http://127.0.0.1:8131
+peregrine-serve shutting down
