@@ -9,14 +9,16 @@
 #   number that decides whether `COLI_ROUTER_LOOKAHEAD_BATCH` (the multi-row
 #   look-ahead lift) pays in or out. A recall under ~50 % is the WASTE caution
 #   and says keep it off; above ~70 % says leave it on by default.
-#   **DECODE-ONLY: absent whenever BATCH > 1.** `model.rs:3517` gates the
-#   scoreboard on `s_n == 1`, because a prefill chunk's "actual set" is a union
-#   over positions and recall against it would not be the number any predictor
-#   is aiming at. That gate cannot distinguish "prefill chunk of s_n positions"
-#   from "batch of s_n sequences each decoding one token", where the actual set
-#   *is* well defined per row — so it correctly suppresses the first and
-#   incorrectly suppresses the second. Until that is split, this line and the
-#   `[lookahead]` line below simply do not appear at B > 1.
+#   **ABSENT FROM THIS SCRIPT AT EVERY BATCH SIZE, including 1.** This used to
+#   say "decode-only, absent whenever BATCH > 1" and blame the `s_n == 1` gate;
+#   that was wrong, and wrong in a way that pointed at the wrong repair. The gate
+#   lives in `forward_hidden`, and `bench` never calls it: `run_bench` goes
+#   through `forward_step_batched` -> `forward_rows_inner`, which contains no
+#   `score_and_stash` call at all. Splitting the gate would change nothing here.
+#   The scoreboard is reachable only from the stdio `GEN` path:
+#     printf 'GEN 64 1 2 3\nQUIT\n' | COLI_PREDICT_EVAL=1 COLI_PREDICT_EVAL_N=16 peregrine "$COLI_MODEL"
+#   Producing it from `bench` or from peregrine-serve needs a hook in
+#   `forward_rows_inner`. The `[lookahead]` line below has the same cause.
 # - `[union] selections=… distinct=… share=…` — the batch-union sharing factor
 #   under speculation. With `--draft γ`, the union is over `(1+γ) × B` rows; the
 #   share is what every distinct expert read serves. If the union grows with γ

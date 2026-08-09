@@ -1,0 +1,13 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 36.1 GB | resident 10.9 + KV 0.7 + stream 3.8 + slack 1.4 + cache 12.9 -> peak 29.7 GB
+peregrine: [ecache] 12.9 GB of cache against 25.6 GB available — a cache this large can lower throughput while *raising* its own hit rate, because a hit that has been paged out is a page fault. If decode is slow, measure a smaller COLI_ECACHE_GB before a larger one.
+[tokenizer] gigatoken BPE active, vocab=154856
+peregrine-serve listening on http://127.0.0.1:8137
+peregrine-serve shutting down
+[ecache] hits=564 misses=9380 disk_reads=9380 prefetch_reads=0 hit_rate=5.7%
+[ecache] resident: 681 slots, 12.88 GB of 12.88 GB budget (100.0% full)
+[prefetch] used=0 wasted=0 unclassified=0 accuracy=0.0% (of 0 classified) yield=0.0% (of 0 issued) fadvise=0 verify_mismatch=0
+[prefetch] resident-unused: 0 slots, 0.00 GB of 12.88 GB budget (0.0%)

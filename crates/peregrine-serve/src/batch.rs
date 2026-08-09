@@ -1085,6 +1085,17 @@ fn run_tuned(
         let hr = 100.0 * h as f64 / (h + m).max(1) as f64;
         let pf = model.ecache_prefetch_reads().unwrap_or(0);
         eprintln!("[ecache] hits={h} misses={m} disk_reads={d} prefetch_reads={pf} hit_rate={hr:.1}%");
+        // Occupancy, because a ~0% hit rate has two opposite causes and the line
+        // above cannot distinguish them: a full cache is evicting the working set
+        // before it can be reused; an empty one is not admitting in the first place.
+        if let Some((slots, used, budget)) = model.ecache_occupancy() {
+            let fill = if budget > 0 { 100.0 * used as f64 / budget as f64 } else { 0.0 };
+            eprintln!(
+                "[ecache] resident: {slots} slots, {:.2} GB of {:.2} GB budget ({fill:.1}% full)",
+                used as f64 / 1e9,
+                budget as f64 / 1e9
+            );
+        }
         let (used, wasted) = model.ecache_prefetch_effectiveness().unwrap_or((0, 0));
         let acc = 100.0 * model.prefetch_accuracy().unwrap_or(0.0);
         let fadv = model.ecache_fadvise_hints().unwrap_or(0);
@@ -1108,6 +1119,17 @@ fn run_tuned(
              fadvise={fadv} verify_mismatch={vm}",
             used + wasted
         );
+        // How much of the cache speculation is *holding* — the unclassified slabs
+        // above, as bytes. This is the quantity that competes with demand data for
+        // the budget, and no counter reported it before 2026-08-09.
+        if let Some((bytes, slots, budget)) = model.ecache_speculative_resident() {
+            let share = if budget > 0 { 100.0 * bytes as f64 / budget as f64 } else { 0.0 };
+            eprintln!(
+                "[prefetch] resident-unused: {slots} slots, {:.2} GB of {:.2} GB budget ({share:.1}%)",
+                bytes as f64 / 1e9,
+                budget as f64 / 1e9
+            );
+        }
     }
 }
 
