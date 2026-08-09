@@ -605,6 +605,26 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                     out.write_all(b"\n")?;
                     // warm-tier diagnostics (stderr): how much of the expert I/O the
                     // cache absorbed this request.
+                    if let Some((resolved, mergeable)) = model.expert_map_stats() {
+                        let share = 100.0 * mergeable as f64 / resolved.max(1) as f64;
+                        let reads = 6 * (resolved - mergeable) + 2 * mergeable;
+                        eprintln!(
+                            "[expertmap] indexed={resolved} coalescing={mergeable} ({share:.1}%) \
+                             -> {reads} reads per full sweep vs {} unmerged",
+                            6 * resolved
+                        );
+                    }
+                    // The hit rate below is not interpretable without this: under
+                    // one token's working set a layer sweep drives any recency
+                    // policy to zero, so a low number is the budget talking, not
+                    // the policy.
+                    if let Some((per_token, protect)) = model.expert_working_set() {
+                        eprintln!(
+                            "[workingset] {:.2} GB per token; prefetch-protect {}",
+                            per_token as f64 / (1u64 << 30) as f64,
+                            if protect { "on (budget cannot hold a pass)" } else { "off (budget holds a pass)" }
+                        );
+                    }
                     if let Some((h, m, d)) = model.ecache_stats() {
                         let hr = 100.0 * h as f64 / (h + m).max(1) as f64;
                         let pf = model.ecache_prefetch_reads().unwrap_or(0);

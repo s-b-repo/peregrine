@@ -1094,6 +1094,82 @@ fn run_tuned(
     //
     // Silent without a warm cache (`ecache_stats` is `None`), so a resident-mode
     // run's output is unchanged.
+    if let Some((resolved, mergeable)) = model.expert_map_stats() {
+        let share = 100.0 * mergeable as f64 / resolved.max(1) as f64;
+        let reads = 6 * (resolved - mergeable) + 2 * mergeable;
+        eprintln!(
+            "[expertmap] indexed={resolved} coalescing={mergeable} ({share:.1}%) \
+             -> {reads} reads per full sweep vs {} unmerged",
+            6 * resolved
+        );
+    }
+    // The hit rate below is not interpretable without this: under one token's
+    // working set a layer sweep drives any recency policy to zero, so a low
+    // number is the budget talking, not the policy.
+    if let Some((per_token, protect)) = model.expert_working_set() {
+        eprintln!(
+            "[workingset] {:.2} GB per token; prefetch-protect {}",
+            per_token as f64 / (1u64 << 30) as f64,
+            if protect { "on (budget cannot hold a pass)" } else { "off (budget holds a pass)" }
+        );
+    }
+    // Where the time actually went. The four lane counters have always been
+    // collected — `moe_forward_concurrent` bumps them per layer — but the only
+    // consumer was the bubble tuner, and `snapshot_and_reset` wipes them every
+    // forward, so no operator could ever ask "was that run I/O-bound?".
+    {
+        let (t, forwards) = model.lane_totals();
+        if forwards > 0 {
+            let s = |us: u64| us as f64 / 1e6;
+            let (io, cpu, gpu, red) = (s(t.io_us), s(t.cpu_us), s(t.gpu_us), s(t.reduce_us));
+            let sum = (io + cpu + gpu + red).max(1e-9);
+            let pct = |v: f64| 100.0 * v / sum;
+            eprintln!(
+                "[lane] {forwards} forwards: io {io:.1}s ({:.0}%) cpu {cpu:.1}s ({:.0}%) \
+                 gpu {gpu:.1}s ({:.0}%) reduce {red:.1}s ({:.0}%)",
+                pct(io),
+                pct(cpu),
+                pct(gpu),
+                pct(red)
+            );
+            // Per forward is the number that maps onto a decode token, and the
+            // caveat is load-bearing: these are summed over lanes that run at the
+            // same time, so `sum / wall` is the overlap achieved, not overhead.
+            // A sum close to wall clock means the lanes are serialising.
+            eprintln!(
+                "[lane] per forward: io {:.2}s cpu {:.2}s (lane-summed, so compare \
+                 sum/wall for the overlap achieved)",
+                io / forwards as f64,
+                cpu / forwards as f64,
+            );
+            // The duty cycles. `io_us` is summed over one thread per ring, so the
+            // I/O lane's occupancy is `io_us / (rings x lane_wall)`. Below ~1.0 the
+            // rings are idle inside the MoE call; and `lane_wall` against the
+            // token's own wall clock is how much of a token is in the MoE lane at
+            // all, the rest being attention, the router and the reduce.
+            let wall = s(t.lane_wall_us);
+            if wall > 0.0 {
+                let rings = std::env::var("COLI_IO_RINGS").ok()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .filter(|&n| n > 0.0)
+                    .unwrap_or(4.0);
+                eprintln!(
+                    "[lane] moe wall {wall:.1}s over {forwards} forwards ({:.2}s each); \
+                     io duty {:.0}% of {rings:.0} rings, cpu {:.1} workers busy",
+                    wall / forwards as f64,
+                    100.0 * io / (rings * wall),
+                    cpu / wall,
+                );
+            }
+            if t.cpu_us > 0 && t.cpu_bytes > 0 {
+                eprintln!(
+                    "[lane] cpu-lane bandwidth {:.2} GB/s over {:.1} GB of expert slabs",
+                    t.cpu_bytes as f64 / 1e9 / s(t.cpu_us),
+                    t.cpu_bytes as f64 / 1e9,
+                );
+            }
+        }
+    }
     if let Some((h, m, d)) = model.ecache_stats() {
         let hr = 100.0 * h as f64 / (h + m).max(1) as f64;
         let pf = model.ecache_prefetch_reads().unwrap_or(0);

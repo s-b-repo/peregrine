@@ -255,7 +255,7 @@ mod tests {
         let mut b = BubbleTuner::new(0.3, 1.5, 3);
         let io = IoTuner::new(IowqCap { bounded: 4, unbounded: 4 }, 1, 16);
         let mut o = PlanOptimizer::new();
-        let t = o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 50, gpu_us: 50, reduce_us: 5, cpu_bytes: 0 }, 1000, None);
+        let t = o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 50, gpu_us: 50, reduce_us: 5, cpu_bytes: 0, lane_wall_us: 0 }, 1000, None);
         assert_eq!(t.lane.io_us, 100);
     }
 
@@ -284,7 +284,7 @@ mod tests {
         io.note_read(100, 50); // 50 rejections accumulated during warm-up
         let mut o = PlanOptimizer::new();
         for _ in 0..16 {
-            o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 1, gpu_us: 1, reduce_us: 0, cpu_bytes: 0 }, 1000, None);
+            o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 1, gpu_us: 1, reduce_us: 0, cpu_bytes: 0, lane_wall_us: 0 }, 1000, None);
         }
         if let Some(rec) = io.recommend() {
             assert_eq!(rec.bounded, 8, "warm-up rejections must not halve the cap on the first adjustment");

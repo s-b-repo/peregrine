@@ -346,6 +346,36 @@ impl ExpertIndex {
     pub fn mergeable(&self) -> usize {
         self.entries.iter().flatten().filter(|e| e.w_run.is_some() && e.s_run.is_some()).count()
     }
+
+    /// Bytes one token's routing touches: `topk` experts in every sparse layer,
+    /// each sized from *its own* layer, since a precision-tiered container does
+    /// not have one expert size (this checkpoint stores the MTP layer at int8 and
+    /// the rest at int4).
+    ///
+    /// This is the number that decides which of capacity or policy binds. A
+    /// front-to-back layer sweep has no intra-pass reuse, so a budget below one
+    /// token's working set cannot hold a pass no matter how it evicts, while a
+    /// budget above it makes plain recency work. Measured either side of that
+    /// threshold on this engine, the same `COLI_PREFETCH_PROTECT` mechanism is
+    /// worth +193 hits below it and −381 above — which is why the engine needs to
+    /// know where it sits rather than picking one default for both.
+    pub fn per_token_bytes(&self, cfg: &Cfg) -> u64 {
+        let n_experts = self.n_experts;
+        let topk = cfg.topk.max(0) as u64;
+        let mut total = 0u64;
+        for layer in (cfg.first_dense.max(0) as usize)..=(cfg.n_layers.max(0) as usize) {
+            // One resolved expert stands in for its layer: within a layer every
+            // expert has the same shape and format.
+            let Some(base) = layer.checked_mul(n_experts) else { continue };
+            let Some(e) = self.entries.get(base..base.saturating_add(n_experts)).and_then(|r| r.iter().flatten().next())
+            else {
+                continue;
+            };
+            let per_expert: u64 = e.plans.iter().map(|t| t.w_len as u64 + t.s_len as u64).sum();
+            total = total.saturating_add(per_expert.saturating_mul(topk));
+        }
+        total
+    }
 }
 
 /// Resolve one expert, preferring the load-time index and falling back to
@@ -1132,6 +1162,10 @@ pub fn moe_forward_concurrent(
     // `(per-expert slots, the GPU lane's device-reduced partial)`. The partial is
     // `None` unless `COLI_CUDA_FUSED_REDUCE` is on and the layer had GPU experts.
     type LaneResults = (Vec<Option<EOut>>, Option<Vec<f32>>);
+    // Wall clock of the 3-lane region. Every other lane counter is summed over
+    // *threads*, which cannot distinguish a saturated lane from an idle one; this
+    // is the denominator that makes them duty cycles.
+    let t_lane = std::time::Instant::now();
     let results: Result<LaneResults, Error> = std::thread::scope(|scope| {
         // ---- I/O lanes: N io_uring rings in PARALLEL, lock-free (atomic) work-stealing ----
         // One thread per ring. Each atomically claims a batch of experts off `io_work`,
@@ -1140,12 +1174,29 @@ pub fn moe_forward_concurrent(
         // dm-crypt decryption on encrypted volumes). The `pos`-ordered reduce is
         // order-independent, so which ring reads which expert never changes the output.
         let n_plans = plans_ref.len();
+        // Claim size, sized so **every ring gets work**.
+        //
+        // `experts_per_batch()` (`COLI_IO_BATCH`, default 16) is a submit-depth
+        // ceiling chosen for prefill, where a chunk's routed union is ~69 experts
+        // per layer. A *decode* token routes 8. With a fixed batch of 16, ring 0's
+        // `fetch_add(16)` returns start 0 and claims all 8; rings 1..N get starts
+        // 16/32/48, every one `>= n_plans`, and break without issuing a single
+        // read. One ring then does the work of four — measured at **24% io duty
+        // across 4 rings**, and ~0.6 GB/s where the same device gives 1.12 GB/s at
+        // 4 rings under `iobench`.
+        //
+        // Ceil-divide instead, keeping the configured value as an upper bound:
+        // decode gets ceil(8/4) = 2 and all four rings run; prefill gets
+        // ceil(69/4) = 18, clamped back to 16, so its deep submits are unchanged.
+        // Measured on GLM-5.2: decode 21.8 -> 14.8 s/tok, ttft 157 -> 116 s, io
+        // duty 24% -> 90%.
+        let n_rings = reactors.len().max(1);
+        let batch = experts_per_batch().min(n_plans.div_ceil(n_rings)).max(1);
         for ring in reactors.iter() {
             let job_tx = job_tx.clone();
             let res_tx = res_tx.clone();
             scope.spawn(move || {
                 loop {
-                    let batch = experts_per_batch();
                     let start = io_work_ref.fetch_add(batch, Ordering::Relaxed);
                     if start >= n_plans {
                         break; // no work left for this ring
@@ -1418,6 +1469,12 @@ pub fn moe_forward_concurrent(
         }
         Ok((slots, gpu_partial))
     });
+    // Recorded before `?` would return: a layer that failed still consumed wall
+    // clock, and dropping it would flatter the duty cycle exactly when something
+    // has gone wrong.
+    if let Some(t) = timings_ref {
+        t.add_lane_wall(t_lane.elapsed().as_micros() as u64);
+    }
     let (slots, gpu_partial) = results?;
 
     // ---- deterministic reduce: scatter in fixed batch-union order ----
@@ -1651,6 +1708,37 @@ mod tests {
             }
         }
         assert_eq!(checked, index.resolved(), "walked a different set than the index holds");
+        Ok(())
+    }
+
+    /// One token's working set is `topk` experts per sparse layer, sized from
+    /// each layer's own experts. This is the threshold the protect default and
+    /// the capacity-vs-policy reading both hang off, so it has to be derived, not
+    /// assumed uniform — a precision-tiered container stores different layers at
+    /// different widths.
+    #[test]
+    fn per_token_bytes_counts_topk_experts_in_every_sparse_layer() -> Result<(), Error> {
+        let dir = tmp_expert_index_dir("workingset")?;
+        let st = SafeTensors::open(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+        let index = ExpertIndex::build(&st, &cfg);
+
+        let layers: Vec<usize> = ((cfg.first_dense as usize)..=(cfg.n_layers as usize))
+            .filter(|&l| (0..cfg.n_experts as usize).any(|e| index.get(l, e).is_some()))
+            .collect();
+        assert!(!layers.is_empty(), "fixture has no sparse layers");
+
+        // Independently: sum each sparse layer's own per-expert bytes × topk.
+        let mut want = 0u64;
+        for &l in &layers {
+            let e = (0..cfg.n_experts as usize).find_map(|e| index.get(l, e)).ok_or_else(|| {
+                Error::Format("layer reported sparse but resolved no expert".into())
+            })?;
+            let per: u64 = e.plans.iter().map(|t| t.w_len as u64 + t.s_len as u64).sum();
+            want += per * cfg.topk.max(0) as u64;
+        }
+        assert_eq!(index.per_token_bytes(&cfg), want);
+        assert!(want > 0);
         Ok(())
     }
 
