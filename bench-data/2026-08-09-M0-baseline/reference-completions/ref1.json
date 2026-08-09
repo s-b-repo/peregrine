@@ -1,0 +1,125 @@
+{
+  "deltas": [
+    {
+      "at_s": 146.976,
+      "gap_s": null,
+      "index": 0,
+      "text": "**"
+    },
+    {
+      "at_s": 160.555,
+      "gap_s": 13.579,
+      "index": 1,
+      "text": "M"
+    },
+    {
+      "at_s": 175.569,
+      "gap_s": 15.014,
+      "index": 2,
+      "text": "ixture"
+    },
+    {
+      "at_s": 190.61,
+      "gap_s": 15.041,
+      "index": 3,
+      "text": "-of"
+    },
+    {
+      "at_s": 206.498,
+      "gap_s": 15.888,
+      "index": 4,
+      "text": "-"
+    },
+    {
+      "at_s": 221.38,
+      "gap_s": 14.882,
+      "index": 5,
+      "text": "Experts"
+    },
+    {
+      "at_s": 236.032,
+      "gap_s": 14.652,
+      "index": 6,
+      "text": " ("
+    },
+    {
+      "at_s": 250.814,
+      "gap_s": 14.782,
+      "index": 7,
+      "text": "Mo"
+    },
+    {
+      "at_s": 266.312,
+      "gap_s": 15.498,
+      "index": 8,
+      "text": "E"
+    },
+    {
+      "at_s": 280.858,
+      "gap_s": 14.546,
+      "index": 9,
+      "text": ")"
+    },
+    {
+      "at_s": 295.395,
+      "gap_s": 14.537,
+      "index": 10,
+      "text": " Layer"
+    },
+    {
+      "at_s": 310.085,
+      "gap_s": 14.691,
+      "index": 11,
+      "text": ":"
+    },
+    {
+      "at_s": 324.962,
+      "gap_s": 14.876,
+      "index": 12,
+      "text": " Routing"
+    },
+    {
+      "at_s": 339.492,
+      "gap_s": 14.53,
+      "index": 13,
+      "text": " a"
+    },
+    {
+      "at_s": 354.318,
+      "gap_s": 14.827,
+      "index": 14,
+      "text": " Token"
+    },
+    {
+      "at_s": 369.085,
+      "gap_s": 14.767,
+      "index": 15,
+      "text": "**\n"
+    }
+  ],
+  "gaps_s": [
+    13.579,
+    15.014,
+    15.041,
+    15.888,
+    14.882,
+    14.652,
+    14.782,
+    15.498,
+    14.546,
+    14.537,
+    14.691,
+    14.876,
+    14.53,
+    14.827,
+    14.767
+  ],
+  "max_tokens": 16,
+  "model": "glm-5.2",
+  "prompt": "Explain how a mixture-of-experts layer routes a token.",
+  "temperature": 0.0,
+  "text": "**Mixture-of-Experts (MoE) Layer: Routing a Token**\n",
+  "tokens": 16,
+  "total_s": 369.16,
+  "ttft_s": 146.975
+}

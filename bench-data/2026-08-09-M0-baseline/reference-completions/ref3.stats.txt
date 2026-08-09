@@ -1,0 +1,8 @@
+── peregrine-gen ──────────────────────────────────────────────
+  generated    16 tokens, 87 chars
+  ttft         2m 25s  (prefill + first token)
+  total        7m 14s
+  decode rate  19.25 s/tok (0.052 tok/s)  (excludes ttft)
+  inter-token  min 15.8s  p50 18.5s  p95 27.3s  max 28.9s
+  finish       stop
+  timings      bench-data/2026-08-09-M0-baseline/reference-completions/ref3.json
