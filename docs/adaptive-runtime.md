@@ -25,11 +25,45 @@ scrape from `&self`.
 
 ## Lane telemetry
 
-`LaneTimings` (`lane.rs`) accumulates per-lane wall time (io / cpu / gpu /
-reduce) inside `moe_forward_concurrent` via atomic counters on a shared
-accumulator threaded through `ForwardCtx`. `PlanOptimizer::tick`
-(`telemetry.rs`) folds `LaneTimings`, `BubbleTuner`, and `IoTuner` snapshots
-into one `RuntimeTelemetry` value per forward.
+`LaneTimings` (`lane.rs`) accumulates per-lane time (io / cpu / gpu / reduce)
+inside `moe_forward_concurrent` via atomic counters on a shared accumulator
+threaded through `ForwardCtx`. `PlanOptimizer::tick` (`telemetry.rs`) folds
+`LaneTimings`, `BubbleTuner`, and `IoTuner` snapshots into one
+`RuntimeTelemetry` value per forward.
+
+### Those four counters are summed over threads, not wall clock
+
+This is the single most important thing to know before reading them. The io lane
+runs **one thread per ring** and the CPU lane a pool, so each counter is a sum of
+busy time across several threads. **`io_us` of 17 s is equally "four rings busy for
+4.3 s" and "one ring busy for 17 s"** — and on their own the counters cannot tell
+you which.
+
+`LaneTimings::lane_wall_us` is the denominator that resolves it: the **wall** clock
+of the 3-lane region itself. With it, the shutdown report prints duty cycles:
+
+```
+[lane] 3 forwards: io 54.7s (73%) cpu 19.5s (26%) gpu 0.0s (0%) reduce 1.0s (1%)
+[lane] moe wall 58.2s over 3 forwards (19.38s each); io duty 24% of 4 rings, cpu 0.3 workers busy
+[lane] cpu-lane bandwidth 1.75 GB/s over 34.0 GB of expert slabs
+```
+
+`io duty 24% of 4 rings` says only ~0.94 rings were doing anything. **That number
+found a bug that had halved decode throughput** — the percentages on the first line
+read "I/O dominates at 73 %", which was true and useless, because it is a share of
+*busy* time and three of the four rings were never busy. See
+[the concurrent scheduler](concurrent-scheduler.md#the-three-lanes) for the fix and
+[Measurement discipline](measurement.md#3-thread-summed-counters-are-not-wall-time)
+for how to read the block.
+
+### Two accumulators, on purpose
+
+`Model` keeps the per-forward accumulator that `publish_lane_timings`
+**resets** each forward — that is the sample the tuner needs — and a second,
+run-lifetime `lane_totals` that is never reset, which is what the `[lane]` report
+prints. Without the second one there is no way to ask "where did this *run* go":
+the tuner's sample is gone by the time anyone could look at it. Both are folded from
+the same `sample`, so the report and the controller can never disagree.
 
 ## Bubble tuner & lane balancer
 

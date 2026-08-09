@@ -235,6 +235,26 @@ with the resident trunk a hit becomes a page fault.
   are a `reheat` question and are tracked there, not force-fitted here.
 - **Heat table** (`gpu.rs::HeatTable`): lock-free atomic routing-frequency
   counters, the substrate every residency/admission decision reads.
+
+  > **⚠ Heat exists only when the GPU tier does.** `model.rs` allocates it as
+  > `gpu.as_ref().map(|_| HeatTable::new(cfg.n_layers + 1, cfg.n_experts))`, so on a
+  > CPU-only binary — or a CUDA binary run without `COLI_GPU=1` — `self.heat` is
+  > `None` and `route_stats.json` persists `"heat": null`. The *accumulation* is not
+  > GPU-specific (`concurrent.rs` bumps it on the CPU MoE path); only the allocation
+  > is.
+  >
+  > Two consequences bite in practice. `COLI_CACHE_ADMIT_MIN_HEAT` needs a GPU tier
+  > (see its [note](configuration.md#coli_cache_admit_min_heat)). And
+  > `peregrine-requantize --tier-hot-frac` — a purely **storage-side** decision about
+  > which experts keep int4 precision — cannot get its input without a GPU run.
+  > `scripts/heat-pass.sh` automates that pass: `COLI_GPU=1`,
+  > `COLI_ROUTE_STATS_PERSIST=1`, varied prompts, and SIGINT rather than SIGKILL
+  > because the file is written at `Drop`.
+  >
+  > The table is `n_layers + 1` rows: the MTP head sits at index `n_layers` and
+  > routes a full set of experts. Consumers must expect the extra row — see
+  > [Tools](tools.md#two-fixes-worth-knowing-about-2026-08-09) for the mismatch that
+  > made heat-tiering impossible until 2026-08-09.
 - **Dynamic VRAM residency**: `reheat()` re-selects the hottest experts every
   256 steps; initial placement is a greedy heat/bytes knapsack
   (`solve_residency_sized`) with deterministic ties, seeded from the previous

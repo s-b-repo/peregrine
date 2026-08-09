@@ -14,12 +14,46 @@ CPU-streaming decode.
 
 | | peregrine (Rust) | colibrì (C) |
 |---|---|---|
-| Decode, single sequence (steady state) | 0.054 tok/s | **0.077 tok/s** |
+| Decode, single sequence (steady state) | **0.062 tok/s** (16.08 s/tok) — was 0.054; see [the io-claim fix](#the-io-claim-fix-2026-08-09) | **0.077 tok/s** |
 | **Batched decode, B=16 (aggregate)** | **0.280 tok/s** (4.4× over B=1) — see the note below on why the 2026-08-01 pass reads 0.224 | — |
 | Warm cache on a repeated forward | **3.58×** (100 % hit, 0 disk) | learned pin |
 | Raw device read rate (after I/O ports) | **~980 MB/s** | ~870 MB/s — but see [the laptop re-measurement](#second-box-glm-52-on-a-7-gb-laptop), which inverts this |
 | Warm-cache hit rate, sustained decode (10 GB cache) | 0.6 % (measured) | — |
 | Tokenizer throughput | **204 MB/s** (gigatoken) | — (HF: 6 MB/s) |
+
+### The io-claim fix (2026-08-09)
+
+Decode was **21.83 s/tok** and is now **16.08 s/tok** — **1.36×**, from four lines.
+The I/O lane claimed work with
+
+```rust
+let start = io_work_ref.fetch_add(batch, Ordering::Relaxed);
+if start >= n_plans { break; }     // no work left for this ring
+```
+
+where `batch` was `COLI_IO_BATCH` (default **16**). A decode token routes **8
+experts per layer**, so ring 0 claimed all 8 and rings 1–3 got starts 16/32/48 —
+every one `>= n_plans` — and **broke without issuing a single read**. One ring did
+four rings' work, on every sparse layer of every decode token. The default is
+correct for prefill, whose per-layer union is ~69 experts; it collapsed decode to
+1× parallelism.
+
+The claim now ceil-divides across rings, keeping the configured value as a ceiling:
+decode gets `ceil(8/4) = 2` and all four rings run, prefill still gets its full 16.
+
+| at defaults | before | after |
+|---|---|---|
+| decode | 21.83 s/tok | **16.08 s/tok** |
+| p50 inter-token | 21.9 s | **15.5 s** |
+| **io duty** | **24 % of 4 rings** | **84 %** |
+
+**It was invisible until the lane counters gained a wall-clock denominator.**
+`io_us`/`cpu_us`/`gpu_us` are summed over *threads*, so 17 s of `io_us` is equally
+four rings busy for 4.3 s or one ring busy for 17 s. `LaneTimings::lane_wall_us`
+distinguishes them, and `io duty 24 % of 4 rings` pointed straight at the claim
+loop. Reproduced independently before any code change by setting `COLI_IO_BATCH=2`
+(14.80 s/tok, 90 % duty). Full working:
+[`bench-data/2026-08-09-decode-levers/`](../bench-data/2026-08-09-decode-levers/README.md).
 
 ## How to read them
 
@@ -128,11 +162,40 @@ four configurations, controlled A/B on the same shard sizes, run-to-run spread
 | 64 MB × 4, 8 rings | 0.67 | **0.86** |
 | 64 MB × 4, 4 rings | 0.53 | **0.64** |
 
-A gap to colibrì remains, and dm-crypt is the standing hypothesis for it: on a
+A gap to colibrì remains, and dm-crypt was the standing hypothesis for it: on a
 LUKS volume reads are CPU-bound on decryption, so *N* blocking `pread`s keep *N*
 cores decrypting where the ring's completion model can leave cores idle. Testing
 that means adding a pread engine behind the same `read_regions` choke point and
 measuring — not asserting.
+
+> **Retracted 2026-08-09 — the `0.84` vs `2.02` row was a two-variable
+> comparison.** The pread engine landed, the test ran, and it does not support the
+> hypothesis it was built for.
+>
+> `COLI_IO_ENGINE=pread` **implies no O_DIRECT** (`concurrent.rs` skips the direct
+> path for that engine). So the recorded pair pitted uring-**with**-O_DIRECT
+> against pread-**without** it — two variables at once, which is exactly the
+> confound [`validation-runbook.md`](validation-runbook.md) §1a warns about.
+> Held constant on a Ryzen 5 5500 / LUKS NVMe (a *different* box from the i5-1235U
+> table above), 5 reps per arm at the shipped 4 rings:
+>
+> | arm | median | spread | verdict |
+> |---|---|---|---|
+> | `uring` buffered | 1.12 GB/s | 5.4 % | — |
+> | `pread` ×8 | 1.06 GB/s | 10.6 % | 5.7 % gap — **inside the noise floor** |
+> | `uring` O_DIRECT | 0.86 GB/s | 10.3 % | **−23 %, outside both spreads** |
+>
+> **The syscall shape costs nothing measurable.** What the same run does show is
+> that O_DIRECT is genuinely the slow arm — which is why `COLI_DIRECT` defaults
+> off. Read the `0.84`/`2.02` row above as "O_DIRECT vs threaded buffered reads",
+> not as "io_uring vs pread", and not as "C beats Rust".
+>
+> The dm-crypt question itself is **still open** — decryption may still cost, and
+> [`M1-storage-config.md`](../bench-data/2026-08-09-prefetch-causes/M1-storage-config.md)
+> records the one cheap read-only measurement that would settle it. What is closed
+> is the inference that the engine gap *demonstrated* it.
+>
+> Full working: [`M5-io-engine.md`](../bench-data/2026-08-09-prefetch-causes/M5-io-engine.md).
 
 *Provenance of the numbers:* peregrine's come from
 [`crates/peregrine-io/examples/iobench.rs`](../crates/peregrine-io/examples/iobench.rs),
