@@ -1,0 +1,5 @@
+arm=bare load_s=12 decode_s=379
+[ecache] hits=0 misses=9944 disk_reads=9944 prefetch_reads=0 hit_rate=0.0%
+[ecache] resident: 227 slots, 4.29 GB of 4.29 GB budget (100.0% full)
+[prefetch] used=0 wasted=0 unclassified=0 accuracy=0.0% (of 0 classified) yield=0.0% (of 0 issued) fadvise=0 verify_mismatch=0
+[prefetch] resident-unused: 0 slots, 0.00 GB of 4.29 GB budget (0.0%)

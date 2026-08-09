@@ -65,6 +65,41 @@ arm_env() {
         echo "COLI_PREFETCH_HINT_PATHS=0"
         echo "COLI_ROUTER_LOOKAHEAD=0"
         ;;
+    # A *bare* cache: big enough to hold a token's whole working set, with no
+    # speculation and — the part that matters — no predictor-driven priority.
+    # `Model::protect_from` runs even at COLI_PREFETCH_WARM_PATHS=0, so the
+    # `bigcache_noprefetch` arm above still had `pack_prio(score, heat)` in the
+    # eviction key and was never a clean LRU measurement. This one is: the victim
+    # order degenerates to pure recency, which under a front-to-back layer sweep
+    # is exactly the policy under suspicion.
+    bigcache_bare)
+        echo "COLI_ECACHE_GB=$BIGCACHE"
+        echo "COLI_PREFETCH_WARM_PATHS=0"
+        echo "COLI_PREFETCH_HINT_PATHS=0"
+        echo "COLI_ROUTER_LOOKAHEAD=0"
+        echo "COLI_PREFETCH_PROTECT=0"
+        ;;
+    # `bigcache_bare` at the *default* budget. This is the one that tests the
+    # sweep hypothesis proper: 227 slots against a 600-expert working set, pure
+    # recency, nothing else in the victim key. If LRU is pathological under a
+    # front-to-back layer sweep it has to show here, where the cache cannot hold
+    # a whole pass — at 681 slots it can, and the pathology has nowhere to bite.
+    bare)
+        echo "COLI_PREFETCH_WARM_PATHS=0"
+        echo "COLI_PREFETCH_HINT_PATHS=0"
+        echo "COLI_ROUTER_LOOKAHEAD=0"
+        echo "COLI_PREFETCH_PROTECT=0"
+        ;;
+    # `bare` plus sweep-aware eviction. The one arm that changes the *policy*
+    # rather than the budget: same 227 slots, same absence of speculation and
+    # priority, victims chosen by highest layer instead of least-recently-used.
+    bare_sweep)
+        echo "COLI_PREFETCH_WARM_PATHS=0"
+        echo "COLI_PREFETCH_HINT_PATHS=0"
+        echo "COLI_ROUTER_LOOKAHEAD=0"
+        echo "COLI_PREFETCH_PROTECT=0"
+        echo "COLI_CACHE_SWEEP=1"
+        ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;
     esac
 }
