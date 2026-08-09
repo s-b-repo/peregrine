@@ -39,7 +39,8 @@ expect_model() { # $1=dev $2=model-substring
 echo "== identity checks"
 expect_model /dev/sdb  "RE100"
 expect_model /dev/sdd  "BX500"
-expect_model /dev/nvme1n1 "600p"
+# The 600p reports its model number, not its marketing name.
+expect_model /dev/nvme1n1 "SSDPEKKW128"
 
 echo "== sanity: targets must not be mounted or in any md array"
 for d in sdb sdd nvme1n1; do
@@ -68,12 +69,13 @@ parted -s /dev/nvme1n1 mklabel gpt mkpart data 1MiB 100%
 udevadm settle
 
 echo "== md0 RAID0, 512 KiB chunk"
-mdadm --create /dev/md0 --level=0 --raid-devices=2 --chunk=512K \
+mdadm --create /dev/md0 --run --level=0 --raid-devices=2 --chunk=512K \
       --metadata=1.2 /dev/sdb1 /dev/sdd1
 
-echo "== filesystems"
-mkfs.ext4 -q -m 0 -L modelstripe /dev/md0
-mkfs.ext4 -q -m 0 -L model600p /dev/nvme1n1p1
+echo "== filesystems (lazy init off: pay the inode-table writes now, in one"
+echo "   burst, instead of trickling background I/O into tonight's benchmark arms)"
+mkfs.ext4 -q -F -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -L modelstripe /dev/md0
+mkfs.ext4 -q -F -m 0 -E lazy_itable_init=0,lazy_journal_init=0 -L model600p /dev/nvme1n1p1
 
 echo "== mounts + persistence"
 mkdir -p /srv/modelstripe /srv/model600p
