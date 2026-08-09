@@ -36,6 +36,9 @@ MAX_TOKENS=${MAX_TOKENS:-32}
 REPEATS=${REPEATS:-3}
 BOOT_TIMEOUT=${BOOT_TIMEOUT:-1800}
 MEMMAX=${MEMMAX:-34G}
+# A non-streaming request spans prefill + all decode tokens; unfused deep
+# batches measured >60 min end-to-end, so the guillotine must sit well past it.
+CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-10800}
 REFS=${REFS:-0}
 REF_TOKENS=${REF_TOKENS:-16}
 
@@ -136,7 +139,7 @@ run_arm() { # $1=B $2=rep
     wait_healthy "$pid" "$log" || { kill -INT "$pid" 2>/dev/null; return 1; }
     python3 scripts/bench-serve-lanes.py \
         --url "http://127.0.0.1:$PORT/v1/chat/completions" \
-        --concurrency "$b" --max-tokens "$MAX_TOKENS" \
+        --concurrency "$b" --max-tokens "$MAX_TOKENS" --timeout "$CLIENT_TIMEOUT" \
         --distinct-prompts --label "$tag" >"$OUT/$tag.json"
     local rc=$?
     stop_server "$pid" "$log" "$OUT/$tag.counters.txt"
