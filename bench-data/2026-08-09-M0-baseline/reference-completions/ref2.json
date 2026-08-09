@@ -1,0 +1,125 @@
+{
+  "deltas": [
+    {
+      "at_s": 123.534,
+      "gap_s": null,
+      "index": 0,
+      "text": "First"
+    },
+    {
+      "at_s": 151.106,
+      "gap_s": 27.572,
+      "index": 1,
+      "text": ","
+    },
+    {
+      "at_s": 168.819,
+      "gap_s": 17.713,
+      "index": 2,
+      "text": " write"
+    },
+    {
+      "at_s": 188.213,
+      "gap_s": 19.394,
+      "index": 3,
+      "text": " the"
+    },
+    {
+      "at_s": 204.119,
+      "gap_s": 15.906,
+      "index": 4,
+      "text": " code"
+    },
+    {
+      "at_s": 219.318,
+      "gap_s": 15.199,
+      "index": 5,
+      "text": " in"
+    },
+    {
+      "at_s": 234.132,
+      "gap_s": 14.814,
+      "index": 6,
+      "text": " a"
+    },
+    {
+      "at_s": 249.123,
+      "gap_s": 14.991,
+      "index": 7,
+      "text": " realistic"
+    },
+    {
+      "at_s": 264.655,
+      "gap_s": 15.532,
+      "index": 8,
+      "text": ","
+    },
+    {
+      "at_s": 280.002,
+      "gap_s": 15.347,
+      "index": 9,
+      "text": " idi"
+    },
+    {
+      "at_s": 295.202,
+      "gap_s": 15.2,
+      "index": 10,
+      "text": "omatic"
+    },
+    {
+      "at_s": 310.712,
+      "gap_s": 15.51,
+      "index": 11,
+      "text": ","
+    },
+    {
+      "at_s": 325.583,
+      "gap_s": 14.871,
+      "index": 12,
+      "text": " production"
+    },
+    {
+      "at_s": 340.997,
+      "gap_s": 15.413,
+      "index": 13,
+      "text": "-ready"
+    },
+    {
+      "at_s": 357.34,
+      "gap_s": 16.344,
+      "index": 14,
+      "text": " manner"
+    },
+    {
+      "at_s": 374.1,
+      "gap_s": 16.759,
+      "index": 15,
+      "text": ","
+    }
+  ],
+  "gaps_s": [
+    27.572,
+    17.713,
+    19.394,
+    15.906,
+    15.199,
+    14.814,
+    14.991,
+    15.532,
+    15.347,
+    15.2,
+    15.51,
+    14.871,
+    15.413,
+    16.344,
+    16.759
+  ],
+  "max_tokens": 16,
+  "model": "glm-5.2",
+  "prompt": "Write a short Rust function that reverses a linked list.",
+  "temperature": 0.0,
+  "text": "First, write the code in a realistic, idiomatic, production-ready manner,",
+  "tokens": 16,
+  "total_s": 374.178,
+  "ttft_s": 123.533
+}
