@@ -30,10 +30,14 @@ fn main() {
     let blk = blk_mb * 1024 * 1024;
 
     let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Longest single ring's *I/O* time, excluding its setup. See the note at the
+    // timer below for why this is not just `t0.elapsed()`.
+    let io_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let t0 = Instant::now();
     std::thread::scope(|sc| {
         for r in 0..rings {
             let total = total.clone();
+            let io_ns = io_ns.clone();
             let engine = engine.as_str();
             sc.spawn(move || {
                 let f = std::fs::File::open(path).expect("open");
@@ -69,6 +73,31 @@ fn main() {
                 // The direct arm goes through `read_direct_aligned` — the same call
                 // the streaming lane makes (`concurrent.rs::read_regions`) — so this
                 // measures the production path, not a sibling with its own batching.
+                //
+                // **Time the I/O, not the setup.** Until 2026-08-09 the only timer
+                // started before this thread was spawned, so `File::open`,
+                // `Reactor::new` and `vec![0u8; blk]` per in-flight request were all
+                // inside it — and that allocation both reserves and *zeroes*
+                // `blkMB x iters x rings` bytes, the same order as the bytes read.
+                //
+                // Splitting them showed setup is **not** what this tool was losing
+                // to: `io` and `wall` come out within ~2% of each other, so the
+                // historical figures were not an allocation artefact. The split is
+                // kept because that had to be *measured* rather than assumed — the
+                // numbers this file produces are what motivated
+                // `COLI_IO_ENGINE=pread` — and because printing both makes any
+                // future setup cost visible instead of silently charging it to the
+                // device.
+                //
+                // The gap that *is* real: `dd bs=1M iflag=direct` on the same file
+                // reaches ~1.5 GB/s where this reports ~0.85 at 32 MB x 8 deep x 8
+                // rings. That is access pattern, not accounting — 64 concurrent
+                // 32 MB reads split into 128 KB requests (`max_hw_sectors_kb`)
+                // oversubscribe a 255-deep queue, while dd is sequential at depth 1
+                // with readahead. Neither number is wrong; they measure different
+                // things, and the engine's own pattern (6 regions per expert, 16
+                // experts per submit) is much closer to this one than to dd's.
+                let t_io = Instant::now();
                 let got: i64 = if engine == "pread" {
                     // Same requests, no ring at all: `iters` blocking preads
                     // spread over `iters` threads, mirroring colibrì's harness.
@@ -105,25 +134,33 @@ fn main() {
                 } else {
                     rx.read_many(&mut reqs).expect("read").iter().map(|v| (*v).max(0)).sum()
                 };
+                io_ns.fetch_max(t_io.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 total.fetch_add(got as u64, std::sync::atomic::Ordering::Relaxed);
             });
         }
     });
-    let dt = t0.elapsed().as_secs_f64();
+    let wall = t0.elapsed().as_secs_f64();
+    // Rings run concurrently, so the slowest ring's I/O window is the one every
+    // ring's bytes were moved within.
+    let dt = (io_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9).max(1e-9);
     let bytes = total.load(std::sync::atomic::Ordering::Relaxed) as f64;
     let label = match engine.as_str() {
         "pread" => format!("pread x{iters} threads"),
         "regbuf" => "io_uring READ_FIXED".to_string(),
         _ => format!("io_uring{}", if direct { " O_DIRECT" } else { " buffered" }),
     };
+    // `wall` is printed beside the I/O window on purpose: a large gap between them
+    // is setup cost (buffer allocation and zeroing, ring creation), which is what
+    // this tool used to silently charge to the device.
     println!(
-        "{} x{} rings: {} reads x {}MB = {:.1} GB in {:.2}s -> {:.2} GB/s",
+        "{} x{} rings: {} reads x {}MB = {:.1} GB in {:.2}s io ({:.2}s wall) -> {:.2} GB/s",
         label,
         rings,
         rings * iters,
         blk_mb,
         bytes / 1e9,
         dt,
+        wall,
         bytes / 1e9 / dt
     );
 }

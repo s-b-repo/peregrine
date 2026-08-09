@@ -46,3 +46,30 @@ readahead that O_DIRECT by definition does not, which is part of why O_DIRECT
 loses and is not a defect in the comparison — it is the comparison. Sequential
 64 MB reads are not the engine's actual access pattern (6 regions per expert,
 ~6 MB and ~8–24 KB each), so this bounds the *device*, not the streaming lane.
+
+## Follow-up: `iobench` was timing its own setup, and that turned out not to matter
+
+Chasing the LUKS sector-size question (M1) surfaced that `iobench` started its
+clock before spawning its rings, so `File::open`, `Reactor::new` and
+`vec![0u8; blk]` — which reserves *and zeroes* `blkMB × iters × rings` bytes, the
+same order as the bytes read — were all inside the measured window. That looked
+like it would understate throughput, and `dd bs=1M iflag=direct` on the same file
+reaching **1.5 GB/s** against `iobench`'s 0.83 seemed to confirm it.
+
+**It did not.** The timer is now split, and `io` lands within ~2 % of `wall`
+(2.54 vs 2.58 s) — setup was never a material part of the measurement, and the
+historical figures are not an allocation artefact. Recorded because the hypothesis
+was wrong and the check is what showed it; the split is kept so any future setup
+cost is visible rather than charged to the device.
+
+The `iobench`-vs-`dd` gap is real and is **access pattern**: 64 concurrent 32 MB
+reads split into 128 KB block-layer requests (`max_hw_sectors_kb=128`)
+oversubscribe a 255-deep queue, while `dd` is sequential at depth 1 with
+readahead. Both are honest; they measure different things, and the streaming
+lane's own pattern is much closer to `iobench`'s.
+
+Re-measured after the fix, on fresh shards — the ranking is unchanged:
+
+```
+uring O_DIRECT  0.69 GB/s      uring buffered  0.84 GB/s      pread x8  0.85 GB/s
+```
