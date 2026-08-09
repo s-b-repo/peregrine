@@ -82,6 +82,7 @@ Error: ... 6.8 GB short, so the kernel would OOM-kill this run part-way through 
 | `COLI_IO_RINGS` | 4 | io_uring rings, each on its own thread — [note](#coli_io_rings) |
 | `COLI_IO_BATCH` | 16 | **upper bound** on experts claimed per ring — [note](#coli_io_batch) |
 | `COLI_IO_ENGINE` | `uring` | `uring` \| `pread` \| `regbuf` — [note](#coli_io_engine) |
+| `COLI_IO_SPLIT_MB` | 0 (off) | split streamed regions larger than this into sub-reads of the same buffer, raising a ring's submit depth (~4 → ~10 at decode) without touching claim sizing; on LUKS each in-flight read is an independent dm-crypt unit. Byte-identical; unmeasured — the M3 A/B decides its default |
 | `COLI_IO_THREADS` | workers | worker threads for `COLI_IO_ENGINE=pread`; 8 is colibrì's harness figure |
 | `COLI_REGBUF` | off | alias for `COLI_IO_ENGINE=regbuf` — [note](#coli_regbuf) |
 | `COLI_REGBUF_SLOTS` | 16 | registered buffers = queue depth for `regbuf` — [note](#coli_regbuf) |
