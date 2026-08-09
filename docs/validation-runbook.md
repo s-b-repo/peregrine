@@ -74,6 +74,25 @@ page-cache state, so it was never a controlled comparison. It does not
 reproduce, and is not evidence either way. The real test needs the model
 shards, O_DIRECT, and a cold cache.
 
+> **✅ SETTLED 2026-08-09.** That test has now run, on the real shards, with
+> repeats. **`pread` and `uring` are the same rate**: at the shipped 4 rings over
+> 5 reps, `uring` 1.12 GB/s (5.4 % spread) against `pread` 1.06 GB/s (10.6 %) — a
+> 5.7 % gap *below* the measured noise floor, which is a stronger statement than
+> "close". `COLI_IO_ENGINE=pread` should not be expected to buy anything here.
+>
+> The same run found the difference that **is** real: **O_DIRECT is the slow arm**,
+> 0.86 vs 1.12 GB/s (−23 %), outside both spreads — consistent with `COLI_DIRECT`
+> defaulting off, and explained by the buffered arm keeping kernel readahead that
+> O_DIRECT by definition discards.
+>
+> Two harness defects were fixed to get here, both of which had silently
+> invalidated earlier attempts — single-pass reporting on a box with a 35 % spread,
+> and an offset walk that wrapped and re-read its own page cache. See
+> [Measurement discipline](measurement.md) before trusting any figure from this
+> harness, and
+> [`M5-io-engine.md`](../bench-data/2026-08-09-prefetch-causes/M5-io-engine.md)
+> for the working.
+
 **`regbuf` has a hard operational limit worth knowing before you plan around
 it.** Registered buffers are **pinned** pages, charged against
 `RLIMIT_MEMLOCK` — 8 MB by default on most distros. A pool sized for real

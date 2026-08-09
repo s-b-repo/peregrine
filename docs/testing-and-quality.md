@@ -2,14 +2,14 @@
 
 # Testing & quality gates
 
-**482 tests passing, 0 warnings, clippy clean** (debug + release), plus a
+**604 tests passing (18 ignored), 0 warnings, clippy clean** (debug + release), plus a
 strict bad-patterns audit. This page is what to run, what each gate enforces,
 and the correctness philosophy behind the test suite.
 
 ## The gates
 
 ```bash
-cargo test --workspace                     # 482 tests, CPU-only, no GPU needed
+cargo test --workspace                     # 604 tests, CPU-only, no GPU needed
 cargo clippy --workspace --all-targets     # clean
 scripts/audit-bad-patterns.sh --strict     # panic / UB / suppression / Cargo gate (CI)
 scripts/audit-reachability.py --list       # [R] shipped-but-unreachable pass

@@ -249,3 +249,48 @@ curl -sN localhost:8080/v1/chat/completions \
   -H 'x-peregrine-priority: high' \
   -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
+
+## `peregrine-gen` — watch generation live, and time it
+
+A streaming client that prints the completion as it arrives and reports what the
+engine did. It exists because `curl -N` shows you the text but nothing about the
+*shape* of the run, and `scripts/bench-prefetch-arms.sh` reports one lumped
+`decode_s` per request — which on a mostly-prefill request is largely prefill.
+
+```bash
+peregrine-gen "Explain how a mixture-of-experts layer routes a token."
+peregrine-gen --port 8137 --max-tokens 8 --json timings.json < prompt.txt
+```
+
+```
+── peregrine-gen ──────────────────────────────────────────────
+  generated    2 tokens, 3 chars
+  ttft         2m 23s  (prefill + first token)
+  total        2m 38s
+  decode rate  15.23 s/tok (0.066 tok/s)  (excludes ttft)
+  inter-token  min 15.1s  p50 15.1s  p95 15.1s  max 15.1s
+```
+
+**Text goes to stdout, statistics to stderr**, so `peregrine-gen "..." > out.txt`
+captures a clean completion while the summary stays on the terminal, and
+`2> stats.txt` captures plain text with no escape codes.
+
+Three things are tuned to this engine rather than generic:
+
+- **Seconds per token, not tokens per second.** Streaming experts off disk puts
+  decode in the tens of seconds per token at GLM-5.2 shapes, where `tok/s` reads
+  `0.07` and says nothing. The unit flips automatically above 1 tok/s.
+- **The status line ticks from its own thread.** A token can take a minute; a line
+  that only redrew on arrival would be indistinguishable from a hang.
+- **The inter-token spread is the headline.** A token served from the warm cache
+  and one that streams a full ~11.3 GB routed union differ by an order of
+  magnitude, so `min/p50/p95/max` carry the signal an average destroys. A
+  slowest/fastest ratio ≥ 2× is called out explicitly, and `--json` writes every
+  interval for offline analysis.
+
+TTFT is measured to the first delta and **excluded from the interval
+percentiles** — prefill is work that happens once, and folding it in would drag
+every percentile with it.
+
+No new dependencies: raw HTTP/1.1 over `std::net::TcpStream` including
+chunked-transfer decoding, plus `serde_json` for the event payloads.
