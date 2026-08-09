@@ -1168,6 +1168,16 @@ fn run_tuned(
                     t.cpu_bytes as f64 / 1e9,
                 );
             }
+            // Cache-lock contention, thread-summed like io_us. Read it against
+            // io thread time: a few percent is bookkeeping, tens of percent is
+            // rings queueing on the mutex — the evidence a sharded cache needs.
+            if t.cache_wait_us > 0 && t.io_us > 0 {
+                eprintln!(
+                    "[lane] cache-lock wait {:.2}s ({:.1}% of io thread time)",
+                    s(t.cache_wait_us),
+                    100.0 * t.cache_wait_us as f64 / t.io_us as f64,
+                );
+            }
         }
     }
     if let Some((h, m, d)) = model.ecache_stats() {

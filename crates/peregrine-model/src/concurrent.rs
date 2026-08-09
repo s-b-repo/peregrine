@@ -574,13 +574,37 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
             .read_direct_aligned(regions)
             .ctx(|| "io_uring O_DIRECT zero-copy expert read".to_string());
     }
+    // The `regbuf` engine is exempt from splitting: its fixed buffers are sized
+    // per-slot from the largest request, and it exists as a measurement option —
+    // changing its request shape would change what it measures.
+    let split = match io_engine() {
+        IoEngine::RegBuf => 0,
+        _ => io_split_bytes(),
+    };
     let mut bufs: Vec<Vec<u8>> = regions.iter().map(|&(_, _, len)| vec![0u8; len]).collect();
     {
-        let mut reqs: Vec<ReadReq> = bufs
-            .iter_mut()
-            .zip(regions)
-            .map(|(b, &(fd, off, _))| ReadReq { fd, offset: off, buf: b.as_mut_slice(), tag: 0 })
-            .collect();
+        // One request per region, or several sub-requests over disjoint
+        // `split_at_mut` slices of the region's landing buffer when splitting
+        // is on (`COLI_IO_SPLIT_MB`). `meta` maps each request back to
+        // (region index, offset within region, length) for the short-read
+        // completion, which must resolve file offsets per sub-request.
+        let mut reqs: Vec<ReadReq> = Vec::with_capacity(regions.len());
+        let mut meta: Vec<(usize, usize, usize)> = Vec::with_capacity(regions.len());
+        for (i, (buf, &(fd, off, _))) in bufs.iter_mut().zip(regions).enumerate() {
+            let mut sub = 0usize;
+            let mut rest: &mut [u8] = buf.as_mut_slice();
+            loop {
+                let take = if split > 0 && rest.len() > split { split } else { rest.len() };
+                let (head, tail) = rest.split_at_mut(take);
+                reqs.push(ReadReq { fd, offset: off + sub as u64, buf: head, tag: 0 });
+                meta.push((i, sub, take));
+                sub += take;
+                rest = tail;
+                if rest.is_empty() {
+                    break;
+                }
+            }
+        }
         // Same request set either way, so the two engines are directly
         // comparable and produce byte-identical results — only the syscall shape
         // differs. The short-read completion below is shared, because a
@@ -611,14 +635,15 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
             }
             IoEngine::Uring => r.read_many(&mut reqs).ctx(|| "io_uring batched expert read".to_string())?,
         };
-        for (i, &n) in res.iter().enumerate() {
+        for (j, &n) in res.iter().enumerate() {
             if n < 0 {
                 return Err(Error::Io(std::io::Error::from_raw_os_error((-n) as i32)));
             }
+            let (i, sub, len) = meta[j];
             let done = n as usize;
-            if done < bufs[i].len() {
+            if done < len {
                 let (fd, off, _) = regions[i];
-                r.read_exact(fd, off + done as u64, &mut bufs[i][done..])
+                r.read_exact(fd, off + (sub + done) as u64, &mut bufs[i][sub + done..sub + len])
                     .ctx(|| "io_uring short-read completion".to_string())?;
             }
         }
@@ -704,6 +729,28 @@ fn pread_threads() -> usize {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or_else(default_workers)
+    })
+}
+
+/// Split threshold for large streamed reads (`COLI_IO_SPLIT_MB`, MiB; 0 = off,
+/// the default). Regions larger than this are submitted as several sub-reads
+/// into disjoint slices of the same landing buffer.
+///
+/// Why: a decode claim is 2 merged experts ≈ 4 in-flight reads per ring, while
+/// `iobench` reaches the device's 1.12 GB/s at 8-deep — the submit depth, not
+/// the claim size, is the suspect for the lane's 0.80 GB/s. Splitting a ~9.5 MB
+/// merged region into 4 MiB pieces takes a ring's depth to ~10 without touching
+/// claim sizing, and on LUKS each in-flight read is also an independent
+/// dm-crypt decryption unit. Byte-identical trivially: the same bytes land at
+/// the same offsets of the same buffer, in however many pieces.
+fn io_split_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_IO_SPLIT_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n << 20)
+            .unwrap_or(0)
     })
 }
 
@@ -1002,6 +1049,11 @@ pub fn moe_forward_concurrent(
     let workers = ctx.workers;
     let cfg = ctx.cfg;
     let ecache = ctx.ecache; // Copy `Option<&Mutex<WarmCache>>`; captured only by the I/O lane
+    // Lock-free residency filter, fetched once per layer call (one brief lock),
+    // so each ring can answer "definitely absent → stream it" without queueing
+    // on the cache mutex behind every other ring's probe and insert.
+    let cache_hint = ecache.map(|c| c.lock().hint());
+    let cache_hint = &cache_hint;
     let use_direct = ctx.direct; // O_DIRECT streaming (page-cache-bypassing); Copy bool
     let reactors = ctx.reactors;
     if reactors.is_empty() {
@@ -1207,7 +1259,26 @@ pub fn moe_forward_concurrent(
                     let mut miss: Vec<usize> = Vec::new();
                     for (idx, plan) in plans_ref.iter().enumerate().take(end).skip(start) {
                         let key = (layer as u32, plan.expert as u32);
-                        let hit = ecache.and_then(|c| c.lock().get(key));
+                        // Filter first: on "definitely absent" skip the mutex
+                        // entirely and go straight to disk. Races are byte-safe
+                        // (see `ResidencyHint`); the wait on the lock we do
+                        // take is metered as evidence for/against sharding.
+                        let hit = ecache.and_then(|c| {
+                            match cache_hint.as_ref() {
+                                Some(h) if !h.might_contain(key) => {
+                                    h.note_fast_miss();
+                                    None
+                                }
+                                _ => {
+                                    let t_lock = std::time::Instant::now();
+                                    let mut g = c.lock();
+                                    if let Some(t) = timings_ref {
+                                        t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
+                                    }
+                                    g.get(key)
+                                }
+                            }
+                        });
                         match hit {
                             Some(bytes) => {
                                 if job_tx.send((idx, bytes)).is_err() {
@@ -1257,7 +1328,11 @@ pub fn moe_forward_concurrent(
                             // which lane owned the cache.
                             let admit = admit_min_heat == 0
                                 || heat_ref.is_none_or(|h| h.get(layer, expert) >= admit_min_heat);
+                            let t_lock = std::time::Instant::now();
                             let mut c = c.lock();
+                            if let Some(t) = timings_ref {
+                                t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
+                            }
                             c.note_disk_read(layer as u32);
                             if admit {
                                 c.insert((layer as u32, expert as u32), bytes.clone());
