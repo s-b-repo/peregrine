@@ -19,6 +19,9 @@ MAX_TOKENS=${MAX_TOKENS:-32}
 REPEATS=${REPEATS:-3}
 BOOT_TIMEOUT=${BOOT_TIMEOUT:-1800}
 MEMMAX=${MEMMAX:-34G}
+# A non-streaming request spans prefill + all decode tokens; unfused deep
+# batches measured >60 min end-to-end, so the guillotine must sit well past it.
+CLIENT_TIMEOUT=${CLIENT_TIMEOUT:-10800}
 
 OUT=${1:?usage: bench-serve-envarms.sh <out-dir> <B> <arm.env> [arm.env ...]}
 B=${2:?need a batch depth}
@@ -75,7 +78,7 @@ run_arm() { # $1=arm-file $2=rep
     echo "  loaded in ~${waited}s" >&2
     python3 scripts/bench-serve-lanes.py \
         --url "http://127.0.0.1:$PORT/v1/chat/completions" \
-        --concurrency "$B" --max-tokens "$MAX_TOKENS" \
+        --concurrency "$B" --max-tokens "$MAX_TOKENS" --timeout "$CLIENT_TIMEOUT" \
         --distinct-prompts --label "$tag" >"$OUT/$tag.json"
     local rc=$?
     kill -INT "$pid" 2>/dev/null

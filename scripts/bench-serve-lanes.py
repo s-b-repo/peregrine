@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 
 
-def stream_one(url, api_key, model_id, prompt, max_tokens, out, idx):
+def stream_one(url, api_key, model_id, prompt, max_tokens, out, idx, timeout_s):
     """One non-streaming request. Records decoded token count and wall time.
 
     Deliberately NOT the SSE path, even though SSE is what a real client uses.
@@ -49,7 +49,7 @@ def stream_one(url, api_key, model_id, prompt, max_tokens, out, idx):
     n = 0
     err = None
     try:
-        with urllib.request.urlopen(req, timeout=3600) as r:
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
             doc = json.loads(r.read().decode("utf-8", "replace"))
         n = int(doc.get("usage", {}).get("completion_tokens", 0))
         if n == 0:
@@ -78,6 +78,15 @@ def main():
         "identical prompts share a routing path and would flatter prefetch",
     )
     p.add_argument("--label", default="")
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=3600.0,
+        help="per-request timeout, seconds. A non-streaming request returns only "
+        "after prefill AND all decode tokens, so this must cover the whole "
+        "request: an unfused B=16 arm measured >60 min end-to-end, and the old "
+        "hardwired 3600 guillotined every stream at 0 tokens (2026-08-09).",
+    )
     a = p.parse_args()
 
     base = (
@@ -96,7 +105,7 @@ def main():
     threads = [
         threading.Thread(
             target=stream_one,
-            args=(a.url, a.api_key, a.model_id, prompts[i], a.max_tokens, out, i),
+            args=(a.url, a.api_key, a.model_id, prompts[i], a.max_tokens, out, i, a.timeout),
         )
         for i in range(a.concurrency)
     ]
