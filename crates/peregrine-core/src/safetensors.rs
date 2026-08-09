@@ -123,18 +123,68 @@ fn direct_load_enabled() -> bool {
 }
 
 impl SafeTensors {
-    /// Index every `model*.safetensors` shard in `dir` (sorted by name, matching
-    /// the C engine's ordering so fused-expert offsets line up across shards).
+    /// Index every `model*.safetensors` shard in `dir` — plus, when the dir
+    /// carries a `model_paths.json` (`{"paths": ["/mnt/fast/model-part", ...]}`),
+    /// every shard in each listed directory. This is how a model split across
+    /// several drives is served without a symlink farm: the primary dir holds
+    /// the sidecars and the paths file, each drive holds its own folder of
+    /// shards, and relative entries resolve against the primary dir.
+    ///
+    /// Shards sort by **file name**, not full path (matching the C engine's
+    /// ordering so fused-expert offsets line up across shards — and so the
+    /// order is independent of which drive a shard lives on). A file name
+    /// appearing in two directories is a hard error: silently preferring one
+    /// copy would make the load depend on listing order.
     pub fn open(dir: &Path) -> Result<SafeTensors, Error> {
-        let mut shard_paths: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(dir).ctx(|| dir.display().to_string())? {
-            // a failed directory entry is surfaced, not silently dropped
-            let path = entry.ctx(|| dir.display().to_string())?.path();
-            if path.extension().is_some_and(|x| x == "safetensors") {
-                shard_paths.push(path);
+        let mut roots: Vec<PathBuf> = vec![dir.to_path_buf()];
+        let paths_file = dir.join("model_paths.json");
+        if paths_file.exists() {
+            let bytes = std::fs::read(&paths_file).ctx(|| paths_file.display().to_string())?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Format(format!("{}: {e}", paths_file.display())))?;
+            let arr = v.get("paths").and_then(|p| p.as_array()).ok_or_else(|| {
+                Error::Format(format!(
+                    "{}: expected {{\"paths\": [\"/dir\", ...]}}",
+                    paths_file.display()
+                ))
+            })?;
+            for p in arr {
+                let s = p.as_str().ok_or_else(|| {
+                    Error::Format(format!("{}: non-string entry in paths", paths_file.display()))
+                })?;
+                let extra = if Path::new(s).is_absolute() { PathBuf::from(s) } else { dir.join(s) };
+                if !extra.is_dir() {
+                    return Err(Error::Format(format!(
+                        "{}: {} is not a directory (drive not mounted?)",
+                        paths_file.display(),
+                        extra.display()
+                    )));
+                }
+                roots.push(extra);
             }
         }
-        shard_paths.sort();
+        let mut shard_paths: Vec<PathBuf> = Vec::new();
+        for root in &roots {
+            for entry in std::fs::read_dir(root).ctx(|| root.display().to_string())? {
+                // a failed directory entry is surfaced, not silently dropped
+                let path = entry.ctx(|| root.display().to_string())?.path();
+                if path.extension().is_some_and(|x| x == "safetensors") {
+                    shard_paths.push(path);
+                }
+            }
+        }
+        shard_paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        for w in shard_paths.windows(2) {
+            if w[0].file_name() == w[1].file_name() {
+                return Err(Error::Format(format!(
+                    "shard {} exists in two model directories ({} and {}) — \
+                     refusing to guess which copy to serve",
+                    w[1].file_name().unwrap_or_default().to_string_lossy(),
+                    w[0].display(),
+                    w[1].display()
+                )));
+            }
+        }
         if shard_paths.is_empty() {
             return Err(Error::Format(format!("no .safetensors shards in {}", dir.display())));
         }
@@ -589,6 +639,12 @@ pub(crate) mod test_support {
 
     /// Write a single-shard `model.safetensors` into `dir`.
     pub fn write_safetensors(dir: &Path, blobs: &[Blob]) -> Result<(), crate::Error> {
+        write_safetensors_named(dir, "model.safetensors", blobs)
+    }
+
+    /// Same, but with a caller-chosen file name — the multi-directory tests
+    /// need distinct shard names spread across several dirs.
+    pub fn write_safetensors_named(dir: &Path, file: &str, blobs: &[Blob]) -> Result<(), crate::Error> {
         let mut header = serde_json::Map::new();
         let mut cursor: i64 = 0;
         let mut data: Vec<u8> = Vec::new();
@@ -608,7 +664,7 @@ pub(crate) mod test_support {
         out.extend_from_slice(&hdr);
         out.extend_from_slice(&data);
         std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("model.safetensors"), out)?;
+        std::fs::write(dir.join(file), out)?;
         Ok(())
     }
 
@@ -668,6 +724,54 @@ mod tests {
         assert!(st.read_f32("w.qs", &mut junk).is_err());
 
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn model_paths_json_merges_directories_bit_identically() -> Result<(), Error> {
+        // The same two shards, once in a single dir and once split across a
+        // primary + a second dir listed in model_paths.json, must load with
+        // identical tensor sets and identical bytes — and a shard name present
+        // in two directories must be refused, not silently resolved.
+        let both = tmpdir("mp_both");
+        let prim = tmpdir("mp_prim");
+        let sec = tmpdir("mp_sec");
+        let a = || Blob { name: "alpha", dtype: "F32", shape: vec![3], bytes: f32_bytes(&[1.0, -2.0, 3.5]) };
+        let b = || Blob { name: "beta.qs", dtype: "U8", shape: vec![4], bytes: vec![9, 8, 7, 6] };
+        write_safetensors_named(&both, "out-00000.safetensors", &[a()])?;
+        write_safetensors_named(&both, "out-00001.safetensors", &[b()])?;
+        write_safetensors_named(&prim, "out-00000.safetensors", &[a()])?;
+        write_safetensors_named(&sec, "out-00001.safetensors", &[b()])?;
+        std::fs::write(
+            prim.join("model_paths.json"),
+            format!(r#"{{"paths": ["{}"]}}"#, sec.display()),
+        )?;
+
+        let st1 = SafeTensors::open(&both)?;
+        let st2 = SafeTensors::open(&prim)?;
+        assert_eq!(st1.len(), st2.len());
+        for st in [&st1, &st2] {
+            assert!(st.has("alpha") && st.has("beta.qs"));
+        }
+        let (mut f1, mut f2) = ([0f32; 3], [0f32; 3]);
+        st1.read_f32("alpha", &mut f1)?;
+        st2.read_f32("alpha", &mut f2)?;
+        assert_eq!(f1, f2);
+        let (mut r1, mut r2) = ([0u8; 4], [0u8; 4]);
+        st1.read_raw("beta.qs", &mut r1)?;
+        st2.read_raw("beta.qs", &mut r2)?;
+        assert_eq!(r1, r2);
+
+        // duplicate shard name across dirs → hard error naming both homes
+        write_safetensors_named(&prim, "out-00001.safetensors", &[b()])?;
+        let Err(err) = SafeTensors::open(&prim) else {
+            return Err(Error::Format("duplicate shard name was accepted".into()));
+        };
+        assert!(format!("{err:?}").contains("two model directories"));
+
+        for d in [&both, &prim, &sec] {
+            std::fs::remove_dir_all(d)?;
+        }
         Ok(())
     }
 
