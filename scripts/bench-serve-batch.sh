@@ -125,6 +125,13 @@ run_arm() { # $1=B $2=rep
     local b=$1 rep=$2
     local tag="b${b}-rep${rep}"
     local log="$OUT/$tag.server.log"
+    # Uniform cold start per arm, if the narrow sudoers rule is installed
+    # (2026-08-09). Logged either way: an arm's warmth is provenance.
+    if sudo -n /usr/local/bin/drop-caches 2>/dev/null; then
+        echo "  page cache dropped" >&2
+    else
+        echo "  page cache NOT dropped (no rule); rotating order is the defense" >&2
+    fi
     start_server "$b" "$log"
     wait_healthy "$pid" "$log" || { kill -INT "$pid" 2>/dev/null; return 1; }
     python3 scripts/bench-serve-lanes.py \
