@@ -279,6 +279,17 @@ pub struct EngineTelemetry {
     pub pending: usize,
     /// Decode steps the engine has run since start.
     pub steps: u64,
+    /// Warm-cache `(hits, misses, disk_reads)` and speculative reads, cumulative.
+    ///
+    /// Published because these are the only *byte-convertible* counters the engine
+    /// has — `disk_reads × bytes_per_expert` is the disk rate, and the two lane
+    /// timing fields cannot give it (they are thread-sums, so they need both
+    /// thread counts to interpret and still exclude the prefetch lane entirely,
+    /// which is untimed). Until 2026-08-10 these reached the shutdown log and
+    /// nothing else, so a run's throughput could only be computed after it ended.
+    /// `None` without a warm cache.
+    pub ecache: Option<(u64, u64, u64)>,
+    pub prefetch_reads: u64,
 }
 
 /// Handle for submitting requests to the engine thread. Cheap to clone and
@@ -1054,6 +1065,8 @@ fn run_tuned(
             active: active.len(),
             pending: pending.len(),
             steps: steps as u64,
+            ecache: model.ecache_stats(),
+            prefetch_reads: model.ecache_prefetch_reads().unwrap_or(0),
         };
     }
     // Shutdown: report what the prefix cache absorbed. Silent when it is off, so

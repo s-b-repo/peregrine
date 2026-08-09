@@ -73,3 +73,67 @@ Re-measured after the fix, on fresh shards — the ranking is unchanged:
 ```
 uring O_DIRECT  0.69 GB/s      uring buffered  0.84 GB/s      pread x8  0.85 GB/s
 ```
+
+---
+
+## Addendum 2026-08-09: both conclusions survive repeats; the harness had two defects
+
+Everything above was measured **one pass per arm**, at **8 rings** where the
+engine ships 4 (`COLI_IO_RINGS`, `model.rs::io_rings`). Both were wrong to do, and
+`iobench` has been changed so neither is the default. Re-measured against a real
+GLM-5.2 shard on the root LUKS/NVMe, 5 reps, at the shipped ring count:
+
+| arm | median GB/s | spread | verdict |
+|---|---|---|---|
+| uring buffered | **1.12** | 5.4 % | — |
+| pread ×8 | 1.06 | 10.6 % | **gap 5.7 %, inside the noise floor — indistinguishable** |
+| uring O_DIRECT | 0.86 | 10.3 % | **−23 %, outside both spreads — a real regression** |
+
+**Both headline conclusions hold, and now for stated reasons rather than
+coincidence.** `pread` and `uring` are the same rate — not because 1.20 and 1.19
+happened to land close on one pass each, but because their difference is smaller
+than the noise floor, which is now measured rather than assumed. And O_DIRECT is
+genuinely the slow arm: a 23 % gap that no overlap of the two distributions can
+account for.
+
+### Defect 1: one pass is not a measurement
+
+Five identical passes against tmpfs returned 2.58 / 2.13 / 1.78 / 2.27 / 2.34 GB/s
+— 35 % spread, on a box carrying ~36 % background CPU load. `iobench` now defaults
+to `REPS=5`, reports median with min/max/spread, and prints an explicit note when
+the spread exceeds 15 % of the median. Its `RINGS` default moved 1 → 4 to match the
+shipped configuration.
+
+### Defect 2: the offset walk silently benchmarks the page cache
+
+Offsets are `(r * iters + i) * blk % flen`. When `rings × iters × blk` exceeds the
+file, they **wrap**, and the later reads of a pass hit regions that same pass just
+pulled into the page cache. Nothing said so. A 15-rep sweep on a 2.5 GiB shard read
+like a clean 2× win:
+
+```
+rings=4   0.94 GB/s     rings=8   1.39 GB/s     rings=12  1.82 GB/s     rings=16  1.76 GB/s
+```
+
+At 12 rings that is 96 reads of 64 MB over **40 distinct slots** — 58 % of each
+pass re-reading its own cache. Re-run at equal work with no wrap, the same sweep
+is flat within noise (0.87 / 0.92 / 1.04 / 1.00), and the 2× disappears. `iobench`
+now computes the distinct-slot count up front and warns, with the re-read
+percentage, before it prints a single rate. **`COLI_IO_RINGS=4` needs no change.**
+
+### The number that actually matters: the device is the constraint
+
+The same harness against tmpfs — identical code path, no device — reaches
+**3.77 GB/s** at 4 rings, against **1.12 GB/s** through the storage path.
+
+**The engine has ~3.4× more headroom than the drive is delivering.** That reframes
+where the next win is: not in the read path — which M5 has now twice failed to find
+a lever in — but in the device under it. A PCIe 3.0 x4 NVMe saturating at ~3.4 GB/s
+lands almost exactly on the engine's own ceiling, which is also why anything faster
+would be wasted on this box (Ryzen 5 5500 is Cezanne; nothing negotiates PCIe 4.0).
+See `[[cortix-box-profile]]` for the slot topology — the one unshared CPU-direct M.2
+link currently holds a 128 GB Intel 600p.
+
+**Caveat on the ceiling figure.** 3.77 GB/s is what tmpfs yields *with the VM and
+VNC helper running*. It is a floor on the engine's capability, not its maximum —
+quiescing that load would raise it, and that measurement has not been taken.

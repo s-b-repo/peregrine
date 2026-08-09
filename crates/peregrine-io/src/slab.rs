@@ -135,6 +135,15 @@ pub enum Bytes {
     /// (~19 MB) expert — the copy used to happen while the cache lock was held,
     /// serializing every I/O lane behind it.
     Shared(std::sync::Arc<[u8]>),
+    /// A refcounted **window** onto shared bytes: `owner[head..head + len]`.
+    ///
+    /// This is what lets one coalesced read be split back into its regions for
+    /// free. An expert's three weight tensors are contiguous on disk, so they can
+    /// be fetched as a single extent — but an [`ExpertSlab`] needs them as three
+    /// separate [`Bytes`], and without a window that split costs a full copy of
+    /// each. Backed by `Arc<[u8]>` rather than `Arc<Bytes>` so no variant has to
+    /// become `Sync`: [`AlignedBuf`] holds a raw pointer and is deliberately not.
+    View { owner: std::sync::Arc<[u8]>, head: usize, len: usize },
 }
 
 impl Bytes {
@@ -144,37 +153,71 @@ impl Bytes {
             Bytes::Vec(v) => v.len(),
             Bytes::Aligned { len, .. } => *len,
             Bytes::Shared(a) => a.len(),
+            Bytes::View { len, .. } => *len,
         }
     }
 
     /// Resident footprint, which for an O_DIRECT region is the whole aligned
     /// window — up to a block larger than the exposed length. The cache budgets
     /// on this so it accounts for the memory it actually holds.
+    ///
+    /// A [`Bytes::View`] reports its **own** length, not its owner's. The regions
+    /// carved out of one extent tile it exactly, so a slab's views sum back to the
+    /// extent and the cache budget stays right; charging each view the whole owner
+    /// would treble-count a merged expert. The trade is that a lone surviving view
+    /// under-reports the owner it is pinning — which cannot happen here, because a
+    /// slab holds all of its regions for exactly as long as it lives.
     pub fn footprint(&self) -> usize {
         match self {
             Bytes::Vec(v) => v.capacity(),
             Bytes::Aligned { buf, .. } => buf.capacity(),
             Bytes::Shared(a) => a.len(),
+            Bytes::View { len, .. } => *len,
         }
     }
 
-    /// The exposed bytes as a mutable slice, or `None` for a [`Bytes::Shared`]
-    /// region (other holders may be reading it concurrently).
+    /// The exposed bytes as a mutable slice, or `None` for a region other holders
+    /// may be reading concurrently ([`Bytes::Shared`], [`Bytes::View`]).
     pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
         match self {
             Bytes::Vec(v) => Some(v),
             Bytes::Aligned { buf, head, len } => Some(&mut buf.as_mut_slice()[*head..*head + *len]),
-            Bytes::Shared(_) => None,
+            Bytes::Shared(_) | Bytes::View { .. } => None,
         }
     }
 
-    /// Convert into refcounted shared bytes (copies once, from any variant).
+    /// Convert into refcounted shared bytes (copies once, from an owned variant).
     /// Cloning the result is a refcount bump.
+    ///
+    /// Already-refcounted variants return themselves untouched — a [`Bytes::View`]
+    /// is as shareable as a [`Bytes::Shared`], so admitting a coalesced expert to
+    /// the warm cache costs no copy at all.
     pub fn into_shared(self) -> Bytes {
         match self {
             Bytes::Shared(a) => Bytes::Shared(a),
+            v @ Bytes::View { .. } => v,
             other => Bytes::Shared(std::sync::Arc::from(other.as_slice())),
         }
+    }
+
+    /// Take the refcounted backing for this region, so windows can be carved from
+    /// it with [`Bytes::view`]. Copies once for an owned variant; free otherwise.
+    pub fn into_arc(self) -> std::sync::Arc<[u8]> {
+        match self {
+            Bytes::Shared(a) => a,
+            Bytes::View { owner, head, len } if head == 0 && len == owner.len() => owner,
+            other => std::sync::Arc::from(other.as_slice()),
+        }
+    }
+
+    /// A refcounted window `owner[head..head + len]`, or `None` if that range does
+    /// not lie inside `owner` — an out-of-range window would be a mis-split of a
+    /// coalesced read, which must fail loudly rather than serve neighbouring bytes.
+    pub fn view(owner: &std::sync::Arc<[u8]>, head: usize, len: usize) -> Option<Bytes> {
+        if head.checked_add(len)? > owner.len() {
+            return None;
+        }
+        Some(Bytes::View { owner: std::sync::Arc::clone(owner), head, len })
     }
 
     /// Whether the exposed region is empty.
@@ -196,17 +239,22 @@ impl std::ops::Deref for Bytes {
             // head+len <= capacity by construction (the aligned window covers the region)
             Bytes::Aligned { buf, head, len } => &buf.as_slice()[*head..*head + *len],
             Bytes::Shared(a) => a,
+            // head+len <= owner.len() by construction (`Bytes::view` refuses otherwise)
+            Bytes::View { owner, head, len } => &owner[*head..*head + *len],
         }
     }
 }
 
 impl Clone for Bytes {
-    /// [`Bytes::Shared`] clones by refcount; the owned variants copy their
-    /// exposed region into a fresh [`Bytes::Vec`] (this keeps [`AlignedBuf`]
-    /// non-cloneable while staying byte-identical to the original).
+    /// [`Bytes::Shared`] and [`Bytes::View`] clone by refcount; the owned variants
+    /// copy their exposed region into a fresh [`Bytes::Vec`] (this keeps
+    /// [`AlignedBuf`] non-cloneable while staying byte-identical to the original).
     fn clone(&self) -> Self {
         match self {
             Bytes::Shared(a) => Bytes::Shared(std::sync::Arc::clone(a)),
+            Bytes::View { owner, head, len } => {
+                Bytes::View { owner: std::sync::Arc::clone(owner), head: *head, len: *len }
+            }
             other => Bytes::Vec(other.to_vec()),
         }
     }

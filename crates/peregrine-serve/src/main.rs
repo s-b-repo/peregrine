@@ -419,8 +419,21 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
 async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
     let t = state.inner.engine.telemetry();
     let (hits, misses, entries, bytes) = state.inner.memo.lock().stats();
+    // `cpu_bytes` is carried in `LaneTimings` and was dropped here until
+    // 2026-08-10, which mattered more than one field usually would: `io_us` and
+    // `cpu_us` are **sums across threads** (rings and workers, different counts),
+    // so neither is comparable to wall time or to the other without knowing both
+    // thread counts. Bytes do not double-count that way, so `cpu_bytes` per
+    // forward is the one figure here that converts to an aggregate rate directly.
+    // (It is bytes fed to compute — warm-cache hits included — not disk bytes.)
     let lane = |l: &peregrine_model::LaneTimings| {
-        serde_json::json!({ "io_us": l.io_us, "cpu_us": l.cpu_us, "gpu_us": l.gpu_us, "reduce_us": l.reduce_us })
+        serde_json::json!({
+            "io_us": l.io_us,
+            "cpu_us": l.cpu_us,
+            "gpu_us": l.gpu_us,
+            "reduce_us": l.reduce_us,
+            "cpu_bytes": l.cpu_bytes,
+        })
     };
     Json(serde_json::json!({
         "steps": t.steps,
@@ -437,6 +450,14 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
         "io_sq_full": t.runtime.io_sq_full,
         "prefetch_accuracy": t.runtime.prefetch_accuracy,
         "cache_hit_rate": t.runtime.cache_hit_rate,
+        // Cumulative and byte-convertible: delta these across two scrapes and
+        // multiply by bytes-per-expert for a live disk rate. `disk_reads` counts
+        // *experts* (six regions each), not regions or device requests.
+        // `prefetch_reads` is the speculative lane, which contributes to device
+        // load but to no lane timing.
+        "ecache": t.ecache.map(|(h, m, d)| serde_json::json!({
+            "hits": h, "misses": m, "disk_reads": d, "prefetch_reads": t.prefetch_reads,
+        })),
         "routing_entropy_ewma": t.runtime.entropy_ewma,
         // Which implementation is dispatching, read from the dispatch path
         // itself — not from `COLI_MOE_ENGINE`, which says what was requested.
