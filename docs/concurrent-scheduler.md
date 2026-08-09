@@ -29,11 +29,36 @@ to the CPU lane when telemetry shows the GPU is the bottleneck.
 **I/O lane.** `COLI_IO_RINGS` io_uring rings (default 4), each on its own
 thread. Rings atomically claim expert batches off a shared `AtomicUsize`
 cursor (`io_work.fetch_add` — lock-free work stealing) and issue a deep
-batched submit: `COLI_IO_BATCH` experts in flight (default 16) × 6 regions
-per expert ≈ 96 concurrent reads. Contiguous regions are merged before
-submit (`read_many` / `read_experts_batched`). On each completion the lane
-stamps the task's slab and routes the now-ready expert to a compute lane —
-it never blocks on a CQE.
+batched submit of up to `COLI_IO_BATCH` experts × 6 regions per expert
+(≈ 96 concurrent reads at the default 16). Contiguous regions are merged
+before submit (`read_many` / `read_experts_batched`). On each completion the
+lane stamps the task's slab and routes the now-ready expert to a compute lane
+— it never blocks on a CQE.
+
+**The claim size is an upper bound, not the claim.** The lane ceil-divides the
+layer's work across the rings:
+
+```rust
+let batch = experts_per_batch().min(n_plans.div_ceil(n_rings)).max(1);
+```
+
+This matters because the two phases have very different work lists. A prefill
+chunk's per-layer routed union is ~69 experts, so it claims the full 16. A
+**decode** token routes only **8 experts per layer** — fewer than one claim.
+With a fixed batch of 16, ring 0's `fetch_add(16)` returned start 0 and took
+all 8, while rings 1–3 got starts 16/32/48, every one `>= n_plans`, and broke
+out **without issuing a single read**. One ring did four rings' work on every
+sparse layer of every decode token: measured at **24 % io duty across 4 rings**,
+and ~0.6 GB/s where the same device gives 1.12 GB/s at 4 rings under `iobench`.
+
+Ceil-dividing gives decode `ceil(8/4) = 2` so all four rings run, and leaves
+prefill at its full 16. Measured effect at defaults: decode **21.83 → 16.08
+s/tok**, io duty **24 % → 84 %**
+([`bench-data/2026-08-09-decode-levers/`](../bench-data/2026-08-09-decode-levers/README.md)).
+The lesson generalises: **any fixed claim size larger than the work list
+serialises a work-stealing loop onto one worker**, silently, and the
+thread-summed lane counters cannot see it — see
+[Measurement discipline](measurement.md).
 
 **CPU lane.** A worker pool computes each streamed expert's SwiGLU as bytes
 land: fused gate+up → silu·up → down → weighted scatter. A streamed expert's
