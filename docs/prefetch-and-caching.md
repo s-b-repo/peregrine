@@ -199,7 +199,7 @@ with the resident trunk a hit becomes a page fault.
 
 | Feature | Gate | What it does |
 |---|---|---|
-| Bloom filter | always on | 2048-bit, two hashes, short-circuits the miss path in `WarmCache::get`; rebuilt on eviction so the hint stays tight |
+| Residency filter | always on | counting filter, 65,536 atomic byte counters, two hashes, shared as an `Arc` outside the cache mutex. The I/O rings answer "definitely absent → stream it" without locking, and it also short-circuits the miss path inside `WarmCache::get`. Replaced the 2048-bit Bloom (2026-08-09), which had a ~24 % false-positive rate at ~700 residents and needed an O(residents) rebuild **under the mutex** on every full-cache admission; counters decrement on evict instead, so nothing is ever rebuilt. Lock-free misses are counted in a separate atomic — stat readers must use `total_misses()`, not the raw `misses` field. Time spent acquiring the cache mutex from the rings is metered as `cache_wait_us` and reported in the `[lane] cache-lock wait` shutdown line: a few percent of io thread time is bookkeeping, tens of percent would be the evidence a sharded cache needs (unmeasured as of the swap — the first sweep on the new layout fills this in) |
 | Transparent zstd | `COLI_CACHE_COMPRESS=1` | compress slabs on admit (~1.2× smaller resident footprint — measured), decode on hit |
 | Idle recompression | `COLI_CACHE_COMPRESS_IDLE=1` | the serve engine converts the coldest raw slot to zstd per idle tick, interruptible the moment a request arrives |
 | Negative TTL | `COLI_CACHE_NEGATIVE_TTL=<N>` | evict never-hit slots older than N clock ticks ahead of LRU order (unprotected slots only; always keeps at least one) |
