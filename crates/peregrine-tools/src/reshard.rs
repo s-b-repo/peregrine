@@ -215,11 +215,19 @@ fn load_heat(path: &Path, n_layers: usize, n_experts: usize) -> Result<Vec<u64>,
         .get("heat")
         .and_then(|h| h.as_array())
         .ok_or_else(|| Error::Format(format!("{} has no `heat` array", path.display())))?;
-    let heat: Vec<u64> = arr.iter().filter_map(|x| x.as_u64()).collect();
+    let mut heat: Vec<u64> = arr.iter().filter_map(|x| x.as_u64()).collect();
+    // The engine's HeatTable is built n_layers + 1 rows — the MTP head gets the
+    // trailing row (`model.rs`: `HeatTable::new(n_layers + 1, n_experts)`), so
+    // every heat file the engine can actually produce is one row longer than
+    // the sparse-layer count. Accept it and drop the MTP row; the same trap
+    // already bit `requant::from_route_stats` and was fixed the same way.
+    if heat.len() == (n_layers + 1) * n_experts {
+        heat.truncate(n_layers * n_experts);
+    }
     if heat.len() != n_layers * n_experts {
         return Err(Error::Format(format!(
-            "{}: heat is {} entries, expected {} (n_layers {n_layers} x n_experts {n_experts}) — \
-             a mismatched trace would misalign every layer",
+            "{}: heat is {} entries, expected {} (n_layers {n_layers} x n_experts {n_experts}, \
+             or one extra MTP row) — a mismatched trace would misalign every layer",
             path.display(),
             heat.len(),
             n_layers * n_experts
