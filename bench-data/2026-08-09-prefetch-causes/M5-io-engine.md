@@ -137,3 +137,22 @@ link currently holds a 128 GB Intel 600p.
 **Caveat on the ceiling figure.** 3.77 GB/s is what tmpfs yields *with the VM and
 VNC helper running*. It is a floor on the engine's capability, not its maximum —
 quiescing that load would raise it, and that measurement has not been taken.
+
+### `COLI_FORCE_ASYNC`: the open question closes with "no effect here"
+
+`ring.rs` documents the flag as having no evidence either way — *"on a device where
+completion is fast enough the io-wq bounce is pure overhead, and until now there
+was no way to find out"*. `Reactor::new` reads it, and `iobench` builds a Reactor,
+so it A/Bs directly. Real shard, 4 rings, 15 reps, no wrap:
+
+| shape | `=1` (default) | `=0` | gap | spreads |
+|---|---|---|---|---|
+| 64 MB × 8 (32 reads) | 1.13 GB/s | 1.15 GB/s | 1.8 % | 20 % / 15 % |
+| 16 MB × 24 (96 reads, the engine's own submit depth) | 0.87 GB/s | 0.85 GB/s | 2.3 % | 27 % / 14 % |
+
+**Not resolvable in either direction, at either depth.** The hypothesis is not
+supported — but it is not refuted either, and the honest statement is that the
+io-wq hand-off costs nothing measurable on *this* device. It is worth re-running
+on a low-latency NVMe, which is the case the comment was actually written about:
+the whole premise is that a fast enough device changes the answer, and this one
+delivers 1.1 GB/s.

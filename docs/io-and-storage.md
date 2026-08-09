@@ -18,16 +18,24 @@ batched-submit / io-wq-worker-cap ownership the design needs.
 - **Registered buffers**: `register_read_buffers()` + `IORING_OP_READ_FIXED`
   are implemented and tested, but **not reachable from the streaming path** —
   nothing calls them outside tests, and `COLI_REGBUF` is read by no code.
-- **Batched submits**: `read_many()` / `read_experts_batched()` issue **one SQE
-  per region** in a single deep submit; the streaming lane keeps `COLI_IO_BATCH`
-  experts × 6 regions ≈ 96 reads in flight per ring. They do **not** coalesce
-  adjacent regions — this said "merge contiguous regions before submit" until
-  2026-08-09, describing an optimization no code performed. Any merging is the
-  kernel's and the device's, not ours. It is worth doing: on the GLM-5.2
-  container an expert's three weight regions are one contiguous 18,874,368-byte
-  run and its three `.qs` scales are another, so six SQEs could be two. What
-  blocks it is that splitting one merged buffer back into three regions needs a
-  refcounted sub-slice `Bytes` does not have yet.
+- **Batched submits**: `read_experts_batched()` issues one deep submit per claim.
+  An expert costs **two SQEs when its regions coalesce, six when they do not** —
+  its three weight tensors are contiguous on disk (18,874,368 bytes at int4,
+  37,748,736 on the int8 MTP layer) and its three `.qs` scales are a second run
+  pooled at the front of the shard, so the common case is two reads. Experts
+  straddling a shard boundary (~0.45 % of this container) keep all six.
+  `COLI_EXPERT_MERGE=0` forces six, for A/B against a bit-identity assertion.
+  Extents come from the load-time expert map (`ExpertIndex`), and each merged
+  buffer is split back into six regions as refcounted `Bytes::View` windows —
+  **no copy**, and admission to the warm cache is then free too, since a view is
+  already shared. The split is computed from each tensor's own offset, never its
+  position: on disk the three projections sit in alphabetical order (down, gate,
+  up), so a positional split would load one matrix's bytes into another and still
+  produce plausible activations.
+  `read_many()` itself does **not** coalesce — it emits one SQE per `ReadReq`.
+  This entry claimed "merge contiguous regions before submit" until 2026-08-09,
+  describing an optimization no code performed; the merging now happens a level
+  up, where the expert's extents are known.
 - **fadvise integration**: `POSIX_FADV_WILLNEED` batched before main-path
   reads (`COLI_FADVISE_MAIN`, default on); optional `POSIX_FADV_DONTNEED`
   after each streamed read for RSS-bounded runs (`COLI_FADVISE_DROP`).
