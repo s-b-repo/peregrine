@@ -48,16 +48,22 @@ const COPY_CHUNK: usize = 4 << 20;
 /// a group's trunk can still be placed file-by-file).
 pub const TRUNK_SHARD_BYTES: u64 = 5_000_000_000;
 
-/// The six per-expert regions, in the exact order the engine's streaming lane
-/// submits them (`concurrent.rs read_expert`: gate/up/down × weight, scale).
-/// The output writes them contiguously in this order so exactly-abutting
-/// offsets on one fd still coalesce into one read.
+/// The six per-expert regions, in the order the engine's **merge** wants them
+/// on disk — NOT the order the lane submits reads. `concurrent.rs::merge_run`
+/// folds one expert's three WEIGHT regions into a single extent and its three
+/// SCALE regions into another, so weights must form one abutting run and
+/// scales another. The first cut of this tool wrote read order
+/// (weight, qs, weight, qs, ...), which wedges an 8 KB scale between every
+/// pair of weights: no run survives, coalescing measured 0.0 % (vs the
+/// original checkpoint's 99.5 %), and every expert cost six scattered reads
+/// instead of two — the layout regression that sank the first sweep on the
+/// resharded tier (2026-08-10, b16-rep1: pool delivered 0.86 GB/s).
 const EXPERT_REGION_ORDER: [&str; 6] = [
     "gate_proj.weight",
-    "gate_proj.weight.qs",
     "up_proj.weight",
-    "up_proj.weight.qs",
     "down_proj.weight",
+    "gate_proj.weight.qs",
+    "up_proj.weight.qs",
     "down_proj.weight.qs",
 ];
 
@@ -862,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn an_experts_six_regions_stay_contiguous_and_in_read_order() -> Result<(), Error> {
+    fn an_experts_regions_form_the_two_abutting_runs_merge_run_wants() -> Result<(), Error> {
         let (dir, out) = fixture_dirs("contig");
         build_fixture(&dir)?;
         let p = plan(&dir, &Options::new(groups3()))?;
