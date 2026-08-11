@@ -88,7 +88,7 @@ pub fn parse_groups(s: &str) -> Result<Vec<GroupSpec>, Error> {
             .ok_or_else(|| Error::Format(format!("--groups entry '{part}' is not <name>:<weight>")))?;
         let weight: f64 = w
             .parse()
-            .map_err(|_| Error::Format(format!("--groups entry '{part}': weight '{w}' is not a number")))?;
+            .map_err(|e| Error::Format(format!("--groups entry '{part}': weight '{w}' is not a number ({e})")))?;
         if !weight.is_finite() || weight <= 0.0 {
             return Err(Error::Format(format!("--groups entry '{part}': weight must be a positive number")));
         }
@@ -185,12 +185,15 @@ fn region_rank(name: &str) -> (usize, &str) {
     (rank, suffix)
 }
 
+/// layer → (expert → that expert's tensor names, in engine read order).
+type ExpertMap = BTreeMap<usize, BTreeMap<usize, Vec<String>>>;
+
 /// Split the source index into routed experts (layer → expert → ordered tensor
 /// names) and trunk (everything else, in source-index order). `mtp_cutoff` is
 /// the model's hidden-layer count: expert tensors on layers at or past it (the
 /// MTP layer) are trunk, because the decode loop never streams them.
-fn scan(st: &SafeTensors, mtp_cutoff: Option<usize>) -> (BTreeMap<usize, BTreeMap<usize, Vec<String>>>, Vec<String>) {
-    let mut experts: BTreeMap<usize, BTreeMap<usize, Vec<String>>> = BTreeMap::new();
+fn scan(st: &SafeTensors, mtp_cutoff: Option<usize>) -> (ExpertMap, Vec<String>) {
+    let mut experts: ExpertMap = BTreeMap::new();
     let mut trunk: Vec<String> = Vec::new();
     for t in st.tensors() {
         match expert_coords(&t.name) {
@@ -266,14 +269,17 @@ fn plan_with(st: &SafeTensors, model: &Path, opts: &Options) -> Result<Plan, Err
     // The config is the only place the MTP cutoff and the heat-array stride
     // live. Without it the tool still reshards (every `.mlp.experts.` layer is
     // treated as routed), but says so — an MTP layer would then be split too.
-    let cfg = Cfg::load(model).ok();
-    if cfg.is_none() {
-        eprintln!(
-            "peregrine-reshard: no readable config.json in {} — treating every \
-             `.mlp.experts.` layer as routed (no MTP cutoff)",
-            model.display()
-        );
-    }
+    let cfg = match Cfg::load(model) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "peregrine-reshard: no readable config.json in {} ({e}) — treating every \
+                 `.mlp.experts.` layer as routed (no MTP cutoff)",
+                model.display()
+            );
+            None
+        }
+    };
     let mtp_cutoff = cfg.as_ref().map(|c| c.n_layers as usize);
     let (experts, trunk) = scan(st, mtp_cutoff);
     if experts.is_empty() {
@@ -633,7 +639,13 @@ pub fn verify(model: &Path, out: &Path) -> Result<VerifyReport, Error> {
             rep.missing.push(t.name.clone());
             continue;
         };
-        let verdict = per_file.get_mut(&o.file_idx).expect("every output tensor has a file");
+        // Every `file_idx` indexes `dst.paths()`, which seeded `per_file` above;
+        // a miss means the output header is corrupt — report it, don't abort the
+        // rest of the verification (and never panic mid-verify).
+        let Some(verdict) = per_file.get_mut(&o.file_idx) else {
+            rep.missing.push(format!("{}: output file index {} out of range", t.name, o.file_idx));
+            continue;
+        };
         verdict.tensors += 1;
         if o.dtype != t.dtype || o.shape != t.shape || o.nbytes != t.nbytes {
             verdict.mismatches.push(format!(
@@ -725,46 +737,47 @@ mod tests {
         });
         std::fs::write(dir.join("config.json"), serde_json::to_vec_pretty(&cfg)?)?;
 
-        fn push(w: &mut ShardWriter, name: &str, dtype: &'static str, shape: Vec<i64>, n: usize) {
-            w.push(name, dtype, shape, synth_bytes(name, n)).expect("fixture push");
+        fn push(w: &mut ShardWriter, name: &str, dtype: &'static str, shape: Vec<i64>, n: usize) -> Result<(), Error> {
+            w.push(name, dtype, shape, synth_bytes(name, n))
         }
-        fn expert(w: &mut ShardWriter, layer: usize, e: usize) {
+        fn expert(w: &mut ShardWriter, layer: usize, e: usize) -> Result<(), Error> {
             let p = format!("model.layers.{layer}.mlp.experts.{e}.");
             for proj in ["gate_proj", "up_proj", "down_proj"] {
-                push(w, &format!("{p}{proj}.weight"), "U8", vec![8, 8], 64);
-                push(w, &format!("{p}{proj}.weight.qs"), "F32", vec![8], 32);
+                push(w, &format!("{p}{proj}.weight"), "U8", vec![8, 8], 64)?;
+                push(w, &format!("{p}{proj}.weight.qs"), "F32", vec![8], 32)?;
             }
+            Ok(())
         }
         let mut w = ShardWriter::new(dir, "model", 1000);
-        push(&mut w, "model.embed_tokens.weight", "BF16", vec![8, 16], 256);
+        push(&mut w, "model.embed_tokens.weight", "BF16", vec![8, 16], 256)?;
         for layer in 0..2usize {
-            push(&mut w, &format!("model.layers.{layer}.input_layernorm.weight"), "F32", vec![16], 64);
-            push(&mut w, &format!("model.layers.{layer}.self_attn.kv_a_proj.weight"), "U8", vec![16, 8], 128);
-            push(&mut w, &format!("model.layers.{layer}.self_attn.kv_a_proj.weight.qs"), "F32", vec![16], 64);
-            push(&mut w, &format!("model.layers.{layer}.mlp.gate.weight"), "F32", vec![8, 16], 512);
-            push(&mut w, &format!("model.layers.{layer}.mlp.shared_experts.up_proj.weight"), "U8", vec![8, 16], 128);
-            push(&mut w, &format!("model.layers.{layer}.mlp.shared_experts.up_proj.weight.qs"), "F32", vec![8], 32);
+            push(&mut w, &format!("model.layers.{layer}.input_layernorm.weight"), "F32", vec![16], 64)?;
+            push(&mut w, &format!("model.layers.{layer}.self_attn.kv_a_proj.weight"), "U8", vec![16, 8], 128)?;
+            push(&mut w, &format!("model.layers.{layer}.self_attn.kv_a_proj.weight.qs"), "F32", vec![16], 64)?;
+            push(&mut w, &format!("model.layers.{layer}.mlp.gate.weight"), "F32", vec![8, 16], 512)?;
+            push(&mut w, &format!("model.layers.{layer}.mlp.shared_experts.up_proj.weight"), "U8", vec![8, 16], 128)?;
+            push(&mut w, &format!("model.layers.{layer}.mlp.shared_experts.up_proj.weight.qs"), "F32", vec![8], 32)?;
             for e in 0..8usize {
-                expert(&mut w, layer, e);
+                expert(&mut w, layer, e)?;
             }
         }
         // The MTP layer sits past num_hidden_layers and has expert-shaped
         // names; the decode loop never streams it, so it must ride trunk.
-        push(&mut w, "model.layers.2.eh_proj.weight", "U8", vec![16, 16], 256);
-        expert(&mut w, 2, 0);
-        push(&mut w, "lm_head.weight", "BF16", vec![8, 16], 256);
+        push(&mut w, "model.layers.2.eh_proj.weight", "U8", vec![16, 16], 256)?;
+        expert(&mut w, 2, 0)?;
+        push(&mut w, "lm_head.weight", "BF16", vec![8, 16], 256)?;
         w.flush()?;
         assert!(w.written.len() > 1, "fixture must be multi-shard to be representative");
         Ok(())
     }
 
-    fn groups3() -> Vec<GroupSpec> {
-        parse_groups("a:1,b:1,c:2").expect("static group spec")
+    fn groups3() -> Result<Vec<GroupSpec>, Error> {
+        parse_groups("a:1,b:1,c:2")
     }
 
     #[test]
-    fn group_spec_parsing_accepts_the_cli_shape_and_rejects_nonsense() {
-        let g = parse_groups("nvme:3,ssd:2.5,hdd:1").expect("valid spec");
+    fn group_spec_parsing_accepts_the_cli_shape_and_rejects_nonsense() -> Result<(), Error> {
+        let g = parse_groups("nvme:3,ssd:2.5,hdd:1")?;
         assert_eq!(g.len(), 3);
         assert_eq!(g[0].name, "nvme");
         assert_eq!(g[1].weight, 2.5);
@@ -774,13 +787,14 @@ mod tests {
         assert!(parse_groups("nvme:0").is_err(), "zero weight");
         assert!(parse_groups("nvme:1,nvme:2").is_err(), "duplicate name");
         assert!(parse_groups("a/b:1").is_err(), "name would escape into the path");
+        Ok(())
     }
 
     #[test]
     fn round_trip_preserves_every_tensor_byte_for_byte() -> Result<(), Error> {
         let (dir, out) = fixture_dirs("roundtrip");
         build_fixture(&dir)?;
-        let plan = plan(&dir, &Options::new(groups3()))?;
+        let plan = plan(&dir, &Options::new(groups3()?))?;
         write(&dir, &out, &plan)?;
 
         let src = SafeTensors::open(&dir)?;
@@ -793,7 +807,7 @@ mod tests {
             src.read_raw(&t.name, &mut a)?;
             dst.read_raw(&t.name, &mut b)?;
             assert_eq!(a, b, "{}: bytes must survive the re-pack exactly", t.name);
-            let o = dst.find(&t.name).expect("present");
+            let o = dst.find(&t.name).ok_or_else(|| Error::Format(format!("{}: missing from output", t.name)))?;
             assert_eq!(o.dtype, t.dtype, "{}: dtype preserved", t.name);
             assert_eq!(o.shape, t.shape, "{}: shape preserved", t.name);
         }
@@ -808,7 +822,7 @@ mod tests {
         // with uniform heat the byte shares are exactly the weight shares.
         let (dir, _out) = fixture_dirs("uniform");
         build_fixture(&dir)?;
-        let p = plan(&dir, &Options::new(groups3()))?;
+        let p = plan(&dir, &Options::new(groups3()?))?;
         let total: u64 = p.routed_bytes.iter().sum();
         let shares: Vec<f64> = p.routed_bytes.iter().map(|&b| b as f64 / total as f64).collect();
         for (share, want) in shares.iter().zip([0.25, 0.25, 0.5]) {
@@ -871,7 +885,7 @@ mod tests {
     fn an_experts_regions_form_the_two_abutting_runs_merge_run_wants() -> Result<(), Error> {
         let (dir, out) = fixture_dirs("contig");
         build_fixture(&dir)?;
-        let p = plan(&dir, &Options::new(groups3()))?;
+        let p = plan(&dir, &Options::new(groups3()?))?;
         write(&dir, &out, &p)?;
         let dst = SafeTensors::open(&out)?;
         for layer in [0usize, 1] {
@@ -881,7 +895,9 @@ mod tests {
                 let prefix = format!("model.layers.{layer}.mlp.experts.{e}.");
                 let mut cursor: Option<(usize, u64)> = None;
                 for suffix in EXPERT_REGION_ORDER {
-                    let t = dst.find(&format!("{prefix}{suffix}")).expect("region present in output");
+                    let t = dst
+                        .find(&format!("{prefix}{suffix}"))
+                        .ok_or_else(|| Error::Format(format!("{prefix}{suffix}: region missing from output")))?;
                     let fname = dst.paths()[t.file_idx].file_name().and_then(|n| n.to_str()).unwrap_or("?");
                     assert_eq!(fname, file, "{prefix}{suffix}: lands in its (layer, group) file");
                     if let Some((fidx, end)) = cursor {
@@ -905,7 +921,7 @@ mod tests {
     fn trunk_and_mtp_tensors_travel_with_the_first_group_and_roll_at_the_budget() -> Result<(), Error> {
         let (dir, out) = fixture_dirs("trunk");
         build_fixture(&dir)?;
-        let mut opts = Options::new(groups3());
+        let mut opts = Options::new(groups3()?);
         opts.trunk_shard_bytes = 600; // force several trunk files
         let p = plan(&dir, &opts)?;
         write(&dir, &out, &p)?;
@@ -919,7 +935,7 @@ mod tests {
             "model.layers.2.mlp.experts.0.gate_proj.weight",        // MTP *expert* — still trunk
             "lm_head.weight",
         ] {
-            let t = dst.find(name).unwrap_or_else(|| panic!("{name} missing from output"));
+            let t = dst.find(name).ok_or_else(|| Error::Format(format!("{name} missing from output")))?;
             let fname = dst.paths()[t.file_idx].file_name().and_then(|n| n.to_str()).unwrap_or("?");
             assert!(fname.starts_with("trunk-a-"), "{name} must ride the first group's trunk, got {fname}");
         }
@@ -937,15 +953,20 @@ mod tests {
     fn manifest_records_files_bytes_and_the_greedy_assignment() -> Result<(), Error> {
         let (dir, out) = fixture_dirs("manifest");
         build_fixture(&dir)?;
-        let p = plan(&dir, &Options::new(groups3()))?;
+        let p = plan(&dir, &Options::new(groups3()?))?;
         write(&dir, &out, &p)?;
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(out.join("manifest.json"))?)?;
-        let groups = v.get("groups").and_then(|g| g.as_array()).expect("groups array");
+        let groups = v
+            .get("groups")
+            .and_then(|g| g.as_array())
+            .ok_or_else(|| Error::Format("manifest.json: no groups array".into()))?;
         assert_eq!(groups.len(), 3);
         for (g, spec) in p.groups.iter().enumerate() {
             assert_eq!(groups[g]["name"], serde_json::json!(spec.name));
             assert_eq!(groups[g]["total_bytes"], serde_json::json!(p.group_bytes[g]));
-            let files = groups[g]["files"].as_array().expect("file list");
+            let files = groups[g]["files"]
+                .as_array()
+                .ok_or_else(|| Error::Format(format!("manifest.json: group {g} has no file list")))?;
             assert_eq!(files.len(), p.files_in_group(g), "group {g} file count");
         }
         // The assignment is the audit trail: every (layer, expert) must be
@@ -970,7 +991,7 @@ mod tests {
     fn verify_passes_a_faithful_copy_and_catches_a_single_flipped_byte() -> Result<(), Error> {
         let (dir, out) = fixture_dirs("verify");
         build_fixture(&dir)?;
-        let p = plan(&dir, &Options::new(groups3()))?;
+        let p = plan(&dir, &Options::new(groups3()?))?;
         write(&dir, &out, &p)?;
 
         let clean = verify(&dir, &out)?;
@@ -984,7 +1005,9 @@ mod tests {
         // Corrupt one payload byte in one output file, far from any header.
         let (path, off) = {
             let dst = SafeTensors::open(&out)?;
-            let t = dst.find("model.layers.0.mlp.experts.0.up_proj.weight").expect("present");
+            let t = dst
+                .find("model.layers.0.mlp.experts.0.up_proj.weight")
+                .ok_or_else(|| Error::Format("up_proj.weight missing from output".into()))?;
             (dst.paths()[t.file_idx].clone(), t.off + 3)
         };
         let f = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;

@@ -1,0 +1,47 @@
+== batch sweep: B=[16 32 48 64] max_tokens=32 repeats=1 memmax=34G
+== model=/home/cortix/models/GLM-5.2
+== host: Linux 7.1.6-arch1-1 | 12 cpus | 46G ram, 38G avail
+== git: 2a262c1
+== env: COLI_CACHE_SWEEP=1 COLI_ECACHE_GB=8 COLI_FUSE_PREFILL=1 COLI_IO_BATCH=8 COLI_KV_BUDGET_MB=4096 COLI_MODEL=/home/cortix/models/GLM-5.2 COLI_PREFETCH_HINT_PATHS=0 COLI_PREFETCH_WARM_PATHS=0 
+-- rep 1 B=16
+  page cache dropped
+  loaded in ~12s
+[b16-rep1] 512 tok in 7302.05s = 0.07 tok/s (streams ok 16/16, ttft med Nones)
+-- rep 1 B=32
+  page cache dropped
+  loaded in ~24s
+== batch sweep: B=[16 32 48 64] max_tokens=32 repeats=1 memmax=34G
+== model=/home/cortix/models/GLM-5.2
+== host: Linux 7.1.6-arch1-1 | 12 cpus | 46G ram, 37G avail
+== git: 18c14e0
+== env: COLI_CACHE_SWEEP=1 COLI_ECACHE_GB=8 COLI_FUSE_PREFILL=1 COLI_IO_BATCH=8 COLI_KV_BUDGET_MB=4096 COLI_MODEL=/home/cortix/models/GLM-5.2 COLI_PREFETCH_HINT_PATHS=0 COLI_PREFETCH_WARM_PATHS=0 
+-- rep 1 B=16
+  page cache dropped
+  loaded in ~12s
+[b16-rep1] 512 tok in 6017.025s = 0.085 tok/s (streams ok 16/16, ttft med Nones)
+-- rep 1 B=32
+  page cache dropped
+  loaded in ~18s
+[b32-rep1] 832 tok in 10800.183s = 0.077 tok/s (streams ok 26/32, ttft med Nones)
+  arm failed (B=32 rep=1)
+-- rep 1 B=48
+  page cache dropped
+  loaded in ~10s
+[b48-rep1] 0 tok in 7627.795s = 0.0 tok/s (streams ok 0/48, ttft med Nones)
+  arm failed (B=48 rep=1)
+-- rep 1 B=64
+  page cache dropped
+  loaded in ~20s
+[b64-rep1] 288 tok in 10800.245s = 0.027 tok/s (streams ok 9/64, ttft med Nones)
+  arm failed (B=64 rep=1)
+
+== medians (aggregate tok/s across B streams)
+   B  runs  median tok/s      all
+  16     1         0.085   [0.09]
+  32     1         0.077   [0.08]
+  48     0             —
+  64     1         0.027   [0.03]
+
+A difference inside +-3% (long runs) is NOT a result. Check .counters.txt:
+more tok/s bought by proportionally more disk_reads means the union is
+still growing; flat tok/s with flat reads is the knee.

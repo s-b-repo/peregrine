@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use peregrine_core::{Cfg, Context, Error, QtInfo, SafeTensors};
-use peregrine_io::{Bytes, Reactor, ReadReq, WarmCache};
+use peregrine_io::{Bytes, CacheHit, OwnedReadReq, Reactor, ReadReq, RegionDone, WarmCache};
 
 use crate::gpu::{GpuTier, HeatTable};
 use crate::lane::LaneTimingsAccum;
@@ -923,6 +923,168 @@ fn read_regions_with_retry(r: &mut Reactor, regions: &[(RawFd, u64, usize)]) -> 
     Ok(out)
 }
 
+/// Whether the I/O lane forwards each expert as its own regions complete (the
+/// owned-completion lane) instead of waiting for the whole claim's wave.
+/// Default on; `COLI_IO_COMPLETION=0` restores the wave path byte-for-byte.
+/// `COLI_IO_ENGINE=pread|regbuf` also implies the wave path — those engines are
+/// wave-shaped measurement arms, and reshaping their requests would change what
+/// they measure.
+fn completion_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_IO_COMPLETION").as_deref(), Ok("0") | Ok("false")))
+}
+
+/// Stream a claim of experts through the owned-completion lane: submit every
+/// region with Reactor-owned buffers, reap completions incrementally, and hand
+/// each expert to `forward` the moment its last region lands — no whole-claim
+/// barrier, so the CPU pool starts on expert 1 while experts 2..N are still on
+/// the wire. Bytes are byte-identical to [`read_experts_batched`]: same
+/// regions, same offsets, same [`pack_slab_from`] carve; only delivery timing
+/// differs, which the `pos`-keyed reduce is built to absorb.
+///
+/// `forward(k, slab)` receives the index into `plans` and the packed slab; it
+/// returns `false` when the consumer is gone, which stops the stream. Returns
+/// `Ok(false)` in that case, `Ok(true)` when every expert was forwarded. On
+/// any early exit the lane is quiesced before returning, so the ring is clean
+/// for the next claim.
+///
+/// On a read error with `COLI_IO_RECOVERY` on (buffered only), the experts not
+/// yet forwarded are re-read individually with the retry ladder; the ones
+/// already forwarded keep their delivered bytes.
+fn stream_experts_completion(
+    r: &mut Reactor,
+    plans: &[&EPlan],
+    direct: bool,
+    mut forward: impl FnMut(usize, peregrine_io::ExpertSlab) -> bool,
+) -> Result<bool, Error> {
+    let n = plans.len();
+    if n == 0 {
+        return Ok(true);
+    }
+    // One owned request per region; `tag` packs (expert k, region slot j) so a
+    // completion routes back without a lookup table. Region counts differ per
+    // expert (2 coalesced, 6 not) — `remaining` tracks each expert's countdown.
+    let mut reqs: Vec<OwnedReadReq> = Vec::with_capacity(6 * n);
+    let mut parts: Vec<Vec<Option<Bytes>>> = Vec::with_capacity(n);
+    let mut remaining: Vec<usize> = Vec::with_capacity(n);
+    let mut all_regions: Vec<(RawFd, u64, usize)> = Vec::with_capacity(6 * n);
+    for (k, p) in plans.iter().enumerate() {
+        let regs = expert_regions(&p.entry, direct);
+        remaining.push(regs.len());
+        parts.push((0..regs.len()).map(|_| None).collect());
+        for (j, &(fd, off, len)) in regs.iter().enumerate() {
+            reqs.push(OwnedReadReq { fd, offset: off, len, tag: ((k as u64) << 32) | j as u64 });
+        }
+        all_regions.extend_from_slice(&regs);
+    }
+    let mut forwarded = vec![false; n];
+    let outcome: Result<bool, Error> = (|| {
+        r.submit_owned(reqs, direct).ctx(|| "owned-completion expert submit".to_string())?;
+        let mut done_buf: Vec<RegionDone> = Vec::new();
+        while r.pending_owned() > 0 {
+            r.reap_some(&mut done_buf).ctx(|| "owned-completion expert reap".to_string())?;
+            for d in done_buf.drain(..) {
+                let k = (d.tag >> 32) as usize;
+                let j = (d.tag & 0xffff_ffff) as usize;
+                let slot = parts
+                    .get_mut(k)
+                    .and_then(|p| p.get_mut(j))
+                    .ok_or_else(|| Error::Format(format!("owned completion for unknown region {k}/{j}")))?;
+                if slot.is_some() {
+                    return Err(Error::Format(format!("duplicate owned completion for region {k}/{j}")));
+                }
+                *slot = Some(d.bytes);
+                let rem = remaining
+                    .get_mut(k)
+                    .ok_or_else(|| Error::Format(format!("owned completion for unknown expert {k}")))?;
+                *rem -= 1; // safe: the duplicate guard above means each region decrements once
+                if *rem == 0 {
+                    let got: Option<Vec<Bytes>> = parts[k].iter_mut().map(|o| o.take()).collect();
+                    let got =
+                        got.ok_or_else(|| Error::Format(format!("expert {k} completed with a region missing")))?;
+                    let slab = pack_slab_from(&plans[k].entry, got)?;
+                    forwarded[k] = true;
+                    if !forward(k, slab) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    })();
+    // Whatever happened, leave the lane empty: owned reads left in flight would
+    // poison the next claim on this ring (and, at drop, dangle their buffers).
+    if r.pending_owned() > 0 {
+        let mut scratch: Vec<RegionDone> = Vec::new();
+        if let Err(e) = r.quiesce_owned(&mut scratch) {
+            peregrine_io::note_advisory_err("owned-lane quiesce after early exit", &e);
+        }
+    }
+    match outcome {
+        Ok(true) => {
+            // Optional page-cache release for long-running RSS-bounded loads —
+            // advisory, riding spare ring slots (see `fadvise_drop_enabled`).
+            if !direct && fadvise_drop_enabled() {
+                r.queue_dontneed(&all_regions);
+            }
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(e) if io_recovery_enabled() && !direct => {
+            // Retry ladder, scoped to the experts that never made it out: the
+            // accounting knows exactly which those are, so a transient failure
+            // does not force re-reading (or re-forwarding) the delivered ones.
+            eprintln!("[io-recovery] completion-lane read failed ({e}); retrying unfinished experts individually");
+            for (k, p) in plans.iter().enumerate() {
+                if forwarded[k] {
+                    continue;
+                }
+                let regs = expert_regions(&p.entry, false);
+                let bytes = read_regions_with_retry(r, &regs)?;
+                let slab = pack_slab_from(&p.entry, bytes)?;
+                forwarded[k] = true;
+                if !forward(k, slab) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-stream one expert with the blocking oracle reader ([`pread_many`]),
+/// looping out short reads. Only for the corruption-recovery path on a CPU
+/// worker (which owns no ring): a warm-cache slot failed to decode, the slot
+/// has been dropped, and these bytes replace it straight from disk. Rare by
+/// construction — non-zero traffic here means real bit rot (see
+/// `WarmCache::decode_failures`).
+fn restream_expert_blocking(e: &ExpertEntry) -> Result<peregrine_io::ExpertSlab, Error> {
+    let regions = expert_regions(e, false);
+    let mut bufs: Vec<Vec<u8>> = regions.iter().map(|&(_, _, len)| vec![0u8; len]).collect();
+    for (buf, &(fd, off, len)) in bufs.iter_mut().zip(regions.iter()) {
+        let mut done = 0usize;
+        while done < len {
+            let n = {
+                let mut req =
+                    [ReadReq { fd, offset: off + done as u64, buf: &mut buf[done..], tag: 0 }];
+                peregrine_io::pread_many(&mut req).first().copied().unwrap_or(-5)
+            };
+            if n < 0 {
+                return Err(Error::Io(std::io::Error::from_raw_os_error((-n) as i32)));
+            }
+            if n == 0 {
+                return Err(Error::Format(format!(
+                    "corrupt-slot re-stream hit EOF at {done} of {len} bytes @ off={off}"
+                )));
+            }
+            done += n as usize;
+        }
+    }
+    pack_slab_from(e, bufs.into_iter().map(Bytes::from).collect())
+}
+
 fn rebuild(t: &TPlan, wb: Bytes, sb: Bytes) -> QtWeight {
     // scale bytes → f32 (a copy inherent to the reinterpret; scales are tiny). The
     // weight bytes `wb` move into the QtWeight with no copy — zero-copy end to end
@@ -1177,11 +1339,22 @@ pub fn moe_forward_concurrent(
         apply_affinity_order(&mut plans, layer, aff);
     }
 
-    // job: (disk-plan index, streamed gate/up/down bytes) from I/O lane → CPU pool.
-    // `Bytes` regions so an O_DIRECT read can hand its aligned DMA buffer over the
-    // channel with no copy (== peregrine_io::ExpertSlab).
+    // job: work for one CPU worker, keyed by disk-plan index. `Bytes` regions so
+    // an O_DIRECT read can hand its aligned DMA buffer over the channel with no
+    // copy (`Bytes3` == peregrine_io::ExpertSlab).
     type Bytes3 = [(Bytes, Bytes); 3];
-    let (job_tx, job_rx) = crossbeam_channel::bounded::<(usize, Bytes3)>(workers.max(1) * 2);
+    enum Job {
+        /// Freshly streamed from disk: compute, and admit to the warm cache on
+        /// the worker — the zstd encode runs here, not on the I/O lane.
+        Stream(usize, Bytes3),
+        /// Warm hit, raw slot: compute only.
+        CacheRaw(usize, Bytes3),
+        /// Warm hit, compressed slot: the refcounted frames decode on the
+        /// worker — the decode used to run on the I/O lane *inside* the cache
+        /// lock, serializing every lane behind one zstd pass.
+        CacheZ(usize, std::sync::Arc<peregrine_io::CompressedSlab>),
+    }
+    let (job_tx, job_rx) = crossbeam_channel::bounded::<Job>(workers.max(1) * 2);
     // result: one computed expert keyed by `pos`, or — under
     // `COLI_CUDA_FUSED_REDUCE` — the GPU lane's single pre-accumulated
     // `[s_n, hidden]` partial standing in for all of its experts at once.
@@ -1210,6 +1383,14 @@ pub fn moe_forward_concurrent(
     // default) admits everything.
     let heat_ref = ctx.heat;
     let admit_min_heat = cache_admit_min_heat();
+    // Completion lane vs wave, resolved once: pread/regbuf are wave-shaped
+    // measurement arms whose request shape *is* what they measure, so only the
+    // uring engine streams per-expert. `COLI_IO_COMPLETION=0` is the escape
+    // hatch back to the wave on uring too.
+    let completion = completion_enabled() && matches!(io_engine(), IoEngine::Uring);
+    // Fixed at cache construction; read once here so workers can run the zstd
+    // encode (`WarmCache::prepare_insert`) without touching the cache lock.
+    let cache_compress = ecache.map(|c| c.lock().compress_on_admit()).unwrap_or(false);
 
     // `(per-expert slots, the GPU lane's device-reduced partial)`. The partial is
     // `None` unless `COLI_CUDA_FUSED_REDUCE` is on and the layer had GPU experts.
@@ -1275,13 +1456,22 @@ pub fn moe_forward_concurrent(
                                     if let Some(t) = timings_ref {
                                         t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
                                     }
-                                    g.get(key)
+                                    g.get_hit(key)
                                 }
                             }
                         });
                         match hit {
-                            Some(bytes) => {
-                                if job_tx.send((idx, bytes)).is_err() {
+                            // Raw slot: bytes are ready — straight to a worker.
+                            Some(CacheHit::Raw(bytes)) => {
+                                if job_tx.send(Job::CacheRaw(idx, *bytes)).is_err() {
+                                    return;
+                                }
+                            }
+                            // Compressed slot: ship the refcounted frames; the
+                            // zstd decode runs on the worker, not on this lane
+                            // (and no longer inside the cache lock).
+                            Some(CacheHit::Compressed(frames)) => {
+                                if job_tx.send(Job::CacheZ(idx, frames)).is_err() {
                                     return;
                                 }
                             }
@@ -1293,6 +1483,55 @@ pub fn moe_forward_concurrent(
                     }
                     let chunk_plans: Vec<&EPlan> = miss.iter().map(|&i| &plans_ref[i]).collect();
                     let t_io = std::time::Instant::now();
+                    if completion {
+                        // Owned-completion lane: each expert is forwarded the
+                        // moment its last region lands, so the CPU pool starts
+                        // on expert 1 while the rest are still on the wire.
+                        //
+                        // Sending on `job_tx` under this ring's lock cannot
+                        // deadlock: workers never take a ring mutex, and iotune
+                        // locks rings only between forwards. `add_io` spans the
+                        // reap loop here, so io duty includes the per-expert
+                        // forwarding — accepted semantics shift vs the wave.
+                        let mut r = ring.lock(); // this ring, uncontended (owned by this thread)
+                        if !use_direct && fadvise_main_enabled() {
+                            // Hint the NEXT claim window while this one streams
+                            // — genuinely ahead of its reads, unlike the wave
+                            // path's same-wave hint. Best-effort: the window may
+                            // be claimed by another ring, which only means the
+                            // readahead lands in the page cache it shares.
+                            let ahead_end = (end + batch).min(n_plans);
+                            let mut ahead: Vec<(RawFd, u64, usize)> = Vec::new();
+                            for p in &plans_ref[end..ahead_end] {
+                                ahead.extend_from_slice(&expert_regions(&p.entry, false));
+                            }
+                            if !ahead.is_empty() {
+                                r.queue_willneed(&ahead);
+                            }
+                        }
+                        let streamed = stream_experts_completion(&mut r, &chunk_plans, use_direct, |k, slab| {
+                            job_tx.send(Job::Stream(miss[k], slab)).is_ok()
+                        });
+                        if let Some(t) = timings_ref {
+                            t.add_io(t_io.elapsed().as_micros() as u64);
+                        }
+                        match streamed {
+                            Ok(true) => continue,
+                            // A dropped receiver means the collector saw an
+                            // error and the forward is unwinding.
+                            Ok(false) => return,
+                            Err(e) => {
+                                if res_tx.send(Err(e)).is_err() {
+                                    peregrine_io::note_advisory_err("io lane error forward", &"collector already gone");
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    // Wave path: the `COLI_IO_COMPLETION=0` escape hatch and the
+                    // pread/regbuf measurement arms. One blocking submit for the
+                    // whole claim; admission still runs on the worker
+                    // (`Job::Stream`), unified with the completion lane.
                     let slabs = {
                         let mut r = ring.lock(); // this ring, uncontended (owned by this thread)
                         read_experts_batched(&mut r, &chunk_plans, use_direct)
@@ -1310,35 +1549,7 @@ pub fn moe_forward_concurrent(
                         }
                     };
                     for (&idx, bytes) in miss.iter().zip(slabs) {
-                        if let Some(c) = ecache {
-                            let expert = plans_ref[idx].expert;
-                            // Admission gate: only cache experts with demonstrated
-                            // reuse (routing heat ≥ threshold). Heat is bumped after
-                            // the reduce, so a first-ever routing reads 0 here —
-                            // threshold 1 = "cache from the second routing on".
-                            //
-                            // **No heat table means the gate cannot be evaluated, so it
-                            // does not apply.** It used to be `is_some_and`, i.e. "no
-                            // table → admit nothing": `heat` is `Some` only when a GPU
-                            // tier exists (`model.rs`), so on any CPU-only run setting
-                            // this knob to 1 silently turned the demand path's cache
-                            // admission off entirely — while the prefetch lane, which
-                            // has no such gate, went on admitting everything. A knob
-                            // documented as "filter one-off experts" instead inverted
-                            // which lane owned the cache.
-                            let admit = admit_min_heat == 0
-                                || heat_ref.is_none_or(|h| h.get(layer, expert) >= admit_min_heat);
-                            let t_lock = std::time::Instant::now();
-                            let mut c = c.lock();
-                            if let Some(t) = timings_ref {
-                                t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
-                            }
-                            c.note_disk_read(layer as u32);
-                            if admit {
-                                c.insert((layer as u32, expert as u32), bytes.clone());
-                            }
-                        }
-                        if job_tx.send((idx, bytes)).is_err() {
+                        if job_tx.send(Job::Stream(idx, bytes)).is_err() {
                             return;
                         }
                     }
@@ -1407,9 +1618,93 @@ pub fn moe_forward_concurrent(
                     // `recv`'s only error is `Disconnected`, which is this
                     // pool's shutdown signal: every ring has finished and
                     // dropped its sender.
-                    let (idx, bytes) = match job_rx.recv() {
+                    let job = match job_rx.recv() {
                         Ok(job) => job,
                         Err(crossbeam_channel::RecvError) => break,
+                    };
+                    let (idx, bytes) = match job {
+                        Job::CacheRaw(idx, bytes) => (idx, bytes),
+                        Job::CacheZ(idx, frames) => match frames.materialize() {
+                            Some(slab) => (idx, slab),
+                            None => {
+                                // Undecodable slot: drop it (with its
+                                // decode-failure accounting) and re-stream from
+                                // disk with the blocking oracle reader — this
+                                // worker owns no ring. Rare by construction:
+                                // non-zero traffic here means real bit rot.
+                                let plan = &plans_ref[idx];
+                                if let Some(c) = ecache {
+                                    let t_lock = std::time::Instant::now();
+                                    let mut g = c.lock();
+                                    if let Some(t) = timings_ref {
+                                        t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
+                                    }
+                                    g.remove_corrupt((layer as u32, plan.expert as u32));
+                                }
+                                match restream_expert_blocking(&plan.entry) {
+                                    Ok(slab) => (idx, slab),
+                                    Err(e) => {
+                                        if res_tx.send(Err(e)).is_err() {
+                                            peregrine_io::note_advisory_err(
+                                                "cpu lane error forward",
+                                                &"collector already gone",
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        },
+                        Job::Stream(idx, bytes) => match ecache {
+                            None => (idx, bytes),
+                            Some(c) => {
+                                // Admission moved here from the I/O lane: the
+                                // zstd encode (`prepare_insert`) runs before the
+                                // lock; only map insert + eviction run under it.
+                                //
+                                // Admission gate: only cache experts with demonstrated
+                                // reuse (routing heat ≥ threshold). Heat is bumped after
+                                // the reduce, so a first-ever routing reads 0 here —
+                                // threshold 1 = "cache from the second routing on".
+                                //
+                                // **No heat table means the gate cannot be evaluated, so it
+                                // does not apply.** It used to be `is_some_and`, i.e. "no
+                                // table → admit nothing": `heat` is `Some` only when a GPU
+                                // tier exists (`model.rs`), so on any CPU-only run setting
+                                // this knob to 1 silently turned the demand path's cache
+                                // admission off entirely — while the prefetch lane, which
+                                // has no such gate, went on admitting everything. A knob
+                                // documented as "filter one-off experts" instead inverted
+                                // which lane owned the cache.
+                                let expert = plans_ref[idx].expert;
+                                let admit = admit_min_heat == 0
+                                    || heat_ref.is_none_or(|h| h.get(layer, expert) >= admit_min_heat);
+                                if admit {
+                                    // Share-convert once: the cache slot and this
+                                    // worker's compute alias the same refcounted
+                                    // bytes. (The old ring-thread admission
+                                    // deep-copied the whole slab instead.)
+                                    let shared = bytes.map(|(w, s)| (w.into_shared(), s.into_shared()));
+                                    let prepared = WarmCache::prepare_insert(shared.clone(), cache_compress);
+                                    let t_lock = std::time::Instant::now();
+                                    let mut g = c.lock();
+                                    if let Some(t) = timings_ref {
+                                        t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
+                                    }
+                                    g.note_disk_read(layer as u32);
+                                    g.insert_prepared((layer as u32, expert as u32), prepared);
+                                    (idx, shared)
+                                } else {
+                                    let t_lock = std::time::Instant::now();
+                                    let mut g = c.lock();
+                                    if let Some(t) = timings_ref {
+                                        t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
+                                    }
+                                    g.note_disk_read(layer as u32);
+                                    (idx, bytes)
+                                }
+                            }
+                        },
                     };
                     let plan = &plans_ref[idx];
                     // Slab bytes consumed by this expert — the bandwidth-governor
@@ -1978,6 +2273,151 @@ mod tests {
         // coalesced expert at its real size rather than treble-counting it.
         let total: usize = slab.iter().map(|(w, s)| w.footprint() + s.footprint()).sum();
         assert_eq!(total, w.len + s.len);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// Build the completion-lane fixture: one file holding an interleaved
+    /// (six-region) expert and a coalesced (two-region) expert, so a single
+    /// claim mixes both per-expert region counts. Returns the open file (keeps
+    /// the fd alive), its path, and the two entries.
+    fn completion_fixture(
+        tag: &str,
+    ) -> Result<(std::fs::File, std::path::PathBuf, ExpertEntry, ExpertEntry), Error> {
+        let path = std::env::temp_dir().join(format!("peregrine_completion_{}_{}", std::process::id(), tag));
+        // Expert A: weight/scale alternate on disk → merge_run finds no
+        // contiguous run and the expert reads six regions. Expert B mirrors the
+        // real container: scales pooled, then weights, both alphabetical
+        // (down, gate, up) → two coalesced regions. Distinct fills per region
+        // so a positional mix-up fails loudly.
+        let a_regions: Vec<Vec<u8>> = (0..6usize)
+            .map(|k| (0..(24 + k * 11)).map(|b| (b as u8).wrapping_mul(3).wrapping_add(k as u8 * 37)).collect())
+            .collect();
+        let b_regions: [Vec<u8>; 6] = [
+            vec![0xD5; 24], // down scale
+            vec![0x65; 8],  // gate scale
+            vec![0x55; 8],  // up scale
+            vec![0xDD; 96], // down weight
+            vec![0x66; 96], // gate weight
+            vec![0x5A; 96], // up weight
+        ];
+        let mut f = std::fs::File::create(&path)?;
+        let mut offs: Vec<u64> = Vec::new();
+        let mut cur = 0u64;
+        for r in a_regions.iter().chain(b_regions.iter()) {
+            offs.push(cur);
+            f.write_all(r)?;
+            cur += r.len() as u64;
+        }
+        f.sync_all()?;
+        let rf = std::fs::File::open(&path)?;
+        let fd = rf.as_raw_fd();
+        let lens: Vec<usize> = a_regions.iter().chain(b_regions.iter()).map(Vec::len).collect();
+        let tp = |wi: usize, si: usize| TPlan {
+            w_fd: fd,
+            w_off: offs[wi],
+            w_len: lens[wi],
+            s_fd: fd,
+            s_off: offs[si],
+            s_len: lens[si],
+            w_fd_direct: None,
+            s_fd_direct: None,
+            fmt: QuantFmt::Int4,
+            o: 1,
+            i: 1,
+            gs: 0,
+        };
+        let a_plans = [tp(0, 1), tp(2, 3), tp(4, 5)];
+        let entry_a = ExpertEntry { w_run: merge_run(&a_plans, true), s_run: merge_run(&a_plans, false), plans: a_plans };
+        assert!(entry_a.w_run.is_none() && entry_a.s_run.is_none(), "interleaved expert must not coalesce");
+        // gate, up, down — pointing at their scattered-on-disk homes (offsets
+        // 6.. are expert B's block).
+        let b_plans = [tp(6 + 4, 6 + 1), tp(6 + 5, 6 + 2), tp(6 + 3, 6)];
+        let entry_b = ExpertEntry { w_run: merge_run(&b_plans, true), s_run: merge_run(&b_plans, false), plans: b_plans };
+        assert!(entry_b.w_run.is_some() && entry_b.s_run.is_some(), "pooled expert must coalesce");
+        assert_eq!(expert_regions(&entry_b, false).len(), 2);
+        Ok((rf, path, entry_a, entry_b))
+    }
+
+    fn eplan(expert: usize, entry: ExpertEntry) -> EPlan {
+        EPlan { pos: expert, expert, rows: Vec::new(), rw: Vec::new(), entry }
+    }
+
+    /// The owned-completion lane must deliver exactly the bytes the blocking
+    /// wave path delivers — same regions, same carve — for both the six-region
+    /// and the coalesced two-region expert shapes, with each expert forwarded
+    /// exactly once. Delivery *order* is explicitly unspecified (completions
+    /// may arrive in any order); byte content is not.
+    #[test]
+    fn completion_lane_bytes_identical_to_wave() -> Result<(), Error> {
+        let (_rf, path, entry_a, entry_b) = completion_fixture("ident")?;
+        let mut reactor = match Reactor::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        // Oracle first: the wave path (untouched code) on the same entries.
+        let want_a = read_expert(&mut reactor, &entry_a, false)?;
+        let want_b = read_expert(&mut reactor, &entry_b, false)?;
+
+        let eplans = [eplan(0, entry_a), eplan(1, entry_b)];
+        let plan_refs: Vec<&EPlan> = eplans.iter().collect();
+        let mut got: Vec<(usize, peregrine_io::ExpertSlab)> = Vec::new();
+        let all = stream_experts_completion(&mut reactor, &plan_refs, false, |k, slab| {
+            got.push((k, slab));
+            true
+        })?;
+        assert!(all, "every expert must be forwarded when the consumer stays");
+        got.sort_by_key(|(k, _)| *k);
+        let ks: Vec<usize> = got.iter().map(|(k, _)| *k).collect();
+        assert_eq!(ks, vec![0, 1], "each expert forwarded exactly once");
+        for ((_, got), want) in got.iter().zip([&want_a, &want_b]) {
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert_eq!(&g.0[..], &w.0[..], "weight bytes identical to the wave path");
+                assert_eq!(&g.1[..], &w.1[..], "scale bytes identical to the wave path");
+            }
+        }
+        // The lane must leave the ring clean: the legacy wave path (which
+        // refuses to run while owned reads are in flight) works right after.
+        let again = read_expert(&mut reactor, &entry_a, false)?;
+        for (g, w) in again.iter().zip(want_a.iter()) {
+            assert_eq!(&g.0[..], &w.0[..]);
+            assert_eq!(&g.1[..], &w.1[..]);
+        }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// A consumer that disappears mid-stream (dropped channel → `forward`
+    /// returns false) stops the stream with `Ok(false)` — and the quiesce on
+    /// the way out leaves the ring reusable, not poisoned by in-flight owned
+    /// reads.
+    #[test]
+    fn completion_lane_stops_cleanly_when_consumer_gone() -> Result<(), Error> {
+        let (_rf, path, entry_a, entry_b) = completion_fixture("gone")?;
+        let mut reactor = match Reactor::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let eplans = [eplan(0, entry_a), eplan(1, entry_b)];
+        let plan_refs: Vec<&EPlan> = eplans.iter().collect();
+        let mut forwards = 0usize;
+        let all = stream_experts_completion(&mut reactor, &plan_refs, false, |_, _| {
+            forwards += 1;
+            false // consumer gone after the first delivery
+        })?;
+        assert!(!all, "a gone consumer must report Ok(false), not success");
+        assert_eq!(forwards, 1, "the stream must stop at the refusing forward");
+        // Ring must be clean for the next claim on this lane.
+        let want_a = read_expert(&mut reactor, &entry_a, false)?;
+        assert_eq!(want_a[0].0.len(), entry_a.plans[0].w_len);
         std::fs::remove_file(&path)?;
         Ok(())
     }
