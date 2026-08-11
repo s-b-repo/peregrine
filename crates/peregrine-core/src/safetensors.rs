@@ -177,9 +177,8 @@ impl SafeTensors {
         for w in shard_paths.windows(2) {
             if w[0].file_name() == w[1].file_name() {
                 return Err(Error::Format(format!(
-                    "shard {} exists in two model directories ({} and {}) — \
+                    "the same shard exists in two model directories ({} and {}) — \
                      refusing to guess which copy to serve",
-                    w[1].file_name().unwrap_or_default().to_string_lossy(),
                     w[0].display(),
                     w[1].display()
                 )));
@@ -397,6 +396,20 @@ impl SafeTensors {
     /// Whether any shard opened a working O_DIRECT fd (so the direct path is usable).
     pub fn has_any_direct(&self) -> bool {
         self.direct_files.iter().any(Option::is_some)
+    }
+
+    /// Every shard fd a streaming read can name: the buffered fd per shard plus
+    /// its O_DIRECT twin where one exists — the exact set behind
+    /// [`Self::region`] / [`Self::region_direct`]. For io_uring fixed-file
+    /// registration (`IOSQE_FIXED_FILE` skips the per-op fd lookup/refcount on
+    /// reads issued every token). The fds stay valid as long as this
+    /// `SafeTensors` is alive.
+    pub fn shard_fds(&self) -> Vec<RawFd> {
+        self.files
+            .iter()
+            .map(|f| f.as_raw_fd())
+            .chain(self.direct_files.iter().flatten().map(|f| f.as_raw_fd()))
+            .collect()
     }
 
     /// The compression scheme applied to `name` (`Compression::None` for

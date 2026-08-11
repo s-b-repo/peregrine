@@ -5,7 +5,8 @@
 ## Prerequisites
 
 - **Linux.** io_uring is the I/O backbone; a reasonably modern kernel
-  (5.11+ for the registered-file/`SINGLE_ISSUER` ring features) is assumed.
+  (5.11+ for the registered-file ring features; ≥ 5.13 if you opt into
+  unprivileged `COLI_SQPOLL=1`) is assumed.
 - **Stable Rust** (edition 2021 workspace; no nightly features anywhere).
 - **Optional — NVIDIA GPU + CUDA toolkit** (`nvcc`) for the GPU lane. The
   default build is CPU-only and the entire test suite runs without a GPU.

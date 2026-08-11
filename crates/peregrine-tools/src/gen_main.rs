@@ -106,23 +106,23 @@ fn parse_args() -> Result<Opts, i32> {
             "--host" => o.host = next!("--host"),
             "--port" => match next!("--port").parse() {
                 Ok(v) => o.port = v,
-                Err(_) => {
-                    eprintln!("peregrine-gen: --port must be a number");
+                Err(e) => {
+                    eprintln!("peregrine-gen: --port must be a number ({e})");
                     return Err(2);
                 }
             },
             "--model" => o.model = next!("--model"),
             "--max-tokens" => match next!("--max-tokens").parse() {
                 Ok(v) => o.max_tokens = v,
-                Err(_) => {
-                    eprintln!("peregrine-gen: --max-tokens must be a number");
+                Err(e) => {
+                    eprintln!("peregrine-gen: --max-tokens must be a number ({e})");
                     return Err(2);
                 }
             },
             "--temperature" => match next!("--temperature").parse() {
                 Ok(v) => o.temperature = v,
-                Err(_) => {
-                    eprintln!("peregrine-gen: --temperature must be a number");
+                Err(e) => {
+                    eprintln!("peregrine-gen: --temperature must be a number ({e})");
                     return Err(2);
                 }
             },
@@ -187,10 +187,10 @@ impl<R: BufRead> Read for Chunked<R> {
                         self.remaining = n;
                         break;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("bad chunk size {hex:?}"),
+                            format!("bad chunk size {hex:?}: {e}"),
                         ))
                     }
                 }
@@ -336,7 +336,11 @@ fn main() -> std::process::ExitCode {
     }
     if code != "200" {
         let mut rest = String::new();
-        let _ = head.read_to_string(&mut rest);
+        // Keep whatever partial body arrived; the read error itself becomes
+        // part of the report rather than silently truncating it.
+        if let Err(e) = head.read_to_string(&mut rest) {
+            rest.push_str(&format!(" (error body unreadable: {e})"));
+        }
         eprintln!("peregrine-gen: server returned {}\n{}", status.trim(), rest.trim());
         return std::process::ExitCode::FAILURE;
     }
@@ -374,14 +378,15 @@ fn main() -> std::process::ExitCode {
                             human(since)
                         )
                     };
-                    let _ = write!(
-                        std::io::stderr(),
+                    // `eprint!` panics if stderr is gone — in this thread that
+                    // ends only the ticker; the main thread notices at `join`.
+                    // stderr is unbuffered, so there is nothing to flush.
+                    eprint!(
                         "\r\x1b[2K\x1b[2m{}\x1b[0m {}  \x1b[2m[{}]\x1b[0m",
                         FRAMES[f % FRAMES.len()],
                         head,
                         human(el)
                     );
-                    let _ = std::io::stderr().flush();
                 }
                 f += 1;
                 std::thread::sleep(Duration::from_millis(120));
@@ -402,6 +407,7 @@ fn main() -> std::process::ExitCode {
     let mut finish_reason = String::new();
     let mut line = String::new();
     let mut stdout = std::io::stdout();
+    let mut stdout_gone = false;
 
     loop {
         line.clear();
@@ -461,21 +467,34 @@ fn main() -> std::process::ExitCode {
         // Clear the status line before emitting text, or the two interleave on
         // the same row. stdout is flushed per delta so a pipe sees tokens live.
         if show_live {
-            let _ = write!(std::io::stderr(), "\r\x1b[2K");
-            let _ = std::io::stderr().flush();
+            eprint!("\r\x1b[2K");
         }
-        let _ = stdout.write_all(delta.as_bytes());
-        let _ = stdout.flush();
+        // A dead stdout (EPIPE: the consumer closed) must not kill the run —
+        // the server streams on regardless, and the stderr summary is still
+        // worth producing. Say so once, then stop echoing.
+        if !stdout_gone {
+            if let Err(e) = stdout.write_all(delta.as_bytes()).and_then(|()| stdout.flush()) {
+                stdout_gone = true;
+                eprintln!("\rperegrine-gen: stdout gone ({e}); continuing for the summary");
+            }
+        }
         text.push_str(delta);
     }
 
     done.store(true, Ordering::Relaxed);
-    let _ = ticker.join();
-    if show_live {
-        let _ = write!(std::io::stderr(), "\r\x1b[2K");
+    if ticker.join().is_err() {
+        // The ticker only panics when stderr dies mid-run (see `eprint!`
+        // above); the report below will meet the same stderr and settle it.
+        eprintln!("peregrine-gen: status ticker died");
     }
-    let _ = stdout.write_all(b"\n");
-    let _ = stdout.flush();
+    if show_live {
+        eprint!("\r\x1b[2K");
+    }
+    if !stdout_gone {
+        if let Err(e) = stdout.write_all(b"\n").and_then(|()| stdout.flush()) {
+            eprintln!("peregrine-gen: stdout gone ({e})");
+        }
+    }
 
     let total = t0.elapsed().as_secs_f64();
     let n = tokens.load(Ordering::Relaxed) as usize;
@@ -483,17 +502,17 @@ fn main() -> std::process::ExitCode {
     let mut sorted = gaps.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut err = std::io::stderr();
+    // Report rows go through `eprintln!` like every other stderr line in this
+    // binary: a dead stderr at this point has nowhere better to be reported.
     let (d, r) = if tty { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
-    let _ = writeln!(err, "{d}──{r} peregrine-gen {d}{}{r}", "─".repeat(46));
-    let _ = writeln!(err, "  generated    {n} tokens, {} chars", text.chars().count());
-    let _ = writeln!(err, "  ttft         {}  {d}(prefill + first token){r}", human(ttft));
-    let _ = writeln!(err, "  total        {}", human(total));
+    eprintln!("{d}──{r} peregrine-gen {d}{}{r}", "─".repeat(46));
+    eprintln!("  generated    {n} tokens, {} chars", text.chars().count());
+    eprintln!("  ttft         {}  {d}(prefill + first token){r}", human(ttft));
+    eprintln!("  total        {}", human(total));
     if n > 1 {
         let decode = (total - ttft).max(0.0);
-        let _ = writeln!(err, "  decode rate  {}  {d}(excludes ttft){r}", rate(n - 1, decode));
-        let _ = writeln!(
-            err,
+        eprintln!("  decode rate  {}  {d}(excludes ttft){r}", rate(n - 1, decode));
+        eprintln!(
             "  inter-token  min {}  p50 {}  p95 {}  max {}",
             human(sorted[0]),
             human(percentile(&sorted, 0.50)),
@@ -505,15 +524,14 @@ fn main() -> std::process::ExitCode {
         // magnitude, and an average hides exactly that.
         let ratio = sorted[sorted.len() - 1] / sorted[0].max(1e-9);
         if ratio >= 2.0 {
-            let _ = writeln!(
-                err,
+            eprintln!(
                 "  {d}spread       {ratio:.1}x slowest/fastest — uneven decode, \
                  consistent with cache hits vs full expert reads{r}"
             );
         }
     }
     if !finish_reason.is_empty() {
-        let _ = writeln!(err, "  finish       {finish_reason}");
+        eprintln!("  finish       {finish_reason}");
     }
 
     if let Some(path) = &opts.json {
@@ -533,10 +551,10 @@ fn main() -> std::process::ExitCode {
             std::fs::write(path, b).map_err(|e| e.to_string())
         }) {
             Ok(()) => {
-                let _ = writeln!(err, "  timings      {path}");
+                eprintln!("  timings      {path}");
             }
             Err(e) => {
-                let _ = writeln!(err, "peregrine-gen: writing {path}: {e}");
+                eprintln!("peregrine-gen: writing {path}: {e}");
                 return std::process::ExitCode::FAILURE;
             }
         }

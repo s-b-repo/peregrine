@@ -29,11 +29,20 @@ to the CPU lane when telemetry shows the GPU is the bottleneck.
 **I/O lane.** `COLI_IO_RINGS` io_uring rings (default 4), each on its own
 thread. Rings atomically claim expert batches off a shared `AtomicUsize`
 cursor (`io_work.fetch_add` — lock-free work stealing) and issue a deep
-batched submit of up to `COLI_IO_BATCH` experts × 6 regions per expert
-(≈ 96 concurrent reads at the default 16). Contiguous regions are merged
-before submit (`read_many` / `read_experts_batched`). On each completion the
-lane stamps the task's slab and routes the now-ready expert to a compute lane
-— it never blocks on a CQE.
+batched submit of up to `COLI_IO_BATCH` experts × 2–6 regions per expert
+(regions coalesce when the expert's tensors are contiguous on disk). On the
+default **owned-completion lane** (`COLI_IO_COMPLETION`, uring engine only)
+the lane submits every region with Reactor-owned landing buffers, reaps
+completions incrementally, and forwards each expert to the CPU pool **the
+moment its last region lands** — expert 1 computes while experts 2..N are
+still on the wire, and the `POSIX_FADV_WILLNEED` hint for the *next* claim
+window rides spare SQ slots during the current one. Until 2026-08-10 this
+paragraph claimed the lane "never blocks on a CQE" while the code waited out
+the whole claim's wave before forwarding anything; the wave path
+(`read_experts_batched`) survives as the `COLI_IO_COMPLETION=0` escape hatch
+and as the request shape of the `pread`/`regbuf` measurement arms. Either
+way delivery order is free: the reduce keys on `pos`, so completion
+reordering is byte-safe by construction.
 
 **The claim size is an upper bound, not the claim.** The lane ceil-divides the
 layer's work across the rings:

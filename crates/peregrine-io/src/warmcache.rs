@@ -36,13 +36,53 @@ fn share_slab(s: ExpertSlab) -> ExpertSlab {
     s.map(|(w, sc)| (w.into_shared(), sc.into_shared()))
 }
 
-/// Compress each of a slab's six regions into a `SlotBytes::Compressed`
-/// variant. Returns `None` on a codec failure (the caller then stores the raw
-/// slab). The Compressed variant also carries `orig_lens` so decompression
-/// can pre-size and validate.
-fn encode_slab(s: &ExpertSlab) -> Option<(SlotBytes, usize)> {
-    // 6 regions in gate/up/down × (weight, scale) order — the layout the reader
-    // and the `pack_slab` builder both use, so the six-Vec array preserves it.
+/// Refcounted zstd frames for one expert slab: six regions in gate/up/down ×
+/// (weight, scale) order — the layout the reader and the `pack_slab` builder
+/// both use — plus each region's decoded length for pre-sizing and validation.
+///
+/// Refcounted so a cache hit can hand out an `Arc` clone under the mutex and
+/// the decode runs wherever the Arc travels (a CPU worker), instead of on the
+/// I/O lane while the cache lock is held — which used to serialize every I/O
+/// lane behind one zstd decode.
+#[derive(Clone)]
+pub struct CompressedSlab {
+    six: [Vec<u8>; 6],
+    orig_lens: [usize; 6],
+}
+
+impl CompressedSlab {
+    /// Decode into a byte-identical [`ExpertSlab`].
+    ///
+    /// Returns `None` when any region fails to decode or comes back the wrong
+    /// length. That must NOT be papered over with empty bytes: the consumer
+    /// feeds the slab straight into `QtWeight`, which reads it as an `[o, i]`
+    /// weight — a zero-length region then indexes out of bounds (an abort,
+    /// under `panic = "abort"`) or silently contributes garbage. The holder of
+    /// a failed decode reports it via [`WarmCache::remove_corrupt`] and
+    /// re-streams from disk — a miss is the correct degradation.
+    pub fn materialize(&self) -> Option<ExpertSlab> {
+        let decode = |i: usize| -> Option<Bytes> {
+            match zstd::stream::decode_all(&self.six[i][..]) {
+                Ok(v) if v.len() == self.orig_lens[i] => Some(Bytes::from(v)),
+                _ => None,
+            }
+        };
+        Some([
+            (decode(0)?, decode(1)?),
+            (decode(2)?, decode(3)?),
+            (decode(4)?, decode(5)?),
+        ])
+    }
+
+    /// Total compressed bytes — the resident footprint of this representation.
+    fn nbytes(&self) -> usize {
+        self.six.iter().map(|v| v.len()).sum()
+    }
+}
+
+/// Compress each of a slab's six regions. Returns `None` on a codec failure
+/// (the caller then stores the raw slab).
+fn encode_slab(s: &ExpertSlab) -> Option<CompressedSlab> {
     let mut six: [Vec<u8>; 6] = Default::default();
     let mut orig: [usize; 6] = [0; 6];
     let mut idx = 0usize;
@@ -56,47 +96,44 @@ fn encode_slab(s: &ExpertSlab) -> Option<(SlotBytes, usize)> {
         six[idx] = es;
         idx += 1;
     }
-    let compressed_bytes: usize = six.iter().map(|v| v.len()).sum();
-    Some((SlotBytes::Compressed { six, orig_lens: orig }, compressed_bytes))
-}
-
-/// Materialize an `ExpertSlab` from a stored `SlotBytes`. For `Raw` this clones
-/// six refcounts (the regions are shared). For `Compressed` it decodes each
-/// region into a fresh `Vec` and assembles the three (weight, scale) pairs.
-///
-/// Returns `None` when any region fails to decode or comes back the wrong
-/// length. That must NOT be papered over with empty bytes: the caller counts
-/// the lookup as a hit and feeds the slab straight into `QtWeight`, which reads
-/// it as an `[o, i]` weight — a zero-length region then indexes out of bounds
-/// (an abort, under `panic = "abort"`) or silently contributes garbage. A miss
-/// is the correct degradation: the expert is simply re-streamed from disk.
-fn materialize(sb: &SlotBytes) -> Option<ExpertSlab> {
-    match sb {
-        SlotBytes::Raw(s) => Some(s.clone()),
-        SlotBytes::Compressed { six, orig_lens } => {
-            let decode = |i: usize| -> Option<Bytes> {
-                match zstd::stream::decode_all(&six[i][..]) {
-                    Ok(v) if v.len() == orig_lens[i] => Some(Bytes::from(v)),
-                    _ => None,
-                }
-            };
-            Some([
-                (decode(0)?, decode(1)?),
-                (decode(2)?, decode(3)?),
-                (decode(4)?, decode(5)?),
-            ])
-        }
-    }
+    Some(CompressedSlab { six, orig_lens: orig })
 }
 
 /// A cached expert slab, held either verbatim or transparently zstd-compressed.
 /// `Compressed` shrinks resident footprint at the cost of one zstd decode per
 /// hit; the choice per slot is fixed at admission time by `COLI_CACHE_COMPRESS`.
 /// Callers never observe the difference — [`WarmCache::get`] materializes a
-/// byte-identical [`ExpertSlab`] either way.
+/// byte-identical [`ExpertSlab`] either way, and [`WarmCache::get_hit`] hands
+/// the refcounted frames out for the caller to materialize off the lock.
+/// `Raw` is boxed so the enum stays pointer-sized next to the `Arc` variant
+/// (an inline `ExpertSlab` is ~288 bytes of `Bytes` headers); slots are
+/// long-lived, so the one admission-time allocation is noise.
 enum SlotBytes {
-    Raw(ExpertSlab),
-    Compressed { six: [Vec<u8>; 6], orig_lens: [usize; 6] },
+    Raw(Box<ExpertSlab>),
+    Compressed(Arc<CompressedSlab>),
+}
+
+/// A warm-cache hit as handed to the streaming lane by [`WarmCache::get_hit`]:
+/// either the raw refcounted slab (ready to compute) or the refcounted
+/// compressed frames — decoded on a CPU worker, not on the I/O lane under the
+/// cache lock. Byte-identical to [`WarmCache::get`] either way.
+pub enum CacheHit {
+    /// Boxed for the same size-parity reason as `SlotBytes::Raw` — the box is
+    /// the clone [`WarmCache::get_hit`] hands out, not an extra copy.
+    Raw(Box<ExpertSlab>),
+    Compressed(Arc<CompressedSlab>),
+}
+
+/// A slab prepared for admission **off the lock**: shared (refcounted) regions,
+/// already encoded when compression is on, plus the footprint numbers
+/// [`WarmCache::insert_prepared`] books. Built by [`WarmCache::prepare_insert`]
+/// on a compute worker so the zstd encode never runs under the cache mutex.
+pub struct PreparedInsert {
+    data: SlotBytes,
+    /// resident footprint the eviction policy sees.
+    incoming: usize,
+    /// pre-encode footprint (compression-ratio accounting).
+    raw_bytes: usize,
 }
 
 struct Slot {
@@ -192,17 +229,25 @@ impl ResidencyHint {
     }
 
     fn bump(c: &AtomicU8) {
-        let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            (v < u8::MAX).then(|| v + 1)
-        });
+        // `Err` is not a failure here: the closure declining to store IS the
+        // saturation rule (stick at 255), so both arms leave the counter
+        // holding its intended value.
+        match c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| (v < u8::MAX).then(|| v + 1)) {
+            Ok(_) => {}
+            Err(saturated) => debug_assert_eq!(saturated, u8::MAX),
+        }
     }
 
     fn drop_one(c: &AtomicU8) {
         // 0 is defensive (an unpaired remove would otherwise wrap to 255);
-        // 255 is the sticky saturation described on the type.
-        let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        // 255 is the sticky saturation described on the type. As in `bump`,
+        // `Err` means the floor/ceiling rule held — the intended outcome.
+        match c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             (v != 0 && v != u8::MAX).then(|| v - 1)
-        });
+        }) {
+            Ok(_) => {}
+            Err(pinned) => debug_assert!(pinned == 0 || pinned == u8::MAX),
+        }
     }
 
     fn add(&self, key: (u32, u32)) {
@@ -433,14 +478,15 @@ impl WarmCache {
         let Some(key) = victim else { return 0 };
         let Some(slot) = self.map.get_mut(&key) else { return 0 };
         let SlotBytes::Raw(slab) = &slot.data else { return 0 };
-        let Some((compressed, new_bytes)) = encode_slab(slab) else { return 0 };
+        let Some(compressed) = encode_slab(slab) else { return 0 };
+        let new_bytes = compressed.nbytes();
         if new_bytes >= slot.bytes {
             return 0; // incompressible — leave raw (decode cost for no gain)
         }
         let saved = slot.bytes - new_bytes;
         self.used -= saved;
         slot.bytes = new_bytes;
-        slot.data = compressed;
+        slot.data = SlotBytes::Compressed(Arc::new(compressed));
         saved
     }
 
@@ -503,7 +549,34 @@ impl WarmCache {
     /// (possibly decompressed) [`ExpertSlab`] clone; on a miss returns `None`
     /// (the caller streams from disk, then [`Self::insert`]s). Returns owned
     /// because compressed slots materialize their bytes fresh per hit.
+    ///
+    /// This decodes **on the calling thread** — under whatever lock the caller
+    /// holds. The streaming lane uses [`Self::get_hit`] instead and decodes on
+    /// a CPU worker; this form remains for callers that want the slab in hand
+    /// (prefetch verify, tests, the sched oracle).
     pub fn get(&mut self, key: (u32, u32)) -> Option<ExpertSlab> {
+        match self.get_hit(key)? {
+            CacheHit::Raw(slab) => Some(*slab),
+            CacheHit::Compressed(frames) => match frames.materialize() {
+                Some(slab) => Some(slab),
+                None => {
+                    self.remove_corrupt(key);
+                    None
+                }
+            },
+        }
+    }
+
+    /// Look up an expert slab without decoding: a `Raw` hit clones six
+    /// refcounts, a `Compressed` hit clones one `Arc` — either way the lock
+    /// hold is O(1) in slab size, which is the whole point ([`CacheHit`]).
+    /// Recency/heat bookkeeping is identical to [`Self::get`].
+    ///
+    /// The hit is counted here, when the payload is handed out. A compressed
+    /// payload that later fails to decode is re-booked as a miss by
+    /// [`Self::remove_corrupt`]; the `prefetch_used` bump is not retracted on
+    /// that (rare, corruption-only) path.
+    pub fn get_hit(&mut self, key: (u32, u32)) -> Option<CacheHit> {
         self.clock += 1;
         // Filter fast-miss: skip the HashMap probe entirely on "definitely absent".
         if !self.hint.might_contain(key) {
@@ -512,48 +585,50 @@ impl WarmCache {
             return None;
         }
         let now = self.clock;
-        // One probe: bump recency and materialize from the same borrow.
-        let (slab, first_prefetch_hit) = match self.map.get_mut(&key) {
+        let (hit, first_prefetch_hit) = match self.map.get_mut(&key) {
             Some(slot) => {
                 slot.used = now;
                 // Frequency half of LFRU. Bumped unconditionally, not under the
                 // `lfru` gate: the counter costs one add on a path that is about
-                // to memcpy an expert slab, and gating it would make the knob's
-                // behavior depend on when it was switched on.
+                // to hand out an expert slab, and gating it would make the
+                // knob's behavior depend on when it was switched on.
                 slot.heat = slot.heat.saturating_add(1);
                 let first = slot.from_prefetch && !slot.ever_hit;
                 if first {
                     slot.ever_hit = true;
                 }
-                (materialize(&slot.data), first)
+                let hit = match &slot.data {
+                    SlotBytes::Raw(s) => CacheHit::Raw(s.clone()),
+                    SlotBytes::Compressed(c) => CacheHit::Compressed(Arc::clone(c)),
+                };
+                (hit, first)
             }
             None => {
                 self.misses += 1;
                 return None;
             }
         };
-        match slab {
-            Some(slab) => {
-                self.hits += 1;
-                self.maybe_decay_heat();
-                if first_prefetch_hit {
-                    self.prefetch_used += 1;
-                }
-                Some(slab)
-            }
-            None => {
-                // A resident slot whose payload will not decode is worse than no
-                // slot at all: drop it so the next lookup re-streams clean bytes,
-                // and count the lookup as the miss it effectively is.
-                crate::note_advisory_err("warm cache: undecodable slot dropped", &"zstd decode failed or wrong length");
-                self.decode_failures += 1;
-                if let Some(s) = self.map.remove(&key) {
-                    self.used = self.used.saturating_sub(s.bytes);
-                    self.hint.remove(key);
-                }
-                self.misses += 1;
-                None
-            }
+        self.hits += 1;
+        self.maybe_decay_heat();
+        if first_prefetch_hit {
+            self.prefetch_used += 1;
+        }
+        Some(hit)
+    }
+
+    /// A hit whose compressed payload would not decode, reported by whichever
+    /// thread tried ([`CompressedSlab::materialize`] → `None`). A resident slot
+    /// that cannot decode is worse than no slot at all: drop it so the next
+    /// lookup re-streams clean bytes, and re-book the optimistic hit
+    /// [`Self::get_hit`] counted as the miss it turned out to be.
+    pub fn remove_corrupt(&mut self, key: (u32, u32)) {
+        crate::note_advisory_err("warm cache: undecodable slot dropped", &"zstd decode failed or wrong length");
+        self.decode_failures += 1;
+        self.hits = self.hits.saturating_sub(1);
+        self.misses += 1;
+        if let Some(s) = self.map.remove(&key) {
+            self.used = self.used.saturating_sub(s.bytes);
+            self.hint.remove(key);
         }
     }
 
@@ -579,8 +654,8 @@ impl WarmCache {
     #[cfg(test)]
     fn corrupt_slot_for_test(&mut self, key: (u32, u32)) {
         if let Some(slot) = self.map.get_mut(&key) {
-            if let SlotBytes::Compressed { six, .. } = &mut slot.data {
-                six[0] = vec![0xFF; 8]; // not a valid zstd frame
+            if let SlotBytes::Compressed(c) = &mut slot.data {
+                Arc::make_mut(c).six[0] = vec![0xFF; 8]; // not a valid zstd frame
             }
         }
     }
@@ -687,45 +762,81 @@ impl WarmCache {
         self.insert_inner(key, data, true);
     }
 
-    fn insert_inner(&mut self, key: (u32, u32), data: ExpertSlab, from_prefetch: bool) {
-        // Sweep-mode admission control, and the eviction rule does not work without
-        // it. Evicting the highest layer does not stop a high layer being
-        // *admitted*: the newcomer is exempt from its own admission's eviction
-        // (`keep`), so it displaces a band member and is then evicted by the next
-        // insert — the band pays a slot for a slab nobody will read. Measured, that
-        // is most of the band gone before a pass ends, and why victim order alone
-        // moved the hit count from 0 to only 71.
-        //
-        // Refusing an admission from above the resident band is what keeps the band
-        // still. Correctness-neutral: a slab that is not cached is re-read from
-        // disk, which is exactly what a miss already does.
-        //
-        // Only once full — while there is room, admitting in sweep order *is* how
-        // the band gets built, from layer 0 upward.
-        if self.sweep
+    /// Whether new admissions encode (the `COLI_CACHE_COMPRESS` choice, fixed
+    /// at construction). Read it once outside the lock and feed it to
+    /// [`Self::prepare_insert`].
+    pub fn compress_on_admit(&self) -> bool {
+        self.compress_on_admit
+    }
+
+    /// The lock-free half of an admission: share the slab (every later hit is a
+    /// refcount bump instead of a full copy) and, when `compress` is set, run
+    /// the zstd encode. An encode failure degrades to storing raw, exactly as
+    /// [`Self::insert`] always has (correctness-neutral). An associated
+    /// function on purpose — it must be callable without the cache lock.
+    pub fn prepare_insert(data: ExpertSlab, compress: bool) -> PreparedInsert {
+        let data = share_slab(data);
+        let raw_bytes = slab_bytes(&data);
+        // `incoming` counts the resident footprint the eviction policy sees.
+        let (slot_data, incoming) = if compress {
+            match encode_slab(&data) {
+                Some(cs) => {
+                    let n = cs.nbytes();
+                    (SlotBytes::Compressed(Arc::new(cs)), n)
+                }
+                None => (SlotBytes::Raw(Box::new(data)), raw_bytes),
+            }
+        } else {
+            (SlotBytes::Raw(Box::new(data)), raw_bytes)
+        };
+        PreparedInsert { data: slot_data, incoming, raw_bytes }
+    }
+
+    /// The locked half of an admission prepared by [`Self::prepare_insert`]:
+    /// map insert + eviction only — no codec work runs under the caller's lock.
+    pub fn insert_prepared(&mut self, key: (u32, u32), prepared: PreparedInsert) {
+        self.insert_slot(key, prepared, false);
+    }
+
+    /// Sweep-mode admission control, and the eviction rule does not work without
+    /// it. Evicting the highest layer does not stop a high layer being
+    /// *admitted*: the newcomer is exempt from its own admission's eviction
+    /// (`keep`), so it displaces a band member and is then evicted by the next
+    /// insert — the band pays a slot for a slab nobody will read. Measured, that
+    /// is most of the band gone before a pass ends, and why victim order alone
+    /// moved the hit count from 0 to only 71.
+    ///
+    /// Refusing an admission from above the resident band is what keeps the band
+    /// still. Correctness-neutral: a slab that is not cached is re-read from
+    /// disk, which is exactly what a miss already does.
+    ///
+    /// Only once full — while there is room, admitting in sweep order *is* how
+    /// the band gets built, from layer 0 upward.
+    fn admission_refused(&self, key: (u32, u32)) -> bool {
+        self.sweep
             && self.used >= self.budget
             && !self.map.contains_key(&key)
             && self.map.keys().map(|k| k.0).max().is_some_and(|top| key.0 > top)
-        {
+    }
+
+    fn insert_inner(&mut self, key: (u32, u32), data: ExpertSlab, from_prefetch: bool) {
+        // Check the gate before paying for share + encode (the worker-side
+        // `prepare_insert` path pays it before its gate — inherent to encoding
+        // off the lock, and sweep mode is the only case that wastes it).
+        if self.admission_refused(key) {
+            return;
+        }
+        let prepared = Self::prepare_insert(data, self.compress_on_admit);
+        self.insert_slot(key, prepared, from_prefetch);
+    }
+
+    fn insert_slot(&mut self, key: (u32, u32), prepared: PreparedInsert, from_prefetch: bool) {
+        if self.admission_refused(key) {
             return;
         }
         self.clock += 1;
         let now = self.clock;
-        // Share once on admission: every later hit is a refcount bump instead of
-        // a full copy of the slab while the cache lock is held.
-        let data = share_slab(data);
-        let raw_bytes = slab_bytes(&data);
-        // Encode the payload into whichever SlotBytes representation is active.
-        // `incoming` counts the resident footprint the eviction policy sees.
-        // Codec failure silently degrades to `Raw` (correctness-neutral).
-        let (slot_data, incoming) = if self.compress_on_admit {
-            match encode_slab(&data) {
-                Some((sb, compressed_bytes)) => (sb, compressed_bytes),
-                None => (SlotBytes::Raw(data), raw_bytes),
-            }
-        } else {
-            (SlotBytes::Raw(data), raw_bytes)
-        };
+        let PreparedInsert { data: slot_data, incoming, raw_bytes } = prepared;
         self.uncompressed_bytes_seen = self.uncompressed_bytes_seen.saturating_add(raw_bytes as u64);
         self.compressed_bytes_seen = self.compressed_bytes_seen.saturating_add(incoming as u64);
         let was_new;
@@ -1011,6 +1122,56 @@ mod tests {
         // The cache stays usable afterwards.
         c.insert((0, 9), patterned_slab(4096, 128));
         assert!(c.get((0, 9)).is_some());
+    }
+
+    #[test]
+    fn get_hit_materialize_equals_get() -> Result<(), &'static str> {
+        // The two-phase hit (refcounted hand-out under the lock, decode on the
+        // consumer) must be byte-identical to the one-shot get(), for raw and
+        // compressed slots alike.
+        for compress in [false, true] {
+            let mut c = WarmCache::new(1 << 20).with_compression(compress);
+            c.insert((1, 2), patterned_slab(4096, 128));
+            let via_hit = match c.get_hit((1, 2)).ok_or("get_hit must hit")? {
+                CacheHit::Raw(s) => {
+                    assert!(!compress, "raw hit only when compression is off");
+                    *s
+                }
+                CacheHit::Compressed(frames) => {
+                    assert!(compress, "compressed hit only when compression is on");
+                    frames.materialize().ok_or("healthy frames must decode")?
+                }
+            };
+            let via_get = c.get((1, 2)).ok_or("get must hit")?;
+            for i in 0..3 {
+                assert_eq!(&via_hit[i].0[..], &via_get[i].0[..], "compress={compress} region {i} weight");
+                assert_eq!(&via_hit[i].1[..], &via_get[i].1[..], "compress={compress} region {i} scale");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remove_corrupt_counts_decode_failure() -> Result<(), &'static str> {
+        // The worker-side decode-failure path: get_hit hands out frames, the
+        // decode fails on the consumer, remove_corrupt re-books the optimistic
+        // hit as a miss and drops the slot so the next lookup re-streams.
+        let mut c = WarmCache::new(1 << 20).with_compression(true);
+        c.insert((3, 4), patterned_slab(4096, 128));
+        c.corrupt_slot_for_test((3, 4));
+        let hits_before = c.hits;
+        let misses_before = c.misses;
+        let frames = match c.get_hit((3, 4)).ok_or("expected a hit")? {
+            CacheHit::Compressed(f) => f,
+            CacheHit::Raw(_) => return Err("expected a compressed hit"),
+        };
+        assert!(frames.materialize().is_none(), "corrupted frames must fail decode");
+        c.remove_corrupt((3, 4));
+        assert_eq!(c.hits, hits_before, "the optimistic hit is retracted");
+        assert_eq!(c.misses, misses_before + 1, "re-booked as a miss");
+        assert_eq!(c.decode_failures(), 1);
+        assert!(!c.contains((3, 4)), "poisoned slot dropped, so the retry re-streams");
+        Ok(())
     }
 
     #[test]
