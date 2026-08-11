@@ -2166,11 +2166,23 @@ impl Model {
         let kv = (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, kv_dtype())).collect();
         // The concurrent MoE lane needs its own ring, set up once, so a layer's
         // experts stream while the CPU pool computes. Only in streaming mode.
+        // `new_streaming` honours the `COLI_SQPOLL` opt-in; other Reactors in
+        // the process (prefetch lanes, the SafeTensors loader) keep plain rings
+        // — each SQPOLL ring costs a polling kthread, worth it only on the
+        // per-token critical path, and only when measured to win.
         let io_reactors: Vec<Mutex<Reactor>> = if stream_experts {
             let n = io_rings();
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
-                v.push(Mutex::new(Reactor::new(256).ctx(|| "concurrent MoE io_uring reactor init".to_string())?));
+                let mut r =
+                    Reactor::new_streaming(256).ctx(|| "concurrent MoE io_uring reactor init".to_string())?;
+                // Fixed-file registration: reads whose fd is registered skip the
+                // per-op fd table lookup/refcount — the same shard fds are read
+                // every token. Non-fatal: on failure reads use the plain-fd path.
+                if let Err(e) = r.register_files(&st.shard_fds()) {
+                    peregrine_io::note_advisory_err("register shard fds with io_uring (plain-fd reads)", &e);
+                }
+                v.push(Mutex::new(r));
             }
             v
         } else {
@@ -3172,6 +3184,10 @@ impl Model {
         // entirely from the warm cache: leaving them to accumulate attributed a
         // whole quiet period's rejections to whichever later forward happened to
         // do I/O, which read as a spike and halved the worker cap.
+        // Under `COLI_SQPOLL` the poll kthread drains the SQ continuously, so
+        // this delta reads near-zero and the halving trigger goes quiet — the
+        // read-µs EWMA is then the tuner's live signal. The io-wq caps the tuner
+        // sets still bind: cold reads punt to io-wq under SQPOLL all the same.
         let sq_full_delta: u64 = self.io_reactors.iter().map(|r| r.lock().take_sq_full()).sum();
         if sample.io_us > 0 || sq_full_delta > 0 {
             self.io_tuner.note_read(sample.io_us, sq_full_delta);

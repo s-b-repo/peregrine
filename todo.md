@@ -433,7 +433,7 @@ system libraries is what produced the inconclusive result above.
 These aren't roadmap line-items but represent the substantial completed groundwork:
 
 - [x] **Real custom CUDA backend** — fused quantized matmuls, Tensor Core WMMA (W4A16/INT4), SwiGLU, attention+RoPE `cuda/backend_cuda.cu`
-- [x] **io_uring with registered files** (`IOSQE_FIXED_FILE`) `ring.rs:55-105`
+- [x] **io_uring with registered files** (`IOSQE_FIXED_FILE`) `ring.rs` — wired in production 2026-08-10: the streaming rings register every shard fd at model load (`model.rs`, `SafeTensors::shard_fds`); previously implemented + tested but caller-less
 - [x] **Genuine 3-lane concurrency** — I/O ∥ CPU ∥ GPU within a single MoE layer, deterministic merge `concurrent.rs:267-521`
 - [x] **Continuous batching** — chunked prefill interleaved with decode `batch.rs:82-189`
 - [x] **Bit-identical fork-join thread pool** `peregrine-par/lib.rs:83-278`

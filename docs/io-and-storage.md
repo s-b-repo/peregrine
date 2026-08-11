@@ -13,8 +13,31 @@ A **custom single-owner reactor thread** built directly on the `io-uring`
 crate — deliberately not `tokio-uring`, whose per-op Future model fights the
 batched-submit / io-wq-worker-cap ownership the design needs.
 
-- **Registered files** (`IOSQE_FIXED_FILE`) plus `SINGLE_ISSUER` and
-  `COOP_TASKRUN` ring flags.
+- **Registered files** (`IOSQE_FIXED_FILE`): the streaming rings register
+  every shard fd (buffered + O_DIRECT twins, `SafeTensors::shard_fds`) right
+  after construction, so read SQEs name a fixed-file slot instead of
+  re-resolving the fd each time. Rings run `COOP_TASKRUN`; **not**
+  `SINGLE_ISSUER` — the scheduler's lane threads are respawned per layer, and
+  a single-issuer ring would reject the new task with `EEXIST`.
+- **Owned-completion lane** (`COLI_IO_COMPLETION`, default on): the demand
+  path submits each claimed expert's regions with Reactor-owned landing
+  buffers and reaps completions incrementally, forwarding every expert to the
+  CPU pool the moment its last region lands — no whole-wave barrier, so
+  compute on expert 1 overlaps the reads of experts 2..N. Bytes are
+  byte-identical to the wave path (same regions, same carve); only delivery
+  timing changes, which the `pos`-keyed reduce absorbs by construction.
+  `COLI_IO_COMPLETION=0` restores the blocking wave;
+  `COLI_IO_ENGINE=pread|regbuf` also implies the wave (those measurement arms
+  are wave-shaped on purpose).
+- **SQPOLL** (`COLI_SQPOLL=1`, default off): a kernel submission-polling
+  thread that removes even the one enter syscall per submit batch
+  (unprivileged since kernel 5.13). Opt-in because the poll kthread
+  busy-polls a core until `COLI_SQPOLL_IDLE_MS` (default 2000) of quiet —
+  usually the wrong trade on a CPU-contended box; the bench arm decides.
+  `COLI_SQPOLL_CPU` pins the kthread. Streaming rings only, with graceful
+  fallback to the plain `COOP_TASKRUN` ring if the kernel refuses. Under
+  SQPOLL the tuner's `sq_full` signal reads near-zero (the kthread drains
+  the SQ continuously); the read-µs EWMA remains the live signal.
 - **Registered buffers**: `register_read_buffers()` + `IORING_OP_READ_FIXED`
   are implemented and tested, but **not reachable from the streaming path** —
   nothing calls them outside tests, and `COLI_REGBUF` is read by no code.
@@ -37,8 +60,11 @@ batched-submit / io-wq-worker-cap ownership the design needs.
   describing an optimization no code performed; the merging now happens a level
   up, where the expert's extents are known.
 - **fadvise integration**: `POSIX_FADV_WILLNEED` batched before main-path
-  reads (`COLI_FADVISE_MAIN`, default on); optional `POSIX_FADV_DONTNEED`
-  after each streamed read for RSS-bounded runs (`COLI_FADVISE_DROP`).
+  reads (`COLI_FADVISE_MAIN`, default on) — on the completion lane the hint
+  covers the **next** claim window, issued on spare SQ slots while the current
+  window streams (reads always outrank hints for slots); optional
+  `POSIX_FADV_DONTNEED` after each streamed read for RSS-bounded runs
+  (`COLI_FADVISE_DROP`).
 - **Adaptive io-wq cap**: the [`IoTuner`](adaptive-runtime.md#iotuner)
   adjusts `iowq_max_workers` between forwards from an EWMA + SQ-full deltas
   (`COLI_IO_TUNE`, default on).

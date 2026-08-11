@@ -104,13 +104,17 @@ Error: ... 6.8 GB short, so the kernel would OOM-kill this run part-way through 
 | `COLI_IO_RINGS` | 4 | io_uring rings, each on its own thread — [note](#coli_io_rings) |
 | `COLI_IO_BATCH` | 16 | **upper bound** on experts claimed per ring — [note](#coli_io_batch) |
 | `COLI_IO_ENGINE` | `uring` | `uring` \| `pread` \| `regbuf` — [note](#coli_io_engine) |
+| `COLI_IO_COMPLETION` | on | forward each expert as its own reads complete (uring only); `0` restores the blocking whole-wave submit — [note](#coli_io_completion) |
+| `COLI_SQPOLL` | off | kernel submission-polling thread on the streaming rings: no enter syscall per submit — [note](#coli_sqpoll) |
+| `COLI_SQPOLL_IDLE_MS` | 2000 | how long the SQPOLL kthread busy-polls before sleeping (the next submit wakes it transparently) |
+| `COLI_SQPOLL_CPU` | unset | pin the SQPOLL kthread to this CPU |
 | `COLI_IO_SPLIT_MB` | 0 (off) | split streamed regions larger than this into sub-reads of the same buffer, raising a ring's submit depth (~4 → ~10 at decode) without touching claim sizing; on LUKS each in-flight read is an independent dm-crypt unit. Byte-identical; unmeasured — the M3 A/B decides its default |
 | `COLI_IO_THREADS` | workers | worker threads for `COLI_IO_ENGINE=pread`; 8 is colibrì's harness figure |
 | `COLI_REGBUF` | off | alias for `COLI_IO_ENGINE=regbuf` — [note](#coli_regbuf) |
 | `COLI_REGBUF_SLOTS` | 16 | registered buffers = queue depth for `regbuf` — [note](#coli_regbuf) |
 | `COLI_IO_DEPTH` | 256 | ring depth for `COLI_MOE_ENGINE=sched` (`peregrine-serve/src/main.rs`) |
 | `COLI_DIRECT` | off | O_DIRECT lane: DMA into aligned buffers, bypassing the page cache. **Measured −23 %** — see [note](#coli_io_engine) |
-| `COLI_FORCE_ASYNC` | on | force `IOSQE_ASYNC` on buffered reads — [note](#coli_force_async) |
+| `COLI_FORCE_ASYNC` | on (off under SQPOLL) | force `IOSQE_ASYNC` on buffered reads — [note](#coli_force_async) |
 | `COLI_EXPERT_MERGE` | on | coalesce an expert's adjacent regions: two reads instead of six. `0` forces the six-region path; bit-identical either way |
 | `COLI_FADVISE_MAIN` | on | `POSIX_FADV_WILLNEED` batched before every main-path read |
 | `COLI_FADVISE_DROP` | off | `POSIX_FADV_DONTNEED` after each streamed read (RSS-bounded runs) |
@@ -180,7 +184,39 @@ Default on because an inline cold read serialises the submitter. **Measured
 reads, 0.87 vs 0.85 at the engine's own 96-deep submit, against 14–27 % spread.
 Leave it on. The premise is that a *fast* device flips the answer, and the drive it
 was measured against delivers 1.1 GB/s — so this is evidence about the knob **here**,
-not about the knob.
+not about the knob. Under `COLI_SQPOLL=1` the default flips to **off**: the poll
+kthread already issues ops nonblocking and hands cold reads to io-wq itself, so
+`IOSQE_ASYNC` would only force a pointless io-wq bounce on page-cache-warm reads.
+An explicit `COLI_FORCE_ASYNC=1`/`0` still wins either way.
+
+### `COLI_IO_COMPLETION`
+
+Default on. The I/O lane submits every claimed expert's regions with
+Reactor-owned landing buffers and forwards each expert to the CPU pool the
+moment its **last region** lands, instead of waiting for the whole claim's
+wave — compute on expert 1 overlaps the reads of experts 2..N, and warm-cache
+admission (including the zstd encode) moves off the I/O lane onto the worker.
+Byte-identical to the wave by construction: same regions, same carve, and the
+reduce keys on `pos`, never arrival order. `0` restores the blocking wave
+path. `COLI_IO_ENGINE=pread|regbuf` also implies the wave — those measurement
+arms are wave-shaped on purpose, and reshaping their requests would change
+what they measure.
+
+### `COLI_SQPOLL`
+
+Default off. Opt-in `IORING_SETUP_SQPOLL` on the **streaming rings only**
+(prefetch/loader rings keep the plain setup): a kernel thread polls the
+submission queue, so a submit is a shared-memory write with **no syscall** —
+on top of the completion lane this removes the last per-wave enter. The
+kthread busy-polls a full core until `COLI_SQPOLL_IDLE_MS` (default 2000) of
+quiet, which is usually the wrong trade on a CPU-contended box — hence
+default off; the `sqpoll-on`/`sqpoll-off` bench arms decide. Unprivileged
+since kernel 5.13; on any setup failure the reactor falls back to the plain
+`COOP_TASKRUN` ring with an advisory note. `COLI_SQPOLL_CPU` pins the
+kthread. Under SQPOLL, `IOSQE_ASYNC` defaults off (the kthread already issues
+ops nonblocking and punts cold reads to io-wq itself) and the io-wq tuner's
+`sq_full` trigger goes quiet (the kthread drains the SQ continuously) — its
+read-µs EWMA remains live.
 
 ### `COLI_MOE_ENGINE`
 
