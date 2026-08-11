@@ -1,0 +1,2 @@
+  batch   steps   tokens    seconds     agg tok/s   tok/s   per-seq tok/s
+      1       2        2      38.15         0.052      0.052          0.0524

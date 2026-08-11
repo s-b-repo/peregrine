@@ -29,11 +29,45 @@ to the CPU lane when telemetry shows the GPU is the bottleneck.
 **I/O lane.** `COLI_IO_RINGS` io_uring rings (default 4), each on its own
 thread. Rings atomically claim expert batches off a shared `AtomicUsize`
 cursor (`io_work.fetch_add` — lock-free work stealing) and issue a deep
-batched submit: `COLI_IO_BATCH` experts in flight (default 16) × 6 regions
-per expert ≈ 96 concurrent reads. Contiguous regions are merged before
-submit (`read_many` / `read_experts_batched`). On each completion the lane
-stamps the task's slab and routes the now-ready expert to a compute lane —
-it never blocks on a CQE.
+batched submit of up to `COLI_IO_BATCH` experts × 2–6 regions per expert
+(regions coalesce when the expert's tensors are contiguous on disk). On the
+default **owned-completion lane** (`COLI_IO_COMPLETION`, uring engine only)
+the lane submits every region with Reactor-owned landing buffers, reaps
+completions incrementally, and forwards each expert to the CPU pool **the
+moment its last region lands** — expert 1 computes while experts 2..N are
+still on the wire, and the `POSIX_FADV_WILLNEED` hint for the *next* claim
+window rides spare SQ slots during the current one. Until 2026-08-10 this
+paragraph claimed the lane "never blocks on a CQE" while the code waited out
+the whole claim's wave before forwarding anything; the wave path
+(`read_experts_batched`) survives as the `COLI_IO_COMPLETION=0` escape hatch
+and as the request shape of the `pread`/`regbuf` measurement arms. Either
+way delivery order is free: the reduce keys on `pos`, so completion
+reordering is byte-safe by construction.
+
+**The claim size is an upper bound, not the claim.** The lane ceil-divides the
+layer's work across the rings:
+
+```rust
+let batch = experts_per_batch().min(n_plans.div_ceil(n_rings)).max(1);
+```
+
+This matters because the two phases have very different work lists. A prefill
+chunk's per-layer routed union is ~69 experts, so it claims the full 16. A
+**decode** token routes only **8 experts per layer** — fewer than one claim.
+With a fixed batch of 16, ring 0's `fetch_add(16)` returned start 0 and took
+all 8, while rings 1–3 got starts 16/32/48, every one `>= n_plans`, and broke
+out **without issuing a single read**. One ring did four rings' work on every
+sparse layer of every decode token: measured at **24 % io duty across 4 rings**,
+and ~0.6 GB/s where the same device gives 1.12 GB/s at 4 rings under `iobench`.
+
+Ceil-dividing gives decode `ceil(8/4) = 2` so all four rings run, and leaves
+prefill at its full 16. Measured effect at defaults: decode **21.83 → 16.08
+s/tok**, io duty **24 % → 84 %**
+([`bench-data/2026-08-09-decode-levers/`](../bench-data/2026-08-09-decode-levers/README.md)).
+The lesson generalises: **any fixed claim size larger than the work list
+serialises a work-stealing loop onto one worker**, silently, and the
+thread-summed lane counters cannot see it — see
+[Measurement discipline](measurement.md).
 
 **CPU lane.** A worker pool computes each streamed expert's SwiGLU as bytes
 land: fused gate+up → silu·up → down → weighted scatter. A streamed expert's

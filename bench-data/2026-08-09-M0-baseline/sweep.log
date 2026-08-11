@@ -1,0 +1,25 @@
+== batch sweep: B=[16 32] max_tokens=32 repeats=3 memmax=34G
+== model=/home/cortix/models/GLM-5.2-colibri-int4-with-int8-mtp
+== host: Linux 7.1.6-arch1-1 | 12 cpus | 46G ram, 23G avail
+== git: 74e06c5
+== env: 
+-- reference transcripts (temperature 0, 16 tokens, quiet server)
+  loaded in ~14s
+  ref 1 done
+  ref 2 done
+  ref 3 done
+-- rep 1 B=16
+  loaded in ~16s
+[b16-rep1] 0 tok in 3600.246s = 0.0 tok/s (streams ok 0/16, ttft med Nones)
+  arm failed (B=16 rep=1)
+-- rep 1 B=32
+  loaded in ~16s
+== batch sweep: B=[16] max_tokens=32 repeats=3 memmax=34G
+== model=/home/cortix/models/GLM-5.2-colibri-int4-with-int8-mtp
+== host: Linux 7.1.6-arch1-1 | 12 cpus | 46G ram, 26G avail
+== git: 27b2a0c
+== env: 
+-- rep 1 B=16
+  page cache dropped
+  loaded in ~16s
+[b16-rep1] 0 tok in 5866.307s = 0.0 tok/s (streams ok 0/16, ttft med Nones)

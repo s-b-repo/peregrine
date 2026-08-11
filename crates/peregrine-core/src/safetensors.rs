@@ -65,6 +65,41 @@ impl SafeTensors {
     /// Read exactly `buf.len()` bytes at `off` from shard `file_idx` through the
     /// io_uring reactor. The single choke point for every disk read here.
     fn read_at(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> Result<(), Error> {
+        // O_DIRECT trunk load (`COLI_DIRECT_LOAD=1`), when this shard has a
+        // working direct fd.
+        //
+        // This is the consumer `region_direct`'s doc has named since it was
+        // written — "the block alignment O_DIRECT requires is applied by the
+        // reader (`Reactor::read_direct_many`)" — while `read_direct_many` had
+        // no caller outside its own test. The streaming lane uses the *other*
+        // direct entry point (`read_direct_aligned`, which returns owned aligned
+        // buffers); this one copies into a caller's buffer, which is exactly the
+        // shape a loader reading into `out` needs, and is why the two exist.
+        //
+        // Worth having because the trunk is read **once**. Every byte of it that
+        // lands in the page cache afterwards is a byte the warm expert cache
+        // cannot use, on a box where that cache is the thing under pressure —
+        // which is the problem `COLI_FADVISE_DROP` attacks after the fact and
+        // O_DIRECT avoids entirely. Off by default: it is the model-load path,
+        // and a fallback that silently produced different bytes would be the
+        // worst possible failure, so the gate is explicit and the fallback is a
+        // plain retry on the buffered fd.
+        if direct_load_enabled() {
+            if let Some(dfd) = self.direct_files.get(file_idx).and_then(|f| f.as_ref()) {
+                let mut req = [peregrine_io::ReadReq { fd: dfd.as_raw_fd(), offset: off, buf, tag: 0 }];
+                let outcome = self.reactor.lock().read_direct_many(&mut req);
+                match outcome {
+                    Ok(res) if res.first().copied().unwrap_or(-1) >= 0 => return Ok(()),
+                    // Any direct failure falls through to the buffered path
+                    // below, which reads the same bytes from the same offsets.
+                    Ok(_) => peregrine_io::note_advisory_err(
+                        "O_DIRECT trunk read returned an error code (using buffered)",
+                        &"short or failed direct read",
+                    ),
+                    Err(e) => peregrine_io::note_advisory_err("O_DIRECT trunk read (using buffered)", &e),
+                }
+            }
+        }
         let fd = self.files[file_idx].as_raw_fd();
         // parking_lot mutex does not poison, so the lock never fails
         self.reactor
@@ -74,19 +109,81 @@ impl SafeTensors {
     }
 }
 
+/// Whether the trunk load reads through O_DIRECT (`COLI_DIRECT_LOAD=1`).
+///
+/// Separate from `COLI_DIRECT`, which selects the *streaming expert* lane. They
+/// are different reads with different economics: experts are re-read constantly
+/// and want the page cache bypassed to stop evicting the warm cache; the trunk
+/// is read once at load and wants the same thing for a different reason. Fusing
+/// them under one variable would make it impossible to A/B either.
+fn direct_load_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("COLI_DIRECT_LOAD").as_deref(), Ok("1") | Ok("true")))
+}
+
 impl SafeTensors {
-    /// Index every `model*.safetensors` shard in `dir` (sorted by name, matching
-    /// the C engine's ordering so fused-expert offsets line up across shards).
+    /// Index every `model*.safetensors` shard in `dir` — plus, when the dir
+    /// carries a `model_paths.json` (`{"paths": ["/mnt/fast/model-part", ...]}`),
+    /// every shard in each listed directory. This is how a model split across
+    /// several drives is served without a symlink farm: the primary dir holds
+    /// the sidecars and the paths file, each drive holds its own folder of
+    /// shards, and relative entries resolve against the primary dir.
+    ///
+    /// Shards sort by **file name**, not full path (matching the C engine's
+    /// ordering so fused-expert offsets line up across shards — and so the
+    /// order is independent of which drive a shard lives on). A file name
+    /// appearing in two directories is a hard error: silently preferring one
+    /// copy would make the load depend on listing order.
     pub fn open(dir: &Path) -> Result<SafeTensors, Error> {
-        let mut shard_paths: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(dir).ctx(|| dir.display().to_string())? {
-            // a failed directory entry is surfaced, not silently dropped
-            let path = entry.ctx(|| dir.display().to_string())?.path();
-            if path.extension().is_some_and(|x| x == "safetensors") {
-                shard_paths.push(path);
+        let mut roots: Vec<PathBuf> = vec![dir.to_path_buf()];
+        let paths_file = dir.join("model_paths.json");
+        if paths_file.exists() {
+            let bytes = std::fs::read(&paths_file).ctx(|| paths_file.display().to_string())?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Format(format!("{}: {e}", paths_file.display())))?;
+            let arr = v.get("paths").and_then(|p| p.as_array()).ok_or_else(|| {
+                Error::Format(format!(
+                    "{}: expected {{\"paths\": [\"/dir\", ...]}}",
+                    paths_file.display()
+                ))
+            })?;
+            for p in arr {
+                let s = p.as_str().ok_or_else(|| {
+                    Error::Format(format!("{}: non-string entry in paths", paths_file.display()))
+                })?;
+                let extra = if Path::new(s).is_absolute() { PathBuf::from(s) } else { dir.join(s) };
+                if !extra.is_dir() {
+                    return Err(Error::Format(format!(
+                        "{}: {} is not a directory (drive not mounted?)",
+                        paths_file.display(),
+                        extra.display()
+                    )));
+                }
+                roots.push(extra);
             }
         }
-        shard_paths.sort();
+        let mut shard_paths: Vec<PathBuf> = Vec::new();
+        for root in &roots {
+            for entry in std::fs::read_dir(root).ctx(|| root.display().to_string())? {
+                // a failed directory entry is surfaced, not silently dropped
+                let path = entry.ctx(|| root.display().to_string())?.path();
+                if path.extension().is_some_and(|x| x == "safetensors") {
+                    shard_paths.push(path);
+                }
+            }
+        }
+        shard_paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        for w in shard_paths.windows(2) {
+            if w[0].file_name() == w[1].file_name() {
+                return Err(Error::Format(format!(
+                    "the same shard exists in two model directories ({} and {}) — \
+                     refusing to guess which copy to serve",
+                    w[0].display(),
+                    w[1].display()
+                )));
+            }
+        }
         if shard_paths.is_empty() {
             return Err(Error::Format(format!("no .safetensors shards in {}", dir.display())));
         }
@@ -299,6 +396,20 @@ impl SafeTensors {
     /// Whether any shard opened a working O_DIRECT fd (so the direct path is usable).
     pub fn has_any_direct(&self) -> bool {
         self.direct_files.iter().any(Option::is_some)
+    }
+
+    /// Every shard fd a streaming read can name: the buffered fd per shard plus
+    /// its O_DIRECT twin where one exists — the exact set behind
+    /// [`Self::region`] / [`Self::region_direct`]. For io_uring fixed-file
+    /// registration (`IOSQE_FIXED_FILE` skips the per-op fd lookup/refcount on
+    /// reads issued every token). The fds stay valid as long as this
+    /// `SafeTensors` is alive.
+    pub fn shard_fds(&self) -> Vec<RawFd> {
+        self.files
+            .iter()
+            .map(|f| f.as_raw_fd())
+            .chain(self.direct_files.iter().flatten().map(|f| f.as_raw_fd()))
+            .collect()
     }
 
     /// The compression scheme applied to `name` (`Compression::None` for
@@ -541,6 +652,12 @@ pub(crate) mod test_support {
 
     /// Write a single-shard `model.safetensors` into `dir`.
     pub fn write_safetensors(dir: &Path, blobs: &[Blob]) -> Result<(), crate::Error> {
+        write_safetensors_named(dir, "model.safetensors", blobs)
+    }
+
+    /// Same, but with a caller-chosen file name — the multi-directory tests
+    /// need distinct shard names spread across several dirs.
+    pub fn write_safetensors_named(dir: &Path, file: &str, blobs: &[Blob]) -> Result<(), crate::Error> {
         let mut header = serde_json::Map::new();
         let mut cursor: i64 = 0;
         let mut data: Vec<u8> = Vec::new();
@@ -560,7 +677,7 @@ pub(crate) mod test_support {
         out.extend_from_slice(&hdr);
         out.extend_from_slice(&data);
         std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join("model.safetensors"), out)?;
+        std::fs::write(dir.join(file), out)?;
         Ok(())
     }
 
@@ -620,6 +737,54 @@ mod tests {
         assert!(st.read_f32("w.qs", &mut junk).is_err());
 
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn model_paths_json_merges_directories_bit_identically() -> Result<(), Error> {
+        // The same two shards, once in a single dir and once split across a
+        // primary + a second dir listed in model_paths.json, must load with
+        // identical tensor sets and identical bytes — and a shard name present
+        // in two directories must be refused, not silently resolved.
+        let both = tmpdir("mp_both");
+        let prim = tmpdir("mp_prim");
+        let sec = tmpdir("mp_sec");
+        let a = || Blob { name: "alpha", dtype: "F32", shape: vec![3], bytes: f32_bytes(&[1.0, -2.0, 3.5]) };
+        let b = || Blob { name: "beta.qs", dtype: "U8", shape: vec![4], bytes: vec![9, 8, 7, 6] };
+        write_safetensors_named(&both, "out-00000.safetensors", &[a()])?;
+        write_safetensors_named(&both, "out-00001.safetensors", &[b()])?;
+        write_safetensors_named(&prim, "out-00000.safetensors", &[a()])?;
+        write_safetensors_named(&sec, "out-00001.safetensors", &[b()])?;
+        std::fs::write(
+            prim.join("model_paths.json"),
+            format!(r#"{{"paths": ["{}"]}}"#, sec.display()),
+        )?;
+
+        let st1 = SafeTensors::open(&both)?;
+        let st2 = SafeTensors::open(&prim)?;
+        assert_eq!(st1.len(), st2.len());
+        for st in [&st1, &st2] {
+            assert!(st.has("alpha") && st.has("beta.qs"));
+        }
+        let (mut f1, mut f2) = ([0f32; 3], [0f32; 3]);
+        st1.read_f32("alpha", &mut f1)?;
+        st2.read_f32("alpha", &mut f2)?;
+        assert_eq!(f1, f2);
+        let (mut r1, mut r2) = ([0u8; 4], [0u8; 4]);
+        st1.read_raw("beta.qs", &mut r1)?;
+        st2.read_raw("beta.qs", &mut r2)?;
+        assert_eq!(r1, r2);
+
+        // duplicate shard name across dirs → hard error naming both homes
+        write_safetensors_named(&prim, "out-00001.safetensors", &[b()])?;
+        let Err(err) = SafeTensors::open(&prim) else {
+            return Err(Error::Format("duplicate shard name was accepted".into()));
+        };
+        assert!(format!("{err:?}").contains("two model directories"));
+
+        for d in [&both, &prim, &sec] {
+            std::fs::remove_dir_all(d)?;
+        }
         Ok(())
     }
 

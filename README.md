@@ -101,7 +101,7 @@ See [`todo.md`](todo.md) for the audited roadmap (**~86% strict / ~89% weighted 
 |---|---|---|---|
 | Model loaders | `peregrine-core` | ✅ | config / safetensors index / QT format / dtype round-trips |
 | CPU int4 forward | `peregrine-kernels`, `peregrine-model` | ✅ **runs end-to-end** | int8/int4 dots bit-exact on AVX-VNNI; MoE vs f32 ref; attention causality / decode==prefill; full `Model` load→forward→generate |
-| io_uring streaming | `peregrine-io` | ✅ | io_uring reads validated byte-for-byte vs `pread` on real hardware (see the skip caveat in [testing](docs/testing-and-quality.md)); priority-weighted LRU cache; **registered files** (`IOSQE_FIXED_FILE`) + `SINGLE_ISSUER`/`COOP_TASKRUN`; O_DIRECT zero-copy lane |
+| io_uring streaming | `peregrine-io` | ✅ | io_uring reads validated byte-for-byte vs `pread` on real hardware (see the skip caveat in [testing](docs/testing-and-quality.md)); priority-weighted LRU cache; **owned-completion lane** forwards each expert as its reads land (`COLI_IO_COMPLETION`, wave path kept as escape hatch); **registered files** (`IOSQE_FIXED_FILE`, wired at model load) + `COOP_TASKRUN`; opt-in **SQPOLL** (`COLI_SQPOLL`); O_DIRECT zero-copy lane |
 | CUDA GPU lane | `peregrine-cuda` | ⚙️ FFI complete, host-gated | FFI to the vendored `cuda/backend_cuda.cu` (fused quant matmul, WMMA W4A16, SwiGLU, attention+RoPE) + `nvcc` build.rs behind the `cuda` feature; pinned staging, persistent stream, graph capture/replay (incl. multi-kernel). Default build is a stub — **GPU tests run on an NVIDIA box** |
 | Concurrent scheduler | `peregrine-model` (`concurrent.rs`) | ✅ core | `moe_streamed` overlaps io_uring streaming ∥ CPU expert compute; `concurrent.rs` runs N rings with lock-free work-stealing ∥ CPU pool ∥ GPU lane, fixed-order reduce; output == sequential |
 | Data-parallel compute | `peregrine-par` | ✅ | persistent scoped pool for rmsnorm / resident MoE / per-row attention / every matmul; **bit-identical to serial** (`f32::to_bits`-exact), work-gated, nesting-safe |
@@ -110,7 +110,7 @@ See [`todo.md`](todo.md) for the audited roadmap (**~86% strict / ~89% weighted 
 | MLA absorption / MTP / DSA | `peregrine-model` | 🟡 all three opt-in, none measured on a real checkpoint | `mla_attention_absorb` behind `COLI_MLA_ABSORB` (≈ dense within 10% on one call, unmeasured end to end). MTP speculative decode is wired behind `--draft N` / `COLI_DRAFT`, greedy-identical, and refuses loudly without an MTP head. DSA sparse attention behind `COLI_DSA`: bit-identical below `index_topk` and with no indexer in the checkpoint, single-sequence path only |
 | Serve (stdio drop-in) | `peregrine-engine` | ✅ | `READY`/`END` handshake — a drop-in for colibrì's `c/glm` behind `openai_server.py` |
 | Serve (native HTTP) | `peregrine-serve` | ✅ | OpenAI-compatible `POST /v1/chat/completions` (SSE + non-streaming), `/v1/models`, `/health`; bearer auth, token caps, graceful shutdown, `#![forbid(unsafe_code)]`, two-tier priority queue via `X-Peregrine-Priority` |
-| Adaptive runtime | `peregrine-model` (`lane.rs`, `iotune.rs`, `telemetry.rs`, `workload.rs`) | ✅ | per-lane wall-time accum + `BubbleTuner` EWMA → `LaneBalancer` (CPU/GPU bias-driven downgrade); `IoTuner` adjusts `iowq_max_workers` between forwards; `PhaseTracker` + `PredictSource::PhaseAware`; per-class prefetch breadth from the serving layer's prompt classifier; heat-threshold cache admission; NUMA worker pinning; real `perf_event_open` LLC-miss counter; cross-session `route_stats.json` at Drop / auto-load on load |
+| Adaptive runtime | `peregrine-model` (`lane.rs`, `iotune.rs`, `telemetry.rs`, `workload.rs`) | ✅ | per-lane wall-time accum + `BubbleTuner` EWMA → `LaneBalancer` (CPU/GPU bias-driven downgrade); `IoTuner` adjusts `iowq_max_workers` between forwards; `PredictSource::PhaseAware` (depth-derived boost; `PhaseTracker` is the unwired stateful alternative); per-class prefetch breadth from the serving layer's prompt classifier; heat-threshold cache admission; NUMA worker pinning; real `perf_event_open` LLC-miss counter; cross-session `route_stats.json` at Drop / auto-load on load |
 | Offline layout tool | `peregrine-tools` | ✅ | `peregrine-layout-reorg` consumes `dump-routes` JSON, emits `<dir>/schedule.json` via `--method greedy`, `louvain`, or `spectral` (Fiedler ordering); loader picks it up and pre-sorts disk reads |
 | Compression | `peregrine-core` (`compress.rs`), `peregrine-io` (`warmcache.rs`) | ✅ | zstd end-to-end on disk (`Blob::with_compression`, header carries the tag + original size); optional transparent zstd on WarmCache admissions (`COLI_CACHE_COMPRESS`) |
 | Tokenizer fast path | `peregrine-token`, `peregrine-serve` (`tok.rs`) | ✅ | vendored gigatoken BPE subset (stable toolchain, no libpython); id-for-id parity vs HF `tokenizers` on the committed GPT-2 fixture; cross-request memo cache; sole runtime tokenizer (HF crate is test-oracle only); `--bench-tokenizer` (34× locally) |
@@ -153,8 +153,12 @@ crates/
                      mem hints (hugepages, NUMA pinning), topology probe, perf counters,
                      aligned slab pool
   peregrine-cuda     FFI to cuda/backend_cuda.cu (feature = "cuda")
-  peregrine-sched    two-lane streaming ancestor — NOT linked by any crate;
-                     the live 3-lane path is peregrine-model/concurrent.rs
+  peregrine-sched    two-lane streaming ancestor — NOT linked by any crate, but
+                     kept as the cross-engine correctness oracle: its
+                     streamed_matches_the_production_concurrent_path runs
+                     moe_streamed and the live moe_forward_concurrent over the
+                     same container bytes. The live 3-lane path is
+                     peregrine-model/concurrent.rs
   peregrine-par      persistent scoped worker pool, bit-identical to serial (std-only)
   peregrine-engine   binary `peregrine`: stdio serve protocol, demo, bench, automaton
   peregrine-serve    binary `peregrine-serve`: OpenAI HTTP server + continuous batching

@@ -25,11 +25,45 @@ scrape from `&self`.
 
 ## Lane telemetry
 
-`LaneTimings` (`lane.rs`) accumulates per-lane wall time (io / cpu / gpu /
-reduce) inside `moe_forward_concurrent` via atomic counters on a shared
-accumulator threaded through `ForwardCtx`. `PlanOptimizer::tick`
-(`telemetry.rs`) folds `LaneTimings`, `BubbleTuner`, and `IoTuner` snapshots
-into one `RuntimeTelemetry` value per forward.
+`LaneTimings` (`lane.rs`) accumulates per-lane time (io / cpu / gpu / reduce)
+inside `moe_forward_concurrent` via atomic counters on a shared accumulator
+threaded through `ForwardCtx`. `PlanOptimizer::tick` (`telemetry.rs`) folds
+`LaneTimings`, `BubbleTuner`, and `IoTuner` snapshots into one
+`RuntimeTelemetry` value per forward.
+
+### Those four counters are summed over threads, not wall clock
+
+This is the single most important thing to know before reading them. The io lane
+runs **one thread per ring** and the CPU lane a pool, so each counter is a sum of
+busy time across several threads. **`io_us` of 17 s is equally "four rings busy for
+4.3 s" and "one ring busy for 17 s"** — and on their own the counters cannot tell
+you which.
+
+`LaneTimings::lane_wall_us` is the denominator that resolves it: the **wall** clock
+of the 3-lane region itself. With it, the shutdown report prints duty cycles:
+
+```
+[lane] 3 forwards: io 54.7s (73%) cpu 19.5s (26%) gpu 0.0s (0%) reduce 1.0s (1%)
+[lane] moe wall 58.2s over 3 forwards (19.38s each); io duty 24% of 4 rings, cpu 0.3 workers busy
+[lane] cpu-lane bandwidth 1.75 GB/s over 34.0 GB of expert slabs
+```
+
+`io duty 24% of 4 rings` says only ~0.94 rings were doing anything. **That number
+found a bug that had halved decode throughput** — the percentages on the first line
+read "I/O dominates at 73 %", which was true and useless, because it is a share of
+*busy* time and three of the four rings were never busy. See
+[the concurrent scheduler](concurrent-scheduler.md#the-three-lanes) for the fix and
+[Measurement discipline](measurement.md#3-thread-summed-counters-are-not-wall-time)
+for how to read the block.
+
+### Two accumulators, on purpose
+
+`Model` keeps the per-forward accumulator that `publish_lane_timings`
+**resets** each forward — that is the sample the tuner needs — and a second,
+run-lifetime `lane_totals` that is never reset, which is what the `[lane]` report
+prints. Without the second one there is no way to ask "where did this *run* go":
+the tuner's sample is gone by the time anyone could look at it. Both are folded from
+the same `sample`, so the report and the controller can never disagree.
 
 ## Bubble tuner & lane balancer
 
@@ -75,10 +109,16 @@ Three governors (`peregrine-io/src/sensors.rs`, stepped from
   `COLI_PREFETCH_TUNE`): normalized Shannon entropy of the routed distribution
   over the K-deep history, EWMA'd per forward — narrow prefetch breadth when
   routing is repetitive, widen when dispersed.
-- **Phase detection** (`workload.rs`): `PhaseTracker` EWMAs frame-to-frame
-  Jaccard distance and flags a shift above `COLI_PHASE_THRESHOLD`
-  (default 0.6). `PredictSource::PhaseAware` folds a heavy vote onto the
-  newest frame's experts during a shift.
+- **Phase detection** (`predict.rs`): `PredictSource::PhaseAware` compares the
+  newest two frames' Jaccard distance against `COLI_PHASE_THRESHOLD`
+  (default 0.6) and, above it, folds a dominating vote onto the newest frame's
+  experts. The weight comes from `predict::phase_boost(depth)`, not a constant:
+  it shipped as a hardcoded `2` until 2026-08-08, which at the default depth
+  only *tied* an expert that had just dropped out, so the shift response was
+  inert while its tests passed on a hand-built `boost: 100`.
+  `PhaseTracker` (`workload.rs`) keeps the stateful form — an EWMA plus a
+  post-shift window — and **has no production caller**; until 2026-08-08 it was
+  also the only reader of `COLI_PHASE_THRESHOLD`, so that knob governed nothing.
 - **Workload classes**: the HTTP handler classifies each request's prompt tail
   (`workload::classify_str` → `Prose | Code | Json | Math | Mixed`) and the
   engine resolves per-class prefetch breadth via
@@ -117,10 +157,28 @@ Details in [Serving](serving.md).
 
 `peregrine_io::PerfCounter` is a real `perf_event_open(2)` LLC-miss counter
 (thread-following, user-space-only, hand-declared `PERF_ATTR_SIZE_VER0` attr
-layout). `telemetry::open_l3_miss_counter` gates it on `COLI_PERF_COUNTERS=1` — **though nothing currently calls it, so the knob is inert;** 
-every constructor degrades to `None` when the kernel refuses (containers,
+layout). `telemetry::open_l3_miss_counter` gates it on `COLI_PERF_COUNTERS=1`. It **is**
+wired: `peregrine-engine`'s `serve` opens it on the decode thread (`main.rs`) and
+prints the total at shutdown. Opening it there is deliberate —
+`perf_event_open(2)` follows the *calling* thread, so the figure covers attention
+and the deterministic reduce, **not** the io_uring workers or the `peregrine-par`
+pool. A whole-process number needs one counter per thread, and presenting this
+one as that is how a number stops meaning anything.
+Every constructor degrades to `None` when the kernel refuses (containers,
 `perf_event_paranoid ≥ 3`, no PMU) — the counter is an optimization input,
 never a dependency.
+
+`COLI_PERF_PREFETCH_FEEDBACK=1` additionally lets the per-forward miss delta
+steer the prefetch distance (rising misses widen it), which is the consumer this
+page and `telemetry.rs` described for months before it existed. It is a
+**second** opt-in on top of `COLI_PERF_COUNTERS`, because a measurement becoming
+a control loop should require saying so. **The direction is a hypothesis.** The
+counter follows the decode thread, so it cannot see the workers that stream and
+compute experts; a rising miss rate there most plausibly tracks a growing KV
+cache, which prefetch breadth does not address. The control law
+(`model.rs::llc_trend` — seeding holds, ±10 % dead band) is pure and unit-tested
+precisely because a live-counter test would pass by not running on any host that
+refuses the syscall.
 
 ## Knob reference
 

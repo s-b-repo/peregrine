@@ -1,0 +1,125 @@
+{
+  "deltas": [
+    {
+      "at_s": 145.47,
+      "gap_s": null,
+      "index": 0,
+      "text": "The"
+    },
+    {
+      "at_s": 162.657,
+      "gap_s": 17.187,
+      "index": 1,
+      "text": " summary"
+    },
+    {
+      "at_s": 178.81,
+      "gap_s": 16.153,
+      "index": 2,
+      "text": " should"
+    },
+    {
+      "at_s": 194.658,
+      "gap_s": 15.848,
+      "index": 3,
+      "text": " be"
+    },
+    {
+      "at_s": 210.892,
+      "gap_s": 16.234,
+      "index": 4,
+      "text": " formatted"
+    },
+    {
+      "at_s": 227.037,
+      "gap_s": 16.146,
+      "index": 5,
+      "text": " as"
+    },
+    {
+      "at_s": 245.393,
+      "gap_s": 18.356,
+      "index": 6,
+      "text": " a"
+    },
+    {
+      "at_s": 265.622,
+      "gap_s": 20.229,
+      "index": 7,
+      "text": " numbered"
+    },
+    {
+      "at_s": 292.915,
+      "gap_s": 27.293,
+      "index": 8,
+      "text": " list"
+    },
+    {
+      "at_s": 311.828,
+      "gap_s": 18.913,
+      "index": 9,
+      "text": ","
+    },
+    {
+      "at_s": 330.579,
+      "gap_s": 18.751,
+      "index": 10,
+      "text": " with"
+    },
+    {
+      "at_s": 350.032,
+      "gap_s": 19.453,
+      "index": 11,
+      "text": " the"
+    },
+    {
+      "at_s": 378.927,
+      "gap_s": 28.894,
+      "index": 12,
+      "text": " first"
+    },
+    {
+      "at_s": 397.457,
+      "gap_s": 18.53,
+      "index": 13,
+      "text": " complete"
+    },
+    {
+      "at_s": 416.044,
+      "gap_s": 18.588,
+      "index": 14,
+      "text": " sentence"
+    },
+    {
+      "at_s": 434.168,
+      "gap_s": 18.123,
+      "index": 15,
+      "text": " of"
+    }
+  ],
+  "gaps_s": [
+    17.187,
+    16.153,
+    15.848,
+    16.234,
+    16.146,
+    18.356,
+    20.229,
+    27.293,
+    18.913,
+    18.751,
+    19.453,
+    28.894,
+    18.53,
+    18.588,
+    18.123
+  ],
+  "max_tokens": 16,
+  "model": "glm-5.2",
+  "prompt": "Summarise the causes of the 1929 financial crash.",
+  "temperature": 0.0,
+  "text": "The summary should be formatted as a numbered list, with the first complete sentence of",
+  "tokens": 16,
+  "total_s": 434.176,
+  "ttft_s": 145.469
+}

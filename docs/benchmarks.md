@@ -14,12 +14,46 @@ CPU-streaming decode.
 
 | | peregrine (Rust) | colibrì (C) |
 |---|---|---|
-| Decode, single sequence (steady state) | 0.054 tok/s | **0.077 tok/s** |
+| Decode, single sequence (steady state) | **0.062 tok/s** (16.08 s/tok) — was 0.054; see [the io-claim fix](#the-io-claim-fix-2026-08-09) | **0.077 tok/s** |
 | **Batched decode, B=16 (aggregate)** | **0.280 tok/s** (4.4× over B=1) — see the note below on why the 2026-08-01 pass reads 0.224 | — |
 | Warm cache on a repeated forward | **3.58×** (100 % hit, 0 disk) | learned pin |
 | Raw device read rate (after I/O ports) | **~980 MB/s** | ~870 MB/s — but see [the laptop re-measurement](#second-box-glm-52-on-a-7-gb-laptop), which inverts this |
 | Warm-cache hit rate, sustained decode (10 GB cache) | 0.6 % (measured) | — |
 | Tokenizer throughput | **204 MB/s** (gigatoken) | — (HF: 6 MB/s) |
+
+### The io-claim fix (2026-08-09)
+
+Decode was **21.83 s/tok** and is now **16.08 s/tok** — **1.36×**, from four lines.
+The I/O lane claimed work with
+
+```rust
+let start = io_work_ref.fetch_add(batch, Ordering::Relaxed);
+if start >= n_plans { break; }     // no work left for this ring
+```
+
+where `batch` was `COLI_IO_BATCH` (default **16**). A decode token routes **8
+experts per layer**, so ring 0 claimed all 8 and rings 1–3 got starts 16/32/48 —
+every one `>= n_plans` — and **broke without issuing a single read**. One ring did
+four rings' work, on every sparse layer of every decode token. The default is
+correct for prefill, whose per-layer union is ~69 experts; it collapsed decode to
+1× parallelism.
+
+The claim now ceil-divides across rings, keeping the configured value as a ceiling:
+decode gets `ceil(8/4) = 2` and all four rings run, prefill still gets its full 16.
+
+| at defaults | before | after |
+|---|---|---|
+| decode | 21.83 s/tok | **16.08 s/tok** |
+| p50 inter-token | 21.9 s | **15.5 s** |
+| **io duty** | **24 % of 4 rings** | **84 %** |
+
+**It was invisible until the lane counters gained a wall-clock denominator.**
+`io_us`/`cpu_us`/`gpu_us` are summed over *threads*, so 17 s of `io_us` is equally
+four rings busy for 4.3 s or one ring busy for 17 s. `LaneTimings::lane_wall_us`
+distinguishes them, and `io duty 24 % of 4 rings` pointed straight at the claim
+loop. Reproduced independently before any code change by setting `COLI_IO_BATCH=2`
+(14.80 s/tok, 90 % duty). Full working:
+[`bench-data/2026-08-09-decode-levers/`](../bench-data/2026-08-09-decode-levers/README.md).
 
 ## How to read them
 
@@ -39,10 +73,14 @@ CPU-streaming decode.
   result — a 10 GB cache against a ~180 GB 16-token working set can hit ~5 %
   at best, however the router behaves. colibrì independently finds its PILOT
   prefetch neutral and MTP a net loss on disk-saturated MoE decode.
-  **Attributing all three to routing entropy is an inference, not a
-  measurement** — the routing overlap has never been measured. Run
-  `peregrine route-stats <routes.json> 256` (and `COLI_UNION_STATS=1` for the
-  live per-step sharing factor) before relying on the entropy story; see the
+  **That entropy attribution was an inference, and it has now been measured
+  and refuted** (2026-08-09, `bench-data/2026-08-09-prefetch-causes/`):
+  `route-stats` over a real-text GLM-5.2 trace puts consecutive-token overlap at
+  **33.55 % against a 3.12 % independence null** — 10.7×, i.e. routing is
+  strongly predictable from the previous token. The low hit rate is therefore a
+  capacity or policy result, not a router result; one token's routed set is
+  ~11.3 GB and the cache was 4 GB, so a slab cannot survive to be reused. Run
+  `COLI_UNION_STATS=1` for the live per-step sharing factor; see the
   correction in [the study](peregrine-vs-colibri.md#52-cache--locality-analysis-peregrine-measured).
 - **The 3-lane scheduler's full advantage is latent** without expert
   residency: colibrì reaches **6.84 tok/s on 6× RTX 5090** (full residency),
@@ -124,11 +162,40 @@ four configurations, controlled A/B on the same shard sizes, run-to-run spread
 | 64 MB × 4, 8 rings | 0.67 | **0.86** |
 | 64 MB × 4, 4 rings | 0.53 | **0.64** |
 
-A gap to colibrì remains, and dm-crypt is the standing hypothesis for it: on a
+A gap to colibrì remains, and dm-crypt was the standing hypothesis for it: on a
 LUKS volume reads are CPU-bound on decryption, so *N* blocking `pread`s keep *N*
 cores decrypting where the ring's completion model can leave cores idle. Testing
 that means adding a pread engine behind the same `read_regions` choke point and
 measuring — not asserting.
+
+> **Retracted 2026-08-09 — the `0.84` vs `2.02` row was a two-variable
+> comparison.** The pread engine landed, the test ran, and it does not support the
+> hypothesis it was built for.
+>
+> `COLI_IO_ENGINE=pread` **implies no O_DIRECT** (`concurrent.rs` skips the direct
+> path for that engine). So the recorded pair pitted uring-**with**-O_DIRECT
+> against pread-**without** it — two variables at once, which is exactly the
+> confound [`validation-runbook.md`](validation-runbook.md) §1a warns about.
+> Held constant on a Ryzen 5 5500 / LUKS NVMe (a *different* box from the i5-1235U
+> table above), 5 reps per arm at the shipped 4 rings:
+>
+> | arm | median | spread | verdict |
+> |---|---|---|---|
+> | `uring` buffered | 1.12 GB/s | 5.4 % | — |
+> | `pread` ×8 | 1.06 GB/s | 10.6 % | 5.7 % gap — **inside the noise floor** |
+> | `uring` O_DIRECT | 0.86 GB/s | 10.3 % | **−23 %, outside both spreads** |
+>
+> **The syscall shape costs nothing measurable.** What the same run does show is
+> that O_DIRECT is genuinely the slow arm — which is why `COLI_DIRECT` defaults
+> off. Read the `0.84`/`2.02` row above as "O_DIRECT vs threaded buffered reads",
+> not as "io_uring vs pread", and not as "C beats Rust".
+>
+> The dm-crypt question itself is **still open** — decryption may still cost, and
+> [`M1-storage-config.md`](../bench-data/2026-08-09-prefetch-causes/M1-storage-config.md)
+> records the one cheap read-only measurement that would settle it. What is closed
+> is the inference that the engine gap *demonstrated* it.
+>
+> Full working: [`M5-io-engine.md`](../bench-data/2026-08-09-prefetch-causes/M5-io-engine.md).
 
 *Provenance of the numbers:* peregrine's come from
 [`crates/peregrine-io/examples/iobench.rs`](../crates/peregrine-io/examples/iobench.rs),
@@ -381,3 +448,182 @@ disk-read counters (`.err`), and wall/RSS stats (`.stat`). `sweep/` additionally
 captures each arm's exact environment (`.env`); for the isolate runs the
 environment is the `variant_env` table in `scripts/bench-b1-isolate.sh`, and
 the per-variant tallies are in `results.csv`.
+
+---
+
+## Benchmark pass — 2026-08-03 (three-arm sweep, archived as data)
+
+Run at `be3ba8b` (still HEAD as of 2026-08-08), `scripts/bench-arms.sh`, three
+arms × three batch sizes, 3 steps, `COLI_ECACHE_GB=4`, real GLM-5.2 744B int4.
+Raw output under [`bench-data/2026-08-03/`](../bench-data/2026-08-03).
+
+| arm | B=1 | B=4 | B=16 | wall_s | peak_rss_gb | major_faults |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 0.046 | 0.103 | 0.190 | 446.59 | 17.58 | **514 315** |
+| improved | 0.044 | 0.117 | **0.224** | 398.23 | 17.10 | **0** |
+| gpu | 0.044 | 0.108 | 0.209 | 433.31 | 17.36 | 626 |
+
+**This section archives the data; it does not claim a result.** Two things in
+that table look like findings and are not, and saying so is the whole point of
+writing it up rather than leaving the directory unexplained.
+
+**The GPU arm appears to regress** — 0.235 at B=16 on 2026-08-01 → 0.209 here,
+now *below* `improved` at 0.224, inverting the previous ordering.
+
+**But the arms are not comparable, and the fault counts say so.** Baseline took
+**514 315 major faults**; `improved` took **zero**. Half a million major faults
+means that arm spent the run refetching pages from disk under the `MemoryMax`
+cap, and the 2026-08-01 baseline did not. A wall-clock comparison across two
+arms whose fault behaviour differs by five hundred thousand events is not
+measuring the engine. That alone can produce the apparent GPU regression with no
+engine change whatsoever.
+
+**Threats to validity.** Same contended host as the other passes. 3 steps is
+short. And the fault asymmetry above is not a caveat on the numbers — it is a
+reason not to use them for a cross-arm claim at all. Re-run before anyone
+concludes the GPU lane got slower; the useful comparison is
+`improved`-vs-`gpu` *within* this pass (0.224 vs 0.209, both at low fault
+counts), which is the pair that shares its conditions.
+
+**Reproducing.** `scripts/bench-arms.sh bench-data/<date> "1 4 16"`.
+
+---
+
+## Benchmark pass — 2026-08-07 (routing-statistics pass)
+
+The first pass whose deliverable is **counters, not wall clock**. It exists to
+settle §13's gate-mass mixed-precision question, which no amount of timing can
+answer and which the synthetic model cannot address at all (4 experts, top-2, so
+there is no weight tail to measure).
+
+`COLI_UNION_STATS` and `COLI_GATE_STATS` had printed only from `serve`, which is
+strictly single-sequence — so `s_n` was a prefill chunk length and both figures
+described sharing across *positions of one prompt*, never across concurrent
+sequences. The question is entirely about what happens as the batch grows.
+`run_bench`, the only batched entry point, printed neither. Both now come from a
+shared `report_gate_stats` / `report_union_stats`.
+
+### Setup
+
+GLM-5.2 744B int4 (`~/models/GLM-5.2-colibri-int4-with-int8-mtp`, 358 GB), 2 GB
+expert cache, `COLI_BENCH_STEPS=2`, `COLI_ROUTE_STATS_PERSIST=0`,
+`MemoryMax=24G`, **one batch size per fresh process**. Sequences start from
+distinct tokens (`bench` seeds `(i*7+1) % vocab`) so their routing diverges.
+
+### Result — batch-union sharing and the low-gate ceiling
+
+| B | selections | distinct reads | share | all-low-gate | fraction | tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 1 200 | 1 200 | 1.000× | **16** | 1.3 % | 0.048 |
+| 4 | 4 800 | 2 235 | 2.148× | **15** | 0.7 % | 0.120 |
+| 16 | 19 200 | 3 855 | 4.981× | **18** | 0.5 % | 0.243 |
+| 16, γ=4 | 58 112 | 10 145 | 5.728× | **18** | 0.2 % | 0.112 |
+
+**Gate-mass mixed-precision loading is closed by the fourth column.** The count
+of experts that are low-gate for *every* row routing them is flat at 15–18 while
+distinct reads grow 8.5×. That is the mechanism exactly: a read is issued per
+union entry, not per row, so adding rows can only remove candidates. The whole
+feature's ceiling at B=16 is 0.5 % of reads, and int2-vs-int4 saves ~25 % of
+those bytes — **~0.12 % of expert bytes** for a dual-precision container, a
+re-keyed warm cache and a precision-aware region locator.
+
+Consistency check that the number is real: at B=1 the all-low-gate fraction
+(1.3 %) equals the independently computed `[gate] below_1%` (1.3 %) exactly, as
+it must — with one row, "every row wants it weakly" *is* "below 1 % of gate mass".
+
+### Result — the gate tail, which sizes the lever that does exist
+
+`[gate] routed=19200 below_0.5%=1.0% below_1%=1.3% below_2%=2.4% below_5%=12.5%`
+(B=16; B=1 gives 1.0 / 1.3 / 2.8 / 14.3). So `COLI_ROUTE_MIN_SHARE=0.05` would
+drop about an eighth of routed selections. **First real-checkpoint sizing this
+knob has ever had.** It changes token values, so gate it with
+`Model::prediction_flip_rate` before running it anywhere real.
+
+### Result — speculation does not get its extra tokens for free
+
+`COLI_DRAFT=4` at B=16 grew the union from 3 855 to **10 145 distinct reads
+(2.63×)**. `todo.md` had claimed one union yields `1 + accepted` tokens; it does
+not — draft rows route substantially different experts. Break-even needs an
+accepted run above ~2.6, not above 1.
+
+Measured verified throughput was **0.112 tok/s against 0.243 baseline (2.2×
+slower)**. **That figure is harness-bound and should not be generalized**: the
+bench seeds each sequence with one arbitrary token and runs two steps, so the MTP
+head drafts with no context and acceptance is near worst case. The union growth
+is *not* harness-bound — it depends on where routed sets fall, not on whether the
+drafts were accepted. A real-workload acceptance rate is still owed.
+
+### Threats to validity
+
+Same contended host as previous passes (an OSX-KVM VM plus a VNC helper), and a
+concurrent `nvcc` compile during the B=16 arm. **Timing numbers here are
+accordingly soft**; the counters are exact and unaffected — they are counts of
+routed experts, not measurements of how fast anything ran. Two steps per run is
+short: enough for routing statistics, not for a throughput claim.
+
+### Reproducing
+
+```bash
+scripts/bench-measure.sh out/union 16      # 3 arms at B=16
+COLI_UNION_STATS=1 COLI_GATE_STATS=1 COLI_BENCH_STEPS=2 \
+  COLI_MODEL=... target/release/peregrine bench 1   # one B per process
+```
+
+Raw output under [`bench-data/2026-08-07-union/`](../bench-data/2026-08-07-union),
+now `b1/`, `b4/` and `b16/` with per-arm `.env` and a `BUILD.txt` in each.
+
+### Addendum — 2026-08-08: the look-ahead arm was never a comparison
+
+The B=1 and B=4 arms were re-run on 2026-08-08 because only `b16/` had been
+archived, leaving two of the four rows above with no data in-tree. **The re-run
+reproduced the published counters exactly** — B=1 `1 200 / 1 000× / 16 / 1.3 %`,
+B=4 `4 800 / 2.148× / 15 / 0.7 %` — so the table was right; it just could not be
+checked.
+
+The re-run also fixed a defect in the harness that invalidated one arm.
+`scripts/bench-measure.sh` defined `lookahead_batch` as
+`COLI_ROUTER_LOOKAHEAD_BATCH=1`, but that knob **defaults to on**
+(`model.rs:836-840` reads `!matches!(v, Ok("0") | Ok("false"))`), so the arm was
+being compared against a baseline that already had it enabled. That is why the
+original run's counters came back byte-identical to baseline and were written off
+as a null result. With `baseline` now setting the knob to `0` explicitly:
+
+| B | arm | distinct reads | disk_reads | wall_s |
+|---|---|---:|---:|---:|
+| 1 | baseline (look-ahead off) | 1 200 | 1 188 | 61.44 |
+| 1 | lookahead_batch | 1 200 | **1 098** | 49.97 |
+| 4 | baseline (look-ahead off) | 2 235 | 2 235 | 80.80 |
+| 4 | lookahead_batch | 2 235 | **2 030** | 102.60 |
+
+**The multi-row look-ahead cuts disk reads by 7.6 % at B=1 and 9.2 % at B=4** —
+a real result on the repo's own test, and one the previous configuration could
+not have produced at any sample size.
+
+Two things it is not. The **union counters are identical across the two arms, as
+they must be**: the look-ahead changes what is *prefetched*, not what is
+*routed*, so `selections`/`distinct`/`share` cannot move and their agreement is a
+consistency check rather than a null. And the **wall clock disagrees with itself**
+(faster at B=1, slower at B=4) on a contended host with 2 steps per run, so read
+the `disk_reads` column and ignore the seconds.
+
+Absent at **every** B: `[predict-eval] recall=` and `[lookahead] issued=`.
+
+**This was blamed on the `s_n == 1` gate until 2026-08-09, and that explanation is
+wrong** — which matters, because it points at the wrong repair. The gate is in
+`forward_hidden`, and `bench` never executes that function: `run_bench` calls
+`forward_step_batched` → `forward_rows_inner`, and `forward_rows_inner` **has no
+`score_and_stash` call at all**. The only call site in the tree is in
+`forward_hidden`, reached from `Model::generate` and friends. So `bench 1` produces
+no scoreboard either, and no amount of splitting the `s_n == 1` gate would change
+that. `peregrine-serve` is in the same position, and additionally never calls
+`predict_eval_report()`, so it could not print one if it had it.
+
+The scoreboard is reachable **only from the stdio `GEN` protocol**:
+
+```bash
+printf 'GEN 64 1 2 3\nQUIT\n' | COLI_PREDICT_EVAL=1 COLI_PREDICT_EVAL_N=16 peregrine "$COLI_MODEL"
+```
+
+`COLI_PREDICT_EVAL_N=16` makes it comparable with the WASTE recall@16 table; the
+default is the model's topk (8 on GLM-5.2). Getting the number from `bench` or from
+the server needs a hook in `forward_rows_inner`, not a gate change.

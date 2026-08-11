@@ -4,6 +4,7 @@
 //! cost one enter syscall instead of N `pread`s. [`pread_many`] is the portable
 //! fallback (and the correctness oracle for the ring).
 
+use crate::slab::Bytes;
 use std::os::unix::io::RawFd;
 
 /// One positioned read into a caller-owned buffer.
@@ -13,6 +14,30 @@ pub struct ReadReq<'a> {
     pub buf: &'a mut [u8],
     /// caller tag echoed back (e.g. an expert id); not used by the reader
     pub tag: u64,
+}
+
+/// One positioned read whose landing buffer the [`Reactor`] owns until its
+/// completion is reaped (the owned-completion lane, [`Reactor::submit_owned`]).
+/// Unlike [`ReadReq`] there is no borrowed buffer: the reactor allocates the
+/// landing storage and hands it back as [`RegionDone::bytes`] — which is what
+/// lets completions be delivered one at a time instead of as a whole wave.
+pub struct OwnedReadReq {
+    pub fd: RawFd,
+    pub offset: u64,
+    pub len: usize,
+    /// caller tag echoed back in [`RegionDone::tag`] (the streaming lane passes
+    /// the expert-local index); not used by the reader
+    pub tag: u64,
+}
+
+/// A completed owned read: exactly `[offset, offset+len)` of its request,
+/// byte-identical to a buffered positioned read of the same range.
+pub struct RegionDone {
+    /// The request's position in its `submit_owned` batch — the stable key,
+    /// independent of arrival order (which io-wq deliberately randomizes).
+    pub idx: usize,
+    pub tag: u64,
+    pub bytes: Bytes,
 }
 
 /// Portable fallback: one `pread` per request. Returns per-request byte counts
@@ -103,17 +128,75 @@ pub fn pread_many_threaded(reqs: &mut [ReadReq], threads: usize) -> Vec<i64> {
 
 #[cfg(target_os = "linux")]
 mod uring {
-    use super::ReadReq;
-    use crate::slab::{align_down, align_up, AlignedBuf, Bytes, SlabPool, ALIGN};
+    use super::{OwnedReadReq, ReadReq, RegionDone};
+    use crate::slab::{align_down, align_up, AlignedBuf, Bytes, SlabHandle, SlabPool, ALIGN};
     use io_uring::{opcode, squeue, types, IoUring};
+    use std::collections::{HashMap, VecDeque};
     use std::io;
     use std::os::unix::io::RawFd;
+
+    /// Landing storage for one owned read: a plain heap `Vec` for buffered
+    /// reads, an [`AlignedBuf`] over the 4096-aligned superset for O_DIRECT.
+    enum LandingBuf {
+        Plain(Vec<u8>),
+        Aligned(AlignedBuf),
+    }
+
+    /// One owned read in flight (or queued behind the ring cap). The aligned
+    /// window fields mirror `read_direct_aligned`'s `Span`: `need = head + want`
+    /// is what must land before the region is complete — the tail padding past
+    /// it may legally EOF-short and is never delivered.
+    struct InFlight {
+        fd: RawFd,
+        /// submission offset (already aligned down for O_DIRECT).
+        a_off: u64,
+        /// the wanted region's offset inside the landing buffer (0 if buffered).
+        head: usize,
+        /// exposed bytes the caller asked for.
+        want: usize,
+        /// head + want.
+        need: usize,
+        /// landing-buffer length actually submitted for reading.
+        a_len: usize,
+        /// bytes landed so far (continuations resume here).
+        done: usize,
+        tag: u64,
+        idx: usize,
+        buf: LandingBuf,
+    }
+
+    impl InFlight {
+        /// The completed region as owned [`Bytes`] — no realignment copy: the
+        /// O_DIRECT variant exposes `[head, head+want)` of the DMA target.
+        fn finish(self) -> RegionDone {
+            let bytes = match self.buf {
+                LandingBuf::Plain(v) => Bytes::Vec(v),
+                LandingBuf::Aligned(buf) => Bytes::Aligned { buf, head: self.head, len: self.want },
+            };
+            RegionDone { idx: self.idx, tag: self.tag, bytes }
+        }
+    }
+
+    /// Ring construction options (env-free — [`Reactor::new_streaming`] fills
+    /// them from `COLI_SQPOLL*`).
+    pub(crate) struct RingOpts {
+        pub(crate) sqpoll: Option<SqpollOpts>,
+    }
+
+    pub(crate) struct SqpollOpts {
+        /// ms the poll kthread keeps spinning on an empty SQ before sleeping.
+        pub(crate) idle_ms: u32,
+        /// optional CPU id to pin the kthread to (`IORING_SETUP_SQ_AFF`).
+        pub(crate) cpu: Option<u32>,
+    }
 
     /// io_uring-backed batched reader (the I/O lane owner thread holds one).
     pub struct Reactor {
         ring: IoUring,
         cap: usize,
         force_async: bool,
+        /// kernel-side submission polling active (the `COLI_SQPOLL` opt-in).
+        sqpoll: bool,
         /// Times a submission-queue push was rejected (queue full) since the
         /// last [`Reactor::take_sq_full`]. Queue-pressure signal for the
         /// adaptive io-wq tuner.
@@ -128,6 +211,21 @@ mod uring {
         /// reusable aligned landing buffers for O_DIRECT reads ([`Reactor::read_direct_many`]);
         /// sized once via [`Reactor::configure_slab`]. Idle (no allocation) until used.
         slab: SlabPool,
+        /// owned-completion lane: reads in flight, keyed by their `user_data`
+        /// (`OWNED_TAG | next_ud`). The reactor owns each landing buffer until
+        /// the completion is reaped, so nothing here dangles.
+        pending: HashMap<u64, InFlight>,
+        /// owned reads accepted but not yet pushed (ring-cap backpressure).
+        queued: VecDeque<InFlight>,
+        /// queued advisory (fadvise) entries, drained into SQ slots left over
+        /// after reads — reads always outrank hints. Bounded drop-oldest.
+        advisory: VecDeque<squeue::Entry>,
+        /// advisory ops pushed to the kernel and not yet reaped.
+        advisory_inflight: usize,
+        /// zero-length owned requests, completed at submit time.
+        ready: Vec<RegionDone>,
+        /// next owned `user_data` low bits (wraps below `OWNED_TAG`).
+        next_ud: u64,
     }
 
     impl Drop for Reactor {
@@ -137,6 +235,11 @@ mod uring {
         /// means a future field reshuffle cannot silently turn this into a
         /// use-after-free of pinned pages.
         fn drop(&mut self) {
+            // Owned reads still in flight point at buffers this Reactor is about
+            // to free — wait their completions out before anything is dropped.
+            if !self.pending.is_empty() || self.advisory_inflight > 0 {
+                self.abort_owned();
+            }
             if !self.registered_bufs.is_empty() {
                 if let Err(e) = self.ring.submitter().unregister_buffers() {
                     crate::note_advisory_err("io_uring unregister_buffers at shutdown", &e);
@@ -156,28 +259,137 @@ mod uring {
         ///
         /// The ring is set up with `COOP_TASKRUN` (completion task work runs
         /// cooperatively at `io_uring_enter` instead of via IPIs → less overhead).
-        /// We deliberately do **not** set `SINGLE_ISSUER`: the streaming scheduler
-        /// reuses one persistent `Reactor` across `moe_streamed` calls that submit
-        /// from different (scoped) worker threads, and single-issuer would reject
-        /// a second submitting task with `-EEXIST`. If a kernel rejects the flag we
-        /// fall back to a plain ring. (`SQPOLL` needs privileges → future opt-in.)
+        /// We deliberately do **not** set `SINGLE_ISSUER`: the concurrent
+        /// scheduler's lane threads are scoped and respawned per layer, so the
+        /// submitting task identity changes every layer and single-issuer would
+        /// reject the second one with `-EEXIST`. If a kernel rejects the flag we
+        /// fall back to a plain ring. `SQPOLL` is the `COLI_SQPOLL` opt-in on
+        /// [`Reactor::new_streaming`] — unprivileged since kernel 5.13, and
+        /// thread-agnostic (the poll kthread issues the ops), which is exactly
+        /// why it composes with the per-layer lane threads where single-issuer
+        /// cannot.
         pub fn new(entries: u32) -> io::Result<Reactor> {
-            let ring = IoUring::builder()
+            let mut r = Self::new_with(entries, RingOpts { sqpoll: None })?;
+            r.apply_force_async_env();
+            Ok(r)
+        }
+
+        /// Streaming-lane ring: [`Reactor::new`] plus the `COLI_SQPOLL` opt-in.
+        ///
+        /// - `COLI_SQPOLL=1` — ask for kernel-side submission polling: a kernel
+        ///   thread drains the SQ, so a hot submit costs no `io_uring_enter` at
+        ///   all. Off by default — the kthread busy-polls a core while awake,
+        ///   the wrong trade on a CPU-contended box unless measured otherwise.
+        /// - `COLI_SQPOLL_IDLE_MS` (default 2000) — how long the kthread polls
+        ///   an empty SQ before sleeping. 2 s spans every intra-token gap (per
+        ///   layer compute runs tens-to-hundreds of ms) so no hot submit pays a
+        ///   wakeup, while between requests the thread sleeps; wakeup after
+        ///   sleep is handled by `submit()` itself, so a larger value buys
+        ///   nothing but burnt cycles.
+        /// - `COLI_SQPOLL_CPU` — optionally pin the kthread to one CPU id,
+        ///   confining the polling burn (and its cache pressure) to one core.
+        ///
+        /// A kernel that refuses the flags falls back to the plain
+        /// `COOP_TASKRUN` ring with an advisory note — same bytes either way.
+        pub fn new_streaming(entries: u32) -> io::Result<Reactor> {
+            let sqpoll = if matches!(std::env::var("COLI_SQPOLL").as_deref(), Ok("1") | Ok("true")) {
+                let idle_ms = std::env::var("COLI_SQPOLL_IDLE_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(2000);
+                let cpu = std::env::var("COLI_SQPOLL_CPU").ok().and_then(|s| s.trim().parse::<u32>().ok());
+                Some(SqpollOpts { idle_ms, cpu })
+            } else {
+                None
+            };
+            let mut r = Self::new_with(entries, RingOpts { sqpoll })?;
+            r.apply_force_async_env();
+            Ok(r)
+        }
+
+        /// Env-free construction from explicit options (testable without
+        /// touching the process environment).
+        pub(crate) fn new_with(entries: u32, opts: RingOpts) -> io::Result<Reactor> {
+            let mut sqpoll_active = false;
+            let ring = match &opts.sqpoll {
+                Some(sp) => {
+                    // No COOP_TASKRUN here: task work runs on the poll kthread
+                    // under SQPOLL, and kernels reject the combination.
+                    let mut b = IoUring::builder();
+                    b.setup_sqpoll(sp.idle_ms);
+                    if let Some(cpu) = sp.cpu {
+                        b.setup_sqpoll_cpu(cpu);
+                    }
+                    match b.build(entries) {
+                        Ok(r) => {
+                            sqpoll_active = true;
+                            Ok(r)
+                        }
+                        Err(e) => {
+                            crate::note_advisory_err(
+                                "io_uring SQPOLL setup (falling back to COOP_TASKRUN ring)",
+                                &e,
+                            );
+                            Self::plain_ring(entries)
+                        }
+                    }
+                }
+                None => Self::plain_ring(entries),
+            }?;
+            Ok(Reactor {
+                ring,
+                cap: entries as usize,
+                // Forced IOSQE_ASYNC exists so a cold read completing inline
+                // cannot serialize the submitting thread. Under SQPOLL the
+                // submitter never issues inline at all — the kthread does, with
+                // nonblocking semantics, punting cold reads to io-wq itself —
+                // so the flag's only remaining effect would be to turn
+                // warm-page-cache reads into a pointless io-wq bounce: off.
+                force_async: !sqpoll_active,
+                sqpoll: sqpoll_active,
+                sq_full: 0,
+                registered: Vec::new(),
+                registered_bufs: Vec::new(),
+                slab: SlabPool::new(ALIGN, 1),
+                pending: HashMap::new(),
+                queued: VecDeque::new(),
+                advisory: VecDeque::new(),
+                advisory_inflight: 0,
+                ready: Vec::new(),
+                next_ud: 0,
+            })
+        }
+
+        /// The default ring: `COOP_TASKRUN`, falling back to a plain ring on
+        /// kernels that reject the flag.
+        fn plain_ring(entries: u32) -> io::Result<IoUring> {
+            IoUring::builder()
                 .setup_coop_taskrun()
                 .build(entries)
                 .or_else(|e| {
                     crate::note_advisory_err("io_uring COOP_TASKRUN setup (using plain ring)", &e);
                     IoUring::new(entries)
-                })?;
-            Ok(Reactor {
-                ring,
-                cap: entries as usize,
-                force_async: true,
-                sq_full: 0,
-                registered: Vec::new(),
-                registered_bufs: Vec::new(),
-                slab: SlabPool::new(ALIGN, 1),
-            })
+                })
+        }
+
+        /// `COLI_FORCE_ASYNC` override on top of the ring-dependent default
+        /// (`1` forces the io-wq hand-off, `0` runs reads inline). Default is
+        /// on for a plain ring — a cold read that completes inline serializes
+        /// the submitter — and off under SQPOLL (see `new_with`); on a device
+        /// where completion is fast enough (a warm page cache, a very
+        /// low-latency NVMe) the io-wq bounce is pure overhead, and this knob
+        /// is how you find out.
+        fn apply_force_async_env(&mut self) {
+            match std::env::var("COLI_FORCE_ASYNC").as_deref() {
+                Ok("0") | Ok("false") => self.set_force_async(false),
+                Ok("1") | Ok("true") => self.set_force_async(true),
+                _ => {}
+            }
+        }
+
+        /// Whether this ring runs with kernel-side submission polling.
+        pub fn is_sqpoll(&self) -> bool {
+            self.sqpoll
         }
 
         /// Submission-queue-full rejections since the last call (swap-reset).
@@ -210,6 +422,12 @@ mod uring {
         /// completion can never be mistaken for a read result and scribble into
         /// another batch's results vector.
         const ADVISORY_TAG: u64 = 1 << 63;
+
+        /// Second-highest bit of `user_data`, set on owned-completion reads
+        /// ([`Reactor::submit_owned`]). Three disjoint namespaces: legacy wave
+        /// reads (low range), owned reads (bit 62), advisories (bit 63) — so no
+        /// lane can ever mistake another lane's completion for its own.
+        const OWNED_TAG: u64 = 1 << 62;
 
         unsafe fn push_counted(&mut self, e: &squeue::Entry) -> io::Result<()> {
             // SAFETY: forwarded caller contract (see above).
@@ -275,6 +493,16 @@ mod uring {
 
         /// Toggle forced `IOSQE_ASYNC` (default on: cold buffered reads run on
         /// io-wq instead of inline, so the submitter never serializes).
+        ///
+        /// Driven by `COLI_FORCE_ASYNC=0` at [`Reactor::new`]. The escape hatch
+        /// matters on a device fast enough that inline completion beats an io-wq
+        /// hand-off — an NVMe with a warm page cache can be exactly that, and
+        /// forcing async then adds a thread bounce per read for nothing.
+        ///
+        /// Advertised in the env tables, deliberately. The audit's own headline
+        /// example is `COLI_REGBUF`: a knob documented as live that no code read.
+        /// A setter with no reader is the same defect facing the other way, and
+        /// the fix for both is that the variable and the code agree.
         pub fn set_force_async(&mut self, on: bool) {
             self.force_async = on;
         }
@@ -332,6 +560,9 @@ mod uring {
         /// the copy-out is the trade-off of the owned-buffer hand-off (which is why
         /// the streaming path keeps the plain read by default — see `COLI_REGBUF`).
         pub fn read_fixed(&mut self, fd: RawFd, off: u64, buf_index: u16, out: &mut [u8]) -> io::Result<()> {
+            if !self.owned_idle() {
+                return Err(Self::err_owned_busy("read_fixed"));
+            }
             let bi = buf_index as usize;
             let cap = self.registered_bufs.get(bi).map(|b| b.len()).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "read_fixed: buffer index not registered")
@@ -399,6 +630,9 @@ mod uring {
         /// Requests longer than a registered buffer are an error rather than a
         /// silent short read.
         pub fn read_fixed_many(&mut self, reqs: &mut [ReadReq]) -> io::Result<Vec<i64>> {
+            if !self.owned_idle() {
+                return Err(Self::err_owned_busy("read_fixed_many"));
+            }
             let nbufs = self.registered_bufs.len();
             if nbufs == 0 {
                 return Err(io::Error::new(
@@ -501,6 +735,9 @@ mod uring {
         }
 
         fn fadvise(&mut self, fd: RawFd, off: u64, len: usize, advice: i32) -> io::Result<()> {
+            if !self.owned_idle() {
+                return Err(Self::err_owned_busy("fadvise"));
+            }
             let e = opcode::Fadvise::new(types::Fd(fd), len as libc::off_t, advice)
                 .offset(off)
                 .build()
@@ -557,6 +794,9 @@ mod uring {
         /// [`Self::read_many`] afterwards run against pages the kernel already
         /// started warming.
         pub fn fadvise_willneed_many(&mut self, regions: &[(RawFd, u64, usize)]) -> io::Result<()> {
+            if !self.owned_idle() {
+                return Err(Self::err_owned_busy("fadvise_willneed_many"));
+            }
             const POSIX_FADV_WILLNEED: i32 = 3;
             let mut i = 0;
             while i < regions.len() {
@@ -627,6 +867,12 @@ mod uring {
         /// completion. Returns per-request result codes in `reqs` order. The
         /// buffers are filled directly by the kernel.
         pub fn read_many(&mut self, reqs: &mut [ReadReq]) -> io::Result<Vec<i64>> {
+            // The wave's `submit_and_wait(pushed)` counts *any* completion, so
+            // owned-lane traffic in flight would satisfy its wait in place of a
+            // wave read. The two lanes never interleave on one ring.
+            if !self.owned_idle() {
+                return Err(Self::err_owned_busy("read_many"));
+            }
             // `None` = no completion seen yet. A sentinel value would be
             // indistinguishable from a real result: the old `i64::MIN` flowed
             // into `-n` and reported "errno 0 = Success" in release builds.
@@ -682,27 +928,40 @@ mod uring {
                 }
                 self.ring.submit_and_wait(pushed)?;
                 let mut got = 0;
-                for cqe in self.ring.completion() {
-                    let ud = cqe.user_data();
-                    if ud & Self::ADVISORY_TAG != 0 {
-                        continue; // stray advisory completion — not a read result
-                    }
-                    match usize::try_from(ud).ok().and_then(|k| results.get_mut(k)) {
-                        Some(slot) => {
-                            *slot = Some(cqe.result() as i64);
-                            got += 1;
+                while got < pushed {
+                    let mut progressed = false;
+                    for cqe in self.ring.completion() {
+                        let ud = cqe.user_data();
+                        if ud & Self::ADVISORY_TAG != 0 {
+                            // stray advisory completion — not a read result
+                            self.advisory_inflight = self.advisory_inflight.saturating_sub(1);
+                            progressed = true;
+                            continue;
                         }
-                        None => {
+                        match usize::try_from(ud).ok().and_then(|k| results.get_mut(k)) {
+                            Some(slot) => {
+                                *slot = Some(cqe.result() as i64);
+                                got += 1;
+                                progressed = true;
+                            }
+                            None => {
+                                return Err(io::Error::other(format!(
+                                    "io_uring completion for unknown request {ud}"
+                                )))
+                            }
+                        }
+                    }
+                    if got < pushed {
+                        // An advisory completion can satisfy part of the wait
+                        // count; wait for the remainder rather than reporting a
+                        // lost read. No progress at all is a real loss.
+                        if !progressed {
                             return Err(io::Error::other(format!(
-                                "io_uring completion for unknown request {ud}"
-                            )))
+                                "io_uring returned {got} completions for {pushed} submitted reads"
+                            )));
                         }
+                        self.ring.submit_and_wait(pushed - got)?;
                     }
-                }
-                if got != pushed {
-                    return Err(io::Error::other(format!(
-                        "io_uring returned {got} completions for {pushed} submitted reads"
-                    )));
                 }
                 i = end;
             }
@@ -752,12 +1011,21 @@ mod uring {
 
                 // an aligned landing buffer: pooled (normal) or a one-off if the pool
                 // buffer is too small (misconfigured) / momentarily exhausted.
-                let (mut ab, pooled) = match self.slab.checkout(a_len) {
-                    Some(b) => (b, true),
+                //
+                // Generation-tagged: the pool records this checkout as outstanding
+                // and rejects a second return of the same tag, which is the
+                // protection `docs/io-and-storage.md` described as active while
+                // the untagged pair was the only thing on this path. The handle is
+                // split into `(buf, gen)` rather than held whole only because the
+                // read body below borrows the buffer directly; that is sound here
+                // because the buffer cannot escape this loop iteration — it is
+                // returned unconditionally before `outcome?` can propagate.
+                let (mut ab, gen) = match self.slab.checkout_tagged(a_len) {
+                    Some(h) => (h.buf, Some(h.gen)),
                     None => (
                         AlignedBuf::with_capacity(a_len)
                             .ok_or_else(|| io::Error::other("aligned alloc failed"))?,
-                        false,
+                        None,
                     ),
                 };
 
@@ -803,8 +1071,8 @@ mod uring {
                     Ok(())
                 })();
 
-                if pooled {
-                    self.slab.checkin(ab);
+                if let Some(g) = gen {
+                    self.slab.checkin_tagged(SlabHandle { buf: ab, gen: g });
                 }
                 outcome?;
                 results[j] = want as i64;
@@ -906,6 +1174,382 @@ mod uring {
                 .map(|b| b.ok_or_else(|| io::Error::other("direct read left a region unfilled")))
                 .collect()
         }
+
+        // ---- owned-completion lane ----------------------------------------
+
+        /// True when the owned lane has nothing queued or in flight. The legacy
+        /// wave calls require this: their `submit_and_wait(n)` counts *any*
+        /// completion toward `n`, so an owned or advisory CQE arriving mid-wave
+        /// would satisfy the wait in place of a wave read.
+        fn owned_idle(&self) -> bool {
+            self.pending.is_empty()
+                && self.queued.is_empty()
+                && self.advisory.is_empty()
+                && self.advisory_inflight == 0
+        }
+
+        fn err_owned_busy(what: &str) -> io::Error {
+            io::Error::other(format!(
+                "{what}: owned-completion reads are in flight on this ring; reap them first"
+            ))
+        }
+
+        /// Owned requests not yet handed back as [`RegionDone`]s: in flight,
+        /// queued behind the ring cap, or ready (zero-length placeholders).
+        pub fn pending_owned(&self) -> usize {
+            self.pending.len() + self.queued.len() + self.ready.len()
+        }
+
+        /// Queue positioned reads whose landing buffers this Reactor owns until
+        /// completion, then start as many as fit the ring. Completions are
+        /// reaped incrementally with [`Reactor::reap_some`] — unlike
+        /// [`Reactor::read_many`] there is no all-or-nothing wave, so the caller
+        /// can hand each finished region onward while the rest are still in
+        /// flight. With `direct` the fd must be opened `O_DIRECT`; the read
+        /// covers the 4096-aligned superset and [`RegionDone::bytes`] exposes
+        /// exactly the requested range, zero-copy, as `read_direct_aligned`.
+        ///
+        /// [`RegionDone::idx`] is the request's position in this call's `reqs`;
+        /// submit one batch per claim so the mapping stays unambiguous.
+        pub fn submit_owned(&mut self, reqs: Vec<OwnedReadReq>, direct: bool) -> io::Result<()> {
+            // Validate and allocate for the whole batch before accepting any of
+            // it: one op cannot carry more than u32 bytes, and failing after
+            // half the batch was queued would leave orphaned reads to fire
+            // during a later caller's reap.
+            let mut ready: Vec<RegionDone> = Vec::new();
+            let mut accepted: Vec<InFlight> = Vec::with_capacity(reqs.len());
+            for (idx, r) in reqs.into_iter().enumerate() {
+                if r.len == 0 {
+                    ready.push(RegionDone { idx, tag: r.tag, bytes: Bytes::Vec(Vec::new()) });
+                    continue;
+                }
+                let inf = if direct {
+                    let a = ALIGN as u64;
+                    let a_off = align_down(r.offset, a);
+                    let head = (r.offset - a_off) as usize;
+                    let a_len = (align_up(r.offset + r.len as u64, a) - a_off) as usize;
+                    let buf = AlignedBuf::with_capacity(a_len)
+                        .ok_or_else(|| io::Error::other("aligned alloc failed"))?;
+                    InFlight {
+                        fd: r.fd,
+                        a_off,
+                        head,
+                        want: r.len,
+                        need: head + r.len,
+                        a_len,
+                        done: 0,
+                        tag: r.tag,
+                        idx,
+                        buf: LandingBuf::Aligned(buf),
+                    }
+                } else {
+                    InFlight {
+                        fd: r.fd,
+                        a_off: r.offset,
+                        head: 0,
+                        want: r.len,
+                        need: r.len,
+                        a_len: r.len,
+                        done: 0,
+                        tag: r.tag,
+                        idx,
+                        buf: LandingBuf::Plain(vec![0u8; r.len]),
+                    }
+                };
+                if u32::try_from(inf.a_len).is_err() {
+                    return Err(io::Error::other(format!(
+                        "owned read {idx} needs a {}-byte submission; io_uring reads are limited to {} per op",
+                        inf.a_len,
+                        u32::MAX
+                    )));
+                }
+                accepted.push(inf);
+            }
+            self.ready.append(&mut ready);
+            self.queued.extend(accepted);
+            // Start I/O immediately: the kernel reads while the caller returns
+            // to its reap loop (or keeps preparing work).
+            self.pump_and_flush()
+        }
+
+        /// Build the submission entry for `inf`'s next (continuation) read.
+        fn owned_sqe(&self, inf: &mut InFlight, ud: u64) -> io::Result<squeue::Entry> {
+            let remaining = inf.a_len - inf.done;
+            let Ok(len32) = u32::try_from(remaining) else {
+                return Err(io::Error::other(format!(
+                    "owned read continuation is {remaining} bytes; io_uring reads are limited to {} per op",
+                    u32::MAX
+                )));
+            };
+            let base = match &mut inf.buf {
+                LandingBuf::Plain(v) => v.as_mut_ptr(),
+                LandingBuf::Aligned(b) => b.as_mut_slice().as_mut_ptr(),
+            };
+            // SAFETY: `done < a_len` (remaining is the non-empty tail of the
+            // same buffer), so `base + done` stays inside the allocation.
+            let ptr = unsafe { base.add(inf.done) };
+            let off = inf.a_off + inf.done as u64;
+            // registered fd → fixed-file read (skips per-op fd lookup)
+            let fixed = self.registered.iter().position(|&f| f == inf.fd);
+            let mut e = match fixed {
+                Some(i) => opcode::Read::new(types::Fixed(i as u32), ptr, len32).offset(off).build(),
+                None => opcode::Read::new(types::Fd(inf.fd), ptr, len32).offset(off).build(),
+            }
+            .user_data(ud);
+            if self.force_async {
+                e = e.flags(squeue::Flags::ASYNC);
+            }
+            Ok(e)
+        }
+
+        /// Fill the ring from the owned queue (reads first), then let queued
+        /// advisory entries ride whatever slots are left — reads always outrank
+        /// hints. Returns whether anything was pushed (the caller then submits).
+        fn pump(&mut self) -> io::Result<bool> {
+            let mut pushed_any = false;
+            while self.pending.len() < self.cap {
+                let Some(mut inf) = self.queued.pop_front() else { break };
+                let ud = Self::OWNED_TAG | self.next_ud;
+                let e = match self.owned_sqe(&mut inf, ud) {
+                    Ok(e) => e,
+                    Err(err) => {
+                        self.queued.push_front(inf);
+                        return Err(err);
+                    }
+                };
+                // SAFETY: the landing buffer is owned by `inf`, which moves into
+                // `self.pending` below and stays there until this completion is
+                // reaped (or waited out by `abort_owned`), so the kernel never
+                // writes into freed memory.
+                match unsafe { self.push_counted(&e) } {
+                    Ok(()) => {
+                        self.next_ud = (self.next_ud + 1) & (Self::OWNED_TAG - 1);
+                        self.pending.insert(ud, inf);
+                        pushed_any = true;
+                    }
+                    Err(e) => {
+                        // SQ out of slots before the cap (already counted for
+                        // the tuner): flush to the kernel; the next pump retries.
+                        self.queued.push_front(inf);
+                        crate::note_advisory_err("owned pump push rejected; flushing SQ", &e);
+                        self.ring.submit()?;
+                        pushed_any = false;
+                        break;
+                    }
+                }
+            }
+            if self.queued.is_empty() {
+                while self.pending.len() + self.advisory_inflight < self.cap {
+                    let Some(e) = self.advisory.pop_front() else { break };
+                    // SAFETY: advisory entries (fadvise) carry no buffer.
+                    match unsafe { self.push_counted(&e) } {
+                        Ok(()) => {
+                            self.advisory_inflight += 1;
+                            pushed_any = true;
+                        }
+                        Err(err) => {
+                            self.advisory.push_front(e);
+                            crate::note_advisory_err("advisory pump push rejected", &err);
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(pushed_any)
+        }
+
+        /// Pump, then hand anything pushed to the kernel without waiting.
+        fn pump_and_flush(&mut self) -> io::Result<()> {
+            if self.pump()? {
+                self.ring.submit()?;
+            }
+            Ok(())
+        }
+
+        /// Reap whatever owned completions are available, blocking for at least
+        /// one when any read is in flight. Appends finished regions to `out` and
+        /// returns how many were appended (which is legitimately 0 after a wave
+        /// of advisory or short completions — poll [`Reactor::pending_owned`],
+        /// not this count, for lane emptiness). Short reads are resubmitted
+        /// ahead of the backlog. On an error CQE the whole owned lane is drained
+        /// (dropping queued work) before the error returns, so the ring is
+        /// clean for whatever the caller does next.
+        pub fn reap_some(&mut self, out: &mut Vec<RegionDone>) -> io::Result<usize> {
+            if !self.ready.is_empty() {
+                let n = self.ready.len();
+                out.append(&mut self.ready);
+                return Ok(n);
+            }
+            self.pump_and_flush()?;
+            if self.pending.is_empty() {
+                // Nothing to wait for. Absorb any advisory completions already
+                // arrived so they never satisfy a later wave's wait.
+                for cqe in self.ring.completion() {
+                    if cqe.user_data() & Self::ADVISORY_TAG != 0 {
+                        self.advisory_inflight = self.advisory_inflight.saturating_sub(1);
+                    }
+                }
+                return Ok(0);
+            }
+            self.ring.submit_and_wait(1)?;
+            let mut reaped = 0usize;
+            let mut first_err: Option<io::Error> = None;
+            for cqe in self.ring.completion() {
+                let ud = cqe.user_data();
+                if ud & Self::ADVISORY_TAG != 0 {
+                    self.advisory_inflight = self.advisory_inflight.saturating_sub(1);
+                    continue;
+                }
+                let n = cqe.result() as i64;
+                let Some(mut inf) = self.pending.remove(&ud) else {
+                    if first_err.is_none() {
+                        first_err =
+                            Some(io::Error::other(format!("io_uring completion for unknown owned request {ud}")));
+                    }
+                    continue;
+                };
+                if n < 0 {
+                    if first_err.is_none() {
+                        first_err = Some(Self::errno_from_result(n));
+                    }
+                    continue;
+                }
+                if n == 0 {
+                    if first_err.is_none() {
+                        first_err = Some(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("owned read hit EOF after {} of {} bytes", inf.done, inf.need),
+                        ));
+                    }
+                    continue;
+                }
+                inf.done += n as usize;
+                if inf.done >= inf.need {
+                    out.push(inf.finish());
+                    reaped += 1;
+                } else if matches!(inf.buf, LandingBuf::Aligned(_)) && !inf.done.is_multiple_of(ALIGN) {
+                    // O_DIRECT only returns an unaligned count at EOF; a
+                    // continuation from an unaligned offset would EINVAL with no
+                    // hint of the real cause (same rule as the wave lane).
+                    if first_err.is_none() {
+                        first_err = Some(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "O_DIRECT short read at unaligned boundary ({} of {} bytes) — \
+                                 the region extends past the end of the file",
+                                inf.done, inf.need
+                            ),
+                        ));
+                    }
+                } else {
+                    // a nearly-done region resumes ahead of the backlog
+                    self.queued.push_front(inf);
+                }
+            }
+            if let Some(err) = first_err {
+                self.abort_owned();
+                return Err(err);
+            }
+            // Refill the slots this reap freed and start those reads now.
+            self.pump_and_flush()?;
+            Ok(reaped)
+        }
+
+        /// Queue `POSIX_FADV_WILLNEED` hints for `regions`, to ride SQ slots
+        /// left over after owned reads. Purely advisory and droppable: the
+        /// backlog is bounded (oldest dropped first) and submission failures are
+        /// harmless — reads never wait on hints, hints never displace reads.
+        pub fn queue_willneed(&mut self, regions: &[(RawFd, u64, usize)]) {
+            const POSIX_FADV_WILLNEED: i32 = 3;
+            self.queue_advisory(regions, POSIX_FADV_WILLNEED);
+        }
+
+        /// Queue `POSIX_FADV_DONTNEED` (drop page-cache references after the
+        /// last consumer), same contract as [`Reactor::queue_willneed`].
+        pub fn queue_dontneed(&mut self, regions: &[(RawFd, u64, usize)]) {
+            const POSIX_FADV_DONTNEED: i32 = 4;
+            self.queue_advisory(regions, POSIX_FADV_DONTNEED);
+        }
+
+        fn queue_advisory(&mut self, regions: &[(RawFd, u64, usize)], advice: i32) {
+            for &(fd, off, len) in regions {
+                let e = opcode::Fadvise::new(types::Fd(fd), len as libc::off_t, advice)
+                    .offset(off)
+                    .build()
+                    .user_data(Self::ADVISORY_TAG);
+                self.advisory.push_back(e);
+            }
+            // Hints are droppable by definition: bound the backlog so a caller
+            // queuing faster than slots free can never grow it without limit.
+            let cap = self.cap.saturating_mul(2).max(8);
+            if self.advisory.len() > cap {
+                let excess = self.advisory.len() - cap;
+                self.advisory.drain(..excess);
+            }
+            // With reads in flight the hints ride the next pump; with the lane
+            // idle there is no later pump, so push and flush now.
+            if self.pending.is_empty() && self.queued.is_empty() {
+                if let Err(e) = self.pump_and_flush() {
+                    crate::note_advisory_err("advisory flush", &e);
+                }
+            }
+        }
+
+        /// Block until the owned lane is fully idle: every queued read pushed
+        /// and reaped (appended to `out` exactly as [`Reactor::reap_some`]
+        /// would), every advisory completion absorbed, leftover advisory hints
+        /// dropped (they are droppable by definition). After this returns `Ok`,
+        /// the wave-lane calls are usable again on this ring.
+        pub fn quiesce_owned(&mut self, out: &mut Vec<RegionDone>) -> io::Result<()> {
+            while self.pending_owned() > 0 {
+                self.reap_some(out)?;
+            }
+            while self.advisory_inflight > 0 {
+                self.ring.submit_and_wait(1)?;
+                let mut progressed = false;
+                for cqe in self.ring.completion() {
+                    progressed = true;
+                    if cqe.user_data() & Self::ADVISORY_TAG != 0 {
+                        self.advisory_inflight = self.advisory_inflight.saturating_sub(1);
+                    }
+                }
+                if !progressed {
+                    return Err(io::Error::other("owned quiesce made no progress"));
+                }
+            }
+            self.advisory.clear();
+            Ok(())
+        }
+
+        /// Return the owned lane to a clean state after an error (or at drop):
+        /// drop queued work and ready results, then wait out every in-flight
+        /// completion — an abandoned CQE would satisfy a later wave's wait in
+        /// place of a real completion, and an abandoned in-flight read points at
+        /// a buffer about to be freed (`drain_pushed`'s contract, owned lane).
+        fn abort_owned(&mut self) {
+            self.queued.clear();
+            self.advisory.clear();
+            self.ready.clear();
+            while !self.pending.is_empty() || self.advisory_inflight > 0 {
+                if let Err(e) = self.ring.submit_and_wait(1) {
+                    crate::note_advisory_err("owned-lane drain: submit_and_wait", &e);
+                    break;
+                }
+                let mut progressed = false;
+                for cqe in self.ring.completion() {
+                    progressed = true;
+                    let ud = cqe.user_data();
+                    if ud & Self::ADVISORY_TAG != 0 {
+                        self.advisory_inflight = self.advisory_inflight.saturating_sub(1);
+                    } else if self.pending.remove(&ud).is_none() {
+                        crate::note_advisory_err("owned-lane drain: stray completion", &ud);
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -950,6 +1594,12 @@ impl Reactor {
     }
     pub fn new(_entries: u32) -> std::io::Result<Reactor> {
         Self::unsupported()
+    }
+    pub fn new_streaming(_entries: u32) -> std::io::Result<Reactor> {
+        Self::unsupported()
+    }
+    pub fn is_sqpoll(&self) -> bool {
+        false
     }
     pub fn register_files(&mut self, _fds: &[RawFd]) -> std::io::Result<()> {
         Self::unsupported()
@@ -1000,6 +1650,20 @@ impl Reactor {
     pub fn read_direct_aligned(&mut self, _reqs: &[(RawFd, u64, usize)]) -> std::io::Result<Vec<crate::Bytes>> {
         Self::unsupported()
     }
+    pub fn submit_owned(&mut self, _reqs: Vec<OwnedReadReq>, _direct: bool) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn pending_owned(&self) -> usize {
+        0
+    }
+    pub fn reap_some(&mut self, _out: &mut Vec<RegionDone>) -> std::io::Result<usize> {
+        Self::unsupported()
+    }
+    pub fn quiesce_owned(&mut self, _out: &mut Vec<RegionDone>) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn queue_willneed(&mut self, _regions: &[(RawFd, u64, usize)]) {}
+    pub fn queue_dontneed(&mut self, _regions: &[(RawFd, u64, usize)]) {}
 }
 
 /// Read a whole file through io_uring (open → size → one ring-backed exact read).
@@ -1448,6 +2112,326 @@ mod tests {
             assert_eq!(&batched[k][..], &data[o..o + len], "batched region {k} bytes mismatch");
             assert_eq!(&batched[k][..], &serial[0][..], "batched region {k} differs from serial read");
         }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    // ---- owned-completion lane ----------------------------------------------
+
+    /// Drive `cases` through the owned lane and assert every region's bytes
+    /// match `data`, keyed by `idx`, with tags echoed. Shared body for the
+    /// owned-lane byte-identity tests.
+    #[cfg(target_os = "linux")]
+    fn owned_roundtrip_asserts(
+        reactor: &mut Reactor,
+        fd: RawFd,
+        cases: &[(u64, usize)],
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        let reqs: Vec<OwnedReadReq> = cases
+            .iter()
+            .enumerate()
+            .map(|(k, &(off, len))| OwnedReadReq { fd, offset: off, len, tag: k as u64 * 7 })
+            .collect();
+        reactor.submit_owned(reqs, false)?;
+        // Reap incrementally (the production shape), then quiesce the tail.
+        let mut done: Vec<RegionDone> = Vec::new();
+        while reactor.pending_owned() > 0 {
+            reactor.reap_some(&mut done)?;
+        }
+        reactor.quiesce_owned(&mut done)?;
+        assert_eq!(done.len(), cases.len(), "every region delivered exactly once");
+        done.sort_by_key(|d| d.idx);
+        for (k, d) in done.iter().enumerate() {
+            assert_eq!(d.idx, k, "regions keyed by submission index");
+            assert_eq!(d.tag, k as u64 * 7, "caller tag echoed");
+            let (off, len) = cases[k];
+            let o = off as usize;
+            assert_eq!(d.bytes.len(), len, "region {k} wrong length");
+            assert_eq!(&d.bytes[..], &data[o..o + len], "region {k} bytes mismatch");
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_completion_matches_pread_oracle() -> std::io::Result<()> {
+        // The owned lane must deliver exactly [offset, offset+len) per request,
+        // byte-identical to the file (the same oracle the wave lane pins),
+        // including a zero-length region, which completes at submit time.
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"owned-lane-oracle-payload", 50021)?;
+        let fd = f.as_raw_fd();
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let cases: Vec<(u64, usize)> =
+            vec![(0, 10), (100, 0), (999, 1), (4096, 4096), (12345, 678), (50011, 10)];
+        owned_roundtrip_asserts(&mut reactor, fd, &cases, &data)?;
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_completion_out_of_order_arrival() -> std::io::Result<()> {
+        // Forced IOSQE_ASYNC (the default) hands every read to io-wq, whose
+        // workers finish in whatever order they please — delivery is keyed by
+        // `idx`, so arrival order must be unobservable in the results.
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"out-of-order-owned-arrival", 64007)?;
+        let fd = f.as_raw_fd();
+        let mut reactor = match Reactor::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let cases: Vec<(u64, usize)> =
+            (0..48u64).map(|i| ((i * 1327) % 60000, 17 + (i as usize % 900))).collect();
+        owned_roundtrip_asserts(&mut reactor, fd, &cases, &data)?;
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_batch_exceeds_ring_cap() -> std::io::Result<()> {
+        // 64 regions through an 8-entry ring: the internal queue must feed the
+        // ring as completions free slots, and still deliver every region once.
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"owned-cap-backpressure", 33013)?;
+        let fd = f.as_raw_fd();
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let cases: Vec<(u64, usize)> =
+            (0..64u64).map(|i| ((i * 499) % 32000, 13 + (i as usize % 400))).collect();
+        owned_roundtrip_asserts(&mut reactor, fd, &cases, &data)?;
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_short_eof_errors_and_ring_stays_clean() -> std::io::Result<()> {
+        // A region extending past EOF must surface as UnexpectedEof, and the
+        // failure must leave the ring clean enough that a fresh owned batch on
+        // the same Reactor succeeds (abort_owned's contract).
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"eof-short-owned", 5003)?;
+        let fd = f.as_raw_fd();
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let reqs = vec![
+            OwnedReadReq { fd, offset: 0, len: 100, tag: 0 },
+            OwnedReadReq { fd, offset: 4900, len: 500, tag: 1 }, // ends 397 bytes past EOF
+        ];
+        reactor.submit_owned(reqs, false)?;
+        let mut done: Vec<RegionDone> = Vec::new();
+        let mut saw_err = false;
+        while reactor.pending_owned() > 0 {
+            match reactor.reap_some(&mut done) {
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(
+                        e.kind(),
+                        std::io::ErrorKind::UnexpectedEof,
+                        "EOF must surface as UnexpectedEof, got: {e}"
+                    );
+                    saw_err = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_err, "a region past EOF must error");
+        assert_eq!(reactor.pending_owned(), 0, "the error drain leaves the lane empty");
+        let reqs = vec![OwnedReadReq { fd, offset: 10, len: 64, tag: 9 }];
+        reactor.submit_owned(reqs, false)?;
+        let mut done2: Vec<RegionDone> = Vec::new();
+        reactor.quiesce_owned(&mut done2)?;
+        assert_eq!(done2.len(), 1, "fresh batch after the error must complete");
+        assert_eq!(&done2[0].bytes[..], &data[10..74]);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_direct_matches_pread() -> std::io::Result<()> {
+        // Owned O_DIRECT reads: unaligned head, block-spanning, exact block,
+        // big span, EOF tail — each delivered zero-copy as the exact requested
+        // range, byte-identical to the file. Skips when the temp FS rejects
+        // O_DIRECT (overlayfs/tmpfs in CI containers).
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"owned-direct-DMA-payload", 41999)?;
+        drop(f); // buffered fd not needed — reads go through the O_DIRECT fd below
+        let df = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&path) {
+            Ok(df) => df,
+            Err(e) => {
+                eprintln!("skipping: filesystem rejects O_DIRECT open: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let dfd = df.as_raw_fd();
+        if !super::probe_direct(dfd) {
+            std::fs::remove_file(&path)?;
+            return Ok(()); // open ok but aligned reads rejected (EINVAL) → skip
+        }
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let cases = [(100u64, 7usize), (4090, 20), (0, 4096), (8191, 4098), (41996, 3)];
+        let reqs: Vec<OwnedReadReq> = cases
+            .iter()
+            .enumerate()
+            .map(|(k, &(off, len))| OwnedReadReq { fd: dfd, offset: off, len, tag: k as u64 })
+            .collect();
+        reactor.submit_owned(reqs, true)?;
+        let mut done: Vec<RegionDone> = Vec::new();
+        match reactor.quiesce_owned(&mut done) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                std::fs::remove_file(&path)?;
+                return Ok(()); // late EINVAL → skip
+            }
+            Err(e) => return Err(e),
+        }
+        assert_eq!(done.len(), cases.len());
+        done.sort_by_key(|d| d.idx);
+        for (k, d) in done.iter().enumerate() {
+            let (off, len) = cases[k];
+            let o = off as usize;
+            assert_eq!(d.bytes.len(), len, "direct region {k} wrong length");
+            assert_eq!(&d.bytes[..], &data[o..o + len], "direct region {k} bytes mismatch");
+        }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_with_queued_advisory_unaffected() -> std::io::Result<()> {
+        // Advisory hints ride spare SQ slots without perturbing read results;
+        // the wave lane refuses to interleave with the owned lane and works
+        // again once the lane is quiesced.
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"advisory-riding-owned", 27011)?;
+        let fd = f.as_raw_fd();
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        // hints queued while idle flush immediately (and harmlessly)
+        reactor.queue_willneed(&[(fd, 0, 8192)]);
+        let cases: Vec<(u64, usize)> =
+            (0..24u64).map(|i| ((i * 997) % 26000, 33 + (i as usize % 250))).collect();
+        let reqs: Vec<OwnedReadReq> = cases
+            .iter()
+            .enumerate()
+            .map(|(k, &(off, len))| OwnedReadReq { fd, offset: off, len, tag: k as u64 })
+            .collect();
+        reactor.submit_owned(reqs, false)?;
+        // more hints while reads are in flight: they wait behind reads and must
+        // never surface in the read results
+        reactor.queue_willneed(&[(fd, 8192, 8192), (fd, 16384, 8192)]);
+        // the wave lane must refuse to interleave
+        let mut probe = [0u8; 8];
+        let mut wave = [ReadReq { fd, offset: 0, buf: &mut probe, tag: 0 }];
+        assert!(
+            reactor.read_many(&mut wave).is_err(),
+            "wave read must refuse while owned reads are in flight"
+        );
+        let mut done: Vec<RegionDone> = Vec::new();
+        reactor.quiesce_owned(&mut done)?;
+        assert_eq!(done.len(), cases.len());
+        done.sort_by_key(|d| d.idx);
+        for (k, d) in done.iter().enumerate() {
+            let (off, len) = cases[k];
+            let o = off as usize;
+            assert_eq!(&d.bytes[..], &data[o..o + len], "region {k} bytes mismatch");
+        }
+        // dontneed on an idle lane flushes immediately; then the wave lane works
+        reactor.queue_dontneed(&[(fd, 0, 8192)]);
+        let mut done2: Vec<RegionDone> = Vec::new();
+        reactor.quiesce_owned(&mut done2)?;
+        let mut after = vec![0u8; 40];
+        let mut wave2 = [ReadReq { fd, offset: 5, buf: &mut after, tag: 0 }];
+        let res = reactor.read_many(&mut wave2)?;
+        assert_eq!(res, vec![40], "wave lane usable after quiesce");
+        assert_eq!(&after[..], &data[5..45]);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sqpoll_ring_matches_plain() -> std::io::Result<()> {
+        // A SQPOLL ring must return the same bytes as a plain ring, on both the
+        // wave lane and the owned lane. Built via env-free `new_with` (no env
+        // mutation — parallel-test-safe); skips when the kernel refuses SQPOLL
+        // (pre-5.13 unprivileged, io_uring restricted, etc).
+        use super::uring::{RingOpts, SqpollOpts};
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"sqpoll-vs-plain-payload", 29009)?;
+        let fd = f.as_raw_fd();
+        let mut sq = match Reactor::new_with(8, RingOpts { sqpoll: Some(SqpollOpts { idle_ms: 100, cpu: None }) }) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        if !sq.is_sqpoll() {
+            eprintln!("skipping: kernel refused SQPOLL (fell back to plain ring)");
+            std::fs::remove_file(&path)?;
+            return Ok(());
+        }
+        // wave lane
+        let mut b0 = vec![0u8; 100];
+        let mut b1 = vec![0u8; 999];
+        let mut reqs = vec![
+            ReadReq { fd, offset: 11, buf: &mut b0, tag: 0 },
+            ReadReq { fd, offset: 20000, buf: &mut b1, tag: 1 },
+        ];
+        let res = sq.read_many(&mut reqs)?;
+        assert_eq!(res, vec![100, 999]);
+        assert_eq!(&b0[..], &data[11..111]);
+        assert_eq!(&b1[..], &data[20000..20999]);
+        // owned lane
+        let cases: Vec<(u64, usize)> =
+            (0..20u64).map(|i| ((i * 1409) % 28000, 21 + (i as usize % 300))).collect();
+        owned_roundtrip_asserts(&mut sq, fd, &cases, &data)?;
         std::fs::remove_file(&path)?;
         Ok(())
     }

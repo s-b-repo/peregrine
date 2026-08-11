@@ -53,12 +53,23 @@ corpus (default length 256), and writes the expert-transition FSA to
 `<model-dir>/automaton.json` (config-tagged; auto-loaded on the next
 `Model::load`). See [Prefetch & prediction](prefetch-and-caching.md).
 
-### `dump-routes <model-dir> <out.json> [corpus-len]`
+### `dump-routes <model-dir> <out.json> [corpus-len] [--text FILE]`
 
-Streams the same synthetic corpus and writes the raw per-forward routing trace
-to `<out.json>` (any path). The trace is a bare nested array
-`[forward][layer][expert-id]` — the input format of
-[`peregrine-layout-reorg`](layout-tools.md).
+Writes the raw per-forward routing trace to `<out.json>` (any path). The trace is
+a bare nested array `[forward][layer][expert-id]` — the input format of
+[`peregrine-layout-reorg`](layout-tools.md) and of
+[`route-stats`](#route-stats-routesjson-n_experts).
+
+**Pass `--text` for anything that reads the trace as a statement about routing.**
+Without it the corpus is uniform-random token ids, and random ids route randomly:
+`route-stats` over such a trace reports consecutive-token overlap at the
+independence null *however the router behaves*, which reads as proof that
+prefetch has nothing to predict when it is only proof that the corpus was noise.
+`--text` encodes a real file with the tokenizer that travels with the container,
+truncated to `corpus-len`. The subcommand warns loudly when it is absent.
+
+Layout tools are less sensitive to this — they want co-occurrence over whatever
+workload you serve — but they are not *insensitive*, and the same flag applies.
 
 ### `galactic <model-dir> [corpus-len]`
 
@@ -67,6 +78,36 @@ The one-shot offline preprocessing pass: ONE corpus run emits every artifact —
 (Louvain ordering + per-layer 2-opt), optional `tiers.json` (only when
 `COLI_TIER_VRAM_MB` and/or `COLI_TIER_RAM_MB` are set), and a
 `route_stats.json` seed. All are picked up automatically at the next load.
+
+### `flip-rate <source-dir> <candidate-dir> [--text FILE] [--tokens N]`
+
+The quality gate for a **lossy** container — a `peregrine-requantize` output
+measured against the checkpoint it was converted from. Every other gate in this
+repo is bit-identity, which a requantized container fails by construction, so
+`prediction_flip_rate` (top-1 agreement under teacher forcing) is what stands in
+its place. Prints `positions`, `flips` and `flip_rate` on stdout.
+
+```bash
+peregrine flip-rate ~/models/GLM-5.2-int4 /mnt/models/GLM-5.2-int2g64 \
+  --text sample.txt --tokens 512
+```
+
+- **The models load one at a time.** Two streaming loads would hold two warm
+  caches against one page cache, and the slower container would be measured
+  while the faster one evicted it. Peak RSS is one model's.
+- **`--text` uses the *source* container's `tokenizer.json`**, so the ids are
+  the ones that container was converted from. Without it the run uses
+  uniform-random token ids and says so loudly on stderr — that is a smoke test
+  of the harness, not a quality figure for the container.
+- **Pick `--tokens` large.** One forward covers every position, and the bytes
+  read are the routed *union*, which saturates: at top-8 over 256 experts a
+  128-position forward already touches ~98% of the container, so 512 positions
+  cost ~2% more bytes than 128 and buy 4× the statistics. There is no per-token
+  read cost to economize on here.
+- Top-1 on one text is a **floor** on quality, not a summary — a container can
+  hold argmax everywhere and still shift the distribution underneath. The gate
+  itself is pinned in both directions by `flip_rate_gate.rs`: zero flips against
+  an identical container, non-zero against a deliberately lossy one.
 
 ### `compile-plan <model-dir>`
 

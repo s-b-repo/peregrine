@@ -210,7 +210,9 @@ fn memlock_limit() -> u64 {
     unsafe {
         let mut rl: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) == 0 {
-            rl.rlim_cur as u64
+            // `rlim_t` is `u64` on glibc/linux-gnu; kept unannotated so a target
+            // where it is narrower widens implicitly rather than being cast.
+            rl.rlim_cur
         } else {
             0
         }

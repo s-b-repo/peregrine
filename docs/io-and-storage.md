@@ -13,17 +13,58 @@ A **custom single-owner reactor thread** built directly on the `io-uring`
 crate — deliberately not `tokio-uring`, whose per-op Future model fights the
 batched-submit / io-wq-worker-cap ownership the design needs.
 
-- **Registered files** (`IOSQE_FIXED_FILE`) plus `SINGLE_ISSUER` and
-  `COOP_TASKRUN` ring flags.
+- **Registered files** (`IOSQE_FIXED_FILE`): the streaming rings register
+  every shard fd (buffered + O_DIRECT twins, `SafeTensors::shard_fds`) right
+  after construction, so read SQEs name a fixed-file slot instead of
+  re-resolving the fd each time. Rings run `COOP_TASKRUN`; **not**
+  `SINGLE_ISSUER` — the scheduler's lane threads are respawned per layer, and
+  a single-issuer ring would reject the new task with `EEXIST`.
+- **Owned-completion lane** (`COLI_IO_COMPLETION`, default on): the demand
+  path submits each claimed expert's regions with Reactor-owned landing
+  buffers and reaps completions incrementally, forwarding every expert to the
+  CPU pool the moment its last region lands — no whole-wave barrier, so
+  compute on expert 1 overlaps the reads of experts 2..N. Bytes are
+  byte-identical to the wave path (same regions, same carve); only delivery
+  timing changes, which the `pos`-keyed reduce absorbs by construction.
+  `COLI_IO_COMPLETION=0` restores the blocking wave;
+  `COLI_IO_ENGINE=pread|regbuf` also implies the wave (those measurement arms
+  are wave-shaped on purpose).
+- **SQPOLL** (`COLI_SQPOLL=1`, default off): a kernel submission-polling
+  thread that removes even the one enter syscall per submit batch
+  (unprivileged since kernel 5.13). Opt-in because the poll kthread
+  busy-polls a core until `COLI_SQPOLL_IDLE_MS` (default 2000) of quiet —
+  usually the wrong trade on a CPU-contended box; the bench arm decides.
+  `COLI_SQPOLL_CPU` pins the kthread. Streaming rings only, with graceful
+  fallback to the plain `COOP_TASKRUN` ring if the kernel refuses. Under
+  SQPOLL the tuner's `sq_full` signal reads near-zero (the kthread drains
+  the SQ continuously); the read-µs EWMA remains the live signal.
 - **Registered buffers**: `register_read_buffers()` + `IORING_OP_READ_FIXED`
   are implemented and tested, but **not reachable from the streaming path** —
   nothing calls them outside tests, and `COLI_REGBUF` is read by no code.
-- **Batched submits**: `read_many()` / `read_experts_batched()` merge
-  contiguous regions before submit; the streaming lane keeps
-  `COLI_IO_BATCH` experts × 6 regions ≈ 96 reads in flight per ring.
+- **Batched submits**: `read_experts_batched()` issues one deep submit per claim.
+  An expert costs **two SQEs when its regions coalesce, six when they do not** —
+  its three weight tensors are contiguous on disk (18,874,368 bytes at int4,
+  37,748,736 on the int8 MTP layer) and its three `.qs` scales are a second run
+  pooled at the front of the shard, so the common case is two reads. Experts
+  straddling a shard boundary (~0.45 % of this container) keep all six.
+  `COLI_EXPERT_MERGE=0` forces six, for A/B against a bit-identity assertion.
+  Extents come from the load-time expert map (`ExpertIndex`), and each merged
+  buffer is split back into six regions as refcounted `Bytes::View` windows —
+  **no copy**, and admission to the warm cache is then free too, since a view is
+  already shared. The split is computed from each tensor's own offset, never its
+  position: on disk the three projections sit in alphabetical order (down, gate,
+  up), so a positional split would load one matrix's bytes into another and still
+  produce plausible activations.
+  `read_many()` itself does **not** coalesce — it emits one SQE per `ReadReq`.
+  This entry claimed "merge contiguous regions before submit" until 2026-08-09,
+  describing an optimization no code performed; the merging now happens a level
+  up, where the expert's extents are known.
 - **fadvise integration**: `POSIX_FADV_WILLNEED` batched before main-path
-  reads (`COLI_FADVISE_MAIN`, default on); optional `POSIX_FADV_DONTNEED`
-  after each streamed read for RSS-bounded runs (`COLI_FADVISE_DROP`).
+  reads (`COLI_FADVISE_MAIN`, default on) — on the completion lane the hint
+  covers the **next** claim window, issued on spare SQ slots while the current
+  window streams (reads always outrank hints for slots); optional
+  `POSIX_FADV_DONTNEED` after each streamed read for RSS-bounded runs
+  (`COLI_FADVISE_DROP`).
 - **Adaptive io-wq cap**: the [`IoTuner`](adaptive-runtime.md#iotuner)
   adjusts `iowq_max_workers` between forwards from an EWMA + SQ-full deltas
   (`COLI_IO_TUNE`, default on).
@@ -82,8 +123,19 @@ older prose: `slab.rs` states outright that the outer `Mutex<Reactor>` already
 serializes access, so a lock-free swap here would be dead weight.)
 `checkout_tagged` / `checkin_tagged` return and verify a generation-tagged
 `SlabHandle { gen }` so a straggler speculative load cannot write into a recycled
-slab — **but nothing calls them**. The live path is the untagged
-`checkout`/`checkin`, so that protection is implemented and not in effect. Expert reads are
+slab. **Wired 2026-08-06** — the O_DIRECT landing path (`ring.rs`, the sole
+production call site) now checks out and returns tagged handles.
+
+Two things had to be fixed before wiring, not after. The check asserted
+`handle.gen < self.gen`, which **every** handle the pool ever issued satisfies,
+because `gen` only increases — so the double-return it advertised could not be
+detected, and wiring it first would merely have made an unfireable check
+reachable. The pool now tracks the generations actually *outstanding*, and a
+handle absent from that set — returned twice, or issued by a different pool — is
+rejected with its buffer dropped rather than pushed onto the free-list, where it
+would let two holders write the same allocation. And the check was a
+`debug_assert!`, compiled out of exactly the build where a late completion can
+happen; it now runs in release. Expert reads are
 zero-copy into the weight: the landing region is a `peregrine_io::Bytes` the
 streamed `QtWeight` moves in, and kernels read it via `Deref<[u8]>`.
 
@@ -94,9 +146,10 @@ budgeted warm RAM cache (`COLI_ECACHE_GB`) with Bloom-filter miss shortcut,
 transparent zstd, negative TTL, heat-gated admission and idle recompression.
 
 Eviction picks the lowest `(priority, recency)` — priority-weighted LRU
-(`warmcache.rs::evict_to_budget`). The LFRU scoring in `tier.rs`
-(`(heat << 8) | recency`) is **not** wired to it; see
-[prefetch & caching](prefetch-and-caching.md#tiering--gpu-residency).
+(`warmcache.rs::evict_to_budget`) — unless `COLI_CACHE_LFRU=1`, which replaces
+the recency component with `tier::lfru_score` (`(heat << 8) | recency`) while
+leaving priority as the primary key. Default off and bit-for-bit the historical
+tuple; see [prefetch & caching](prefetch-and-caching.md#tiering--gpu-residency).
 
 ## Compression (`peregrine-core/src/compress.rs`)
 

@@ -1,0 +1,5 @@
+be3ba8b todo.md: settle the "can we match colibri's disk read" question in writing
+uncommitted files: 59
+built 2026-08-08T16:30:28+02:00
+batch=1 steps=2 ecache_gb=2 draft=4 memmax=24G
+model=/home/cortix/models/GLM-5.2-colibri-int4-with-int8-mtp

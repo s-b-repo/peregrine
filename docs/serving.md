@@ -54,13 +54,15 @@ except that `messages` must be non-empty; unknown fields are ignored):
 
 | Field | Type | Default | Behavior |
 |---|---|---|---|
-| `messages` | `[{role, content}]` (both strings) | — | required non-empty; array-form `content` is not accepted |
+| `messages` | `[{role, content, …}]` | — | required non-empty. `content` may be a string, `null`, absent, or an **array of `{type, text}` parts** (parts without `text` are dropped, the rest concatenated). Assistant turns may carry `tool_calls`; `role: "tool"` is accepted and replayed as an observation |
+| `tools` | `[{type, function:{name, description, parameters}}]` | none | tool schemas, rendered into the system turn — see [Tool calling](#tool-calling) |
+| `tool_choice` | string or object | none | only the exact string `"none"` is honoured, and it disables tools for that request. Any other value (including `"auto"`, `"required"`, or an object naming a function) leaves all tools active — peregrine does not force a call |
 | `max_tokens` | int | `256` | clamped to `[1, --max-tokens]` |
 | `temperature` | float | `0.0` (greedy) | clamped to `[0.0, 2.0]`; note the default differs from OpenAI's `1.0` |
 | `top_p` | float | `0.95` | clamped to `[0.0, 1.0]` |
 | `stream` | bool | `false` | SSE streaming when `true` |
 
-`model`, `n`, `stop`, `seed`, `logprobs`, penalties, `tools`,
+`model`, `n`, `stop`, `seed`, `logprobs`, penalties,
 `response_format`, and `stream_options` are not supported (ignored). Stop ids
 come from the model's `config.json` `eos_token_id` and are never emitted.
 Non-greedy sampling is seeded from the clock, so it is not reproducible;
@@ -107,6 +109,51 @@ on the next engine step.
 
 (Unparseable JSON bodies are rejected by the framework before the handler and
 return plain-text 4xx, not the OpenAI shape.)
+
+### Tool calling
+
+OpenAI clients send tool *schemas* in a `tools` array and expect calls back in
+`choices[].message.tool_calls`. GLM-5.2 reads schemas from the system turn and
+emits calls as `<tool_call>` markup its tokenizer has dedicated tokens for.
+peregrine bridges the two in both directions, so an OpenAI-shaped client needs
+no changes.
+
+**Request → prompt.** Schemas render into a `# Tools` block inside the **first**
+system turn (a system turn is synthesized if the request has none). This is
+GLM's own template placement: a bare tools turn with no system content trains
+the model to answer the schema instead of using it. `tool_choice: "none"`
+suppresses the block entirely; see the field table for why no other value
+changes anything. Assistant turns carrying `tool_calls` are rendered back into
+`<tool_call>` markup so a multi-turn conversation replays to the model in the
+form it emitted, and `role: "tool"` turns become `<|observation|>` with the
+result wrapped in `<tool_response>`.
+
+**Output → response.** A streaming filter splits the token stream into visible
+text, tool calls, and `<think>` reasoning, holding back any suffix that could
+still turn out to be a marker — so a `<tool_call>` arriving one character at a
+time never leaks a fragment to the client. Then:
+
+- `finish_reason` is `"tool_calls"` when the turn produced any call, else `"stop"`.
+- `content` is `null` on a calls-only turn, and the text otherwise.
+- Call ids are `call_<completion-id-without-the-chatcmpl-prefix>_<index>`, stable
+  between the streaming and non-streaming paths for the same completion.
+- Argument values are typed **from the declared schema**, falling back to
+  sniffing only for undeclared parameters. This is what keeps a shell command
+  `1.10` a string instead of the float `1.1`, and a file named `true` a string
+  instead of a boolean.
+- `<think>` blocks are dropped, not shown.
+
+**One deliberate divergence from OpenAI's streaming shape:** peregrine emits one
+*whole* call per SSE chunk, where OpenAI fragments `arguments` across deltas. The
+markup is not a well-formed call until its closing tag arrives, so emitting
+partial arguments would mean emitting text that may never become valid JSON.
+Clients that accumulate `arguments` deltas still work — they receive one delta
+containing the whole string.
+
+**Truncation.** A call cut off at the token cap is still parsed and returned:
+the call is the point of the turn, so a recovered one beats a discarded one. An
+unclosed `<think>` block is *not* recovered — reasoning is not for the client —
+so a response truncated mid-reasoning is an empty one.
 
 ### `X-Peregrine-Priority` header
 
@@ -202,3 +249,48 @@ curl -sN localhost:8080/v1/chat/completions \
   -H 'x-peregrine-priority: high' \
   -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
+
+## `peregrine-gen` — watch generation live, and time it
+
+A streaming client that prints the completion as it arrives and reports what the
+engine did. It exists because `curl -N` shows you the text but nothing about the
+*shape* of the run, and `scripts/bench-prefetch-arms.sh` reports one lumped
+`decode_s` per request — which on a mostly-prefill request is largely prefill.
+
+```bash
+peregrine-gen "Explain how a mixture-of-experts layer routes a token."
+peregrine-gen --port 8137 --max-tokens 8 --json timings.json < prompt.txt
+```
+
+```
+── peregrine-gen ──────────────────────────────────────────────
+  generated    2 tokens, 3 chars
+  ttft         2m 23s  (prefill + first token)
+  total        2m 38s
+  decode rate  15.23 s/tok (0.066 tok/s)  (excludes ttft)
+  inter-token  min 15.1s  p50 15.1s  p95 15.1s  max 15.1s
+```
+
+**Text goes to stdout, statistics to stderr**, so `peregrine-gen "..." > out.txt`
+captures a clean completion while the summary stays on the terminal, and
+`2> stats.txt` captures plain text with no escape codes.
+
+Three things are tuned to this engine rather than generic:
+
+- **Seconds per token, not tokens per second.** Streaming experts off disk puts
+  decode in the tens of seconds per token at GLM-5.2 shapes, where `tok/s` reads
+  `0.07` and says nothing. The unit flips automatically above 1 tok/s.
+- **The status line ticks from its own thread.** A token can take a minute; a line
+  that only redrew on arrival would be indistinguishable from a hang.
+- **The inter-token spread is the headline.** A token served from the warm cache
+  and one that streams a full ~11.3 GB routed union differ by an order of
+  magnitude, so `min/p50/p95/max` carry the signal an average destroys. A
+  slowest/fastest ratio ≥ 2× is called out explicitly, and `--json` writes every
+  interval for offline analysis.
+
+TTFT is measured to the first delta and **excluded from the interval
+percentiles** — prefill is work that happens once, and folding it in would drag
+every percentile with it.
+
+No new dependencies: raw HTTP/1.1 over `std::net::TcpStream` including
+chunked-transfer decoding, plus `serde_json` for the event payloads.

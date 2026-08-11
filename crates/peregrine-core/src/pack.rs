@@ -402,7 +402,22 @@ pub fn bf16_bytes(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect()
 }
 
-/// Round-trip check helper: bf16 encode then decode.
+/// Round-trip check helper: bf16 encode then decode — what a value becomes if
+/// stored as bf16.
+///
+/// **Deliberately has no production caller, and that is not an oversight.**
+/// Nothing in the engine *writes* bf16: it is a source dtype the reader converts
+/// (`safetensors::read_f32`, `Dtype::Bf16`) and the pruner copies through
+/// verbatim. A round-trip helper is only meaningful where something encodes, so
+/// the honest options were to invent a call site or to say why there isn't one.
+///
+/// Inventing one is the failure this repo's `[R]` audit exists to catch, wearing
+/// the opposite face: the audit hunts features documented as reachable that
+/// aren't, and answering it with a contrived caller would make the metric agree
+/// while making the code worse. Kept because it is the correct helper the day
+/// anything does write bf16 — a converter with a `--target bf16` scheme, or a
+/// precision-floor report attributing quantization error against what bf16
+/// already lost.
 pub fn bf16_roundtrip(v: f32) -> f32 {
     bf16_to_f32((v.to_bits() >> 16) as u16)
 }

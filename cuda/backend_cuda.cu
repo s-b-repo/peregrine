@@ -16,6 +16,16 @@ struct ColiCudaTensor {
     int tracked;
 };
 
+/* One cached, instantiated CUDA graph of an `expert_group` launch shape. */
+#define COLI_CUDA_GRAPH_CACHE 16
+struct ColiCudaGraph;
+typedef struct {
+    uint64_t key;              /* launch shape; 0 = empty slot */
+    struct ColiCudaGraph *g;
+    unsigned gen;              /* ctx->scratch_gen at capture */
+    uint64_t used;             /* LRU stamp */
+} GraphSlot;
+
 typedef struct {
     int device;
     int compute_major,compute_minor;
@@ -24,11 +34,24 @@ typedef struct {
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
+    /* Fused reduce (COLI_CUDA_FUSED_REDUCE): CSR metadata + the accumulated
+     * [s_n, D] output, device side and pinned staging side. */
+    void *red_meta; size_t red_meta_cap;
+    void *host_red; size_t host_red_cap;
+    float *red_out; size_t red_out_cap;
+    float *host_red_out; size_t host_red_out_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
+    void *host_desc; size_t host_desc_cap;      /* pinned staging: capture cannot copy from pageable */
     size_t tensor_count, tensor_bytes;
+    /* Bumped whenever a scratch buffer is actually reallocated. A captured graph
+     * holds baked device pointers, so it is only valid at the generation it was
+     * captured under — see `reserve`. */
+    unsigned scratch_gen;
+    GraphSlot graphs[COLI_CUDA_GRAPH_CACHE];
+    uint64_t graph_clock;
 } DeviceContext;
 
 typedef struct {
@@ -114,6 +137,28 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         y[(size_t)s * O + o] = partial[0] * (fmt ? scales[o] : 1.0f);
 }
 
+/* Gate-weighted accumulation of an expert group's rows into their batch rows —
+ * the layer-level reduce, on the device.
+ *
+ * `y` is `[total, D]` in call order; output row `s` sums the contributions
+ * `row_idx[row_ptr[s] .. row_ptr[s+1]]`, each scaled by its router weight.
+ *
+ * **CSR, and no atomics anywhere.** `f32 +=` is not associative, so an atomic
+ * scatter would give a different answer per run on identical input — the engine
+ * would lose reproducibility to gain a reduce. Here every `(s, d)` is written by
+ * exactly one thread which sums its contributions in ascending `row_idx` order,
+ * so the result is fixed by the CSR layout the host built and by nothing else. */
+__global__ static void grouped_reduce(float *out,const float *y,const int *row_ptr,
+                                        const int *row_idx,const float *rw,int D){
+    int s=blockIdx.x;
+    int lo=row_ptr[s],hi=row_ptr[s+1];
+    for(int d=threadIdx.x+blockIdx.y*blockDim.x;d<D;d+=blockDim.x*gridDim.y){
+        float acc=0.f;
+        for(int j=lo;j<hi;j++){int k=row_idx[j];acc+=rw[k]*y[(size_t)k*D+d];}
+        out[(size_t)s*D+d]=acc;
+    }
+}
+
 __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -122,66 +167,108 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     }
 }
 
-/* Four warps share one A tile and compute 16x64 outputs.  This matters for
- * prefill: the first prototype reloaded/converter A once per 16 output cols. */
-__global__ static void w4a16_matmul(float *y,const float *x,const uint8_t *w,
+/* Four warps share one A tile and compute TM x (4*TN) outputs.  This matters for
+ * prefill: the first prototype reloaded/converted A once per 16 output cols.
+ *
+ * Templated on the WMMA fragment shape because that shape is the one thing about
+ * this kernel worth tuning per (M, K, N), and fp16 WMMA admits exactly three:
+ * 16x16x16, 32x8x16 and 8x32x16. `WmmaTuner` measures them and picks; `<16,16,16>`
+ * is the historical instantiation and stays the default, so an unmeasured run
+ * executes precisely the code it always did. */
+template<int TM,int TN,int TK>
+__global__ static void w4a16_matmul_t(float *y,const float *x,const uint8_t *w,
                                     const float *scale,int M,int K,int N){
 #if __CUDA_ARCH__ >= 700
-    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
-    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
-    __shared__ __half ah[256],bh[4][256];
-    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    using namespace nvcuda;
+    constexpr int AS=TM*TK, BS=TN*TK, CS=TM*TN;
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*TM,n0=blockIdx.x*(TN*4)+warp*TN;
+    __shared__ __half ah[AS],bh[4][BS];
+    wmma::fragment<wmma::accumulator,TM,TN,TK,float> acc;wmma::fill_fragment(acc,0.f);
     size_t rb=(size_t)(K+1)/2;
-    for(int k0=0;k0<K;k0+=16){
-        for(int z=threadIdx.x;z<256;z+=blockDim.x){
-            int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+    for(int k0=0;k0<K;k0+=TK){
+        for(int z=threadIdx.x;z<AS;z+=blockDim.x){
+            int m=z/TK,k=z%TK,gm=m0+m,gk=k0+k;
             ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);
         }
-        for(int z=lane;z<256;z+=32){
-            int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
+        for(int z=lane;z<BS;z+=32){
+            int n=z/TK,gk=k0+(z%TK),gn=n0+n;float v=0.f;
             if(gn<N&&gk<K){uint8_t q=w[(size_t)gn*rb+(gk>>1)];int a=(gk&1)?q>>4:q&15;
                 v=(float)(a&8?a-16:a)*scale[gn];}
             bh[warp][z]=__float2half(v);           /* [Ntile,Ktile] == B col-major */
         }
         __syncthreads();
-        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
-        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
-        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::fragment<wmma::matrix_a,TM,TN,TK,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,TM,TN,TK,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,TK);wmma::load_matrix_sync(bf,bh[warp],TK);
         wmma::mma_sync(acc,af,bf,acc);__syncthreads();
     }
-    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
-    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+    __shared__ float out[4][CS];wmma::store_matrix_sync(out[warp],acc,TN,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<CS;z+=32){int m=z/TN,n=z%TN;
         if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*N+n0+n]=out[warp][z];}
 #endif
 }
 
-/* Gate and up use the same input.  Eight warps compute both 16x64 projections
- * while sharing the FP32->FP16 conversion of A. */
-__global__ static void w4a16_gate_up(float *gate,float *up,const float *x,
+/* Gate and up use the same input.  Eight warps compute both TM x (4*TN)
+ * projections while sharing the FP32->FP16 conversion of A. Templated on the
+ * fragment shape for the same reason as `w4a16_matmul_t`. */
+template<int TM,int TN,int TK>
+__global__ static void w4a16_gate_up_t(float *gate,float *up,const float *x,
         const uint8_t *gw,const uint8_t *uw,const float *gs,const float *us,
         int M,int K,int N){
 #if __CUDA_ARCH__ >= 700
-    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31,which=warp&1,tile=warp>>1;
-    int m0=blockIdx.y*16,n0=blockIdx.x*64+tile*16;const uint8_t *w=which?uw:gw;
+    using namespace nvcuda;
+    constexpr int AS=TM*TK, BS=TN*TK, CS=TM*TN;
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31,which=warp&1,tile=warp>>1;
+    int m0=blockIdx.y*TM,n0=blockIdx.x*(TN*4)+tile*TN;const uint8_t *w=which?uw:gw;
     const float *scale=which?us:gs;float *y=which?up:gate;size_t rb=(size_t)(K+1)/2;
-    __shared__ __half ah[256],bh[8][256];
-    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
-    for(int k0=0;k0<K;k0+=16){
-        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+    __shared__ __half ah[AS],bh[8][BS];
+    wmma::fragment<wmma::accumulator,TM,TN,TK,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=TK){
+        for(int z=threadIdx.x;z<AS;z+=blockDim.x){int m=z/TK,k=z%TK,gm=m0+m,gk=k0+k;
             ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);}
-        for(int z=lane;z<256;z+=32){int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
+        for(int z=lane;z<BS;z+=32){int n=z/TK,gk=k0+(z%TK),gn=n0+n;float v=0.f;
             if(gn<N&&gk<K){uint8_t q=w[(size_t)gn*rb+(gk>>1)];int a=(gk&1)?q>>4:q&15;
                 v=(float)(a&8?a-16:a)*scale[gn];}bh[warp][z]=__float2half(v);}
         __syncthreads();
-        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
-        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
-        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::fragment<wmma::matrix_a,TM,TN,TK,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,TM,TN,TK,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,TK);wmma::load_matrix_sync(bf,bh[warp],TK);
         wmma::mma_sync(acc,af,bf,acc);__syncthreads();
     }
-    __shared__ float out[8][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
-    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+    __shared__ float out[8][CS];wmma::store_matrix_sync(out[warp],acc,TN,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<CS;z+=32){int m=z/TN,n=z%TN;
         if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*N+n0+n]=out[warp][z];}
 #endif
+}
+
+/* The three fp16 WMMA fragment shapes, dispatched at runtime.
+ *
+ * A `switch` over template instantiations, not a runtime tile: WMMA fragment
+ * shapes are compile-time — `wmma::fragment<...,M,N,K,...>` has no runtime form
+ * — so "tunable tile size" for this kernel can only mean selecting among
+ * instantiations. Anything outside the three legal shapes falls back to
+ * 16x16x16, which is what an unmeasured or corrupt `kernel_tuning.json` gets. */
+#define COLI_W4A16_TILES(EMIT) \
+    EMIT(16,16,16) EMIT(32,8,16) EMIT(8,32,16)
+
+static void w4a16_gate_up_dispatch(dim3 grid,cudaStream_t s,int tm,int tn,int tk,
+        float *gate,float *up,const float *x,const uint8_t *gw,const uint8_t *uw,
+        const float *gs,const float *us,int M,int K,int N){
+#define COLI_EMIT(A,B,C) if(tm==A&&tn==B&&tk==C){ \
+        w4a16_gate_up_t<A,B,C><<<grid,256,0,s>>>(gate,up,x,gw,uw,gs,us,M,K,N); return; }
+    COLI_W4A16_TILES(COLI_EMIT)
+#undef COLI_EMIT
+    w4a16_gate_up_t<16,16,16><<<grid,256,0,s>>>(gate,up,x,gw,uw,gs,us,M,K,N);
+}
+
+static void w4a16_matmul_dispatch(dim3 grid,cudaStream_t s,int tm,int tn,int tk,
+        float *y,const float *x,const uint8_t *w,const float *scale,int M,int K,int N){
+#define COLI_EMIT(A,B,C) if(tm==A&&tn==B&&tk==C){ \
+        w4a16_matmul_t<A,B,C><<<grid,128,0,s>>>(y,x,w,scale,M,K,N); return; }
+    COLI_W4A16_TILES(COLI_EMIT)
+#undef COLI_EMIT
+    w4a16_matmul_t<16,16,16><<<grid,128,0,s>>>(y,x,w,scale,M,K,N);
 }
 
 __global__ static void quantize_s4_rows(uint8_t *q,float *scale,const float *x,int S,int K){
@@ -338,24 +425,60 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         ctx[((size_t)s*H+h)*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
-static int reserve(float **ptr, size_t *cap, size_t bytes) {
+/* ---- scratch reservation, and the generation counter graph capture needs ----
+ *
+ * Every reserve here is grow-only and FREES BEFORE IT REALLOCATES, so a buffer's
+ * device address is stable only until something asks for a larger one. A
+ * captured CUDA graph bakes the addresses it was recorded with, so a replay
+ * after any growth would read and write freed VRAM — silently, since the
+ * allocator will happily hand those pages to something else.
+ *
+ * `ctx->scratch_gen` is bumped on every ACTUAL reallocation (not on a satisfied
+ * request), and a cached graph carries the generation it was captured under.
+ * Mismatch means discard, not replay. Threading `ctx` through these three
+ * helpers rather than bumping at the call sites is deliberate: `dc->y` is the
+ * *same* buffer as `ctx->y`, so an attention call can invalidate an
+ * expert-group graph, and a scheme that required each caller to remember would
+ * fail exactly at the call site nobody thought about. */
+static void note_realloc(DeviceContext *ctx) {
+    if (ctx) ctx->scratch_gen++;
+}
+
+static int reserve(DeviceContext *ctx, float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
     *ptr = nullptr;
     *cap = 0;
+    note_realloc(ctx);
     if (!cuda_ok(cudaMalloc(ptr, bytes), "scratch allocation")) return 0;
     *cap = bytes;
     return 1;
 }
 
-static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
+static int reserve_bytes(DeviceContext *ctx,void **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes) return 1; if(*ptr) cudaFree(*ptr); *ptr=nullptr; *cap=0;
+    note_realloc(ctx);
     if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
 }
 
-static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
+static int reserve_pinned(DeviceContext *ctx,float **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
+    note_realloc(ctx);
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
+}
+
+/* Pinned host staging for the group descriptors.
+ *
+ * Capture rejects an async copy out of pageable memory, and `expert_group` built
+ * its descriptors in a `GroupDesc host[256]` on the stack. Staging them in
+ * pinned memory is what makes the H2D copy recordable — and, because a graph
+ * replays the copy rather than the values, it is also what lets one captured
+ * graph serve a *different set of experts* at the same shape: rewrite the pinned
+ * buffer, replay, and the descriptors the kernels read are the new ones. */
+static int reserve_pinned_bytes(DeviceContext *ctx,void **ptr,size_t *cap,size_t bytes){
+    if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
+    note_realloc(ctx);
+    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned descriptor staging"))return 0;*cap=bytes;return 1;
 }
 
 extern "C" int coli_cuda_init(const int *devices, int count) {
@@ -392,10 +515,18 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     return 1;
 }
 
+/* Defined with the rest of the graph cache below; declared here because
+ * shutdown must free the instantiated graphs before it frees the stream and the
+ * scratch they were captured against. */
+static void graph_cache_clear(DeviceContext *ctx);
+
 extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx)) continue;
+        /* Graphs first: they hold device pointers into the buffers freed below
+         * and an exec handle bound to the stream destroyed below. */
+        graph_cache_clear(ctx);
         if (ctx->x) cudaFree(ctx->x);
         if (ctx->y) cudaFree(ctx->y);
         if (ctx->gate) cudaFree(ctx->gate);
@@ -404,8 +535,13 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
         for(int b=0;b<24;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
+        if (ctx->red_meta) cudaFree(ctx->red_meta);
+        if (ctx->red_out) cudaFree(ctx->red_out);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
+        if (ctx->host_desc) cudaFreeHost(ctx->host_desc);
+        if (ctx->host_red) cudaFreeHost(ctx->host_red);
+        if (ctx->host_red_out) cudaFreeHost(ctx->host_red_out);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
@@ -416,12 +552,44 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
         ctx->host_x_cap=ctx->host_y_cap=0;
+        ctx->host_desc=nullptr; ctx->host_desc_cap=0;
+        ctx->red_meta=nullptr; ctx->red_meta_cap=0;
+        ctx->red_out=nullptr; ctx->red_out_cap=0;
+        ctx->host_red=nullptr; ctx->host_red_cap=0;
+        ctx->host_red_out=nullptr; ctx->host_red_out_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
     g_nctx = 0;
 }
 
 extern "C" int coli_cuda_device_count(void) { return g_nctx; }
+
+/* How many CUDA devices the DRIVER reports, independent of whether this process
+ * has initialized any.
+ *
+ * `coli_cuda_device_count` above returns `g_nctx` — the number of contexts
+ * *this process built* — which is the right answer for "which devices may I
+ * address" and the wrong one for "does this host have a GPU". Anything using
+ * the latter to decide whether to call `coli_cuda_init` is circular: the count
+ * is 0 until init runs, so the gate never opens. That is exactly what
+ * `peregrine_cuda::is_available()` did, and it reported "unavailable" on a
+ * working RTX 3060.
+ *
+ * Creates no context: `cudaGetDeviceCount` only queries the driver, so this is
+ * safe to call before init and cheap enough for a startup banner. Returns 0
+ * rather than a negative on driver errors (no driver, no permission) because
+ * every caller wants "how many can I use", and "none" is the honest answer to
+ * that in all of those cases. */
+extern "C" int coli_cuda_probe_device_count(void) {
+    int n = 0;
+    cudaError_t e = cudaGetDeviceCount(&n);
+    if (e != cudaSuccess || n < 0) {
+        /* Clear the sticky error so a later real call is not misattributed. */
+        cudaGetLastError();
+        return 0;
+    }
+    return n;
+}
 
 extern "C" int coli_cuda_device_at(int index) {
     return index >= 0 && index < g_nctx ? g_ctx[index].device : -1;
@@ -495,6 +663,87 @@ extern "C" void coli_cuda_graph_free(ColiCudaGraph *g) {
     std::free(g);
 }
 
+/* ---- the expert-group graph cache (COLI_CUDA_GRAPH) ----
+ *
+ * The decode loop calls `expert_group` once per sparse layer per token, and at
+ * B=1 every routed expert contributes exactly one row — so the *launch shape*
+ * (arm, expert count, D, I, rows) repeats constantly while the *contents*
+ * (which experts, what activations) change every call. That is exactly the
+ * split CUDA Graphs exist for: the shape becomes an instantiated graph, and the
+ * contents ride in through pinned staging buffers the graph copies from.
+ *
+ * The counters are here because "is it replaying" is not observable otherwise,
+ * and a shape key that churns would leave this capturing on every call — slower
+ * than not having it, with nothing in the output to say so. */
+static uint64_t g_graph_captures, g_graph_replays, g_graph_invalidations, g_graph_misses;
+static std::mutex g_graph_stats_mu;
+
+extern "C" void coli_cuda_graph_cache_stats(uint64_t *captures, uint64_t *replays,
+                                              uint64_t *invalidations, uint64_t *uncacheable) {
+    std::lock_guard<std::mutex> lock(g_graph_stats_mu);
+    if (captures) *captures = g_graph_captures;
+    if (replays) *replays = g_graph_replays;
+    if (invalidations) *invalidations = g_graph_invalidations;
+    if (uncacheable) *uncacheable = g_graph_misses;
+}
+
+/* FNV-1a over the launch shape. Not a hash of the *inputs*: two calls with the
+ * same shape and different experts must collide here, because that is the whole
+ * benefit — one graph serving every generation at that shape. */
+static uint64_t graph_key(int arm, int count, int D, int I, const int *rows, int extra) {
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&h](uint64_t v) {
+        for (int b = 0; b < 8; b++) { h ^= (v >> (b * 8)) & 0xFF; h *= 1099511628211ULL; }
+    };
+    mix((uint64_t)arm); mix((uint64_t)count); mix((uint64_t)D); mix((uint64_t)I); mix((uint64_t)extra);
+    for (int c = 0; c < count; c++) mix((uint64_t)rows[c]);
+    /* 0 marks an empty slot, so a shape that hashes to it takes 1 instead —
+     * a collision with one other shape at worst, never a lost entry. */
+    return h ? h : 1;
+}
+
+/* Look up a live graph for `key`, discarding any entry captured under a stale
+ * scratch generation. Returns NULL on miss. */
+static ColiCudaGraph *graph_lookup(DeviceContext *ctx, uint64_t key) {
+    for (int i = 0; i < COLI_CUDA_GRAPH_CACHE; i++) {
+        GraphSlot *s = &ctx->graphs[i];
+        if (s->key != key || !s->g) continue;
+        if (s->gen != ctx->scratch_gen) {
+            /* A scratch buffer grew since capture, so this graph's baked device
+             * pointers are dangling. Free it rather than replay it. */
+            coli_cuda_graph_free(s->g);
+            s->g = NULL; s->key = 0;
+            std::lock_guard<std::mutex> lock(g_graph_stats_mu);
+            g_graph_invalidations++;
+            return NULL;
+        }
+        s->used = ++ctx->graph_clock;
+        return s->g;
+    }
+    return NULL;
+}
+
+/* Store `g` under `key`, evicting the least recently used slot when full. */
+static void graph_store(DeviceContext *ctx, uint64_t key, ColiCudaGraph *g) {
+    int victim = 0;
+    for (int i = 0; i < COLI_CUDA_GRAPH_CACHE; i++) {
+        GraphSlot *s = &ctx->graphs[i];
+        if (!s->g) { victim = i; break; }
+        if (s->used < ctx->graphs[victim].used || ctx->graphs[victim].g == NULL) victim = i;
+    }
+    GraphSlot *s = &ctx->graphs[victim];
+    if (s->g) coli_cuda_graph_free(s->g);
+    s->key = key; s->g = g; s->gen = ctx->scratch_gen; s->used = ++ctx->graph_clock;
+}
+
+/* Drop every cached graph on a device (shutdown, and any wholesale change). */
+static void graph_cache_clear(DeviceContext *ctx) {
+    for (int i = 0; i < COLI_CUDA_GRAPH_CACHE; i++) {
+        if (ctx->graphs[i].g) coli_cuda_graph_free(ctx->graphs[i].g);
+        ctx->graphs[i].g = NULL; ctx->graphs[i].key = 0;
+    }
+}
+
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
@@ -514,8 +763,18 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         coli_cuda_tensor_free(t);
         return 0;
     }
+    /* The conversion runs on the default stream, but every consumer of these
+     * weights (`expert_group`, `pipe_gemm`) runs on `ctx->stream`, which is
+     * NON-BLOCKING and therefore not ordered against it. Without the sync below
+     * a kernel could read unconverted offset-encoded nibbles — rare, because
+     * there is always host work between an upload and its first use, and
+     * invisible when it happens, because the GPU arm is already documented as
+     * not token-identical. Uploading is a blocking multi-megabyte H2D copy
+     * already, so making it also *finish* before returning costs nothing and
+     * gives the function the contract every caller assumes it had. */
     if(fmt==2){offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
-        if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
+        if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")||
+           !cuda_ok(cudaStreamSynchronize(0),"int4 weight conversion sync")){coli_cuda_tensor_free(t);return 0;}}
     if (fmt) {
         if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
             !cuda_ok(cudaMemcpy(t->scales, scales, (size_t)O * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
@@ -541,7 +800,11 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
     if(tensor->fmt==2){
         offset_to_signed_s4<<<(unsigned)((tensor->weight_bytes+255)/256),256>>>(
             (uint8_t*)tensor->weights,tensor->weight_bytes);
-        if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
+        /* Same ordering hazard as tensor_upload, and worse here: a refresh
+         * happens during `reheat`, i.e. between decode steps, so the window
+         * before the next `expert_group` is far shorter than at startup. */
+        if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")||
+           !cuda_ok(cudaStreamSynchronize(0),"int4 weight refresh sync")) return 0;
     }
     return !tensor->fmt || cuda_ok(cudaMemcpy(tensor->scales,scales,
         (size_t)tensor->O*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
@@ -557,7 +820,7 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
-    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
+    if (!reserve(ctx, &ctx->x, &ctx->x_cap, xb) || !reserve(ctx, &ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
     dim3 grid((unsigned)O, (unsigned)S);
     quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb);
@@ -578,8 +841,8 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     int D = gate->I, I = gate->O;
     size_t xb=(size_t)S*D*sizeof(float), ib=(size_t)S*I*sizeof(float);
     size_t yb=(size_t)S*D*sizeof(float);
-    if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
-        !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
+    if (!reserve(ctx, &ctx->x,&ctx->x_cap,xb) || !reserve(ctx, &ctx->y,&ctx->y_cap,yb) ||
+        !reserve(ctx, &ctx->gate,&ctx->gate_cap,ib) || !reserve(ctx, &ctx->up,&ctx->up_cap,ib)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
     dim3 hidden_grid((unsigned)I,(unsigned)S), output_grid((unsigned)D,(unsigned)S);
     quant_matmul<<<hidden_grid,256>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
@@ -602,19 +865,23 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
        gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
     DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
     int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
-    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
-       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
-       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    if(!reserve(ctx, &ctx->x,&ctx->x_cap,xb)||!reserve(ctx, &ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(ctx, &ctx->up,&ctx->up_cap,ib)||!reserve(ctx, &ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(ctx, &ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(ctx, &ctx->host_y,&ctx->host_y_cap,xb))return 0;
     std::memcpy(ctx->host_x,x,xb);
     if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                                "shared w4a16 input upload"))return 0;
     dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
     dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
-    w4a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,
+    /* The shared expert is not part of the routed group and is not tuned: it
+     * runs at the default fragment shape, which is what this call has always
+     * used. Kept explicit rather than defaulted so a future tuner has to decide
+     * to include it rather than inherit it by accident. */
+    w4a16_gate_up_t<16,16,16><<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,
         (const uint8_t*)gate->weights,(const uint8_t*)up->weights,gate->scales,up->scales,S,D,I);
     silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
-    w4a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D);
+    w4a16_matmul_t<16,16,16><<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D);
     if(!cuda_ok(cudaGetLastError(),"shared w4a16 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                                "shared w4a16 output download")||
@@ -623,12 +890,157 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
     return 1;
 }
 
-extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
-                                        ColiCudaTensor *const *ups,
-                                        ColiCudaTensor *const *downs,
-                                        const int *rows, int count,
-                                        float *y, const float *x) {
-    if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
+/* Which kernel arm a call takes. Also the first component of the graph key: two
+ * calls of the same shape on different arms are different launch sequences. */
+enum { ARM_TC_INT4 = 0, ARM_W4A16 = 1, ARM_W4_PACKED = 2, ARM_GENERIC = 3 };
+
+static int select_arm(DeviceContext *ctx, int all_s4, int D, int I, const int *rows, int count) {
+    int tc = getenv("COLI_CUDA_TC_INT4") && atoi(getenv("COLI_CUDA_TC_INT4"));
+    tc = tc && all_s4 && D % 32 == 0 && I % 32 == 0 && D % 8 == 0 && I % 8 == 0;
+    int tc_min = getenv("COLI_CUDA_TC_MIN_ROWS") ? atoi(getenv("COLI_CUDA_TC_MIN_ROWS")) : 8;
+    for (int c = 0; c < count && tc; c++) tc = rows[c] >= tc_min;
+    if (tc) return ARM_TC_INT4;
+    if (all_s4 && ctx->compute_major >= 7 && getenv("COLI_CUDA_TC_W4A16") && atoi(getenv("COLI_CUDA_TC_W4A16")))
+        return ARM_W4A16;
+    if (all_s4 && (!getenv("COLI_CUDA_W4_PACKED") || atoi(getenv("COLI_CUDA_W4_PACKED")))) return ARM_W4_PACKED;
+    return ARM_GENERIC;
+}
+
+/* Scratch an arm needs beyond the common buffers.
+ *
+ * Split out of the dispatch because `cudaMalloc` is illegal during stream
+ * capture: every allocation an arm can make has to happen before `graph_begin`,
+ * or the capture aborts on the one call whose activation quantization buffer
+ * happened to need growing. */
+static int prepare_arm(DeviceContext *ctx, int arm, int total, int D, int I) {
+    if (arm != ARM_TC_INT4) return 1;
+    size_t qb = (size_t)(total + 7) * (size_t)(D > I ? D : I) / 2;
+    return reserve_bytes(ctx, (void **)&ctx->qx, &ctx->qx_cap, qb) &&
+           reserve(ctx, &ctx->qscale, &ctx->qscale_cap, (size_t)(total + 7) * sizeof(float));
+}
+
+/* Issue one arm's kernels on `ctx->stream`. Launches only — no allocation, no
+ * synchronization, no host memory access — so the identical call is valid
+ * whether the stream is capturing or executing. That equivalence is what makes
+ * "the graph does what eager mode does" true by construction rather than by a
+ * second implementation that has to be kept in step. */
+/* The WMMA fragment shape the W4A16 arm should use, `{0,0,0}` meaning "the
+ * default". Travels as one struct because a partially-overridden tile is not a
+ * tile — WMMA shapes are legal only as complete triples. */
+typedef struct { int m, n, k; } WmmaTile;
+
+static void dispatch_arm(DeviceContext *ctx, int arm, const GroupDesc *host, GroupDesc *dev,
+                         const int *rows, int count, int D, int I, int total, int max_rows,
+                         WmmaTile tile) {
+    if (arm == ARM_TC_INT4) {
+        size_t qb = (size_t)(total + 7) * (size_t)(D > I ? D : I) / 2;
+        cudaMemsetAsync(ctx->qx, 0, qb, ctx->stream);
+        quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->x,total,D);
+        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->gate,ctx->qx,ctx->qscale,dev,D,I,0);
+        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->up,ctx->qx,ctx->qscale,dev,D,I,1);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
+        grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
+    } else if (arm == ARM_W4A16) {
+        /* W4A16 Tensor Core per gruppo: attivazioni fp16 per tile (lossless al
+         * contrario del path W4A4), un lancio per expert dentro lo stream —
+         * l'overhead di lancio e' trascurabile rispetto ai GEMM.
+         *
+         * NOTE: this arm passes `host[c].g/u/d` — DEVICE WEIGHT POINTERS — as
+         * kernel arguments, so a captured graph would be bound to the expert set
+         * it was recorded with. That is why it is excluded from the graph cache;
+         * see `graph_cacheable_arm`. */
+        int tc16_min=getenv("COLI_CUDA_TC_W4A16_MIN")?atoi(getenv("COLI_CUDA_TC_W4A16_MIN")):16;
+        int off16=0;
+        for(int c=0;c<count;c++){
+            int r=rows[c];
+            float *g16=ctx->gate+(size_t)off16*I,*u16=ctx->up+(size_t)off16*I;
+            float *x16=ctx->x+(size_t)off16*D,*y16=ctx->y+(size_t)off16*D;
+            if(r>=tc16_min){
+                /* Grid follows the tile: each block covers TM rows and 4*TN
+                 * columns, so a hardcoded (63/64, 15/16) would under-cover
+                 * every shape but 16x16x16 and silently leave columns unwritten. */
+                int tm=tile.m?tile.m:16,tn=tile.n?tile.n:16,tk=tile.k?tile.k:16;
+                dim3 hg16((unsigned)((I+tn*4-1)/(tn*4)),(unsigned)((r+tm-1)/tm));
+                dim3 og16((unsigned)((D+tn*4-1)/(tn*4)),(unsigned)((r+tm-1)/tm));
+                w4a16_gate_up_dispatch(hg16,ctx->stream,tm,tn,tk,g16,u16,x16,
+                    (const uint8_t*)host[c].g,(const uint8_t*)host[c].u,host[c].gs,host[c].us,r,D,I);
+                silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
+                w4a16_matmul_dispatch(og16,ctx->stream,tm,tn,tk,y16,g16,
+                    (const uint8_t*)host[c].d,host[c].ds,r,I,D);
+            }else{
+                /* piccoli batch: tile TC quasi vuoti + overhead di lancio — il
+                 * kernel naive per-elemento resta piu' veloce (misurato in decode) */
+                quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
+                    host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D));
+                quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
+                    host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D));
+                silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
+                quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
+                    host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I));
+            }
+            off16+=r;
+        }
+    } else if (arm == ARM_W4_PACKED) {
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
+        if(dual)grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        else{
+            grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
+            grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
+        }
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    } else {
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
+        grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }
+}
+
+/* An arm is cacheable when every kernel argument it passes is either a stable
+ * scratch pointer or a shape — i.e. when the only thing that varies between
+ * calls of one shape rides in through the descriptor buffer the graph copies. */
+static int graph_cacheable_arm(int arm) { return arm != ARM_W4A16; }
+
+static int graph_enabled(void) {
+    const char *v = getenv("COLI_CUDA_GRAPH");
+    return v && atoi(v);
+}
+
+/* Launch a cached graph and wait for it, so the pinned output buffer is settled
+ * before the caller copies out of it. */
+static int graph_run(DeviceContext *ctx, ColiCudaGraph *g) {
+    return cuda_ok(cudaGraphLaunch(g->exec, ctx->stream), "expert group graph launch") &&
+           cuda_ok(cudaStreamSynchronize(ctx->stream), "expert group graph synchronize");
+}
+
+/* The optional layer-level reduce fused onto the end of a group dispatch.
+ *
+ * Present ⇒ the kernels write `ctx->y` as usual and one `grouped_reduce` folds
+ * it into `[s_n, D]` on the device, so the D2H carries `s_n` rows instead of
+ * `total`. At batch saturation those differ by the batch's expert-per-row
+ * factor — ~5× at B=16 on the measured GLM-5.2 unions — which is the whole
+ * point, and also why a B=1 measurement of this cannot tell you anything. */
+typedef struct {
+    const int *row_ptr;   /* [s_n + 1], ascending, row_ptr[s_n] == total */
+    const int *row_idx;   /* [total], each entry an index into the y rows */
+    const float *rw;      /* [total], the router weight of each y row */
+    int s_n;
+    float *out;           /* host destination, [s_n, D] */
+} ReduceSpec;
+
+static int expert_group_impl(ColiCudaTensor *const *gates,
+                             ColiCudaTensor *const *ups,
+                             ColiCudaTensor *const *downs,
+                             const int *rows, int count,
+                             float *y, const float *x,
+                             const ReduceSpec *red, WmmaTile tile, int *arm_out) {
+    if (!gates || !ups || !downs || !rows || !x || count < 1) return 0;
+    if (!red && !y) return 0;
+    if (red && (!red->row_ptr || !red->row_idx || !red->rw || !red->out || red->s_n < 1)) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
@@ -647,17 +1059,118 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
-    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
-       !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
-       !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))) return 0;
+    if(!reserve(ctx, &ctx->x,&ctx->x_cap,xb)||!reserve(ctx, &ctx->y,&ctx->y_cap,xb)||
+       !reserve(ctx, &ctx->gate,&ctx->gate_cap,ib)||!reserve(ctx, &ctx->up,&ctx->up_cap,ib)||
+       !reserve_bytes(ctx, &ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))) return 0;
     int async=!getenv("COLI_CUDA_ASYNC")||atoi(getenv("COLI_CUDA_ASYNC"));
-    if(async&&(!reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-               !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)))return 0;
+    if(async&&(!reserve_pinned(ctx, &ctx->host_x,&ctx->host_x_cap,xb)||
+               !reserve_pinned(ctx, &ctx->host_y,&ctx->host_y_cap,xb)))return 0;
+    int profile=getenv("COLI_CUDA_PROFILE")&&atoi(getenv("COLI_CUDA_PROFILE"));
+    GroupDesc *dev=(GroupDesc*)ctx->group_desc;
+    int arm=select_arm(ctx,all_s4,D,I,rows,count);
+    /* Report which arm actually ran. The tile only reaches ARM_W4A16, so a
+     * caller timing tiles has to know whether its tile was even consulted —
+     * mirroring the arm selection on the host would be a second copy of this
+     * decision, and the two drifting is how a tuner starts recording noise. */
+    if(arm_out)*arm_out=arm;
+    if(!prepare_arm(ctx,arm,total,D,I))return 0;
+
+    /* Fused-reduce scratch: one device buffer holding row_ptr | row_idx | rw,
+     * plus the [s_n, D] output. Reserved here, before any capture, because
+     * `cudaMalloc` is illegal on a capturing stream. The pinned mirror is
+     * staged unconditionally on this path (not just under the graph knob) so
+     * the H2D is async either way — the metadata is small and the copy is on
+     * the critical path of every layer. */
+    size_t rmb=0,rob=0; int *red_ptr_dev=NULL,*red_idx_dev=NULL; float *red_rw_dev=NULL;
+    if(red){
+        rmb=(size_t)(red->s_n+1+total)*sizeof(int)+(size_t)total*sizeof(float);
+        rob=(size_t)red->s_n*D*sizeof(float);
+        if(!reserve_bytes(ctx,&ctx->red_meta,&ctx->red_meta_cap,rmb)||
+           !reserve(ctx,&ctx->red_out,&ctx->red_out_cap,rob)||
+           !reserve_pinned_bytes(ctx,&ctx->host_red,&ctx->host_red_cap,rmb)||
+           !reserve_pinned(ctx,&ctx->host_red_out,&ctx->host_red_out_cap,rob))return 0;
+        /* Lay the three arrays out contiguously and identically on both sides,
+         * so one copy moves all of them and the device offsets are arithmetic
+         * rather than three separate allocations to keep in step. */
+        int *hp=(int*)ctx->host_red;
+        std::memcpy(hp,red->row_ptr,(size_t)(red->s_n+1)*sizeof(int));
+        std::memcpy(hp+red->s_n+1,red->row_idx,(size_t)total*sizeof(int));
+        std::memcpy((float*)(hp+red->s_n+1+total),red->rw,(size_t)total*sizeof(float));
+        red_ptr_dev=(int*)ctx->red_meta;
+        red_idx_dev=red_ptr_dev+red->s_n+1;
+        red_rw_dev=(float*)(red_idx_dev+total);
+    }
+
+    /* ---- graph-cached path (COLI_CUDA_GRAPH) ----
+     *
+     * Requires async staging (capture cannot record a copy from pageable
+     * memory), a cacheable arm, and no profiling (the event records that
+     * measure the phases are not part of the work being replayed). Anything
+     * else falls through to the eager path below, unchanged. */
+    if(graph_enabled()&&async&&graph_cacheable_arm(arm)&&!profile){
+        size_t db=(size_t)count*sizeof(GroupDesc);
+        if(!reserve_pinned_bytes(ctx,&ctx->host_desc,&ctx->host_desc_cap,db))return 0;
+        /* Staged BEFORE the lookup: `reserve_pinned_bytes` can bump the scratch
+         * generation, and a graph looked up first would then be validated
+         * against the generation it is about to be invalidated by. */
+        std::memcpy(ctx->host_desc,host,db);
+        std::memcpy(ctx->host_x,x,xb);
+        /* `s_n` joins the key: the same expert shape reducing into a different
+         * number of batch rows is a different `grouped_reduce` grid, and a
+         * plain dispatch is a different sequence again (hence the -1). */
+        /* The tile changes which kernel instantiation was recorded, so it has to
+         * separate cache entries or a tuner switching tiles would keep replaying
+         * the tile it started with. */
+        uint64_t key=graph_key(arm,count,D,I,rows,
+                               (red?red->s_n:-1)*1000003+tile.m*10007+tile.n*101+tile.k);
+        ColiCudaGraph *g=graph_lookup(ctx,key);
+        if(!g){
+            if(!coli_cuda_graph_begin(device))return 0;
+            /* The recorded sequence is exactly the eager one: descriptors in,
+             * activations in, the arm's kernels, results out. The two copies
+             * are inside the graph on purpose — that is what lets one graph
+             * serve every later call at this shape with different experts and
+             * different activations. */
+            cudaMemcpyAsync(ctx->group_desc,ctx->host_desc,db,cudaMemcpyHostToDevice,ctx->stream);
+            cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream);
+            if(red)cudaMemcpyAsync(ctx->red_meta,ctx->host_red,rmb,cudaMemcpyHostToDevice,ctx->stream);
+            dispatch_arm(ctx,arm,host,dev,rows,count,D,I,total,max_rows,tile);
+            if(red){
+                grouped_reduce<<<dim3((unsigned)red->s_n,(unsigned)((D+255)/256)),256,0,ctx->stream>>>(
+                    ctx->red_out,ctx->y,red_ptr_dev,red_idx_dev,red_rw_dev,D);
+                cudaMemcpyAsync(ctx->host_red_out,ctx->red_out,rob,cudaMemcpyDeviceToHost,ctx->stream);
+            }else{
+                cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream);
+            }
+            if(!coli_cuda_graph_end(device,&g)){
+                /* Capture failed and the stream is no longer capturing. Drop
+                 * every cached graph: a failed capture can leave sibling
+                 * entries recorded against a stream state we can no longer
+                 * reason about, and replaying one of those is the silent
+                 * failure this whole mechanism is built to avoid. */
+                graph_cache_clear(ctx);
+                return 0;
+            }
+            graph_store(ctx,key,g);
+            { std::lock_guard<std::mutex> lock(g_graph_stats_mu); g_graph_captures++; }
+        }else{
+            { std::lock_guard<std::mutex> lock(g_graph_stats_mu); g_graph_replays++; }
+        }
+        if(!graph_run(ctx,g))return 0;
+        if(red)std::memcpy(red->out,ctx->host_red_out,rob);
+        else std::memcpy(y,ctx->host_y,xb);
+        { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+          g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+        return 1;
+    }
+    if(graph_enabled()){ std::lock_guard<std::mutex> lock(g_graph_stats_mu); g_graph_misses++; }
+
     cudaError_t copy_desc=async?cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
                                                 cudaMemcpyHostToDevice,ctx->stream)
                                :cudaMemcpy(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),cudaMemcpyHostToDevice);
     if(!cuda_ok(copy_desc,"expert group descriptors"))return 0;
-    int profile=getenv("COLI_CUDA_PROFILE")&&atoi(getenv("COLI_CUDA_PROFILE"));
+    if(red&&!cuda_ok(cudaMemcpyAsync(ctx->red_meta,ctx->host_red,rmb,cudaMemcpyHostToDevice,ctx->stream),
+                     "expert group reduce metadata"))return 0;
     cudaEvent_t ev[4]={};
     if(profile) for(int i=0;i<4;i++) if(!cuda_ok(cudaEventCreate(&ev[i]),"profile event")) profile=0;
     if(profile) cudaEventRecord(ev[0],ctx->stream);
@@ -666,78 +1179,24 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                             :cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice);
     if(!cuda_ok(copy_x,"expert group input upload")) return 0;
     if(profile) cudaEventRecord(ev[1],ctx->stream);
-    GroupDesc *dev=(GroupDesc*)ctx->group_desc;
-    int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
-    tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
-    int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
-    for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
-    if(tc){
-        size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
-        if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
-           !reserve(&ctx->qscale,&ctx->qscale_cap,(size_t)(total+7)*sizeof(float)))return 0;
-        cudaMemsetAsync(ctx->qx,0,qb,ctx->stream);
-        quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->x,total,D);
-        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->gate,ctx->qx,ctx->qscale,dev,D,I,0);
-        grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->up,ctx->qx,ctx->qscale,dev,D,I,1);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
-        quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
-        grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
-    }else if(all_s4&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
-             atoi(getenv("COLI_CUDA_TC_W4A16"))){
-        /* W4A16 Tensor Core per gruppo: attivazioni fp16 per tile (lossless al
-         * contrario del path W4A4), un lancio per expert dentro lo stream —
-         * l'overhead di lancio e' trascurabile rispetto ai GEMM. */
-        int tc16_min=getenv("COLI_CUDA_TC_W4A16_MIN")?atoi(getenv("COLI_CUDA_TC_W4A16_MIN")):16;
-        int off16=0;
-        for(int c=0;c<count;c++){
-            int r=rows[c];
-            float *g16=ctx->gate+(size_t)off16*I,*u16=ctx->up+(size_t)off16*I;
-            float *x16=ctx->x+(size_t)off16*D,*y16=ctx->y+(size_t)off16*D;
-            if(r>=tc16_min){
-                dim3 hg16((unsigned)((I+63)/64),(unsigned)((r+15)/16));
-                dim3 og16((unsigned)((D+63)/64),(unsigned)((r+15)/16));
-                w4a16_gate_up<<<hg16,256,0,ctx->stream>>>(g16,u16,x16,
-                    (const uint8_t*)host[c].g,(const uint8_t*)host[c].u,host[c].gs,host[c].us,r,D,I);
-                silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
-                w4a16_matmul<<<og16,128,0,ctx->stream>>>(y16,g16,
-                    (const uint8_t*)host[c].d,host[c].ds,r,I,D);
-            }else{
-                /* piccoli batch: tile TC quasi vuoti + overhead di lancio — il
-                 * kernel naive per-elemento resta piu' veloce (misurato in decode) */
-                quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
-                    host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D));
-                quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
-                    host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D));
-                silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
-                quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
-                    host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I));
-            }
-            off16+=r;
-        }
-    }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
-        if(dual)grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        else{
-            grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
-            grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
-        }
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
-        grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
-    }else{
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
-        grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
-        grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
-    }
+    dispatch_arm(ctx,arm,host,dev,rows,count,D,I,total,max_rows,tile);
+    if(red)grouped_reduce<<<dim3((unsigned)red->s_n,(unsigned)((D+255)/256)),256,0,ctx->stream>>>(
+        ctx->red_out,ctx->y,red_ptr_dev,red_idx_dev,red_rw_dev,D);
     if(profile) cudaEventRecord(ev[2],ctx->stream);
     if(!async&&!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group synchronize"))return 0;
-    cudaError_t copy_y=async?cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream)
-                            :cudaMemcpy(y,ctx->y,xb,cudaMemcpyDeviceToHost);
+    cudaError_t copy_y;
+    if(red){
+        /* The whole point: `s_n` rows leave the device instead of `total`. */
+        copy_y=async?cudaMemcpyAsync(ctx->host_red_out,ctx->red_out,rob,cudaMemcpyDeviceToHost,ctx->stream)
+                    :cudaMemcpy(red->out,ctx->red_out,rob,cudaMemcpyDeviceToHost);
+    }else{
+        copy_y=async?cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream)
+                    :cudaMemcpy(y,ctx->y,xb,cudaMemcpyDeviceToHost);
+    }
     if(!cuda_ok(cudaGetLastError(),"expert group launch")||!cuda_ok(copy_y,"expert group output download"))return 0;
     if(async){if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group synchronize"))return 0;
-        std::memcpy(y,ctx->host_y,xb);}
+        if(red)std::memcpy(red->out,ctx->host_red_out,rob);
+        else std::memcpy(y,ctx->host_y,xb);}
     if(profile){
         cudaEventRecord(ev[3],ctx->stream); cudaEventSynchronize(ev[3]); float a=0,b=0,c=0;
         cudaEventElapsedTime(&a,ev[0],ev[1]); cudaEventElapsedTime(&b,ev[1],ev[2]);
@@ -751,6 +1210,37 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     return 1;
 }
 
+extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
+                                        ColiCudaTensor *const *ups,
+                                        ColiCudaTensor *const *downs,
+                                        const int *rows, int count,
+                                        float *y, const float *x) {
+    WmmaTile none = {0,0,0};
+    return expert_group_impl(gates,ups,downs,rows,count,y,x,NULL,none,NULL);
+}
+
+extern "C" int coli_cuda_expert_group_tiled(ColiCudaTensor *const *gates,
+                                              ColiCudaTensor *const *ups,
+                                              ColiCudaTensor *const *downs,
+                                              const int *rows, int count,
+                                              float *y, const float *x,
+                                              int tile_m, int tile_n, int tile_k,
+                                              int *arm_out) {
+    WmmaTile tile = {tile_m,tile_n,tile_k};
+    return expert_group_impl(gates,ups,downs,rows,count,y,x,NULL,tile,arm_out);
+}
+
+extern "C" int coli_cuda_expert_group_reduce(ColiCudaTensor *const *gates,
+                                               ColiCudaTensor *const *ups,
+                                               ColiCudaTensor *const *downs,
+                                               const int *rows, int count,
+                                               const int *row_ptr, const int *row_idx,
+                                               const float *rw, int s_n,
+                                               float *out, const float *x) {
+    ReduceSpec red = { row_ptr, row_idx, rw, s_n, out };
+    WmmaTile none = {0,0,0};
+    return expert_group_impl(gates,ups,downs,rows,count,NULL,x,&red,none,NULL);
+}
 
 extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const float *q,
                                             const float *latent,const float *rope,int H,int Q,
@@ -760,8 +1250,8 @@ extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const flo
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
     size_t rb=(size_t)T*R*sizeof(float),cb=(size_t)H*V*sizeof(float);
-    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->al,&dc->al_cap,lb)||
-       !reserve(&dc->ar,&dc->ar_cap,rb)||!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
+    if(!reserve(dc, &dc->aq,&dc->aq_cap,qb)||!reserve(dc, &dc->al,&dc->al_cap,lb)||
+       !reserve(dc, &dc->ar,&dc->ar_cap,rb)||!reserve(dc, &dc->ac,&dc->ac_cap,cb))return 0;
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"attention q upload")||
        !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"attention latent upload")||
        !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention rope upload"))return 0;
@@ -783,8 +1273,8 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
     size_t rb=(size_t)T*R*sizeof(float),cb=(size_t)S*H*V*sizeof(float);
-    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->al,&dc->al_cap,lb)||
-       !reserve(&dc->ar,&dc->ar_cap,rb)||!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
+    if(!reserve(dc, &dc->aq,&dc->aq_cap,qb)||!reserve(dc, &dc->al,&dc->al_cap,lb)||
+       !reserve(dc, &dc->ar,&dc->ar_cap,rb)||!reserve(dc, &dc->ac,&dc->ac_cap,cb))return 0;
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"attention batch q upload")||
        !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"attention batch latent upload")||
        !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention batch rope upload"))return 0;
@@ -794,7 +1284,7 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
     if(!cuda_ok(cudaGetLastError(),"attention batch launch"))return 0;
     const float *src=dc->ac;size_t ob=cb;
     if(proj){
-        ob=(size_t)S*proj->O*sizeof(float);if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
+        ob=(size_t)S*proj->O*sizeof(float);if(!reserve(dc, &dc->y,&dc->y_cap,ob))return 0;
         quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
             proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
         if(!cuda_ok(cudaGetLastError(),"attention o_proj launch"))return 0;src=dc->y;
@@ -894,7 +1384,7 @@ __global__ static void pipe_rows_add(float *x,const float *partial,const int *ro
 extern "C" float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes){
     DeviceContext *ctx=find_ctx(device);
     if(slot<0||slot>=24||!select_ctx(ctx)) return NULL;
-    if(!reserve(&ctx->pipe_buf[slot],&ctx->pipe_cap[slot],bytes)) return NULL;
+    if(!reserve(ctx, &ctx->pipe_buf[slot],&ctx->pipe_cap[slot],bytes)) return NULL;
     return ctx->pipe_buf[slot];
 }
 extern "C" void *coli_cuda_pipe_alloc(int device,size_t bytes){
@@ -907,19 +1397,54 @@ extern "C" void coli_cuda_pipe_free(int device,void *p){
     DeviceContext *ctx=find_ctx(device); if(!p||!select_ctx(ctx)) return;
     cudaFree(p);
 }
+/* The two staging primitives are stream-ordered for exactly the reason the compute
+ * primitives below are, and they were missed by the 2026-08-07 pass that fixed those.
+ *
+ * A blocking `cudaMemcpy` runs on the legacy default stream. `ctx->stream` is
+ * `cudaStreamNonBlocking`, so the default stream does **not** implicitly synchronize
+ * with it: `pipe_silu_mul` (on ctx->stream) followed by `pipe_download` with no
+ * intervening `pipe_sync` is a read-before-write race, and the symmetric case —
+ * uploading into a buffer a still-running kernel is reading — is the same bug facing
+ * the other way. It never fired only because the sole callers are the graph-capture
+ * tests, which sync via `graph.launch()` first. That is precisely why the earlier pass
+ * did not find it: the primitives it *did* fix were the ones those tests chained.
+ *
+ * Issuing on `ctx->stream` and draining it before returning keeps the blocking
+ * contract every caller already assumes while making the ordering real. */
 extern "C" int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes){
-    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
-    return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyHostToDevice),"pipe upload");
+    DeviceContext *ctx=find_ctx(device); if(!dst||!src||!select_ctx(ctx)) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyHostToDevice,ctx->stream),"pipe upload")
+        && cuda_ok(cudaStreamSynchronize(ctx->stream),"pipe upload sync");
 }
 extern "C" int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes){
-    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
-    return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToHost),"pipe download");
+    DeviceContext *ctx=find_ctx(device); if(!dst||!src||!select_ctx(ctx)) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyDeviceToHost,ctx->stream),"pipe download")
+        && cuda_ok(cudaStreamSynchronize(ctx->stream),"pipe download sync");
 }
+/* Every `pipe_*` op below runs on `ctx->stream`. That is not a style choice.
+ *
+ * `ctx->stream` is created with `cudaStreamNonBlocking` (see coli_cuda_init),
+ * which means it does **not** implicitly synchronize with the legacy default
+ * stream. Until 2026-08-07 `pipe_rmsnorm`, `pipe_rmsnorm_s`, `pipe_rope`,
+ * `pipe_rope_base` and `pipe_rows_add` launched with no stream argument — i.e.
+ * on the default stream — while `pipe_silu_mul` and `pipe_add` used
+ * `ctx->stream`. A chain mixing them therefore had **no ordering guarantee
+ * whatsoever**: a `pipe_silu_mul` could read a buffer a `pipe_rmsnorm` had not
+ * finished writing, nondeterministically.
+ *
+ * Nothing was wrong in practice only because no live path builds such a chain —
+ * the `pipe_*` set is exercised solely by the graph-capture tests, which use
+ * silu_mul/add. The bug would have surfaced the moment the device-resident
+ * forward wired one, as intermittently wrong logits with no failing test.
+ *
+ * The same change is what makes capture possible at all: `cudaStreamBeginCapture`
+ * records `ctx->stream`, so an op on any other stream is silently not in the
+ * graph. */
 extern "C" int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                                       const float *w_dev,int S,int D,float eps){
     DeviceContext *ctx=find_ctx(device);
     if(S<1||D<1||!select_ctx(ctx)) return 0;
-    pipe_rmsnorm_rows<<<S,256>>>(y_dev,x_dev,w_dev,D,eps,D,D);
+    pipe_rmsnorm_rows<<<S,256,0,ctx->stream>>>(y_dev,x_dev,w_dev,D,eps,D,D);
     return cuda_ok(cudaGetLastError(),"pipe rmsnorm");
 }
 extern "C" int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const float *x_dev,
@@ -927,7 +1452,7 @@ extern "C" int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const float *x_d
                                         int xstride,int ystride){
     DeviceContext *ctx=find_ctx(device);
     if(S<1||D<1||xstride<D||ystride<D||!select_ctx(ctx)) return 0;
-    pipe_rmsnorm_rows<<<S,256>>>(y_dev,x_dev,w_dev,D,eps,xstride,ystride);
+    pipe_rmsnorm_rows<<<S,256,0,ctx->stream>>>(y_dev,x_dev,w_dev,D,eps,xstride,ystride);
     return cuda_ok(cudaGetLastError(),"pipe rmsnorm strided");
 }
 extern "C" int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,
@@ -935,21 +1460,24 @@ extern "C" int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,
                                    float theta){
     DeviceContext *ctx=find_ctx(device);
     if(rows<1||R<2||R>256||heads<1||!select_ctx(ctx)) return 0;
-    pipe_rope_rows<<<rows,128>>>(v_dev,pos_dev,0,stride,offset,R,heads,theta);
+    pipe_rope_rows<<<rows,128,0,ctx->stream>>>(v_dev,pos_dev,0,stride,offset,R,heads,theta);
     return cuda_ok(cudaGetLastError(),"pipe rope");
 }
 extern "C" int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows,
                                         int stride,int offset,int R,int heads,float theta){
     DeviceContext *ctx=find_ctx(device);
     if(rows<1||R<2||R>256||heads<1||!select_ctx(ctx)) return 0;
-    pipe_rope_rows<<<rows,128>>>(v_dev,NULL,pos_base,stride,offset,R,heads,theta);
+    pipe_rope_rows<<<rows,128,0,ctx->stream>>>(v_dev,NULL,pos_base,stride,offset,R,heads,theta);
     return cuda_ok(cudaGetLastError(),"pipe rope base");
 }
+/* Device-to-device, so async-on-stream is both capturable and correctly ordered
+ * against the ops around it. Host visibility, if a caller ever needs it, is
+ * `coli_cuda_pipe_sync` — the same contract the rest of the pipe_* set has. */
 extern "C" int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
                                      int spitch,int width,int height){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
-    return cuda_ok(cudaMemcpy2D(dst,(size_t)dpitch*4,src,(size_t)spitch*4,
-        (size_t)width*4,height,cudaMemcpyDeviceToDevice),"pipe copy2d");
+    return cuda_ok(cudaMemcpy2DAsync(dst,(size_t)dpitch*4,src,(size_t)spitch*4,
+        (size_t)width*4,height,cudaMemcpyDeviceToDevice,ctx->stream),"pipe copy2d");
 }
 /* attention batch + fused o_proj with DEVICE-resident q/latent/rope: the whole
  * upstream projection chain stayed on this device, so nothing is uploaded here.
@@ -962,13 +1490,13 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t cb=(size_t)S*H*V*sizeof(float);
-    if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
+    if(!reserve(dc, &dc->ac,&dc->ac_cap,cb))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
         rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch"))return 0;
     size_t ob=(size_t)S*proj->O*sizeof(float);
-    if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
+    if(!reserve(dc, &dc->y,&dc->y_cap,ob))return 0;
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
         proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
     if(!cuda_ok(cudaGetLastError(),"pipe o_proj launch"))return 0;
@@ -991,7 +1519,7 @@ extern "C" int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,siz
 extern "C" int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *partial_dev,
                                        const int *rows_dev,int nrows,int D){
     DeviceContext *ctx=find_ctx(device); if(nrows<1||D<1||!select_ctx(ctx)) return 0;
-    pipe_rows_add<<<nrows,256>>>(x_dev,partial_dev,rows_dev,D);
+    pipe_rows_add<<<nrows,256,0,ctx->stream>>>(x_dev,partial_dev,rows_dev,D);
     return cuda_ok(cudaGetLastError(),"pipe rows add");
 }
 /* GEMM with device-resident activations: same quant_matmul kernel as
@@ -1001,17 +1529,32 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
     if(!t||S<1) return 0;
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
     dim3 grid((unsigned)t->O,(unsigned)S);
-    quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
+    /* on ctx->stream with the rest of the pipe_* set — see the ordering note
+     * above coli_cuda_pipe_rmsnorm. This one was the only capturable op left on
+     * the default stream. */
+    quant_matmul<<<grid,256,0,ctx->stream>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
         row_bytes(t->fmt,t->I));
     return cuda_ok(cudaGetLastError(),"pipe gemm");
 }
 /* copia diretta scheda->scheda (P2P se disponibile, altrimenti staging driver) */
+/* Same default-stream hazard as pipe_upload/pipe_download, with an extra edge in the
+ * cross-device case: the source's pending writes and the destination's later reads sit
+ * on two different non-blocking streams, so draining one end is not enough. */
 extern "C" int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,
                                         const float *src,size_t bytes){
     if(!dst||!src) return 0;
     if(dst_dev==src_dev){ DeviceContext *c=find_ctx(dst_dev); if(!select_ctx(c)) return 0;
-        return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToDevice),"pipe intra copy"); }
-    return cuda_ok(cudaMemcpyPeer(dst,dst_dev,src,src_dev,bytes),"pipe peer copy");
+        return cuda_ok(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyDeviceToDevice,c->stream),"pipe intra copy")
+            && cuda_ok(cudaStreamSynchronize(c->stream),"pipe intra copy sync"); }
+    DeviceContext *sc=find_ctx(src_dev),*dc=find_ctx(dst_dev);
+    if(!sc||!dc) return 0;
+    /* drain the producer before reading its buffer... */
+    if(!select_ctx(sc)||!cuda_ok(cudaStreamSynchronize(sc->stream),"pipe peer copy src drain")) return 0;
+    /* ...then land the copy on the consumer's stream, so ops the caller queues next
+     * on dst_dev are ordered after it without a device-wide sync. */
+    if(!select_ctx(dc)) return 0;
+    return cuda_ok(cudaMemcpyPeerAsync(dst,dst_dev,src,src_dev,bytes,dc->stream),"pipe peer copy")
+        && cuda_ok(cudaStreamSynchronize(dc->stream),"pipe peer copy sync");
 }
 /* come attention_project_batch_dev ma l'uscita di o_proj RESTA sul device (out_dev). */
 extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiCudaTensor *proj,
@@ -1022,7 +1565,7 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t cb=(size_t)S*H*V*sizeof(float);
-    if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
+    if(!reserve(dc, &dc->ac,&dc->ac_cap,cb))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
         rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
@@ -1056,7 +1599,7 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
        w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)H*(Q+R)*sizeof(float),cb=(size_t)H*V*sizeof(float);
-    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
+    if(!reserve(dc, &dc->aq,&dc->aq_cap,qb)||!reserve(dc, &dc->ac,&dc->ac_cap,cb))return 0;
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"kvdev q upload"))return 0;
     size_t shared=(size_t)(2*K+T+256)*sizeof(float);
     attention_absorb_batch_kernel<<<dim3(H,1),256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,

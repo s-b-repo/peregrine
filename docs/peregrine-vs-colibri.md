@@ -44,7 +44,12 @@ headline findings:
   in §5.2, and `peregrine route-stats`).
 - This independently corroborates two of colibrì's own findings: its **PILOT** cross-layer prefetch
   is "neutral" on a disk-saturated box, and its **MTP** speculative decoding is a *net loss* on MoE
-  decode — both symptoms of the same high routing entropy.
+  decode. **The shared explanation is not high routing entropy** — that was the reading until
+  2026-08-09, when `route-stats` was finally run on a real-text GLM-5.2 trace and put
+  consecutive-token overlap at **33.55 % against a 3.12 % independence null**
+  ([`bench-data/2026-08-09-prefetch-causes`](../bench-data/2026-08-09-prefetch-causes/M2-routing-structure.md)).
+  Routing is strongly predictable; what both findings share is that a disk-saturated box has nowhere
+  to put the bytes a correct prediction fetches. One token's routed set is ~11.3 GB.
 - **peregrine's architectural advantage (the concurrent 3-lane scheduler) is real but *latent* on
   this hardware**: it pays off only under full/partial expert *residency* (multi-GPU or large RAM),
   which is exactly where colibrì reports **6.84 tok/s on 6× RTX 5090**. On a single RTX 3060 (12 GB),
@@ -58,7 +63,7 @@ headline findings:
 Net: on a single box the dominant limit is the **memory-vs-working-set wall**, and within that regime
 **colibrì is currently ~1.4× faster** thanks to a more mature streaming path. The Rust rewrite lands in
 the same order of magnitude, adds a verified warm-cache/scheduler stack and memory-safety guarantees
-(282 tests, `#![forbid(unsafe_code)]` outside FFI, `deny(unwrap/panic)`), and is architected to win in
+(604 tests, `#![forbid(unsafe_code)]` outside FFI, `deny(unwrap/panic)`), and is architected to win in
 the residency regime the C engine's phased loop leaves on the table — but it has a concrete, fixable
 I/O-lane-depth gap to close before it beats the C engine at raw single-box streaming.
 
@@ -133,7 +138,7 @@ GLM‑5.2 (as shipped in the int4 container both engines consume) is a DeepSeek�
   learned auto-pin (`.coli_usage`), MTP speculation, DSA, io_uring (`URING=1`).
 - **peregrine** — the Rust rewrite ([`DESIGN.md`](../DESIGN.md)): Linux + NVIDIA, a concurrent
   3-lane (CPU∥GPU∥SSD) MoE scheduler, io_uring reactor, warm cache, look-ahead prefetch, and a
-  memory-safe kernel/loader stack validated by 282 tests.
+  memory-safe kernel/loader stack validated by 604 tests.
 
 ---
 
@@ -168,7 +173,7 @@ to the sequential path (guarded by the `streamed_experts_match_resident` test). 
 | Dimension | colibrì (C) | peregrine (Rust) |
 |---|---|---|
 | MoE scheduling | **Phased** (CPU inline, GPU after) | **Concurrent 3-lane** (CPU∥GPU∥SSD, deterministic reduce) |
-| Language / safety | C, manual memory | Rust; `#![forbid(unsafe_code)]` except io_uring/CUDA FFI; `deny(unwrap/expect/panic)`; **282 tests, clippy-clean** |
+| Language / safety | C, manual memory | Rust; `#![forbid(unsafe_code)]` except io_uring/CUDA FFI; `deny(unwrap/expect/panic)`; **604 tests, clippy-clean** |
 | SSD I/O | hand-rolled io_uring (`uring.h`, `URING=1`), `O_DIRECT`, io-wq cap | `io-uring` crate + custom reactor; registered files (`IOSQE_FIXED_FILE`), COOP_TASKRUN, forced ASYNC; **batched 6→1 submit/expert** |
 | RAM expert tier | per-layer LRU `ecache`, auto-sized from `MemAvailable`; LFRU pinned hot-store; learned `.coli_usage` | **byte-budgeted `(layer,expert)` WarmCache** (quantized bytes; `COLI_ECACHE_GB`) |
 | Prefetch | **PILOT** cross-layer (router-lookahead, 71.6 % recall); `PILOT_REAL` | **PILOT lane** (prev-token predictor, dedicated ring, background warm) |
@@ -235,7 +240,7 @@ effect on this box*.
 
 ### 3.7 Correctness & quality
 - Streamed path is **bit-identical** to the resident path (same bytes → same kernels). GPU experts
-  compute in f32 (intentionally not bit-exact vs the int4 CPU path — documented). **282 tests pass,
+  compute in f32 (intentionally not bit-exact vs the int4 CPU path — documented). **604 tests pass,
   `cargo clippy --workspace --all-targets` is clean** (CPU and `--features cuda`).
 
 ---
@@ -481,10 +486,20 @@ OOM, by different means.
 - **LUKS-encrypted NVMe** adds read overhead vs colibrì's published raw-NVMe boxes — a reason to treat
   the absolute tok/s as *this box's* number, not a universal one. A second LUKS box (i5-1235U laptop,
   2026-08-01) isolated the I/O lanes with no model loaded and measured the same ordering, wider:
-  **colibrì 2.02 GB/s vs peregrine 0.84 GB/s** at 8-way `O_DIRECT`. On dm-crypt, reads are CPU-bound on
-  decryption, so *N* blocking `pread`s keep *N* cores decrypting where the ring can leave cores idle —
-  evidence that §5.1's throughput gap is an I/O-lane property, not a prefill-batching artifact. See
+  **colibrì 2.02 GB/s vs peregrine 0.84 GB/s** at 8-way `O_DIRECT`. See
   [Benchmarks](benchmarks.md#second-box-glm-52-on-a-7-gb-laptop).
+
+  > **The dm-crypt reading of that pair is retracted (2026-08-09).** It was stated here as "on
+  > dm-crypt, reads are CPU-bound on decryption, so *N* blocking `pread`s keep *N* cores busy where
+  > the ring can leave cores idle — evidence that §5.1's gap is an I/O-lane property". That does not
+  > survive a controlled test. `COLI_IO_ENGINE=pread` **implies no O_DIRECT**, so the pair compared
+  > uring-*with*-O_DIRECT against pread-*without* — two variables. Held constant on a Ryzen 5 5500 /
+  > LUKS NVMe over 5 reps per arm: `uring` **1.12 GB/s** vs `pread` **1.06 GB/s**, a 5.7 % gap against
+  > a 5–11 % measured spread, i.e. **indistinguishable**. The real difference is O_DIRECT itself
+  > (0.86 vs 1.12, −23 %, outside both spreads). The syscall shape is not the lever, and this bullet
+  > is not evidence about dm-crypt — which remains an open question with its own cheap test in
+  > [`M1-storage-config.md`](../bench-data/2026-08-09-prefetch-causes/M1-storage-config.md).
+  > Working: [`M5-io-engine.md`](../bench-data/2026-08-09-prefetch-causes/M5-io-engine.md).
 - **The dense set bounds the minimum box.** Measured from container headers, GLM-5.2's always-resident
   (non-expert) weights are **10.59 GB** of a 374 GB int4 container; the routed experts stream. A machine
   with less than ~16 GB of RAM+swap OOM-kills *both* engines during load, so "744B on a small box" has a

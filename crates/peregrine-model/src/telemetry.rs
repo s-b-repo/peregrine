@@ -27,6 +27,16 @@ pub struct RuntimeTelemetry {
     /// `COLI_CUDA_PROFILE` is also set (the CUDA event timing is opt-in because
     /// it costs four events and a sync per call).
     pub gpu: GpuTransferStats,
+    /// EWMA of the normalized Shannon entropy of the routed distribution:
+    /// ~0 when routing is repetitive (a few experts dominate), ~1 when it is
+    /// dispersed. Drives `COLI_ENTROPY_ADAPT`'s prefetch-breadth decision.
+    ///
+    /// Added here because `Model::routing_entropy_ewma` documented itself "for
+    /// telemetry scrapes" while `RuntimeTelemetry` — the actual telemetry
+    /// snapshot — had no field for it, so the value was computed every forward
+    /// and reachable by nothing. The underlying EWMA was always live; only the
+    /// way out was missing.
+    pub entropy_ewma: f32,
 }
 
 /// PCIe-side observables for the GPU expert lane, mirrored out of
@@ -44,6 +54,16 @@ pub struct GpuTransferStats {
     pub h2d_ms: f64,
     pub kernel_ms: f64,
     pub d2h_ms: f64,
+    /// Expert-group graph cache (`COLI_CUDA_GRAPH=1`), mirrored the same way.
+    ///
+    /// Reported because the cache's failure mode is silent: a launch shape that
+    /// churns captures on every call and is *slower* than the eager path, with
+    /// every output still correct. `replays` near zero while `captures` tracks
+    /// `calls` is what that looks like from outside, and nothing else shows it.
+    pub graph_captures: u64,
+    pub graph_replays: u64,
+    pub graph_invalidations: u64,
+    pub graph_uncacheable: u64,
 }
 
 impl GpuTransferStats {
@@ -52,6 +72,7 @@ impl GpuTransferStats {
         #[cfg(feature = "cuda")]
         {
             let g = peregrine_cuda::group_stats();
+            let gc = peregrine_cuda::graph_cache_stats();
             GpuTransferStats {
                 calls: g.calls,
                 experts: g.experts,
@@ -59,6 +80,10 @@ impl GpuTransferStats {
                 h2d_ms: g.h2d_ms,
                 kernel_ms: g.kernel_ms,
                 d2h_ms: g.d2h_ms,
+                graph_captures: gc.captures,
+                graph_replays: gc.replays,
+                graph_invalidations: gc.invalidations,
+                graph_uncacheable: gc.uncacheable,
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -146,6 +171,9 @@ impl PlanOptimizer {
             prefetch_accuracy: cache.and_then(|c| ratio(c.prefetch_used, c.prefetch_used + c.prefetch_wasted)),
             cache_hit_rate: cache.and_then(|c| ratio(c.hits, c.hits + c.misses)),
             gpu: GpuTransferStats::read(),
+            // The optimizer has no view of routing; `Model::publish_lane_timings`
+            // fills this from `routing_entropy_ewma()` after the snapshot.
+            entropy_ewma: 0.0,
         }
     }
 }
@@ -168,8 +196,19 @@ impl Default for PlanOptimizer {
 /// Open an LLC-miss hardware counter for the calling thread, gated on
 /// `COLI_PERF_COUNTERS=1` (and the kernel granting `perf_event_open` —
 /// `perf_event_paranoid <= 2`, a real PMU, no seccomp filter). `None`
-/// otherwise. Consumers feed [`peregrine_io::PerfCounter::read`] deltas into
-/// the prefetch tuner: rising misses → widen prefetch distance.
+/// otherwise.
+///
+/// The caller hands the result to [`crate::Model::attach_perf_counter`], which
+/// reports the total at shutdown and — only under the separate
+/// `COLI_PERF_PREFETCH_FEEDBACK=1` — feeds per-forward deltas to the prefetch
+/// tuner: rising misses widen the distance.
+///
+/// **This sentence used to describe that consumer in the present tense while it
+/// did not exist**, which is the `[R]` failure mode in `docs/BAD_PATTERNS.md`
+/// wearing a doc comment. It exists now; what is still unestablished is whether
+/// the *direction* is right, since the counter follows the decode thread and
+/// therefore misses the io_uring and `peregrine-par` workers that actually move
+/// expert bytes. `Model::llc_trend` carries the argument and the test.
 pub fn open_l3_miss_counter() -> Option<peregrine_io::PerfCounter> {
     if !matches!(std::env::var("COLI_PERF_COUNTERS").as_deref(), Ok("1") | Ok("true")) {
         return None;
@@ -216,7 +255,7 @@ mod tests {
         let mut b = BubbleTuner::new(0.3, 1.5, 3);
         let io = IoTuner::new(IowqCap { bounded: 4, unbounded: 4 }, 1, 16);
         let mut o = PlanOptimizer::new();
-        let t = o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 50, gpu_us: 50, reduce_us: 5, cpu_bytes: 0 }, 1000, None);
+        let t = o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 50, gpu_us: 50, reduce_us: 5, cpu_bytes: 0, lane_wall_us: 0, cache_wait_us: 0 }, 1000, None);
         assert_eq!(t.lane.io_us, 100);
     }
 
@@ -245,7 +284,7 @@ mod tests {
         io.note_read(100, 50); // 50 rejections accumulated during warm-up
         let mut o = PlanOptimizer::new();
         for _ in 0..16 {
-            o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 1, gpu_us: 1, reduce_us: 0, cpu_bytes: 0 }, 1000, None);
+            o.tick(&mut b, &io, LaneTimings { io_us: 100, cpu_us: 1, gpu_us: 1, reduce_us: 0, cpu_bytes: 0, lane_wall_us: 0, cache_wait_us: 0 }, 1000, None);
         }
         if let Some(rec) = io.recommend() {
             assert_eq!(rec.bounded, 8, "warm-up rejections must not halve the cap on the first adjustment");

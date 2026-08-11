@@ -4,9 +4,17 @@
 //!
 //! Everything is deterministic: same trace → same artifacts.
 
+// The last first-party crate to adopt the panic-lint denials the other nine
+// already carry. It qualified all along — zero unwrap/expect/panic in this
+// crate's sources — so this is a ratchet, not a cleanup. Each binary target
+// is its own crate root, so the attribute has to be repeated per target.
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 pub mod prune;
 pub mod requant;
+pub mod reshard;
 pub mod skipbound;
+pub mod stwrite;
 
 use peregrine_core::{Context, Error};
 use serde_json::Value;
@@ -417,13 +425,25 @@ pub fn two_opt(order: &mut [i32], w: &HashMap<i32, HashMap<i32, u32>>) -> u64 {
 /// placement is the "hypergraph placement" property: co-firing experts land in
 /// the same tier, so one forward's routed set crosses as few tiers as possible.
 ///
-/// `heat[expert]` is this layer's per-expert routing heat; `bytes_per_expert`
-/// is uniform (int4 experts are same-shaped). Returns `(vram, ram)` expert-id
-/// lists, deterministic.
+/// `heat[expert]` is this layer's per-expert routing heat. `bytes_of(expert)`
+/// reports what **that** expert actually occupies.
+///
+/// **It used to be a scalar `bytes_per_expert`, on the reasoning that "int4
+/// experts are same-shaped".** That stopped being true when
+/// `peregrine-requantize --tier-hot-frac` shipped: a heat-tiered container holds
+/// int4 and int2 experts side by side, differing by ~40% in size, and
+/// `QtInfo::detect` is per-tensor precisely so a mixed container loads. A
+/// uniform size on such a container mis-sizes every community it places — and
+/// silently, since the planner has no way to notice. The closure mirrors
+/// `gpu.rs::solve_residency_sized`, which took exactly this shape for exactly
+/// this reason; callers with a genuinely uniform container pass `|_| n` and get
+/// the old behavior.
+///
+/// Returns `(vram, ram)` expert-id lists, deterministic.
 pub fn assign_tiers(
     w: &HashMap<i32, HashMap<i32, u32>>,
     heat: &HashMap<i32, u64>,
-    bytes_per_expert: u64,
+    bytes_of: impl Fn(i32) -> u64,
     vram_budget: u64,
     ram_budget: u64,
 ) -> (Vec<i32>, Vec<i32>) {
@@ -432,18 +452,23 @@ pub fn assign_tiers(
     // two communities that happened to have a cross edge — the oversized block
     // then missed a tier its real community would have fit in.
     let mut blocks = louvain_blocks(w);
+    // A community's byte cost is now the sum of its members', not a count times
+    // a constant. `.max(1)` per expert, not once over the total, so a single
+    // expert the container cannot size cannot make a whole community free.
+    let block_bytes = |b: &Vec<i32>| -> u64 {
+        b.iter().map(|&e| bytes_of(e).max(1)).sum()
+    };
     // greedy by heat density, deterministic tie-break by first expert id
     let density = |b: &Vec<i32>| -> (u64, i32) {
         let h: u64 = b.iter().map(|e| heat.get(e).copied().unwrap_or(0)).sum();
-        let bytes = (b.len() as u64) * bytes_per_expert.max(1);
-        (h * 1_000_000 / bytes, -b.first().copied().unwrap_or(0))
+        (h * 1_000_000 / block_bytes(b).max(1), -b.first().copied().unwrap_or(0))
     };
     blocks.sort_by_key(|b| std::cmp::Reverse(density(b)));
     let mut vram: Vec<i32> = Vec::new();
     let mut ram: Vec<i32> = Vec::new();
     let (mut vleft, mut rleft) = (vram_budget, ram_budget);
     for b in blocks {
-        let bytes = (b.len() as u64) * bytes_per_expert.max(1);
+        let bytes = block_bytes(&b);
         if bytes <= vleft {
             vleft -= bytes;
             vram.extend(b);
@@ -977,13 +1002,46 @@ mod tests {
         let w = build_cooccurrence(&trace, 0);
         let heat: HashMap<i32, u64> =
             [(1, 100), (2, 90), (3, 80), (10, 5), (11, 4), (12, 3)].into_iter().collect();
-        let (vram, ram) = assign_tiers(&w, &heat, 10, 30, 30);
+        // `|_| 10` is the old scalar behavior, so this pins that a uniform
+        // container plans exactly as it always did.
+        let (vram, ram) = assign_tiers(&w, &heat, |_| 10, 30, 30);
         let mut v = vram.clone();
         v.sort_unstable();
         assert_eq!(v, vec![1, 2, 3], "hot community whole into VRAM");
         let mut r = ram.clone();
         r.sort_unstable();
         assert_eq!(r, vec![10, 11, 12], "cold community whole into RAM");
+    }
+
+    /// The case a scalar `bytes_per_expert` cannot express: a heat-tiered
+    /// container (`peregrine-requantize --tier-hot-frac`) where experts within
+    /// one layer differ in size. Sized uniformly, the hot community looks like it
+    /// fits and the plan overcommits; sized per expert, the planner sees it does
+    /// not and places the community that does.
+    #[test]
+    fn tiers_size_each_expert_from_the_container_not_from_a_probe() {
+        let mut trace = Vec::new();
+        for _ in 0..5 {
+            trace.push(vec![vec![1, 2, 3]]);
+            trace.push(vec![vec![10, 11, 12]]);
+        }
+        let w = build_cooccurrence(&trace, 0);
+        let heat: HashMap<i32, u64> =
+            [(1, 100), (2, 90), (3, 80), (10, 5), (11, 4), (12, 3)].into_iter().collect();
+        // The hot community is stored at a wider precision — 30 bytes each — and
+        // the cold one at 10. A VRAM budget of 30 fits the cold community only.
+        let bytes_of = |e: i32| if (1..=3).contains(&e) { 30 } else { 10 };
+        let (vram, _ram) = assign_tiers(&w, &heat, bytes_of, 30, 0);
+        let mut v = vram.clone();
+        v.sort_unstable();
+        assert_eq!(v, vec![10, 11, 12], "the community that actually fits is the one placed");
+
+        // Same graph, same heat, same budget, uniform sizing → the *other*
+        // answer. If these two ever agree, the closure has stopped being read.
+        let (uniform_vram, _) = assign_tiers(&w, &heat, |_| 10, 30, 0);
+        let mut uv = uniform_vram.clone();
+        uv.sort_unstable();
+        assert_eq!(uv, vec![1, 2, 3], "uniform sizing places the hot community — and overcommits");
     }
 
     #[test]

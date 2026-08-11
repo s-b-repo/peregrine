@@ -64,12 +64,35 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub struct HeatTable {
     n_experts: usize,
     counts: Vec<AtomicU32>,
+    /// Per-slot value of [`Self::clock`] at the slot's most recent routing — the
+    /// `last` array [`peregrine_io::pick_lfru`] scores recency from.
+    ///
+    /// Lives **here** rather than in a second table because heat and recency are
+    /// two readings of one event: a separate structure would have its own bump
+    /// site, and the two sites would eventually disagree about what counts as a
+    /// routing. The cost is one extra relaxed store beside a `fetch_add` that is
+    /// already touching the line.
+    last: Vec<AtomicU32>,
+    /// Monotonic forward counter, advanced once per forward by [`Self::tick`].
+    ///
+    /// Per **forward**, deliberately, not per layer: `lfru_score` saturates
+    /// recency at an age of 255, and a per-layer clock would run 78 ticks a
+    /// token on GLM-5.2 — every slot would read as maximally stale within three
+    /// tokens and the recency term would stop distinguishing anything. Per
+    /// forward gives 255 tokens of resolution against a `reheat` that runs every
+    /// 256 steps.
+    clock: AtomicU32,
 }
 
 impl HeatTable {
     /// A zeroed table for `n_layers × n_experts` routed experts.
     pub fn new(n_layers: usize, n_experts: usize) -> HeatTable {
-        HeatTable { n_experts, counts: (0..n_layers * n_experts).map(|_| AtomicU32::new(0)).collect() }
+        HeatTable {
+            n_experts,
+            counts: (0..n_layers * n_experts).map(|_| AtomicU32::new(0)).collect(),
+            last: (0..n_layers * n_experts).map(|_| AtomicU32::new(0)).collect(),
+            clock: AtomicU32::new(0),
+        }
     }
 
     /// Record one routing of `expert` in `layer` (lock-free; out-of-range ignored).
@@ -81,9 +104,39 @@ impl HeatTable {
         if expert >= self.n_experts {
             return;
         }
-        if let Some(c) = layer.checked_mul(self.n_experts).and_then(|b| b.checked_add(expert)).and_then(|i| self.counts.get(i)) {
+        let idx = layer.checked_mul(self.n_experts).and_then(|b| b.checked_add(expert));
+        if let Some(c) = idx.and_then(|i| self.counts.get(i)) {
             c.fetch_add(1, Ordering::Relaxed);
         }
+        // Stamped from the same bounds check, so a slot can never have a recency
+        // without a count — `pick_lfru` reads the two as one score.
+        if let Some(l) = idx.and_then(|i| self.last.get(i)) {
+            l.store(self.clock.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    /// Advance the recency clock. Called once per forward; see [`Self::clock`].
+    pub fn tick(&self) {
+        self.clock.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The current recency clock, to be passed to `pick_lfru` alongside
+    /// [`Self::last_snapshot`].
+    pub fn clock(&self) -> u32 {
+        self.clock.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot of the per-slot last-routed stamps, row-major like
+    /// [`Self::snapshot`] and always the same length.
+    ///
+    /// A fresh process starts every stamp at 0 with the clock at 0, so every
+    /// slot scores as maximally *recent* and LFRU degrades to pure frequency
+    /// until the clock has advanced. That is the honest cold-start behaviour:
+    /// recency the process never observed should not order anything. (`last` is
+    /// deliberately **not** persisted in `route_stats.json` — a stamp from a
+    /// previous process is measured against a clock that no longer exists.)
+    pub fn last_snapshot(&self) -> Vec<u32> {
+        self.last.iter().map(|c| c.load(Ordering::Relaxed)).collect()
     }
 
     /// One slot's current count (0 for out-of-range) — a single atomic load, so
@@ -123,6 +176,14 @@ impl HeatTable {
         true
     }
 
+    /// Frequency, recency and the clock they are measured against, read
+    /// together so all three describe one instant. Reading them through three
+    /// separate calls is what would let a residency generation score a `last`
+    /// against a `clock` from a different forward.
+    pub fn snapshot_all(&self) -> (Vec<u32>, Vec<u32>, u32) {
+        (self.snapshot(), self.last_snapshot(), self.clock())
+    }
+
     /// Total slots (`n_layers * n_experts`) — length of [`Self::snapshot`].
     pub fn len(&self) -> usize {
         self.counts.len()
@@ -134,12 +195,179 @@ impl HeatTable {
     }
 }
 
+/// One residency generation's view of the routing statistics.
+///
+/// Bundled rather than passed as three parameters because `pick_lfru` scores
+/// frequency and recency **against each other**: a `last` array snapshotted at
+/// one instant and a `clock` read at another produce ages that are quietly wrong
+/// rather than obviously wrong, and nothing downstream can detect it. Build one
+/// with [`HeatTable::snapshot_all`].
+pub struct HeatView<'a> {
+    /// Routing frequency, row-major `[layer * n_experts + expert]`.
+    pub counts: &'a [u32],
+    /// Last-routed stamps, same layout and length as `counts`.
+    pub last: &'a [u32],
+    /// The forward counter `last` is measured against.
+    pub clock: u32,
+}
+
+impl<'a> HeatView<'a> {
+    /// A frequency-only view, for callers that have counts and no clock.
+    ///
+    /// [`SwapPolicy::Freq`] works normally against it. [`SwapPolicy::Lfru`]
+    /// proposes **nothing** — `pick_lfru` reads an empty `last` as a length
+    /// mismatch and answers "no decision", which is the right answer: LFRU
+    /// without recency is not LFRU, and quietly running frequency-only under an
+    /// `lfru` label would make the two policies indistinguishable in exactly the
+    /// measurement meant to tell them apart.
+    pub fn frequency_only(counts: &'a [u32]) -> HeatView<'a> {
+        HeatView { counts, last: &[], clock: 0 }
+    }
+
+    /// This layer's `n_experts`-wide frequency row, or empty if out of range.
+    fn heat_row(&self, layer: usize, n_experts: usize) -> &[u32] {
+        row_of(self.counts, layer, n_experts)
+    }
+
+    /// This layer's recency row. Empty when no recency was supplied, which
+    /// `pick_lfru` rejects as a length mismatch — the documented "no decision"
+    /// answer rather than a decision made on absent data.
+    fn last_row(&self, layer: usize, n_experts: usize) -> &[u32] {
+        row_of(self.last, layer, n_experts)
+    }
+}
+
+/// One layer's row out of a row-major `[layer * n_experts + expert]` table.
+fn row_of(table: &[u32], layer: usize, n_experts: usize) -> &[u32] {
+    let Some(start) = layer.checked_mul(n_experts) else {
+        return &[];
+    };
+    match start.checked_add(n_experts) {
+        Some(end) if end <= table.len() => &table[start..end],
+        _ => &[],
+    }
+}
+
+/// How [`GpuTier::reheat`] chooses the next residency generation.
+///
+/// The default re-plans the whole set every generation, which is correct but
+/// unbounded in churn: any expert whose heat rank moved is a candidate upload.
+/// The two incremental policies are `peregrine-io`'s hot-store rules applied to
+/// the shape they were written for — **per layer, the resident set is exactly a
+/// fixed-size slot array** — and both carry a 25 %-plus-4-count hysteresis, so a
+/// marginally hotter expert does not displace a resident at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapPolicy {
+    /// Re-rank every candidate and take the hottest that fit (the historical
+    /// behaviour, and what an unset `COLI_GPU_TIER_SWAP` selects).
+    Replan,
+    /// At most one `pick_lfru` swap per layer per generation: frequency first,
+    /// recency only as a tiebreak.
+    Lfru,
+    /// At most one `pick_swap` swap per layer per generation: frequency only.
+    Freq,
+}
+
+impl SwapPolicy {
+    /// Parse `COLI_GPU_TIER_SWAP`. Unrecognized values are **not** silently
+    /// treated as off: the caller reports them, because a misspelled policy that
+    /// reads as "default" is a knob that stopped being a knob.
+    pub fn parse(s: &str) -> Option<SwapPolicy> {
+        match s {
+            "" | "replan" => Some(SwapPolicy::Replan),
+            "lfru" => Some(SwapPolicy::Lfru),
+            "freq" => Some(SwapPolicy::Freq),
+            _ => None,
+        }
+    }
+}
+
+/// The configured [`SwapPolicy`], read once per `reheat` from
+/// `COLI_GPU_TIER_SWAP`. An unparseable value warns and falls back to `Replan`.
+pub fn swap_policy() -> SwapPolicy {
+    match std::env::var("COLI_GPU_TIER_SWAP") {
+        Ok(v) => SwapPolicy::parse(&v).unwrap_or_else(|| {
+            peregrine_io::note_advisory_err(
+                "COLI_GPU_TIER_SWAP is not a known policy (replan|lfru|freq); using replan",
+                &v,
+            );
+            SwapPolicy::Replan
+        }),
+        // Both variants named rather than `Err(_)`: unset and non-UTF-8 are the
+        // two ways nobody chose a policy, and spelling them out is what stops a
+        // future third variant from being swallowed by a wildcard.
+        Err(std::env::VarError::NotPresent) | Err(std::env::VarError::NotUnicode(_)) => {
+            SwapPolicy::Replan
+        }
+    }
+}
+
+/// One incremental residency generation, as `(evict, admit)` pairs.
+///
+/// Pure — it decides, it does not upload — so the policy is unit-testable on a
+/// host with no GPU, which is the only way the hysteresis behaviour gets tested
+/// at all: `mod real`'s tests skip themselves without a device.
+///
+/// **Per layer, and at most one swap per layer**, because that is the shape
+/// `pick_lfru`/`pick_swap` were written for: `pinned` is a slot array and
+/// `Swap::slot` indexes it. A layer holding no residents is skipped rather than
+/// grown — admitting into an empty set is a *sizing* decision, which is
+/// [`SwapPolicy::Replan`]'s job, not a swap.
+pub fn plan_swaps(
+    heat: &HeatView,
+    n_layers: usize,
+    first_dense: usize,
+    n_experts: usize,
+    policy: SwapPolicy,
+    resident: impl Fn(usize, usize) -> bool,
+) -> Vec<((usize, usize), (usize, usize))> {
+    if matches!(policy, SwapPolicy::Replan) || n_experts == 0 || first_dense >= n_layers {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for layer in first_dense..n_layers {
+        let pinned: Vec<usize> = (0..n_experts).filter(|&e| resident(layer, e)).collect();
+        if pinned.is_empty() {
+            continue;
+        }
+        let hr = heat.heat_row(layer, n_experts);
+        if hr.is_empty() {
+            continue;
+        }
+        let swap = match policy {
+            SwapPolicy::Lfru => {
+                peregrine_io::pick_lfru(hr, heat.last_row(layer, n_experts), heat.clock, &pinned)
+            }
+            SwapPolicy::Freq => peregrine_io::pick_swap(hr, &pinned),
+            SwapPolicy::Replan => None,
+        };
+        // `slot` indexes `pinned`; `eid` is an expert id. Conflating them would
+        // evict the wrong expert whenever residency is not a prefix of 0..n.
+        if let Some(s) = swap {
+            if let Some(&victim) = pinned.get(s.slot) {
+                out.push(((layer, victim), (layer, s.eid)));
+            }
+        }
+    }
+    out
+}
+
 /// Persistent Expert Residency Solver. Greedy knapsack over `(layer, expert)`
 /// pairs, maximizing total heat within `budget` bytes. Handles heterogeneous
 /// expert sizes (per-layer inter-size variation) by sorting on `heat /
 /// bytes_per_expert` — a small expert with modest heat can beat a larger cold
 /// one. Falls back to [`plan_residency`] round-robin when the heat table is
 /// all-zero. Deterministic ties (equal ratio → lower layer, lower expert).
+/// **No production caller, and the reason is worth stating rather than fixing.**
+/// A uniform per-expert cost makes this a top-N-by-heat-density, which for equal
+/// sizes is just top-N-by-heat — and `rank_by_heat` already does that while
+/// preserving `plan_residency`'s round-robin tie-break, which this does not
+/// (it breaks ties by ascending layer/expert). On a partially-warm heat table
+/// the two disagree on every tie, and the disagreement is pure residency churn.
+/// So the callers that look like they want this either want `rank_by_heat`
+/// (uniform sizes) or `solve_residency_sized` with a real per-expert closure
+/// (mixed sizes — a heat-tiered container). Kept as the documented uniform-cost
+/// entry point; wiring it would mean picking the wrong one of those two.
 pub fn solve_residency_greedy(
     counts: &[u32],
     n_layers: usize,
@@ -821,7 +1049,7 @@ mod gpu_residency_tests {
         let n_experts = cfg.n_experts as usize;
         let mut counts = vec![0u32; cfg.n_layers as usize * n_experts];
         counts[2 * n_experts] = 99; // make (layer 2, expert 0) the hottest
-        let after = tier.reheat(&st, &cfg, &counts)?;
+        let after = tier.reheat(&st, &cfg, &super::HeatView::frequency_only(&counts))?;
         std::fs::remove_dir_all(&dir)?;
         assert!(before > 0, "tiny experts must fit VRAM");
         assert_eq!(after, before, "reheat at full capacity keeps the resident count");
@@ -882,6 +1110,152 @@ mod placement_tests {
         assert_eq!(placed.len(), 7);
         let layers: BTreeSet<usize> = placed.iter().map(|&(l, _)| l).collect();
         assert_eq!(layers, (5..8).collect(), "all sparse layers still covered");
+    }
+
+    /// Tests for the incremental residency policies (`COLI_GPU_TIER_SWAP`).
+    ///
+    /// Pure, and here rather than in `mod real`, because those tests skip
+    /// themselves on a host without a CUDA device — a hysteresis rule tested
+    /// only there is a rule with no test on most machines.
+    mod swap_policy {
+        use super::super::{plan_swaps, HeatView, SwapPolicy};
+
+        const N_LAYERS: usize = 4;
+        const FIRST_DENSE: usize = 2;
+        const N_EXPERTS: usize = 8;
+
+        /// Row-major heat table with `(layer, expert) -> count` overrides.
+        fn table(entries: &[(usize, usize, u32)]) -> Vec<u32> {
+            let mut t = vec![0u32; N_LAYERS * N_EXPERTS];
+            for &(l, e, c) in entries {
+                t[l * N_EXPERTS + e] = c;
+            }
+            t
+        }
+
+        fn plan(
+            counts: &[u32],
+            last: &[u32],
+            clock: u32,
+            policy: SwapPolicy,
+            resident: &[(usize, usize)],
+        ) -> Vec<((usize, usize), (usize, usize))> {
+            let view = HeatView { counts, last, clock };
+            plan_swaps(&view, N_LAYERS, FIRST_DENSE, N_EXPERTS, policy, |l, e| {
+                resident.contains(&(l, e))
+            })
+        }
+
+        #[test]
+        fn replan_proposes_nothing_so_the_default_path_is_untouched() {
+            // The knob's off-state must be inert, not merely similar: any swap
+            // proposed here would be an upload the historical path never made.
+            let counts = table(&[(2, 7, 500), (2, 0, 1)]);
+            assert!(plan(&counts, &[], 0, SwapPolicy::Replan, &[(2, 0)]).is_empty());
+        }
+
+        #[test]
+        fn a_decisively_hotter_expert_swaps_in_at_most_once_per_layer() {
+            // Layer 2 holds two cold residents; two non-residents are far hotter.
+            // Both qualify, but a generation moves ONE — the bound that makes this
+            // policy a brake on PCIe churn rather than a re-plan by another name.
+            let counts = table(&[(2, 0, 1), (2, 1, 2), (2, 5, 900), (2, 6, 800)]);
+            let swaps = plan(&counts, &[], 0, SwapPolicy::Freq, &[(2, 0), (2, 1)]);
+            assert_eq!(swaps.len(), 1, "one swap per layer per generation: {swaps:?}");
+            let ((vl, ve), (al, ae)) = swaps[0];
+            assert_eq!((vl, al), (2, 2), "a swap never crosses layers");
+            assert_eq!(ve, 0, "the coldest resident is the victim");
+            assert_eq!(ae, 5, "the hottest non-resident is admitted");
+        }
+
+        #[test]
+        fn a_marginally_hotter_expert_does_not_evict_a_resident() {
+            // 100 -> 104 is +4 counts, exactly the hysteresis floor and under the
+            // 25% term. Without the hysteresis this churns every generation, which
+            // is the failure mode `pick_swap` was ported to avoid.
+            let counts = table(&[(2, 0, 100), (2, 5, 104)]);
+            assert!(
+                plan(&counts, &[], 0, SwapPolicy::Freq, &[(2, 0)]).is_empty(),
+                "a swap inside the hysteresis band is churn with no information behind it"
+            );
+            // Decisively hotter clears it, so the test above is not passing by
+            // the policy being inert.
+            let counts = table(&[(2, 0, 100), (2, 5, 400)]);
+            assert_eq!(plan(&counts, &[], 0, SwapPolicy::Freq, &[(2, 0)]).len(), 1);
+        }
+
+        #[test]
+        fn the_victim_is_a_pinned_slot_not_an_expert_id() {
+            // Residency {3, 6} is not a prefix of 0..n, so `Swap::slot` (an index
+            // into `pinned`) and the expert id differ: slot 0 is expert 3. Reading
+            // `slot` as an id would evict expert 0, which is not even resident.
+            let counts = table(&[(2, 3, 1), (2, 6, 50), (2, 4, 900)]);
+            let swaps = plan(&counts, &[], 0, SwapPolicy::Freq, &[(2, 3), (2, 6)]);
+            assert_eq!(swaps, vec![((2, 3), (2, 4))], "coldest pinned slot is expert 3");
+        }
+
+        #[test]
+        fn dense_layers_and_empty_layers_are_left_alone() {
+            // Layer 1 is dense (below `first_dense`) and layer 3 holds nothing.
+            // Admitting into an empty layer is a sizing decision, not a swap.
+            let counts = table(&[(1, 0, 900), (3, 0, 900)]);
+            assert!(plan(&counts, &[], 0, SwapPolicy::Freq, &[(1, 1)]).is_empty());
+            assert!(plan(&counts, &[], 0, SwapPolicy::Freq, &[]).is_empty());
+        }
+
+        #[test]
+        fn lfru_decides_where_frequency_lands_exactly_on_the_hysteresis_edge() {
+            // 100 resident vs 129 candidate is `pick_swap`'s boundary to the
+            // count: `129 <= 100 + 25 + 4` holds, so frequency-only abstains.
+            // LFRU adds a recency term worth at most 255 against one count's 256
+            // — enough to carry a candidate that is *already* at the edge, and
+            // never enough to carry one that is not. That narrowness is the
+            // design (`tier.rs`: "a merely-recent expert cannot displace a
+            // genuinely hotter one"), so this test pins the one band where the
+            // two policies can differ at all. If it ever widened, LFRU would be
+            // promoting on recency alone and both policies would still "work".
+            let counts = table(&[(2, 0, 100), (2, 5, 129)]);
+            assert!(
+                plan(&counts, &[], 0, SwapPolicy::Freq, &[(2, 0)]).is_empty(),
+                "frequency-only must abstain exactly on its hysteresis edge"
+            );
+            let mut last = vec![0u32; N_LAYERS * N_EXPERTS];
+            last[2 * N_EXPERTS] = 0; // resident: routed long enough ago to score 0
+            last[2 * N_EXPERTS + 5] = 300; // candidate: routed this generation
+            let swaps = plan(&counts, &last, 300, SwapPolicy::Lfru, &[(2, 0)]);
+            assert_eq!(swaps, vec![((2, 0), (2, 5))], "recency must carry the edge case under lfru");
+
+            // Same counts, candidate equally stale: the recency term cancels and
+            // LFRU must land back on frequency's answer. Otherwise the test above
+            // would pass for a policy that swaps on nothing.
+            let stale = [0u32; N_LAYERS * N_EXPERTS];
+            let swaps = plan(&counts, &stale, 300, SwapPolicy::Lfru, &[(2, 0)]);
+            assert!(swaps.is_empty(), "with no recency advantage lfru must agree with freq: {swaps:?}");
+        }
+
+        #[test]
+        fn lfru_without_recency_makes_no_decision() {
+            // A `HeatView` carrying no `last` must not quietly degrade to
+            // frequency-only: the two policies would then be the same policy
+            // under two names, and the A/B measuring them would compare nothing.
+            let counts = table(&[(2, 0, 1), (2, 5, 900)]);
+            let view = HeatView::frequency_only(&counts);
+            let swaps =
+                plan_swaps(&view, N_LAYERS, FIRST_DENSE, N_EXPERTS, SwapPolicy::Lfru, |l, e| {
+                    (l, e) == (2, 0)
+                });
+            assert!(swaps.is_empty(), "lfru with no recency data must abstain: {swaps:?}");
+        }
+
+        #[test]
+        fn an_unknown_policy_name_is_not_silently_off() {
+            assert_eq!(SwapPolicy::parse(""), Some(SwapPolicy::Replan));
+            assert_eq!(SwapPolicy::parse("replan"), Some(SwapPolicy::Replan));
+            assert_eq!(SwapPolicy::parse("lfru"), Some(SwapPolicy::Lfru));
+            assert_eq!(SwapPolicy::parse("freq"), Some(SwapPolicy::Freq));
+            assert_eq!(SwapPolicy::parse("LFRU"), None, "case is not normalized away");
+            assert_eq!(SwapPolicy::parse("1"), None, "a boolean-looking value is not a policy");
+        }
     }
 
     #[test]
@@ -958,6 +1332,15 @@ mod real {
         /// expert is evicted and re-uploaded (a full ~151 MB host dequantize plus
         /// PCIe transfer) every 256 decode steps forever.
         forced_f32: std::collections::HashSet<(usize, usize)>,
+        /// MoE intermediate dim — the `I` of every expert's `KernelShape`. Held
+        /// on the tier because `compute` has no `Cfg` and a shape keyed on the
+        /// wrong `I` would merge two genuinely different kernels into one row.
+        inter: usize,
+        /// Online WMMA tile autotuner (`COLI_CUDA_AUTOTUNE=1`), `None` when off.
+        /// `Mutex` because `compute` takes `&self` — one GPU-lane thread issues
+        /// dispatch, so it is never contended; it is here to hold the borrow
+        /// checker's line, not a race.
+        tuner: Option<parking_lot::Mutex<crate::wmma_tune::WmmaTuner>>,
     }
 
     /// Load and upload one expert to VRAM: raw per-row int4 (`fmt=2`, ~8× denser)
@@ -1008,10 +1391,33 @@ mod real {
     /// were int4. Under-planning wastes VRAM; over-planning silently truncates
     /// the tier, so the conservative answer is the right one.
     fn experts_are_per_row_int4(st: &SafeTensors, cfg: &Cfg) -> bool {
+        // Every sparse layer, including the MTP head at `cfg.n_layers`, and not
+        // just one expert of one layer. A single probe of (first_dense, 0) answers
+        // for a uniform container but reports "all int4" on a per-layer-tiered one
+        // — the GLM-5.2 checkpoint stores the MTP layer's 256 experts at int8 and
+        // the rest at int4, so the probe said yes and the operator never saw the
+        // "not per-row int4" notice that explains an 8x-larger VRAM plan. Expert 0
+        // still stands in for its layer: precision is chosen per layer by
+        // `peregrine-requantize`, and `solve_residency_sized` asks per expert
+        // anyway when it actually sizes the tier.
+        ((cfg.first_dense as usize)..=(cfg.n_layers as usize))
+            .all(|layer| expert_is_per_row_int4(st, cfg, layer, 0))
+    }
+
+    /// Whether **this** expert stores all three projections as per-row int4, i.e.
+    /// whether it will upload raw (int4-resident) or dequantized (f32, ~8×).
+    ///
+    /// The per-expert form exists because the whole-container probe above answers
+    /// one question — "can the entire tier be planned as int4?" — and a tiered
+    /// container makes that question the wrong one. On a mix, the probe correctly
+    /// says "no" and the planner then sizes *every* expert at f32, which is safe
+    /// but ~8× too pessimistic for the int4 majority; the tier ends up a fraction
+    /// of the VRAM it was given. Asking per expert costs one index lookup per
+    /// candidate at load time and gets both halves right.
+    fn expert_is_per_row_int4(st: &SafeTensors, cfg: &Cfg, layer: usize, e: usize) -> bool {
         use peregrine_core::QtInfo;
-        let (hidden, inter) = (cfg.hidden as i64, cfg.moe_inter as i64);
-        let l = cfg.first_dense as usize;
-        let pe = |t: &str| format!("model.layers.{l}.mlp.experts.0.{t}");
+        let (hidden, inter) = (cfg.hidden, cfg.moe_inter);
+        let pe = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
         [(pe("gate_proj.weight"), inter, hidden), (pe("up_proj.weight"), inter, hidden), (pe("down_proj.weight"), hidden, inter)]
             .iter()
             .all(|(name, o, i)| QtInfo::detect(st, name, *o, *i).fmt == peregrine_core::QtFmt::Int4)
@@ -1062,13 +1468,20 @@ mod real {
             // N experts and uploads 8N worth — the per-expert tracking below then
             // truncates the tier, silently, to ~1/8 of what was asked for.
             let raw_int4 = int4 && experts_are_per_row_int4(st, cfg);
+            // Contexts this process actually initialized, as opposed to the
+            // driver-visible count the startup banner reports. They differ
+            // whenever init partially fails, and that difference is exactly what
+            // a "the GPU tier is smaller than I asked for" report needs.
+            eprintln!(
+                "peregrine: CUDA contexts initialized: {} (device {device})",
+                peregrine_cuda::device_count()
+            );
             if int4 && !raw_int4 {
                 eprintln!(
                     "peregrine: COLI_GPU_INT4 set, but this container's experts are not per-row \
                      int4 — they upload dequantized to f32 (8x), so the VRAM plan is sized for f32"
                 );
             }
-            let bytes_per_expert = if raw_int4 { int4_bytes } else { f32_bytes };
             let budget = free.saturating_sub(headroom_bytes);
 
             // Heat-density knapsack over the persisted routing counts. On a cold
@@ -1081,7 +1494,19 @@ mod real {
                 cfg.first_dense as usize,
                 cfg.n_experts as usize,
                 budget,
-                |_, _| bytes_per_expert,
+                // Per-expert, not one scalar. `solve_residency_sized` takes this
+                // closure precisely so a tier holding differently-sized residents
+                // still fits its budget, and passing `|_, _| constant` gave that
+                // back for free. On a uniform container every call returns the
+                // same number and the plan is unchanged; on a tiered one the int4
+                // experts stop being budgeted as if they were f32.
+                |layer, e| {
+                    if int4 && expert_is_per_row_int4(st, cfg, layer, e) {
+                        int4_bytes
+                    } else {
+                        f32_bytes
+                    }
+                },
             );
             let mut capacity = placement.len(); // expert-count view of the budget
             let mut experts = HashMap::new();
@@ -1154,7 +1579,29 @@ mod real {
                     adaptive_f32_frac,
                     precision,
                     forced_f32,
+                    inter: cfg.moe_inter as usize,
+                    // A *second* opt-in on top of `COLI_CUDA_TC_W4A16`: the tile
+                    // only reaches that arm, so tuning without it would record
+                    // measurements of a kernel the tile never touched and then
+                    // "select" between them.
+                    tuner: (std::env::var("COLI_CUDA_AUTOTUNE").as_deref() == Ok("1"))
+                        .then(|| parking_lot::Mutex::new(crate::wmma_tune::WmmaTuner::new())),
                 }))
+            }
+        }
+
+        /// The tuner's table, for persistence beside `route_stats.json`.
+        /// `None` when autotuning is off — so an absent knob writes no file
+        /// rather than an empty one that looks like a measured result.
+        pub fn tuning_json(&self) -> Option<serde_json::Value> {
+            self.tuner.as_ref().map(|t| t.lock().to_json())
+        }
+
+        /// Restore a table written by [`Self::tuning_json`]. Ignored when
+        /// autotuning is off.
+        pub fn restore_tuning(&self, v: &serde_json::Value) {
+            if let Some(t) = self.tuner.as_ref() {
+                *t.lock() = crate::wmma_tune::WmmaTuner::from_json(v);
             }
         }
 
@@ -1163,7 +1610,16 @@ mod real {
         /// newly-hot ones. Reuses [`Self::build`]'s dequantize+upload path. Called
         /// between forwards with `&mut self`, so residency adapts to the workload
         /// without a rewrite. Returns the resident count after re-selection.
-        pub fn reheat(&mut self, st: &SafeTensors, cfg: &Cfg, counts: &[u32]) -> Result<usize, Error> {
+        pub fn reheat(&mut self, st: &SafeTensors, cfg: &Cfg, heat: &super::HeatView) -> Result<usize, Error> {
+            let counts = heat.counts;
+            // Incremental policies run instead of the re-plan, not before it:
+            // both decide the same thing (which experts are resident next
+            // generation) and running one after the other would let the re-plan
+            // immediately undo every swap.
+            match super::swap_policy() {
+                super::SwapPolicy::Replan => {}
+                policy => return self.reheat_incremental(st, cfg, heat, policy),
+            }
             // Re-read free VRAM each generation: another process may have taken
             // some since load, and the budget must reflect what is available now
             // (plus what this tier already holds, which it is free to reuse).
@@ -1208,9 +1664,32 @@ mod real {
                             .collect();
                         (plan.into_iter().map(|(k, _)| k).collect(), prec)
                     }
-                    // Uniform format: every resident is the same size, so the
-                    // count-based rank already respects the byte budget.
+                    // Uniform format: every resident is the same size, so a
+                    // byte-budgeted knapsack over a constant cost is the whole
+                    // decision.
+                    //
+                    // This was hand-rolled as `rank_by_heat(.., capacity)` then
+                    // `take(budget / uniform)` — which is what
+                    // `solve_residency_greedy` does, except that the hand-rolled
+                    // version **lost the cold-start fallback**: on an all-zero
+                    // heat table `solve_residency_sized` reproduces
+                    // `plan_residency`'s round-robin spread, while ranking by
+                    // heat and truncating gives whatever order the sort happened
+                    // to leave. So `build` and `reheat` disagreed about placement
+                    // on a cold table, and the first reheat of a fresh process
+                    // reshuffled residency for no reason.
                     None => {
+                        // `rank_by_heat`, not `solve_residency_greedy`. They differ
+                        // on **equal heat**: `rank_by_heat` keeps candidates in
+                        // round-robin order, which is `plan_residency`'s static
+                        // placement, while `solve_residency_sized` breaks ties by
+                        // ascending (layer, expert). A partially-warm table has many
+                        // ties, so swapping them silently reshuffles residency for
+                        // experts the heat table cannot distinguish — churn with no
+                        // information behind it, and every moved expert is a PCIe
+                        // upload. The byte budget is applied after ranking because
+                        // in this branch every resident is the same size, which is
+                        // what makes the count-based rank sufficient.
                         let want = super::rank_by_heat(
                             counts,
                             cfg.n_layers as usize,
@@ -1298,6 +1777,99 @@ mod real {
             Ok(self.experts.len())
         }
 
+        /// [`Self::reheat`] under an incremental [`SwapPolicy`]: hold the
+        /// resident *set size* fixed and move at most one expert per layer.
+        ///
+        /// **Why this exists beside the re-plan rather than replacing it.** The
+        /// re-plan re-ranks every candidate, so any expert whose heat rank moved
+        /// is an upload — on a churny generation that is gigabytes into the PCIe
+        /// lane the tier is meant to be feeding, which is why
+        /// `COLI_PCIE_BUDGET_MB` had to exist to truncate it. These policies
+        /// brake at the source: `pick_lfru`/`pick_swap` refuse a swap unless the
+        /// candidate beats the victim by 25 % **plus** four routing counts, so a
+        /// generation where nothing meaningfully changed uploads nothing at all.
+        ///
+        /// The re-plan remains the default because it is the only one that can
+        /// *resize* the resident set (VRAM freed by another process, a layer
+        /// holding nothing) — a swap has no opinion about how many experts
+        /// should be resident, only about which.
+        ///
+        /// **Adaptive precision is not supported here and falls back rather than
+        /// approximating.** `plan_precision_fitted` decides residency and format
+        /// together; a one-in-one-out swap that assumed the tier's uniform
+        /// format would silently undo the f32 promotions the knob was set for.
+        fn reheat_incremental(
+            &mut self,
+            st: &SafeTensors,
+            cfg: &Cfg,
+            heat: &super::HeatView,
+            policy: super::SwapPolicy,
+        ) -> Result<usize, Error> {
+            if self.adaptive_f32_frac.is_some() {
+                peregrine_io::note_advisory_err(
+                    "COLI_GPU_TIER_SWAP is ignored while adaptive f32 residency is on \
+                     (the two decide the same thing); using replan",
+                    &format!("{policy:?}"),
+                );
+                return self.reheat(st, cfg, heat);
+            }
+            let swaps = super::plan_swaps(
+                heat,
+                cfg.n_layers as usize,
+                cfg.first_dense as usize,
+                cfg.n_experts as usize,
+                policy,
+                |layer, e| self.experts.contains_key(&(layer, e)),
+            );
+            // Same PCIe brake as the re-plan path, over the same cost basis. A
+            // swap admits exactly one expert in the tier's uniform format.
+            let unit = if self.int4 { self.expert_bytes.0 } else { self.expert_bytes.1 };
+            let costs: Vec<usize> = swaps.iter().map(|_| unit).collect();
+            let mut quota = super::admit_uploads(&costs, super::pcie_budget_bytes());
+            for (victim, admit) in swaps {
+                if quota == 0 {
+                    break;
+                }
+                quota -= 1;
+                // Evict FIRST so the victim's `Drop` returns its VRAM before the
+                // admission allocates. Reversed, a tier sized to fill the budget
+                // would need one expert's worth of headroom it does not have,
+                // and every swap would fail on the last free byte.
+                let evicted = self.experts.remove(&victim);
+                let victim_int4 = self.precision.remove(&victim).unwrap_or(self.int4);
+                self.forced_f32.remove(&victim);
+                drop(evicted);
+                match upload_expert(st, cfg, admit.0, admit.1, self.device, self.int4) {
+                    Ok((ge, landed_int4)) => {
+                        self.experts.insert(admit, ge);
+                        self.precision.insert(admit, landed_int4);
+                        if self.int4 && !landed_int4 {
+                            self.forced_f32.insert(admit);
+                        }
+                    }
+                    // The victim is already gone and its bytes are already freed,
+                    // so the tier is one expert short until the next generation
+                    // — which is a residency loss, not a correctness one: a
+                    // non-resident expert streams from the CPU lane. Do not try
+                    // to re-upload the victim; that is the same allocation that
+                    // just failed, and failing it twice would leave the maps
+                    // describing a tier that does not exist.
+                    Err(e_up) => {
+                        peregrine_io::note_advisory_err(
+                            &format!(
+                                "gpu tier swap upload for ({}, {}) — slot left empty, \
+                                 evicted ({}, {}) [int4={}] is not restored",
+                                admit.0, admit.1, victim.0, victim.1, victim_int4
+                            ),
+                            &e_up,
+                        );
+                        break;
+                    }
+                }
+            }
+            Ok(self.experts.len())
+        }
+
         /// Whether expert `e` of `layer` is resident in VRAM.
         pub fn has(&self, layer: usize, e: usize) -> bool {
             self.experts.contains_key(&(layer, e))
@@ -1357,7 +1929,7 @@ mod real {
                     rows.push((xg.len() / hidden) as i32);
                     x.extend_from_slice(xg);
                 }
-                let y = peregrine_cuda::expert_group(&refs, &rows, &x, hidden)?;
+                let y = self.dispatch_tuned(&refs, &rows, &x, hidden)?;
                 let mut outs = Vec::with_capacity(idxs.len());
                 let mut off = 0usize;
                 for &r in &rows {
@@ -1375,6 +1947,146 @@ mod real {
             // permutation must not escape this function.
             super::scatter_by_index(jobs.len(), &classes, per_class)
                 .ok_or_else(|| Error::Format("gpu compute: format partition is not a bijection".into()))
+        }
+
+        /// One `expert_group` dispatch, with the WMMA tile chosen by the online
+        /// tuner when `COLI_CUDA_AUTOTUNE=1` and left at the default otherwise.
+        ///
+        /// **Timed with a wall clock, not `COLI_CUDA_PROFILE`'s events, and the
+        /// reason is not convenience**: enabling profiling disables the graph
+        /// cache (event records are not part of the work being replayed), so a
+        /// tuner driven by kernel-ms would only ever measure the un-cached path
+        /// and then pick a tile for the cached one. `expert_group` synchronizes
+        /// before returning, so the wall clock is a real end-to-end measure; the
+        /// H2D/D2H it also contains are tile-independent, so differences between
+        /// tiles still attribute to the kernel.
+        fn dispatch_tuned(
+            &self,
+            refs: &[&GpuExpert],
+            rows: &[i32],
+            x: &[f32],
+            hidden: usize,
+        ) -> Result<Vec<f32>, Error> {
+            let Some(tuner) = self.tuner.as_ref() else {
+                return peregrine_cuda::expert_group(refs, rows, x, hidden);
+            };
+            let shape = crate::wmma_tune::KernelShape {
+                d: hidden as u32,
+                i: self.inter as u32,
+                count: rows.len().min(u16::MAX as usize) as u16,
+                max_rows: rows.iter().copied().max().unwrap_or(0).clamp(0, u16::MAX as i32) as u16,
+            };
+            let tile = tuner.lock().select(shape);
+            let t0 = std::time::Instant::now();
+            let (y, arm) = peregrine_cuda::expert_group_tiled(refs, rows, x, hidden, tile.w4a16_dims())?;
+            let us = t0.elapsed().as_micros() as f32;
+            // Record under the arm that ACTUALLY ran, and only when the timing
+            // means something about a tile.
+            //
+            // `COLI_CUDA_TC_W4A16` gates on compute capability and a row-count
+            // floor, so a group that missed the floor silently ran the scalar
+            // kernel — and crediting that time to the tile the tuner selected is
+            // how a table fills with measurements of a kernel the tile never
+            // touched. The int4 arm gets its one legal fragment recorded rather
+            // than discarded: it is a real measurement at this shape, just not a
+            // *choice*, and tagging it keeps it from sharing a row with the
+            // fp16 numbers (where the faster arm would read as the faster tile).
+            match arm {
+                peregrine_cuda::GroupArm::W4A16 => tuner.lock().observe(shape, tile, us),
+                peregrine_cuda::GroupArm::Int4Tc => {
+                    tuner.lock().observe(shape, crate::wmma_tune::TileConfig::default_int4tc(), us)
+                }
+                // Tile-insensitive arms: timing them would be noise in the table.
+                peregrine_cuda::GroupArm::PackedW4 | peregrine_cuda::GroupArm::Generic => {}
+            }
+            Ok(y)
+        }
+
+        /// [`Self::compute`] with the layer-level gate-weighted accumulation
+        /// fused onto the device (`COLI_CUDA_FUSED_REDUCE`): returns one
+        /// `[s_n, hidden]` partial instead of a per-expert output each.
+        ///
+        /// `dst[k]`/`weights[k]` describe job `k`'s rows in the same flattened
+        /// order `compute` builds `x` in — job by job, rows within a job in the
+        /// job's own order.
+        ///
+        /// **What changes numerically, stated rather than discovered.** The GPU
+        /// experts now sum among themselves before meeting the CPU lane's
+        /// contributions, instead of interleaving with them in batch-union
+        /// order. Where a residency generation spans two formats,
+        /// `partition_by_format` splits it again and the class partials are
+        /// added in class order. Both are fixed orders — repeat-stable, and
+        /// pinned as such by `fused_reduce_is_bit_stable_across_repeats` — but
+        /// neither is the host reduce's order, which is why this is a knob.
+        pub fn compute_reduced(
+            &self,
+            layer: usize,
+            jobs: &[(usize, Vec<f32>)],
+            hidden: usize,
+            dst: &[usize],
+            weights: &[f32],
+            s_n: usize,
+        ) -> Result<Vec<f32>, Error> {
+            let mut acc = vec![0f32; s_n * hidden];
+            if jobs.is_empty() {
+                return Ok(acc);
+            }
+            if hidden == 0 || s_n == 0 {
+                return Err(Error::Format("gpu compute_reduced: empty hidden or batch".into()));
+            }
+            let total: usize = jobs.iter().map(|(_, xg)| xg.len() / hidden.max(1)).sum();
+            if dst.len() != total || weights.len() != total {
+                return Err(Error::Format("gpu compute_reduced: dst/weights length != total rows".into()));
+            }
+            for (e, xg) in jobs {
+                if !self.experts.contains_key(&(layer, *e)) {
+                    return Err(Error::Format(format!("gpu expert ({layer},{e}) not resident")));
+                }
+                if !xg.len().is_multiple_of(hidden) {
+                    return Err(Error::Format("gpu compute_reduced: ragged gathered rows".into()));
+                }
+            }
+            // Where each job's rows start in the flattened `dst`/`weights`, so a
+            // format class can slice out exactly its own.
+            let mut job_at = Vec::with_capacity(jobs.len() + 1);
+            let mut running = 0usize;
+            for (_, xg) in jobs {
+                job_at.push(running);
+                running += xg.len() / hidden;
+            }
+            job_at.push(running);
+
+            let fmt: Vec<bool> =
+                jobs.iter().map(|(e, _)| self.precision.get(&(layer, *e)).copied().unwrap_or(self.int4)).collect();
+            for idxs in &super::partition_by_format(&fmt) {
+                let mut refs = Vec::with_capacity(idxs.len());
+                let mut rows = Vec::with_capacity(idxs.len());
+                let mut x = Vec::new();
+                let mut cdst = Vec::new();
+                let mut crw = Vec::new();
+                for &i in idxs {
+                    let (e, xg) = &jobs[i];
+                    let ge = self
+                        .experts
+                        .get(&(layer, *e))
+                        .ok_or_else(|| Error::Format(format!("gpu expert ({layer},{e}) not resident")))?;
+                    refs.push(ge);
+                    rows.push((xg.len() / hidden) as i32);
+                    x.extend_from_slice(xg);
+                    cdst.extend_from_slice(&dst[job_at[i]..job_at[i + 1]]);
+                    crw.extend_from_slice(&weights[job_at[i]..job_at[i + 1]]);
+                }
+                let layout = peregrine_cuda::ReduceLayout::build(&cdst, s_n)
+                    .ok_or_else(|| Error::Format("gpu compute_reduced: row destination out of range".into()))?;
+                let part = peregrine_cuda::expert_group_reduce(&refs, &rows, &x, hidden, &layout, &crw, s_n)?;
+                if part.len() != acc.len() {
+                    return Err(Error::Format("gpu compute_reduced: short partial".into()));
+                }
+                for (a, p) in acc.iter_mut().zip(&part) {
+                    *a += p;
+                }
+            }
+            Ok(acc)
         }
     }
 
@@ -1433,8 +2145,23 @@ mod stub {
         pub fn compute(&self, _layer: usize, _jobs: &[(usize, Vec<f32>)], _hidden: usize) -> Result<Vec<Vec<f32>>, Error> {
             Err(Error::Format("gpu tier not built (no cuda feature)".into()))
         }
-        pub fn reheat(&mut self, _st: &SafeTensors, _cfg: &Cfg, _counts: &[u32]) -> Result<usize, Error> {
+        pub fn compute_reduced(
+            &self,
+            _layer: usize,
+            _jobs: &[(usize, Vec<f32>)],
+            _hidden: usize,
+            _dst: &[usize],
+            _weights: &[f32],
+            _s_n: usize,
+        ) -> Result<Vec<f32>, Error> {
+            Err(Error::Format("gpu tier not built (no cuda feature)".into()))
+        }
+        pub fn reheat(&mut self, _st: &SafeTensors, _cfg: &Cfg, _heat: &super::HeatView) -> Result<usize, Error> {
             Ok(0)
         }
+        pub fn tuning_json(&self) -> Option<serde_json::Value> {
+            None
+        }
+        pub fn restore_tuning(&self, _v: &serde_json::Value) {}
     }
 }

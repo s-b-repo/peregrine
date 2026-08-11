@@ -1,0 +1,4 @@
+arm=bigcache load_s=10 decode_s=238
+[ecache] hits=5 misses=6339 disk_reads=6339 prefetch_reads=377 hit_rate=0.1%
+[prefetch] used=0 wasted=0 unclassified=377 accuracy=0.0% (of 0 classified) yield=0.0% (of 377 issued) fadvise=0 verify_mismatch=0
+[prefetch] resident-unused: 66 slots, 1.25 GB of 12.88 GB budget (9.7%)

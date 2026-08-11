@@ -135,6 +135,15 @@ pub enum Bytes {
     /// (~19 MB) expert — the copy used to happen while the cache lock was held,
     /// serializing every I/O lane behind it.
     Shared(std::sync::Arc<[u8]>),
+    /// A refcounted **window** onto shared bytes: `owner[head..head + len]`.
+    ///
+    /// This is what lets one coalesced read be split back into its regions for
+    /// free. An expert's three weight tensors are contiguous on disk, so they can
+    /// be fetched as a single extent — but an [`ExpertSlab`] needs them as three
+    /// separate [`Bytes`], and without a window that split costs a full copy of
+    /// each. Backed by `Arc<[u8]>` rather than `Arc<Bytes>` so no variant has to
+    /// become `Sync`: [`AlignedBuf`] holds a raw pointer and is deliberately not.
+    View { owner: std::sync::Arc<[u8]>, head: usize, len: usize },
 }
 
 impl Bytes {
@@ -144,37 +153,71 @@ impl Bytes {
             Bytes::Vec(v) => v.len(),
             Bytes::Aligned { len, .. } => *len,
             Bytes::Shared(a) => a.len(),
+            Bytes::View { len, .. } => *len,
         }
     }
 
     /// Resident footprint, which for an O_DIRECT region is the whole aligned
     /// window — up to a block larger than the exposed length. The cache budgets
     /// on this so it accounts for the memory it actually holds.
+    ///
+    /// A [`Bytes::View`] reports its **own** length, not its owner's. The regions
+    /// carved out of one extent tile it exactly, so a slab's views sum back to the
+    /// extent and the cache budget stays right; charging each view the whole owner
+    /// would treble-count a merged expert. The trade is that a lone surviving view
+    /// under-reports the owner it is pinning — which cannot happen here, because a
+    /// slab holds all of its regions for exactly as long as it lives.
     pub fn footprint(&self) -> usize {
         match self {
             Bytes::Vec(v) => v.capacity(),
             Bytes::Aligned { buf, .. } => buf.capacity(),
             Bytes::Shared(a) => a.len(),
+            Bytes::View { len, .. } => *len,
         }
     }
 
-    /// The exposed bytes as a mutable slice, or `None` for a [`Bytes::Shared`]
-    /// region (other holders may be reading it concurrently).
+    /// The exposed bytes as a mutable slice, or `None` for a region other holders
+    /// may be reading concurrently ([`Bytes::Shared`], [`Bytes::View`]).
     pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
         match self {
             Bytes::Vec(v) => Some(v),
             Bytes::Aligned { buf, head, len } => Some(&mut buf.as_mut_slice()[*head..*head + *len]),
-            Bytes::Shared(_) => None,
+            Bytes::Shared(_) | Bytes::View { .. } => None,
         }
     }
 
-    /// Convert into refcounted shared bytes (copies once, from any variant).
+    /// Convert into refcounted shared bytes (copies once, from an owned variant).
     /// Cloning the result is a refcount bump.
+    ///
+    /// Already-refcounted variants return themselves untouched — a [`Bytes::View`]
+    /// is as shareable as a [`Bytes::Shared`], so admitting a coalesced expert to
+    /// the warm cache costs no copy at all.
     pub fn into_shared(self) -> Bytes {
         match self {
             Bytes::Shared(a) => Bytes::Shared(a),
+            v @ Bytes::View { .. } => v,
             other => Bytes::Shared(std::sync::Arc::from(other.as_slice())),
         }
+    }
+
+    /// Take the refcounted backing for this region, so windows can be carved from
+    /// it with [`Bytes::view`]. Copies once for an owned variant; free otherwise.
+    pub fn into_arc(self) -> std::sync::Arc<[u8]> {
+        match self {
+            Bytes::Shared(a) => a,
+            Bytes::View { owner, head, len } if head == 0 && len == owner.len() => owner,
+            other => std::sync::Arc::from(other.as_slice()),
+        }
+    }
+
+    /// A refcounted window `owner[head..head + len]`, or `None` if that range does
+    /// not lie inside `owner` — an out-of-range window would be a mis-split of a
+    /// coalesced read, which must fail loudly rather than serve neighbouring bytes.
+    pub fn view(owner: &std::sync::Arc<[u8]>, head: usize, len: usize) -> Option<Bytes> {
+        if head.checked_add(len)? > owner.len() {
+            return None;
+        }
+        Some(Bytes::View { owner: std::sync::Arc::clone(owner), head, len })
     }
 
     /// Whether the exposed region is empty.
@@ -196,17 +239,22 @@ impl std::ops::Deref for Bytes {
             // head+len <= capacity by construction (the aligned window covers the region)
             Bytes::Aligned { buf, head, len } => &buf.as_slice()[*head..*head + *len],
             Bytes::Shared(a) => a,
+            // head+len <= owner.len() by construction (`Bytes::view` refuses otherwise)
+            Bytes::View { owner, head, len } => &owner[*head..*head + *len],
         }
     }
 }
 
 impl Clone for Bytes {
-    /// [`Bytes::Shared`] clones by refcount; the owned variants copy their
-    /// exposed region into a fresh [`Bytes::Vec`] (this keeps [`AlignedBuf`]
-    /// non-cloneable while staying byte-identical to the original).
+    /// [`Bytes::Shared`] and [`Bytes::View`] clone by refcount; the owned variants
+    /// copy their exposed region into a fresh [`Bytes::Vec`] (this keeps
+    /// [`AlignedBuf`] non-cloneable while staying byte-identical to the original).
     fn clone(&self) -> Self {
         match self {
             Bytes::Shared(a) => Bytes::Shared(std::sync::Arc::clone(a)),
+            Bytes::View { owner, head, len } => {
+                Bytes::View { owner: std::sync::Arc::clone(owner), head: *head, len: *len }
+            }
             other => Bytes::Vec(other.to_vec()),
         }
     }
@@ -235,11 +283,15 @@ impl std::fmt::Debug for Bytes {
 /// after a subsequent checkout hands the same allocation to someone else. The
 /// generation is checked by [`SlabPool::checkin_tagged`] — **not** by
 /// [`SlabPool::checkin`], which validates capacity and free-list length only.
-/// Neither tagged variant has a caller (including in tests), so this protection
-/// is written and not in force; the live path is the untagged pair. Note also
-/// that `checkin_tagged`'s assertion cannot detect the double-return its own doc
-/// advertises: any previously-issued handle satisfies `gen < self.gen`. Fix that
-/// before wiring it, or the wiring installs a check that never fires.
+///
+/// **The check was inert until 2026-08-06 and is now real.** It asserted
+/// `handle.gen < self.gen`, which every previously-issued handle satisfies —
+/// `gen` only ever increases — so the double-return it advertised could not be
+/// detected. Wiring the tagged pair without fixing that would have installed a
+/// check that never fires, which is worse than no check: the doc claiming the
+/// protection would finally have been *reachable* and still wrong. The pool now
+/// tracks the set of generations actually outstanding, so a handle returned
+/// twice, or returned to a pool that never issued it, is caught by absence.
 pub struct SlabHandle {
     pub buf: AlignedBuf,
     pub gen: u32,
@@ -263,6 +315,14 @@ pub struct SlabPool {
     /// checkouts (never reused for the same buffer). Wraps every 2³² checkouts;
     /// aliasing across a full wrap is astronomically unlikely in a decode session.
     gen: u32,
+    /// Generations currently checked out via [`SlabPool::checkout_tagged`] and
+    /// not yet returned. This is what makes the tag mean anything: "is this
+    /// handle live?" is a set-membership question, and comparing against a
+    /// monotonic counter — the original check — can only answer "was a handle
+    /// ever issued", which is true of every handle including one already
+    /// returned. Bounded by `max_bufs` (typically 1–16), so the linear scan is
+    /// cheaper than a hash.
+    outstanding: Vec<u32>,
 }
 
 impl SlabPool {
@@ -275,6 +335,7 @@ impl SlabPool {
             max_bufs: max_bufs.max(1),
             allocated: 0,
             gen: 0,
+            outstanding: Vec::new(),
         }
     }
 
@@ -303,6 +364,7 @@ impl SlabPool {
         let buf = self.checkout(needed)?;
         let g = self.gen;
         self.gen = self.gen.wrapping_add(1);
+        self.outstanding.push(g);
         Some(SlabHandle { buf, gen: g })
     }
 
@@ -322,15 +384,30 @@ impl SlabPool {
         self.free.push(buf);
     }
 
-    /// Generation-checked checkin: asserts (in debug) that the caller returned
-    /// the same handle they got. Same runtime semantics as [`Self::checkin`] in
-    /// release builds.
+    /// Generation-checked checkin: the handle's generation must be one this pool
+    /// issued and has not already taken back. A handle returned twice, or one
+    /// belonging to a different pool, is rejected and its buffer dropped — the
+    /// same outcome [`Self::checkin`] gives a foreign buffer, and for the same
+    /// reason: putting it on the free-list would let a later checkout hand the
+    /// same allocation to a second holder while the first still writes into it.
+    ///
+    /// The check runs in **release too**, unlike the `debug_assert!` this
+    /// replaced. A straggler write into a recycled slab is a production
+    /// phenomenon (a completion landing after its region was abandoned), so a
+    /// check compiled out of release guards exactly the build that cannot hit it.
     pub fn checkin_tagged(&mut self, handle: SlabHandle) {
-        // In release the check is compiled out; misuse degrades to an unnecessary
-        // check-in, not UB. The purpose is diagnostic — real memory safety comes
-        // from `SlabHandle` being a fresh owned move-only type.
-        debug_assert!(handle.gen < self.gen || self.gen == 0, "handle generation appears fresh");
-        self.checkin(handle.buf);
+        match self.outstanding.iter().position(|&g| g == handle.gen) {
+            Some(i) => {
+                self.outstanding.swap_remove(i);
+                self.checkin(handle.buf);
+            }
+            None => {
+                crate::note_advisory_err(
+                    "slab checkin_tagged rejected (handle already returned, or from another pool)",
+                    &format!("generation {} is not outstanding", handle.gen),
+                );
+            }
+        }
     }
 
     /// Capacity of each buffer in this pool (a multiple of [`ALIGN`]).
@@ -378,6 +455,58 @@ mod tests {
             }
             assert!(b.as_slice().iter().enumerate().all(|(i, &x)| x == (i % 251) as u8));
         }
+        Ok(())
+    }
+
+    /// The bug this pair of tests exists for: `checkin_tagged` asserted
+    /// `handle.gen < self.gen`, which is true of **every** handle the pool ever
+    /// issued, including one already returned. The check was reachable-looking
+    /// and unfireable. A double return must now be caught.
+    #[test]
+    fn a_handle_returned_twice_is_rejected() -> Result<(), &'static str> {
+        let mut p = SlabPool::new(4096, 1);
+        let h = p.checkout_tagged(4096).ok_or("checkout")?;
+        let gen = h.gen;
+        assert_eq!(p.in_use(), 1);
+        p.checkin_tagged(h);
+        assert_eq!(p.in_use(), 0, "first return lands");
+
+        // The forged second return is exactly what a straggler completion would
+        // do: same generation, buffer already back on the free-list.
+        let stray = AlignedBuf::with_capacity(4096).ok_or("alloc")?;
+        p.checkin_tagged(SlabHandle { buf: stray, gen });
+        assert_eq!(p.allocated(), 1, "a rejected return must not enter the pool's accounting");
+        assert_eq!(p.in_use(), 0);
+
+        // The decisive assertion: had the buffer been accepted, the free-list
+        // would hold two entries for one allocation and the next two checkouts
+        // would hand the same memory to two holders.
+        let first = p.checkout_tagged(4096).ok_or("checkout after reject")?;
+        assert!(p.checkout_tagged(4096).is_none(), "pool of 1 must not hand out a second buffer");
+        p.checkin_tagged(first);
+        Ok(())
+    }
+
+    /// A handle from another pool has a generation this pool never issued, and is
+    /// rejected by the same mechanism — absence from the outstanding set.
+    #[test]
+    fn a_handle_from_another_pool_is_rejected() -> Result<(), &'static str> {
+        let mut a = SlabPool::new(4096, 1);
+        let mut b = SlabPool::new(4096, 1);
+        // Burn generations in `b` so its next tag is one `a` has genuinely issued —
+        // a check that only compared magnitudes would wave this through.
+        let h0 = b.checkout_tagged(4096).ok_or("b0")?;
+        b.checkin_tagged(h0);
+        let from_a = a.checkout_tagged(4096).ok_or("a0")?;
+        b.checkin_tagged(from_a);
+        assert_eq!(b.allocated(), 1, "foreign buffer must not join the pool's accounting");
+        // `b` holds exactly the one allocation it made, free. If the foreign
+        // buffer had been accepted its free-list would hold two entries against
+        // one allocation, and `b` would hand out two live buffers from a pool of
+        // one — the aliasing this check exists to prevent.
+        let own = b.checkout_tagged(4096).ok_or("b's own buffer is available")?;
+        assert!(b.checkout_tagged(4096).is_none(), "pool of 1 must not hand out a second buffer");
+        b.checkin_tagged(own);
         Ok(())
     }
 

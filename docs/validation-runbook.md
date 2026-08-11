@@ -74,6 +74,25 @@ page-cache state, so it was never a controlled comparison. It does not
 reproduce, and is not evidence either way. The real test needs the model
 shards, O_DIRECT, and a cold cache.
 
+> **✅ SETTLED 2026-08-09.** That test has now run, on the real shards, with
+> repeats. **`pread` and `uring` are the same rate**: at the shipped 4 rings over
+> 5 reps, `uring` 1.12 GB/s (5.4 % spread) against `pread` 1.06 GB/s (10.6 %) — a
+> 5.7 % gap *below* the measured noise floor, which is a stronger statement than
+> "close". `COLI_IO_ENGINE=pread` should not be expected to buy anything here.
+>
+> The same run found the difference that **is** real: **O_DIRECT is the slow arm**,
+> 0.86 vs 1.12 GB/s (−23 %), outside both spreads — consistent with `COLI_DIRECT`
+> defaulting off, and explained by the buffered arm keeping kernel readahead that
+> O_DIRECT by definition discards.
+>
+> Two harness defects were fixed to get here, both of which had silently
+> invalidated earlier attempts — single-pass reporting on a box with a 35 % spread,
+> and an offset walk that wrapped and re-read its own page cache. See
+> [Measurement discipline](measurement.md) before trusting any figure from this
+> harness, and
+> [`M5-io-engine.md`](../bench-data/2026-08-09-prefetch-causes/M5-io-engine.md)
+> for the working.
+
 **`regbuf` has a hard operational limit worth knowing before you plan around
 it.** Registered buffers are **pinned** pages, charged against
 `RLIMIT_MEMLOCK` — 8 MB by default on most distros. A pool sized for real
@@ -172,12 +191,18 @@ Record flip rates next to the byte savings. A halved working set at an
 unacceptable flip rate is not a win, and the point of measuring is to be able to
 say which it is.
 
-## 4. The CUDA lane — never exercised
+## 4. The CUDA lane
 
-No GPU has ever run this code.
+**This section said "no GPU has ever run this code" until 2026-08-06. That was
+already false when written** — `benchmarks.md` §GPU lane records a measured run
+(1.09×, 62 residents, `[CUDA] device 0: NVIDIA GeForce RTX 3060, 12.5 GB VRAM,
+sm_86`). The dev box has `nvcc` (CUDA 13.3) and one RTX 3060, and all six
+`peregrine-cuda` tests pass on it, graph capture and replay included. What the
+box does *not* have is a **second** GPU, a second host, or a GDS driver stack —
+that is the real boundary, and it is narrower than this section claimed.
 
 ```bash
-cargo test -p peregrine-cuda --features cuda      # incl. graph capture/replay
+CARGO_TARGET_DIR=target/cuda cargo test -p peregrine-cuda --features cuda   # incl. graph capture/replay
 scripts/bench-arms.sh out/gpu-$(date +%F) gpu
 ```
 
@@ -188,8 +213,82 @@ Two specifics worth checking beyond "does it run":
   bytes. The VRAM knapsack sizes residents from a *single* `bytes_per_expert`, so
   an int3 container with `COLI_GPU_INT4=1` may plan N experts and upload 8N worth.
   Expect eviction thrash or CUDA OOM; confirm before trusting a GPU int3 run.
-- **`build.rs` succeeds without `nvcc`**, so nothing in this repo has ever
-  syntax-checked the `.cu` file against a real toolchain.
+- **`build.rs` used to succeed whether `nvcc` was missing *or* the `.cu` failed
+  to compile** — one `cargo:warning` and a success exit for both, and nothing
+  greps build warnings, so a broken kernel edit left the build green. Fixed
+  2026-08-06: an absent toolkit is still a warning (a CPU-only host must build
+  the workspace), but a toolkit that is present and rejects the source now fails
+  the build. On this box that means every `.cu` edit is compiled for real.
+
+### 4a. FIRST: is the CUDA driver even usable? (2026-08-08)
+
+**Check this before anything else in §4, because failure here is silent.** The
+kernel module and the userspace CUDA driver library can be different versions
+after an upgrade without a reboot, and `init(&[0])` then returns 0 — so every
+GPU-gated test returns early and the suite reports `ok`. A green run is not
+evidence a kernel executed.
+
+```bash
+nvidia-smi -L                      # "Failed to initialize NVML: Driver/library version mismatch" ⇒ reboot
+cat /proc/driver/nvidia/version    # kernel module version
+# Positive check, because the negative one is what lies:
+CARGO_TARGET_DIR=target/cuda cargo test -p peregrine-cuda --features cuda -- --nocapture 2>&1 \
+  | grep -c "device discovery"     # any hits ⇒ NO device; every GPU test skipped
+```
+
+This was the state on 2026-08-08 (module 610.43.02, library 610.57). **The box
+was rebooted at 14:08 that day and it is now clear** — both sides 610.57.04,
+`nvidia-smi` reports the RTX 3060 12 GB, and the GPU-gated tests execute (17
+passing in `peregrine-cuda`). The check stays first in this section because the
+failure mode recurs on every driver upgrade, and because the run that first
+executed those tests found a test asserting a premise it had destroyed and a real
+arm-reporting bug — see `todo.md` §0. §4b below is still unmeasured: that run was
+a *correctness* pass, not a throughput one.
+
+### 4b. The three 2026-08-08 GPU knobs
+
+All three are opt-in and all three are unmeasured. Run each arm for **200 s+ and
+take medians** — the box's OSX-KVM VM plus a VNC helper swing ~50 s runs by ±45 %.
+
+```bash
+# Graph cache: the claim is fewer launches, so kernel time must stay FLAT while
+# wall clock drops. Check /metrics, not just the clock.
+for g in 0 1; do COLI_CUDA_GRAPH=$g scripts/bench-measure.sh out/graph-$g; done
+curl -s localhost:8080/metrics | jq '.gpu | {graph_captures,graph_replays,graph_invalidations,graph_uncacheable}'
+```
+
+- `graph_replays` **at or near zero while `graph_captures` tracks `calls`** means
+  the launch-shape key is churning: the knob is capturing on every call and is
+  strictly slower than not having it. Report that; do not ship a knob that never
+  hits.
+- `graph_invalidations` climbing steadily means residency or batch size is still
+  moving, so graphs are being discarded as fast as they are made.
+- `graph_uncacheable` high means the calls are taking the W4A16 arm or
+  `COLI_CUDA_PROFILE` is set — the knob is on and inert.
+
+```bash
+# Fused reduce: a BYTE win, and batch-size dependent by construction. B=1 cannot
+# show it — measure D2H at both, one batch size per fresh process.
+for b in 1 16; do
+  for f in 0 1; do
+    COLI_CUDA_FUSED_REDUCE=$f COLI_CUDA_PROFILE=1 \
+      scripts/bench-measure.sh out/reduce-b$b-f$f
+  done
+done
+```
+
+Expect `d2h_ms` to fall by roughly the expert-per-row factor at B=16 (~5× on the
+measured GLM-5.2 unions) and by **nothing** at B=1. A B=1-only run cannot
+distinguish "it worked" from "the regime had no win". Also confirm token values:
+this knob changes the GPU arm's low bits by design, so check it against
+`prediction_flip_rate`, not against a bit-identity anchor.
+
+```bash
+# WMMA autotune: needs the W4A16 arm to actually engage (compute ≥ 7.0 AND every
+# group clearing COLI_CUDA_TC_W4A16_MIN rows), or it records nothing at all.
+COLI_CUDA_TC_W4A16=1 COLI_CUDA_AUTOTUNE=1 scripts/bench-measure.sh out/autotune
+jq '.rows | length' <model_dir>/kernel_tuning.json   # 0 rows ⇒ the arm never ran
+```
 
 ## 5. Decode throughput and peak RSS
 
@@ -427,6 +526,55 @@ the margin over that baseline.
   real checkpoint, and the next step is *still* not the read path: re-measure
   on a second workload, since the fraction is a property of the routing
   distribution as much as of the weights.
+
+## 9. Does `COLI_PREFETCH_LANES > 1` buy anything?
+
+The prefetch-lane pool ships defaulting to **1**, i.e. the "parallel-async" part
+of the feature is off unless asked for, and nothing has ever measured whether
+raising it pays. This step settles it.
+
+**It cannot be an arm in `bench-arms.sh`.** That harness drives `peregrine bench`
+→ `Model::forward_step_batched`, and the only caller that ever selects a lane
+other than 0 is `Model::enqueue_seq_prefetch`, which lives in `peregrine-serve`'s
+batch loop. A lane sweep run through `bench` measures nothing and returns a clean
+null result — which is worse than no number, because it looks like an answer.
+Hence a separate harness that drives the real server:
+
+```bash
+cargo build --release --bins
+CONCURRENCY=8 MAX_TOKENS=32 REPEATS=3 scripts/bench-serve-lanes.sh bench-data/lanes 1 2 4 8
+```
+
+It starts one server per arm, fires `CONCURRENCY` concurrent completions, and
+reports medians. Two design points worth keeping if you rewrite it: it counts
+`usage.completion_tokens` rather than SSE deltas (a token that only extends a
+multi-byte character emits no delta, so delta-counting undercounts decode work —
+a first attempt measured 0 tokens from two healthy streams), and it runs the arms
+in **rotating order** across repeats because there is no passwordless sudo on the
+dev box to drop the page cache between them.
+
+**Budget this before starting.** Measured on the dev box (RTX 3060, 46 GB RAM,
+358 GB int4 container, `COLI_ECACHE_GB=4`): single-stream decode ran **~50 s per
+token**, and 8 concurrent streams took **>25 min for 4 batched steps** — 8
+distinct prompts route to 8 distinct expert sets, so the per-step union is far
+wider than a single stream's. A 4-arm × 3-repeat × 32-token sweep is therefore
+a multi-day run there, not an afternoon. On a box that can hold more of the
+container resident it is an afternoon. **Do not shrink `MAX_TOKENS` to make it
+fit** — the dev box swings ±45 % on ~50 s runs and only settles to ±3 % past
+200 s, so a short sweep produces numbers that cannot distinguish the arms.
+
+Read `*.counters.txt` alongside the throughput table. More tok/s bought by more
+disk reads is not a win, and lanes are exactly the knob that could buy it that
+way.
+
+- **No separation outside the noise band** → keep the default at 1 and say so in
+  `docs/configuration.md`; the pool costs a thread and an io_uring ring per lane,
+  and an unmeasured default of 4 is a cost with a story attached.
+- **Clear win at some lane count** → change the default, quote the number, and
+  re-check whether the bulk emitters (`tiers.json` seed, `enqueue_expert_replicas`)
+  should spread too. They deliberately sit on lane 0 today *pending this result*;
+  the per-layer emitter and router look-ahead must stay on one lane regardless,
+  since one stream's staggered reads must not overtake each other.
 
 ## What to do with the results
 

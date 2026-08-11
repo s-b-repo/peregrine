@@ -1,0 +1,10 @@
+== env-arm sweep: B=16 max_tokens=32 repeats=2 memmax=34G
+== arms: bench-data/2026-08-09-M1-envarms/arms/profile.env bench-data/2026-08-09-M1-envarms/arms/profile-prefetch-on.env bench-data/2026-08-09-M1-envarms/arms/profile-prot0.env bench-data/2026-08-09-M1-envarms/arms/profile-iob16.env bench-data/2026-08-09-M1-envarms/arms/split4.env bench-data/2026-08-09-M1-envarms/arms/pread8.env bench-data/2026-08-09-M1-envarms/arms/pread12.env
+== model=/home/cortix/models/GLM-5.2
+== git: 18c14e0
+-- rep 1 arm profile.env
+  page cache dropped
+  loaded in ~20s
+[profile-rep1] 0 tok in 6198.119s = 0.0 tok/s (streams ok 0/16, ttft med Nones)
+  arm failed (profile.env rep=1)
+-- rep 1 arm profile-prefetch-on.env

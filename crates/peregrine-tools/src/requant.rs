@@ -42,7 +42,6 @@ use peregrine_core::config::Cfg;
 use peregrine_core::qt::QtInfo;
 use peregrine_core::safetensors::SafeTensors;
 use peregrine_core::{Context, Error};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Target precision for the tensors a plan selects.
@@ -168,12 +167,27 @@ impl HeatTier {
             .get("heat")
             .and_then(|h| h.as_array())
             .ok_or_else(|| Error::Format("route_stats.json has no `heat` array".into()))?;
-        let heat: Vec<u32> = arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
-        if heat.len() != n_layers * n_experts {
+        let mut heat: Vec<u32> = arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
+        let want = n_layers * n_experts;
+        // The producer is one row longer than the consumer wants. `HeatTable` is
+        // built `n_layers + 1` rows (`model.rs`) because the MTP head sits at
+        // layer index `n_layers` and routes a full set of experts — a 2026-08-09
+        // fix for that head never accumulating heat. The extra row is real data,
+        // but it is not a layer this container requantizes, so drop it.
+        //
+        // Demanding an exact `n_layers * n_experts` made the two permanently
+        // irreconcilable: at GLM-5.2 shapes the table is 79 x 256 = 20 224 and
+        // this asked for 78 x 256 = 19 968, so `--tier-hot-frac` refused every
+        // heat file the engine could produce, however the run was done.
+        if heat.len() == want + n_experts {
+            heat.truncate(want);
+        }
+        if heat.len() != want {
             return Err(Error::Format(format!(
-                "route_stats.json heat is {} entries, expected {} (n_layers {n_layers} x n_experts                  {n_experts}) — a mismatched trace would misalign every layer",
+                "route_stats.json heat is {} entries, expected {want} (n_layers {n_layers} x \
+                 n_experts {n_experts}, or one row more for the MTP head) — a mismatched trace \
+                 would misalign every layer",
                 heat.len(),
-                n_layers * n_experts
             )));
         }
         Ok(heat)
@@ -372,48 +386,30 @@ impl ShardWriter {
 
     /// Write the buffered pieces as one shard. A no-op when nothing is pending,
     /// so calling it at the end is always safe.
+    ///
+    /// Header construction and the fsync-then-rename commit live in
+    /// [`crate::stwrite`] (shared with `peregrine-reshard`); this writer's own
+    /// job is only the buffering and the shard-budget roll.
     pub fn flush(&mut self) -> Result<(), Error> {
         if self.pending.is_empty() {
             return Ok(());
         }
         let path = self.shard_path(self.index);
-        let mut header = serde_json::Map::new();
-        if !self.meta.is_empty() {
-            let mut m = serde_json::Map::new();
-            for (k, v) in &self.meta {
-                m.insert(k.clone(), serde_json::Value::String(v.clone()));
-            }
-            header.insert("__metadata__".into(), serde_json::Value::Object(m));
-        }
-        let mut cursor: i64 = 0;
-        for p in &self.pending {
-            let start = cursor;
-            let end = start + p.bytes.len() as i64;
-            let mut entry = serde_json::Map::new();
-            entry.insert("dtype".into(), serde_json::Value::String(p.dtype.to_string()));
-            entry.insert("shape".into(), serde_json::json!(p.shape));
-            entry.insert("data_offsets".into(), serde_json::json!([start, end]));
-            header.insert(p.name.clone(), serde_json::Value::Object(entry));
-            cursor = end;
-        }
-        let hdr = serde_json::to_vec(&serde_json::Value::Object(header))
-            .map_err(|e| Error::Format(format!("serialize shard header: {e}")))?;
-        std::fs::create_dir_all(&self.dir).ctx(|| format!("create {}", self.dir.display()))?;
-        let tmp = path.with_extension("safetensors.part");
-        {
-            let f = std::fs::File::create(&tmp).ctx(|| format!("create {}", tmp.display()))?;
-            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-            w.write_all(&(hdr.len() as u64).to_le_bytes()).ctx(|| "write header length".to_string())?;
-            w.write_all(&hdr).ctx(|| "write header".to_string())?;
-            for p in &self.pending {
-                w.write_all(&p.bytes).ctx(|| format!("write payload for '{}'", p.name))?;
-            }
-            let f = w.into_inner().map_err(|e| Error::Format(format!("flush shard: {e}")))?;
-            // Durability before the rename: a shard that exists must be complete,
-            // because the resume path treats existence as "already done".
-            f.sync_all().ctx(|| format!("fsync {}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, &path).ctx(|| format!("commit {}", path.display()))?;
+        let pieces: Vec<crate::stwrite::PieceMeta> = self
+            .pending
+            .iter()
+            .map(|p| crate::stwrite::PieceMeta {
+                name: p.name.clone(),
+                dtype: p.dtype.to_string(),
+                shape: p.shape.clone(),
+                nbytes: p.bytes.len() as u64,
+                extra: Vec::new(),
+            })
+            .collect();
+        let pending = &self.pending;
+        crate::stwrite::write_streaming(&path, &self.meta, &pieces, |i, w| {
+            w.write_all(&pending[i].bytes).ctx(|| format!("write payload for '{}'", pending[i].name))
+        })?;
         self.written.push(path);
         self.pending.clear();
         self.pending_bytes = 0;
@@ -467,7 +463,19 @@ pub fn plan_sizes(indir: &Path, plan: &Plan) -> Result<Report, Error> {
         match (t.name.contains(&plan.include), expert_dims(&t.name, &cfg)) {
             (true, Some((o, i))) => {
                 rep.tensors_requantized += 1;
-                rep.bytes_out += (plan.target.payload_bytes(o, i) + plan.target.scale_count(o, i) * 4) as u64;
+                // Mirror `requantize`'s per-expert choice exactly (see the
+                // `expert_coords` match there): a tier overrides the uniform
+                // target per expert, and sizing every expert at `plan.target`
+                // ignored that. `--dry-run --tier-hot-frac` therefore reported
+                // the all-cold size whatever the fraction — identical output for
+                // every `--tier-hot-frac`, and a "plan for N GB of free space"
+                // line that under-states a tiered run by the whole difference
+                // between hot and cold for the experts kept hot.
+                let target = match (&plan.tier, expert_coords(&t.name)) {
+                    (Some(tr), Some((layer, expert))) => tr.target_for(layer, expert),
+                    _ => plan.target,
+                };
+                rep.bytes_out += (target.payload_bytes(o, i) + target.scale_count(o, i) * 4) as u64;
             }
             _ => {
                 rep.bytes_out += nbytes;
@@ -683,7 +691,13 @@ fn expert_dims(name: &str, cfg: &Cfg) -> Option<(usize, usize)> {
 
 /// `(layer, expert)` from a routed-expert tensor name, e.g.
 /// `model.layers.7.mlp.experts.42.gate_proj.weight` -> `(7, 42)`.
-fn expert_coords(name: &str) -> Option<(usize, usize)> {
+///
+/// Public because `peregrine-reshard` must classify tensors with *exactly* the
+/// same parse the engine's `ExpertIndex` uses — two implementations of "is this
+/// a routed expert?" would eventually disagree on some name and misplace it.
+/// Note `.mlp.shared_experts.` does not contain the `.mlp.experts.` needle, so
+/// shared experts stay trunk here just as they are skipped there.
+pub fn expert_coords(name: &str) -> Option<(usize, usize)> {
     let layer = name.split("model.layers.").nth(1)?.split('.').next()?.parse().ok()?;
     let expert = name.split(".mlp.experts.").nth(1)?.split('.').next()?.parse().ok()?;
     Some((layer, expert))

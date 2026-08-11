@@ -1,0 +1,27 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+positions=24 layers=78 experts/layer=256
+
+consecutive-token routing overlap (mean over sparse layers)
+  routed set size   8.0
+  overlap |A∩B|/|A| 0.3355  (33.55%)
+  jaccard           0.2212
+  independence null 0.0312  (3.12%)
+  NOTE: this is a routing statistic. It is NOT the 0.6% in benchmarks.md,
+        which is a warm-cache hit rate (58/9600 at a 10 GB cache).
+
+union growth |∪ routed(t..t+w)| / |routed(t)|
+  w  consecutive  strided(proxy for B indep. seqs)  independent null
+  2        1.664                           1.917             1.969
+  3        2.229                           2.704             2.907
+  4        2.755                           3.391             3.816
+  5        3.250                           3.927             4.697
+  6        3.720                           4.575             5.550
+  16       7.760                           7.760            12.745
+
+reading it: w=γ+1 consecutive is what a γ-token speculative verify pays
+(near 1.0 = speculation is nearly free in bytes; near w = it multiplies them).
+strided is the batching proxy; compare against the null to see whether the
+router carries structure or is behaving like independent draws.

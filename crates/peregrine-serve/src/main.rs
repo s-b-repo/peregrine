@@ -18,6 +18,7 @@
 mod batch;
 mod memo;
 mod tok;
+mod tools;
 
 use std::sync::Arc;
 
@@ -101,12 +102,64 @@ struct ChatRequest {
     top_p: Option<f32>,
     #[serde(default)]
     stream: bool,
+    /// Tool schemas, in OpenAI shape. Rendered into the system turn for the
+    /// model (see [`tools::render_preamble`]) — GLM-5.2 does not read a `tools`
+    /// field, it reads the markup its tokenizer has tokens for.
+    #[serde(default)]
+    tools: Option<Vec<tools::ToolDef>>,
+    /// Accepted for compatibility. `"none"` suppresses the tool preamble;
+    /// `"auto"`, `"required"`, and a named-function choice all render the same
+    /// schemas, because forcing a call is a decoding constraint this engine
+    /// does not implement — claiming otherwise would be worse than ignoring it.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Clone)]
 struct ChatMessage {
     role: String,
-    content: String,
+    /// Absent, `null`, a string, or an array of content parts — every shape the
+    /// OpenAI-compatible clients actually send. An assistant turn that is
+    /// *only* tool calls carries no content at all, so this cannot be required.
+    #[serde(default)]
+    content: Option<MessageContent>,
+    /// Assistant turns replaying the model's own calls.
+    ///
+    /// A `role: "tool"` turn's `tool_call_id` needs no field here: serde ignores
+    /// unknown members, and the prompt form is positional — results render in
+    /// the order they arrive, so nothing correlates them by id.
+    #[serde(default)]
+    tool_calls: Option<Vec<serde_json::Value>>,
+}
+
+/// The two content encodings OpenAI clients use, plus the parts form's
+/// non-text members (images, files) which this text-only engine drops.
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Deserialize, Clone)]
+struct ContentPart {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+impl ChatMessage {
+    /// The message's text, with the parts form flattened. Non-text parts
+    /// contribute nothing rather than a placeholder: a caption invented here
+    /// would be indistinguishable to the model from something the user wrote.
+    fn text(&self) -> String {
+        match &self.content {
+            None => String::new(),
+            Some(MessageContent::Text(s)) => s.clone(),
+            Some(MessageContent::Parts(ps)) => {
+                ps.iter().filter_map(|p| p.text.as_deref()).collect::<Vec<_>>().join("")
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -162,22 +215,61 @@ fn tk<T>(r: Result<T, peregrine_core::Error>) -> Result<T, ApiError> {
 /// Build the GLM-5.2 prompt from chat messages (no chat_template ships in the
 /// tokenizer): `[gMASK]<sop>` then `<|role|>\n{content}` per turn, ending with
 /// an empty `<|assistant|>` turn to generate into.
-fn build_prompt(messages: &[ChatMessage]) -> String {
+/// `tools` are rendered into the *first* system turn (GLM's own template puts
+/// them there); a conversation with no system turn gets one, since a tools
+/// block appended to a user turn reads to the model as the user quoting
+/// schemas at it.
+fn build_prompt(messages: &[ChatMessage], tools: &[tools::ToolDef]) -> String {
     let mut s = String::from("[gMASK]<sop>");
+    let preamble = if tools.is_empty() { String::new() } else { tools::render_preamble(tools) };
+    let mut preamble_placed = preamble.is_empty();
+    if !preamble_placed && !messages.iter().any(|m| m.role == "system") {
+        s.push_str("<|system|>\n");
+        s.push_str(preamble.trim_start_matches('\n'));
+        preamble_placed = true;
+    }
     for m in messages {
         let role = match m.role.as_str() {
             "system" => "<|system|>",
             "assistant" => "<|assistant|>",
             "user" => "<|user|>",
+            // A tool result is an observation turn — the role the model was
+            // trained to read results in, not a user message about one.
+            "tool" => "<|observation|>",
             // unknown roles are treated as user content, never trusted as markup
             _ => "<|user|>",
         };
         s.push_str(role);
         s.push('\n');
-        s.push_str(&m.content);
+        if m.role == "tool" {
+            s.push_str("<tool_response>\n");
+            s.push_str(&m.text());
+            s.push_str("\n</tool_response>");
+        } else {
+            s.push_str(&m.text());
+        }
+        if m.role == "system" && !preamble_placed {
+            s.push_str(&preamble);
+            preamble_placed = true;
+        }
+        // An assistant turn that called tools replays as the markup it emitted.
+        if m.role == "assistant" {
+            if let Some(calls) = &m.tool_calls {
+                s.push_str(&tools::render_assistant_calls(calls));
+            }
+        }
     }
     s.push_str("<|assistant|>\n");
     s
+}
+
+/// The tool schemas this request should expose to the model, honouring
+/// `tool_choice: "none"`.
+fn active_tools(req: &ChatRequest) -> &[tools::ToolDef] {
+    if req.tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none") {
+        return &[];
+    }
+    req.tools.as_deref().unwrap_or(&[])
 }
 
 /// A monotonically-unique-ish seed for the sampler without extra deps.
@@ -215,7 +307,14 @@ fn submit_request(
 /// what routing distribution decode will see. The tail is capped at 512 chars
 /// (classification is a ratio heuristic; more text doesn't sharpen it).
 fn classify_request(messages: &[ChatMessage]) -> peregrine_model::TokenClass {
-    let last_user = messages.iter().rev().find(|m| m.role == "user").map(|m| m.content.as_str()).unwrap_or("");
+    // `match`, not `.map(..).unwrap_or_default()`: no-user-turn is a real case
+    // here (a tools-only or system-only request), and the empty string is the
+    // answer to it rather than a stand-in for one.
+    let last_user = match messages.iter().rev().find(|m| m.role == "user") {
+        Some(m) => m.text(),
+        None => String::new(),
+    };
+    let last_user = last_user.as_str();
     let tail_start = last_user.len().saturating_sub(512);
     // step forward to a char boundary so the slice is valid UTF-8
     let mut start = tail_start;
@@ -240,7 +339,7 @@ fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>, usiz
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
-    let prompt = build_prompt(&req.messages);
+    let prompt = build_prompt(&req.messages, active_tools(req));
     let ids = tk(state.inner.tokenizer.encode(&prompt))?;
     if ids.len() > state.inner.args.max_prompt_tokens {
         return Err(ApiError::new(
@@ -305,6 +404,81 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+/// `GET /metrics` — the engine's live telemetry.
+///
+/// This endpoint is why `PlanOptimizer::snapshot` says "safe to call from a
+/// `/metrics` handler" and why `BubbleTuner::ewma_snapshot` says "used for
+/// /metrics": both were written for a handler that did not exist, so the
+/// adaptive runtime observed itself and then had nowhere to say so. Everything
+/// here was already being computed every forward.
+///
+/// Deliberately **not** behind `check_auth`, matching `/health`: an operator
+/// scraping liveness and an operator scraping load are the same operator, and
+/// requiring a key on one but not the other is the kind of asymmetry that ends
+/// with monitoring disabled. Nothing here is request content — only counters.
+async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let t = state.inner.engine.telemetry();
+    let (hits, misses, entries, bytes) = state.inner.memo.lock().stats();
+    // `cpu_bytes` is carried in `LaneTimings` and was dropped here until
+    // 2026-08-10, which mattered more than one field usually would: `io_us` and
+    // `cpu_us` are **sums across threads** (rings and workers, different counts),
+    // so neither is comparable to wall time or to the other without knowing both
+    // thread counts. Bytes do not double-count that way, so `cpu_bytes` per
+    // forward is the one figure here that converts to an aggregate rate directly.
+    // (It is bytes fed to compute — warm-cache hits included — not disk bytes.)
+    let lane = |l: &peregrine_model::LaneTimings| {
+        serde_json::json!({
+            "io_us": l.io_us,
+            "cpu_us": l.cpu_us,
+            "gpu_us": l.gpu_us,
+            "reduce_us": l.reduce_us,
+            "cpu_bytes": l.cpu_bytes,
+        })
+    };
+    Json(serde_json::json!({
+        "steps": t.steps,
+        "active": t.active,
+        "pending": t.pending,
+        // Two lane views, and they answer different questions: `last` is what the
+        // most recent token cost, `ewma` is which lane structurally dominates —
+        // the one the balancer acts on. Reporting only one hides either a spike
+        // or a trend.
+        "lane_last": lane(&t.lane_last),
+        "lane_ewma": lane(&t.lane_ewma),
+        "bias": format!("{:?}", t.runtime.bias),
+        "io_ewma_us": t.runtime.io_ewma_us,
+        "io_sq_full": t.runtime.io_sq_full,
+        "prefetch_accuracy": t.runtime.prefetch_accuracy,
+        "cache_hit_rate": t.runtime.cache_hit_rate,
+        // Cumulative and byte-convertible: delta these across two scrapes and
+        // multiply by bytes-per-expert for a live disk rate. `disk_reads` counts
+        // *experts* (six regions each), not regions or device requests.
+        // `prefetch_reads` is the speculative lane, which contributes to device
+        // load but to no lane timing.
+        "ecache": t.ecache.map(|(h, m, d)| serde_json::json!({
+            "hits": h, "misses": m, "disk_reads": d, "prefetch_reads": t.prefetch_reads,
+        })),
+        "routing_entropy_ewma": t.runtime.entropy_ewma,
+        // Which implementation is dispatching, read from the dispatch path
+        // itself — not from `COLI_MOE_ENGINE`, which says what was requested.
+        "moe_engine": peregrine_model::concurrent::moe_engine_name(),
+        "gpu": {
+            "calls": t.runtime.gpu.calls,
+            "experts": t.runtime.gpu.experts,
+            "rows": t.runtime.gpu.rows,
+            "transfer_fraction": t.runtime.gpu.transfer_fraction(),
+            // Whether COLI_CUDA_GRAPH is actually replaying. Zero replays with
+            // nonzero captures means the launch-shape key is churning and the
+            // knob is costing throughput rather than saving it.
+            "graph_captures": t.runtime.gpu.graph_captures,
+            "graph_replays": t.runtime.gpu.graph_replays,
+            "graph_invalidations": t.runtime.gpu.graph_invalidations,
+            "graph_uncacheable": t.runtime.gpu.graph_uncacheable,
+        },
+        "memo": { "hits": hits, "misses": misses, "entries": entries, "bytes": bytes },
+    }))
+}
+
 async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<ModelList>, ApiError> {
     check_auth(&state, &headers)?;
     Ok(Json(ModelList {
@@ -359,12 +533,20 @@ async fn chat_completions(
         let mid = model_id.clone();
         let cid = completion_id.clone();
         let memo_state = state.inner.clone();
+        // The schemas outlive the request body here: the filter types arguments
+        // from them, and the spawned task owns everything it touches.
+        let stream_tools: Vec<tools::ToolDef> = active_tools(&req).to_vec();
         tokio::spawn(async move {
             // Token payloads split multi-byte characters, so deltas come from an
             // incremental decoder that holds an unfinished character until the
             // next token completes it (see `IncrementalDecoder`).
             let mut dec = tok::IncrementalDecoder::new();
             let mut out_ids: Vec<u32> = Vec::new();
+            // Tool markup arrives split across tokens, so the decoded text goes
+            // through the filter before any of it becomes a delta: a client must
+            // never see half a `<tool_call>`.
+            let mut filter = tools::OutputFilter::with_tools(&stream_tools);
+            let mut emitted_calls = 0usize;
             // OpenAI clients expect the role in the first chunk.
             if sse_tx.send(Ok(chunk_event(&cid, &mid, created, None, Some("assistant"), None))).await.is_err() {
                 return; // client disconnected before the first frame
@@ -373,9 +555,20 @@ async fn chat_completions(
                 match msg {
                     EngineOut::Token(t) => {
                         out_ids.push(t);
-                        let delta = dec.push(&tokenizer.decode_bytes(&[t]));
-                        if delta.is_empty() {
+                        let decoded = dec.push(&tokenizer.decode_bytes(&[t]));
+                        if decoded.is_empty() {
                             continue; // token only extended an unfinished character
+                        }
+                        let delta = filter.push(&decoded);
+                        for c in filter.take_calls() {
+                            let call = c.to_openai(emitted_calls, &call_id(&cid, emitted_calls));
+                            emitted_calls += 1;
+                            if sse_tx.send(Ok(tool_call_chunk_event(&cid, &mid, created, call))).await.is_err() {
+                                return; // client disconnected
+                            }
+                        }
+                        if delta.is_empty() {
+                            continue; // text held back as a possible partial marker
                         }
                         let ev = chunk_event(&cid, &mid, created, Some(&delta), None, None);
                         if sse_tx.send(Ok(ev)).await.is_err() {
@@ -399,7 +592,12 @@ async fn chat_completions(
                 memo_state.memo.lock().insert(key, out_ids);
             }
             // tail frames: a send error just means the client hung up first
-            let tail = dec.finish();
+            let tail = {
+                let decoded_tail = dec.finish();
+                let mut t = filter.push(&decoded_tail);
+                t.push_str(&filter.finish());
+                t
+            };
             let tail_ev = if tail.is_empty() {
                 None
             } else {
@@ -409,8 +607,15 @@ async fn chat_completions(
             if let Some(ev) = tail_ev {
                 hung_up = sse_tx.send(Ok(ev)).await.is_err();
             }
+            // A call closed only by end-of-generation still reaches the client.
+            for c in filter.take_calls() {
+                let call = c.to_openai(emitted_calls, &call_id(&cid, emitted_calls));
+                emitted_calls += 1;
+                hung_up = hung_up || sse_tx.send(Ok(tool_call_chunk_event(&cid, &mid, created, call))).await.is_err();
+            }
+            let finish = if emitted_calls > 0 { "tool_calls" } else { "stop" };
             if hung_up
-                || sse_tx.send(Ok(chunk_event(&cid, &mid, created, None, None, Some("stop")))).await.is_err()
+                || sse_tx.send(Ok(chunk_event(&cid, &mid, created, None, None, Some(finish)))).await.is_err()
                 || sse_tx.send(Ok(Event::default().data("[DONE]"))).await.is_err()
             {
                 peregrine_core::note_advisory_err("SSE stream tail", &"client disconnected before [DONE]");
@@ -433,8 +638,10 @@ async fn chat_completions(
         if let Some(key) = memo_key {
             state.inner.memo.lock().insert(key, out_ids.clone());
         }
+        let (text, calls) = split_output(&tk(tokenizer.decode(&out_ids))?, active_tools(&req));
         Ok(Json(json_completion(
-            &tk(tokenizer.decode(&out_ids))?,
+            &text,
+            &calls,
             &completion_id,
             &model_id,
             created,
@@ -449,12 +656,29 @@ async fn chat_completions(
 /// a replayed response cannot drift in shape from a fresh one.
 fn json_completion(
     text: &str,
+    calls: &[tools::ParsedCall],
     completion_id: &str,
     model_id: &str,
     created: u64,
     prompt_tokens: usize,
     completion_tokens: usize,
 ) -> serde_json::Value {
+    let mut message = serde_json::Map::new();
+    message.insert("role".into(), serde_json::json!("assistant"));
+    // `content` stays present-but-null when the turn was only tool calls: a
+    // client that reads `content` unconditionally gets null, not the markup.
+    message.insert(
+        "content".into(),
+        if text.is_empty() && !calls.is_empty() { serde_json::Value::Null } else { serde_json::json!(text) },
+    );
+    if !calls.is_empty() {
+        let arr: Vec<serde_json::Value> =
+            calls.iter().enumerate().map(|(i, c)| c.to_openai(i, &call_id(completion_id, i))).collect();
+        message.insert("tool_calls".into(), serde_json::Value::Array(arr));
+    }
+    // A turn with calls finishes as `tool_calls`; agent clients branch on this
+    // rather than on the presence of the array.
+    let finish = if calls.is_empty() { "stop" } else { "tool_calls" };
     serde_json::json!({
         "id": completion_id,
         "object": "chat.completion",
@@ -462,8 +686,8 @@ fn json_completion(
         "model": model_id,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": text },
-            "finish_reason": "stop"
+            "message": serde_json::Value::Object(message),
+            "finish_reason": finish
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,
@@ -494,26 +718,75 @@ fn memo_response(
     prompt_tokens: usize,
 ) -> Result<Response, ApiError> {
     if !req.stream {
-        let text = tk(tokenizer.decode(out_ids))?;
-        return Ok(Json(json_completion(&text, completion_id, model_id, created, prompt_tokens, out_ids.len()))
-            .into_response());
+        let (text, calls) = split_output(&tk(tokenizer.decode(out_ids))?, active_tools(req));
+        return Ok(Json(json_completion(
+            &text,
+            &calls,
+            completion_id,
+            model_id,
+            created,
+            prompt_tokens,
+            out_ids.len(),
+        ))
+        .into_response());
     }
     let mut events: Vec<Result<Event, std::convert::Infallible>> =
         vec![Ok(chunk_event(completion_id, model_id, created, None, Some("assistant"), None))];
     let mut dec = tok::IncrementalDecoder::new();
+    // The replay runs through the same filter as a live stream, so a memoized
+    // tool call comes back as a call and not as the markup that produced it.
+    let mut filter = tools::OutputFilter::with_tools(active_tools(req));
+    let mut emitted_calls = 0usize;
     for &t in out_ids {
-        let delta = dec.push(&tokenizer.decode_bytes(&[t]));
+        let decoded = dec.push(&tokenizer.decode_bytes(&[t]));
+        if decoded.is_empty() {
+            continue;
+        }
+        let delta = filter.push(&decoded);
+        for c in filter.take_calls() {
+            let call = c.to_openai(emitted_calls, &call_id(completion_id, emitted_calls));
+            emitted_calls += 1;
+            events.push(Ok(tool_call_chunk_event(completion_id, model_id, created, call)));
+        }
         if !delta.is_empty() {
             events.push(Ok(chunk_event(completion_id, model_id, created, Some(&delta), None, None)));
         }
     }
-    let tail = dec.finish();
+    let tail = {
+        let decoded_tail = dec.finish();
+        let mut t = filter.push(&decoded_tail);
+        t.push_str(&filter.finish());
+        t
+    };
     if !tail.is_empty() {
         events.push(Ok(chunk_event(completion_id, model_id, created, Some(&tail), None, None)));
     }
-    events.push(Ok(chunk_event(completion_id, model_id, created, None, None, Some("stop"))));
+    for c in filter.take_calls() {
+        let call = c.to_openai(emitted_calls, &call_id(completion_id, emitted_calls));
+        emitted_calls += 1;
+        events.push(Ok(tool_call_chunk_event(completion_id, model_id, created, call)));
+    }
+    let finish = if emitted_calls > 0 { "tool_calls" } else { "stop" };
+    events.push(Ok(chunk_event(completion_id, model_id, created, None, None, Some(finish))));
     events.push(Ok(Event::default().data("[DONE]")));
     Ok(Sse::new(tokio_stream::iter(events)).keep_alive(KeepAlive::default()).into_response())
+}
+
+/// Split a whole generation into visible text and tool calls. The one-shot
+/// counterpart of the streaming filter, so both wire formats agree on what was
+/// content and what was markup.
+fn split_output(raw: &str, tool_defs: &[tools::ToolDef]) -> (String, Vec<tools::ParsedCall>) {
+    let mut f = tools::OutputFilter::with_tools(tool_defs);
+    let mut text = f.push(raw);
+    text.push_str(&f.finish());
+    (text.trim().to_string(), f.take_calls())
+}
+
+/// A tool call's id, derived from the completion id so it is unique per
+/// response and stable between the streaming and non-streaming renderings of
+/// the same generation — a client correlates its tool result against this.
+fn call_id(completion_id: &str, index: usize) -> String {
+    format!("call_{}_{index}", completion_id.trim_start_matches("chatcmpl-"))
 }
 
 /// Wall-clock seconds since the epoch, for the OpenAI `created` field.
@@ -546,6 +819,28 @@ fn chunk_event(
         "created": created,
         "model": model_id,
         "choices": [{ "index": 0, "delta": serde_json::Value::Object(delta_obj), "finish_reason": finish }]
+    });
+    Event::default().data(payload.to_string())
+}
+
+/// A streaming chunk carrying one whole tool call.
+///
+/// OpenAI streams a call in fragments (name first, `arguments` accumulated
+/// across deltas); this emits it complete in a single delta instead. Both are
+/// legal — a client concatenates argument fragments either way — and a whole
+/// call is the only form this server can honestly send, since the markup is
+/// not a valid call until its closing tag arrives.
+fn tool_call_chunk_event(id: &str, model_id: &str, created: u64, call: serde_json::Value) -> Event {
+    let payload = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_id,
+        "choices": [{
+            "index": 0,
+            "delta": { "tool_calls": [call] },
+            "finish_reason": serde_json::Value::Null
+        }]
     });
     Event::default().data(payload.to_string())
 }
@@ -646,11 +941,52 @@ fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Resul
     Ok(())
 }
 
+/// Install `peregrine-sched`'s two-lane engine when `COLI_MOE_ENGINE=sched`.
+///
+/// Mirrors `peregrine-engine`'s installer, and for the same structural reason:
+/// `peregrine-sched` depends on `peregrine-model`, so only a binary can bridge
+/// the two. Slower by construction (no GPU lane, no warm cache, no prefetch) —
+/// it is an A/B against the default, not a default.
+fn install_moe_engine() {
+    // Matched through `as_deref()` — the idiom every other env gate in this
+    // repo uses. `unwrap_or_default()` is a [P] hit and `Err(_)` a [B] one,
+    // and both audits are right: neither says which case it is handling.
+    let var = std::env::var("COLI_MOE_ENGINE");
+    match var.as_deref() {
+        Ok("sched") => {}
+        // Unset, empty, or the default engine: nothing to install.
+        Ok("") | Ok("concurrent") => return,
+        Ok(other) => {
+            eprintln!("peregrine: COLI_MOE_ENGINE={other} is not a known engine (concurrent|sched); using concurrent");
+            return;
+        }
+        _ => return,
+    }
+    let depth: u32 = std::env::var("COLI_IO_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    match peregrine_sched::SchedEngine::new(depth) {
+        Ok(engine) => {
+            if peregrine_model::concurrent::install_moe_engine(Box::new(engine)) {
+                eprintln!("peregrine-serve: MoE engine = sched (ring depth {depth}) — two-lane: no GPU lane, no warm cache, no prefetch");
+            }
+        }
+        Err(e) => eprintln!("peregrine-serve: COLI_MOE_ENGINE=sched requested but the io_uring ring failed ({e}); using concurrent"),
+    }
+    // Confirm against the dispatch path rather than against the branch above.
+    // Every message in this function reports an *intent*; this one reports what
+    // `moe_forward_dispatch` will actually do, and the two differ whenever the
+    // ring failed or something installed first.
+    if !peregrine_model::concurrent::moe_engine_installed() {
+        eprintln!("peregrine-serve: MoE dispatch = concurrent (no alternative engine installed)");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cap glibc arenas before the model spawns its worker pools, so the server no
     // longer needs `MALLOC_ARENA_MAX=2` in the environment to keep RSS flat.
     peregrine_model::cap_malloc_arenas();
+    eprintln!("{}", peregrine_model::startup_banner());
+    install_moe_engine();
     let args = Args::parse();
     let dir = std::path::PathBuf::from(&args.model);
     // Tokenizer throughput bench: encode a text file through both backends and
@@ -659,11 +995,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bench_tokenizer(&dir, file)?;
         return Ok(());
     }
-    let model = Model::load(&dir)?;
+    let mut model = Model::load(&dir)?;
+    // `COLI_PREDICT_SOURCE`: force a specific prefetch predictor. The stdio binary
+    // has always honoured this and the server never did, so the one knob that can
+    // select `PhaseAware` was unreachable from the **batched** engine — which is
+    // precisely where per-sequence prefetch lives, and so the only place the
+    // phase-aware predictor was ever meant to matter. Applied before the model
+    // moves into the engine thread; no thread affinity involved, unlike the perf
+    // counter, which stays with whoever decodes.
+    if let Some(name) = model.apply_predictor_override() {
+        eprintln!("peregrine-serve: prefetch predictor = {name} (COLI_PREDICT_SOURCE)");
+    }
     let tokenizer = TokenBackend::load(&dir).map_err(|e| format!("tokenizer: {e}"))?;
 
     // One engine thread owns the model and continuously batches all requests.
-    let (engine, _engine_join) = batch::spawn(model, args.max_batch)?;
+    let (engine, engine_join) = batch::spawn(model, args.max_batch)?;
 
     let addr = format!("{}:{}", args.host, args.port);
     let state = AppState {
@@ -677,6 +1023,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state);
@@ -691,5 +1038,246 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("peregrine-serve shutting down");
         })
         .await?;
+
+    // Wait for the engine thread to drain before returning from `main`.
+    //
+    // The join handle was `_engine_join` until 2026-08-08 — held, never joined —
+    // so the process exited while the engine thread was still alive and
+    // `Model::drop` never ran. That silently cost two things the server is
+    // documented to do: **`route_stats.json` is written at Drop**, so the HTTP
+    // server never persisted routing heat or co-activation across sessions
+    // (`COLI_ROUTE_STATS_PERSIST` had no effect here, only in the stdio binary),
+    // and the `[ecache]` / `[prefetch] used/wasted/accuracy` shutdown counters
+    // never printed — which is why a lane-count sweep against this server could
+    // not read the one diagnostic that says whether prefetch is earning its keep.
+    //
+    // Bounded, because the wait is not guaranteed to end: the engine exits when
+    // both request senders drop, and those live in an `Arc<Inner>` that a
+    // detached SSE pump task may still hold — graceful shutdown waits for
+    // connections, not for `tokio::spawn`ed tasks. Losing the counters is a bad
+    // trade for a server that will not exit, so this reports and moves on.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ok = engine_join.join().is_ok();
+        if done_tx.send(ok).is_err() {
+            // `main` hit the timeout below and stopped listening. Expected, not a
+            // fault — but it means the drain finished *after* the deadline, which
+            // is the one case where raising the deadline would have helped.
+            peregrine_core::note_advisory_err(
+                "engine join handoff",
+                &"engine drained after main stopped waiting — consider a longer shutdown deadline",
+            );
+        }
+    });
+    match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(true) => {}
+        Ok(false) => eprintln!("peregrine-serve: batch engine thread panicked"),
+        // Timeout and Disconnected mean different things and get different words:
+        // the first is a slow drain, the second is a watchdog that died before
+        // reporting — which would otherwise look like a clean shutdown.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => eprintln!(
+            "peregrine-serve: batch engine still busy after 30s; \
+             route_stats.json and the [ecache]/[prefetch] counters may be incomplete"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("peregrine-serve: engine join watchdog exited without reporting")
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The HTTP surface's own contracts — the ones that live in `main.rs` rather
+    //! than in `tools.rs`.
+    //!
+    //! This module did not exist before 2026-08-08, which meant the entire
+    //! tool-calling integration — prompt assembly, `tool_choice`, the OpenAI
+    //! response shape — was reachable only through a running server with a
+    //! loaded model, so nothing exercised it. `tools.rs` was well covered on its
+    //! own; the wiring between it and the wire format was not covered at all.
+    //!
+    //! Fixtures go through `serde_json::from_value` rather than being built by
+    //! hand: `ChatRequest`/`ChatMessage` are `Deserialize`-only, and going in
+    //! through the wire shape tests the deserialization contract at the same
+    //! time — which is precisely what `docs/serving.md` was stale about.
+
+    use super::*;
+    use serde_json::json;
+
+    fn msgs(v: serde_json::Value) -> Result<Vec<ChatMessage>, serde_json::Error> {
+        serde_json::from_value(v)
+    }
+
+    fn tool_defs() -> Result<Vec<tools::ToolDef>, serde_json::Error> {
+        serde_json::from_value(json!([{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "run a command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+            }
+        }]))
+    }
+
+    #[test]
+    fn the_preamble_lands_in_the_first_system_turn_and_only_there(
+    ) -> Result<(), serde_json::Error> {
+        let m = msgs(json!([
+            {"role": "system", "content": "you are first"},
+            {"role": "system", "content": "you are second"},
+            {"role": "user", "content": "hi"}
+        ]))?;
+        let p = build_prompt(&m, &tool_defs()?);
+        assert_eq!(p.matches("# Tools").count(), 1, "exactly one preamble:\n{p}");
+        let first = p.find("you are first").unwrap_or(usize::MAX);
+        let tools_at = p.find("# Tools").unwrap_or(usize::MAX);
+        let second = p.find("you are second").unwrap_or(usize::MAX);
+        assert!(first < tools_at && tools_at < second, "preamble belongs to the FIRST system turn:\n{p}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_system_turn_is_synthesized_only_when_there_are_tools() -> Result<(), serde_json::Error> {
+        // Same messages, opposite outcomes — the shape that keeps a conditional
+        // from quietly becoming unconditional.
+        let m = msgs(json!([{"role": "user", "content": "hi"}]))?;
+        let with = build_prompt(&m, &tool_defs()?);
+        let without = build_prompt(&m, &[]);
+        assert!(with.contains("<|system|>"), "tools with no system turn must synthesize one:\n{with}");
+        assert!(with.contains("# Tools"), "{with}");
+        assert!(!without.contains("<|system|>"), "no tools must not invent a system turn:\n{without}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_tool_result_replays_as_an_observation_not_a_user_turn(
+    ) -> Result<(), serde_json::Error> {
+        let m = msgs(json!([
+            {"role": "user", "content": "read it"},
+            {"role": "tool", "content": "file contents"}
+        ]))?;
+        let p = build_prompt(&m, &[]);
+        assert!(p.contains("<|observation|>\n<tool_response>\nfile contents\n</tool_response>"), "{p}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_role_is_treated_as_user_content_and_never_as_markup(
+    ) -> Result<(), serde_json::Error> {
+        let m = msgs(json!([{"role": "<|system|>evil", "content": "hi"}]))?;
+        let p = build_prompt(&m, &[]);
+        assert!(p.contains("<|user|>\nhi"), "unknown role falls back to user:\n{p}");
+        assert!(!p.contains("evil"), "the role string must never reach the prompt:\n{p}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_assistant_turns_calls_replay_as_the_markup_the_model_emitted(
+    ) -> Result<(), serde_json::Error> {
+        // The round trip that ties this file to tools.rs: render a call into the
+        // prompt, then parse that same markup back and require the same call.
+        // A divergence between the render and parse sides is invisible to either
+        // module's own tests.
+        let m = msgs(json!([{
+            "role": "assistant", "content": null,
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "read", "arguments": "{\"filePath\":\"/etc/hosts\"}"}
+            }]
+        }]))?;
+        let p = build_prompt(&m, &[]);
+        // Slice out just the markup: the surrounding `[gMASK]<sop>` and
+        // `<|assistant|>` role markers are prompt scaffolding, not model output,
+        // and feeding them to the output filter would (correctly) return them as
+        // visible text.
+        let start = p.find("<tool_call>").unwrap_or(0);
+        let end = p.rfind("</tool_call>").map_or(p.len(), |i| i + "</tool_call>".len());
+        let (text, calls) = split_output(&p[start..end], &[]);
+        assert_eq!(text, "", "the replayed markup is a call, not visible text");
+        assert_eq!(calls.len(), 1, "prompt: {p}");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments["filePath"], json!("/etc/hosts"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_choice_none_is_the_only_value_that_disables_tools(
+    ) -> Result<(), serde_json::Error> {
+        let base = json!({"messages": [{"role": "user", "content": "hi"}], "tools": [{
+            "type": "function", "function": {"name": "bash"}
+        }]});
+        let with_choice = |c: serde_json::Value| -> Result<usize, serde_json::Error> {
+            let mut v = base.clone();
+            v["tool_choice"] = c;
+            let req: ChatRequest = serde_json::from_value(v)?;
+            Ok(active_tools(&req).len())
+        };
+        assert_eq!(with_choice(json!("none"))?, 0, "\"none\" disables tools");
+        assert_eq!(with_choice(json!("auto"))?, 1, "\"auto\" leaves them active");
+        assert_eq!(with_choice(json!("required"))?, 1, "peregrine never forces a call");
+        // The object form is a *decision*, not an oversight: `.as_str()` is None,
+        // so a client naming one function still gets all of them.
+        assert_eq!(
+            with_choice(json!({"type": "function", "function": {"name": "bash"}}))?,
+            1,
+            "the object form does not narrow the set"
+        );
+        let req: ChatRequest = serde_json::from_value(base)?;
+        assert_eq!(active_tools(&req).len(), 1, "absent tool_choice leaves them active");
+        Ok(())
+    }
+
+    #[test]
+    fn content_may_be_a_string_an_array_of_parts_null_or_absent(
+    ) -> Result<(), serde_json::Error> {
+        let m = msgs(json!([
+            {"role": "user", "content": "plain"},
+            {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "image_url"}, {"type": "text", "text": "b"}]},
+            {"role": "user", "content": null},
+            {"role": "user"}
+        ]))?;
+        assert_eq!(m[0].text(), "plain");
+        assert_eq!(m[1].text(), "ab", "text parts concatenate; non-text parts are dropped");
+        assert_eq!(m[2].text(), "");
+        assert_eq!(m[3].text(), "");
+        Ok(())
+    }
+
+    #[test]
+    fn a_calls_only_turn_nulls_content_and_finishes_as_tool_calls() {
+        let calls = vec![tools::ParsedCall { name: "read".into(), arguments: json!({"p": 1}) }];
+        let v = json_completion("", &calls, "chatcmpl-abc", "m", 0, 1, 1);
+        let choice = &v["choices"][0];
+        assert_eq!(choice["message"]["content"], serde_json::Value::Null, "null, not \"\"");
+        assert_eq!(choice["finish_reason"], json!("tool_calls"));
+        assert_eq!(choice["message"]["tool_calls"][0]["id"], json!("call_abc_0"));
+
+        // Opposite outcome over the same function: no calls → text and "stop".
+        let plain = json_completion("hello", &[], "chatcmpl-abc", "m", 0, 1, 1);
+        let choice = &plain["choices"][0];
+        assert_eq!(choice["message"]["content"], json!("hello"));
+        assert_eq!(choice["finish_reason"], json!("stop"));
+        assert_eq!(choice["message"].get("tool_calls"), None, "no empty array when there are no calls");
+    }
+
+    #[test]
+    fn a_call_id_is_stable_per_completion_and_unique_per_index() {
+        assert_eq!(call_id("chatcmpl-xyz", 0), "call_xyz_0");
+        assert_eq!(call_id("chatcmpl-xyz", 0), call_id("chatcmpl-xyz", 0), "stable");
+        assert_ne!(call_id("chatcmpl-xyz", 0), call_id("chatcmpl-xyz", 1), "unique per index");
+        assert_ne!(call_id("chatcmpl-a", 0), call_id("chatcmpl-b", 0), "unique per completion");
+    }
+
+    #[test]
+    fn split_output_separates_visible_text_from_calls() -> Result<(), serde_json::Error> {
+        let (text, calls) = split_output(
+            "here you go<tool_call>bash\n<arg_key>command</arg_key>\n<arg_value>ls</arg_value>\n</tool_call>",
+            &tool_defs()?,
+        );
+        assert_eq!(text, "here you go", "trimmed, and no markup");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["command"], json!("ls"), "declared string stays a string");
+        Ok(())
+    }
 }

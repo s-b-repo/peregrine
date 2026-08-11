@@ -1,0 +1,7 @@
+peregrine: [ram] avail 25.5 GB | resident 10.9 + KV 0.7 + stream 3.8 + slack 1.4 + cache 2.1 -> peak 18.9 GB
+peregrine bench: loaded 78 layers, vocab 154880, mtp=yes, draft=γ=4, in 9.5s
+peregrine bench: speculative batched-verify on (γ=4 draft tokens per sequence per step)
+    [ecache] disk_reads this batch: 9675
+[gate] routed=58112 below_0.5%=0.4% below_1%=0.6% below_2%=1.6% below_5%=11.1%
+[union] selections=58112 distinct=10145 calls=214 share=5.728x
+[union] all-low-gate reads=18/10145 (0.2%) — the ceiling on per-token precision selection under batch union

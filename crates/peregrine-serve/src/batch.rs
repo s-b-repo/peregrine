@@ -26,6 +26,23 @@ use tokio::sync::mpsc;
 /// A no-op without a GPU tier, so it is harmless in CPU-only deployments.
 const REHEAT_EVERY: usize = 256;
 
+/// Ticket dispenser for [`SeqState::seq_id`] — the value that picks a sequence's
+/// prefetch lane, and the only thing about a sequence that must not move.
+///
+/// It has to be *stable*, which the obvious candidate is not: `active` is compacted
+/// with `retain` every tick, so a sequence's index into it slides down whenever an
+/// earlier one retires. Keying the lane on that index (as this did until 2026-08-08)
+/// migrated live streams between lanes mid-flight, leaving a sequence's queued reads
+/// split across two io_uring rings with no ordering between them.
+///
+/// The trade-off is deliberate and worth stating: the positional index spread the
+/// *currently active* sequences perfectly across lanes, and a monotonic ticket does
+/// not — ids 0 and 4 collide on lane 0 under four lanes even if lane 2 is idle. That
+/// is the cheaper mistake (a shared warm cache absorbs it), and occupancy-aware
+/// assignment is only worth building if the lane-count measurement says lanes pay.
+/// Wrapping is fine: the pool takes this modulo its width.
+static NEXT_SEQ_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Prompt tokens prefilled per engine step for an admitting sequence. Bounding the
 /// chunk lets active sequences keep decoding while a new long prompt prefills, so a
 /// big admission doesn't stall the batch for its whole prefill. Also the floor for
@@ -198,6 +215,10 @@ struct Prefilling {
     /// `SeqState` when the prefill completes, so the sequence keeps one history
     /// across its whole life instead of starting blank at its first decode.
     hist: Mutex<RouteHistory>,
+    /// Stable prefetch-lane key, from [`NEXT_SEQ_ID`]. Assigned at admission and
+    /// carried into the `SeqState`, for the same reason `hist` is: a fused prefill
+    /// row prefetches too, and it must use the lane the sequence will keep.
+    seq_id: usize,
 }
 
 /// Request priority. Higher priority requests are admitted and drained before
@@ -238,12 +259,47 @@ pub enum EngineOut {
     Error(String),
 }
 
+/// What the engine thread publishes each tick for `GET /metrics` to read.
+///
+/// The engine thread **owns** the `Model` exclusively — the HTTP handlers hold
+/// only channels — so a scrape cannot call `Model::telemetry()` itself. This is
+/// the seam: the engine writes a snapshot once per tick, the handler clones it.
+/// Cheap enough to publish unconditionally (a struct copy under an uncontended
+/// lock, once per decode step, against a step that reads gigabytes).
+#[derive(Clone, Debug, Default)]
+pub struct EngineTelemetry {
+    pub runtime: peregrine_model::RuntimeTelemetry,
+    /// Most recent forward's per-lane wall time.
+    pub lane_last: peregrine_model::LaneTimings,
+    /// The bubble tuner's smoothed per-lane times — what the balancer acts on.
+    /// Distinct from `lane_last`: one token's cost versus which lane dominates.
+    pub lane_ewma: peregrine_model::LaneTimings,
+    /// Sequences decoding right now, and prompts waiting to be prefilled.
+    pub active: usize,
+    pub pending: usize,
+    /// Decode steps the engine has run since start.
+    pub steps: u64,
+    /// Warm-cache `(hits, misses, disk_reads)` and speculative reads, cumulative.
+    ///
+    /// Published because these are the only *byte-convertible* counters the engine
+    /// has — `disk_reads × bytes_per_expert` is the disk rate, and the two lane
+    /// timing fields cannot give it (they are thread-sums, so they need both
+    /// thread counts to interpret and still exclude the prefetch lane entirely,
+    /// which is untimed). Until 2026-08-10 these reached the shutdown log and
+    /// nothing else, so a run's throughput could only be computed after it ended.
+    /// `None` without a warm cache.
+    pub ecache: Option<(u64, u64, u64)>,
+    pub prefetch_reads: u64,
+}
+
 /// Handle for submitting requests to the engine thread. Cheap to clone and
 /// `Send + Sync` (a tokio unbounded sender), so it lives in shared server state.
 #[derive(Clone)]
 pub struct EngineHandle {
     tx_normal: mpsc::UnboundedSender<EngineRequest>,
     tx_high: mpsc::UnboundedSender<EngineRequest>,
+    /// Published by the engine thread each tick; read by `/metrics`.
+    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
 }
 
 impl EngineHandle {
@@ -257,6 +313,12 @@ impl EngineHandle {
         };
         ch.send(req).map_err(|send_err| Error::Format(format!("batch engine is not running: {send_err}")))
     }
+
+    /// The engine's most recent published telemetry. All-zero before the first
+    /// tick, which is the honest answer to "what is it doing" at that point.
+    pub fn telemetry(&self) -> EngineTelemetry {
+        self.telemetry.lock().clone()
+    }
 }
 
 /// Spawn the engine on a dedicated OS thread that owns `model`, batching up to
@@ -267,11 +329,13 @@ pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle
     let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
     let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
+    let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
+    let tel = telemetry.clone();
     let join = std::thread::Builder::new()
         .name("peregrine-batch".to_string())
-        .spawn(move || run(model, rx_normal, rx_high, cap, fuse_prefill()))
+        .spawn(move || run(model, rx_normal, rx_high, cap, fuse_prefill(), tel))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high }, join))
+    Ok((EngineHandle { tx_normal, tx_high, telemetry }, join))
 }
 
 /// [`spawn`] with the prefill/decode fusion forced on or off.
@@ -285,9 +349,23 @@ fn spawn_fused(model: Model, max_batch: usize, fuse: bool) -> Result<(EngineHand
     spawn_tuned(model, max_batch, fuse, None)
 }
 
-/// [`spawn`] with the fusion and the draft depth forced.
+/// Override for the speculation knobs, `None` meaning "read the environment".
+/// Production passes the default (all `None`); tests force values so they never
+/// race each other on the process-wide `OnceLock`s the environment resolves
+/// through. Bundled rather than passed as two parameters because `run_tuned`
+/// already sits at clippy's argument limit, and because the two are one
+/// decision: sampled speculation without a depth is not a configuration.
+#[derive(Clone, Copy, Default)]
+struct SpecOverride {
+    /// `COLI_DRAFT`.
+    depth: Option<usize>,
+    /// `COLI_DRAFT_SAMPLED`.
+    sampled: Option<bool>,
+}
+
+/// [`spawn`] with the fusion and the speculation knobs forced.
 ///
-/// Both resolve through process-wide `OnceLock`s, and a test that mutated the
+/// These resolve through process-wide `OnceLock`s, and a test that mutated the
 /// environment would race every other test in the binary — the same reason
 /// `iotune.rs` gives for not gating a feature on one.
 #[cfg(test)]
@@ -297,14 +375,27 @@ fn spawn_tuned(
     fuse: bool,
     depth: Option<usize>,
 ) -> Result<(EngineHandle, JoinHandle<()>), Error> {
+    spawn_spec(model, max_batch, fuse, SpecOverride { depth, sampled: None })
+}
+
+/// [`spawn_tuned`] with the sampled-speculation knob forced too.
+#[cfg(test)]
+fn spawn_spec(
+    model: Model,
+    max_batch: usize,
+    fuse: bool,
+    spec: SpecOverride,
+) -> Result<(EngineHandle, JoinHandle<()>), Error> {
     let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
     let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
+    let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
+    let tel = telemetry.clone();
     let join = std::thread::Builder::new()
         .name("peregrine-batch-test".to_string())
-        .spawn(move || run_tuned(model, rx_normal, rx_high, cap, fuse, depth))
+        .spawn(move || run_tuned(model, rx_normal, rx_high, cap, fuse, spec, tel))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high }, join))
+    Ok((EngineHandle { tx_normal, tx_high, telemetry }, join))
 }
 
 /// Latency SLA target for adaptive batching, in milliseconds. When set
@@ -328,19 +419,41 @@ fn draft_depth() -> usize {
     *V.get_or_init(|| std::env::var("COLI_DRAFT").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0))
 }
 
+/// Extend speculation to temperature > 0 requests via rejection sampling
+/// (`COLI_DRAFT_SAMPLED`). Default **off**, and it is not a performance knob.
+///
+/// [`peregrine_model::speculative_sample`] emits exactly the target
+/// distribution, so this is *distributionally* invisible — but not
+/// *sequence*-invisible: the tokens a seeded request produces change, because
+/// rejection sampling draws two uniforms per draft where plain decode draws one
+/// per token. A caller pinning outputs by seed would see different text with the
+/// same seed and no error anywhere.
+///
+/// It also rests on a claim this engine cannot check: that the MTP head's
+/// distribution really is the `q` the drafts were drawn from. `mtp_draft_sampled`
+/// makes that true by construction *for the head as implemented*; whether that
+/// head is a good proposal distribution at temperature is a modelling question,
+/// and a bad one costs acceptance rate rather than correctness.
+fn draft_sampled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("COLI_DRAFT_SAMPLED").ok().as_deref(), Some("1") | Some("true")))
+}
+
 /// How deep this sequence may speculate.
 ///
-/// **Zero unless the request decodes greedily.** Accepting a draft only where
-/// it matches the model's argmax makes speculation *sequence*-identical to
-/// greedy decoding; at temperature > 0 it is only distribution-preserving, and
-/// silently changing which tokens a sampled request emits is not a speedup, it
-/// is a different answer. A sequence with depth 0 contributes exactly one row,
-/// which is the historical path — so greedy and sampled requests share a batch
+/// **Zero for a sampled request unless `sampled` is set.** Accepting a draft
+/// only where it matches the model's argmax makes speculation
+/// *sequence*-identical to greedy decoding; at temperature > 0 the best
+/// available guarantee is distribution-preservation, and silently changing which
+/// tokens a sampled request emits is not a speedup, it is a different answer.
+/// `sampled` (from `COLI_DRAFT_SAMPLED`) is the operator taking that trade
+/// deliberately. A sequence with depth 0 contributes exactly one row, which is
+/// the historical path — so drafting and non-drafting requests share a batch
 /// with no special casing anywhere else.
 ///
 /// Pure so the policy is testable without a model.
-fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize) -> usize {
-    if global == 0 || !has_mtp || temp > 0.0 {
+fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize, sampled: bool) -> usize {
+    if global == 0 || !has_mtp || (temp > 0.0 && !sampled) {
         return 0;
     }
     // Never draft past what the request can still emit: a draft accepted beyond
@@ -493,6 +606,9 @@ struct SeqState {
     /// each concurrent stream prefetches from its own routing (not the cross-sequence
     /// union). Wrapped in a `Mutex` because the batched forward records into it.
     hist: Mutex<RouteHistory>,
+    /// Stable prefetch-lane key — see [`NEXT_SEQ_ID`]. Not this sequence's index in
+    /// `active`, which slides when an earlier sequence retires.
+    seq_id: usize,
     pos: usize,
     next_tok: i32,
     sampler: Sampler,
@@ -502,8 +618,17 @@ struct SeqState {
     /// Tokens this sequence speculated for the *next* forward, drafted from
     /// [`Self::hlast`] by the MTP head. Empty when speculation is off, when the
     /// checkpoint has no MTP head, or when this request samples at
-    /// temperature > 0 — see [`draft_depth_for`].
+    /// temperature > 0 without `COLI_DRAFT_SAMPLED` — see [`draft_depth_for`].
     draft: Vec<i32>,
+    /// The distribution each entry of [`Self::draft`] was drawn from, under
+    /// `COLI_DRAFT_SAMPLED`; empty on the greedy path, which needs no `q`.
+    ///
+    /// Carried beside `draft` rather than derived at verify time because
+    /// [`peregrine_model::accept_run_sampled`]'s correctness rests on `q` being
+    /// the distribution the draft *was* sampled from — re-deriving it from the
+    /// draft head at verify time would recompute a forward, and recomputing it
+    /// from anything else would be a different distribution wearing its name.
+    draft_q: Vec<Vec<f32>>,
     /// Pre-final-norm hidden at this sequence's last committed position: what
     /// the next draft continues from. Empty until the first verify produces it.
     hlast: Vec<f32>,
@@ -518,18 +643,21 @@ fn run(
     rx_high: mpsc::UnboundedReceiver<EngineRequest>,
     max_batch: usize,
     fuse: bool,
+    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
 ) {
-    run_tuned(model, rx_normal, rx_high, max_batch, fuse, None)
+    run_tuned(model, rx_normal, rx_high, max_batch, fuse, SpecOverride::default(), telemetry)
 }
 
-/// [`run`] with the draft depth overridable, for tests. `None` reads `COLI_DRAFT`.
+/// [`run`] with the speculation knobs overridable, for tests. Each `None` reads
+/// the corresponding environment variable.
 fn run_tuned(
     mut model: Model,
     mut rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
     mut rx_high: mpsc::UnboundedReceiver<EngineRequest>,
     max_batch: usize,
     fuse: bool,
-    depth_override: Option<usize>,
+    spec: SpecOverride,
+    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
 ) {
     let vocab = model.cfg.vocab as usize;
     let stop_ids = model.cfg.stop_ids.clone();
@@ -542,7 +670,8 @@ fn run_tuned(
     let sla_ms = batch_sla_ms();
     // Resolved once: prefill chunking is a latency/work trade, not a per-tick decision.
     let chunk_div = prefill_chunk_div();
-    let depth = depth_override.unwrap_or_else(draft_depth);
+    let depth = spec.depth.unwrap_or_else(draft_depth);
+    let sampled_spec = spec.sampled.unwrap_or_else(draft_sampled);
     let has_mtp = model.has_mtp();
     let mut prefix = PrefixCache::new(prefix_cache_budget());
     // Resolved once: the KV byte ceiling admission respects alongside the count.
@@ -755,9 +884,10 @@ fn run_tuned(
             }
         }
         // Per-sequence, parallel-async prefetch: warm each stream's predicted next
-        // experts onto its assigned lane (round-robin) while sampling proceeds.
-        for (i, s) in active.iter().enumerate() {
-            model.enqueue_seq_prefetch(&s.hist, i);
+        // experts onto its assigned lane while sampling proceeds. Keyed on the
+        // sequence's own id, not its index here — see [`NEXT_SEQ_ID`].
+        for s in active.iter() {
+            model.enqueue_seq_prefetch(&s.hist, s.seq_id);
         }
 
         // Emit each sequence's confirmed run and decide who continues.
@@ -772,12 +902,22 @@ fn run_tuned(
         for (i, s) in active.iter_mut().enumerate() {
             let base = first_row.get(i).copied().unwrap_or(i);
             let g = s.draft.len();
-            // A drafting sequence is greedy by construction (`draft_depth_for`),
-            // so `accept_run`'s argmax and `sampler.pick` agree. A
-            // non-drafting one keeps its own sampler, temperature and all.
+            // A greedy drafting sequence takes `accept_run`, whose argmax rule
+            // and `sampler.pick` agree by construction. A sampled one (only
+            // reachable under `COLI_DRAFT_SAMPLED`) takes the rejection-sampling
+            // rule, which needs the `q` each draft was drawn from. A
+            // non-drafting sequence keeps its own sampler, temperature and all.
             let (k, spec_next) = if g > 0 {
                 let rows = logits.get(base * vocab..(base + g + 1) * vocab).unwrap_or(&[]);
-                peregrine_model::accept_run(rows, vocab, &s.draft)
+                if s.sampler.temp > 0.0 {
+                    // `take`, not borrow: a `q` must never be scored against a
+                    // different forward's rows, so a tick that somehow skipped
+                    // drafting finds none rather than last tick's.
+                    let q = std::mem::take(&mut s.draft_q);
+                    peregrine_model::accept_run_sampled(rows, vocab, &s.draft, &q, &mut s.sampler)
+                } else {
+                    peregrine_model::accept_run(rows, vocab, &s.draft)
+                }
             } else {
                 (0, 0)
             };
@@ -790,7 +930,12 @@ fn run_tuned(
             // With no drafts that is a single token from row 0, which is the
             // historical decode step exactly.
             let final_next = if g > 0 {
-                spec_next // greedy by construction; `accept_run` already picked it
+                // Already chosen by whichever accept rule ran: `accept_run`'s
+                // argmax for a greedy request, `accept_run_sampled`'s residual
+                // or bonus draw for a sampled one. Re-picking here would take a
+                // second sample from the same row and emit a token the accept
+                // rule never verified against.
+                spec_next
             } else {
                 let lo = base * vocab;
                 match logits.get(lo..lo + vocab) {
@@ -860,15 +1005,35 @@ fn run_tuned(
         // wall-clock optimisation, so an error here drops back to plain decode
         // for that sequence rather than dropping the client.
         if depth > 0 {
+            let sampled = sampled_spec;
             for s in active.iter_mut() {
-                let g = draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new));
+                let g =
+                    draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new), sampled);
                 s.draft.clear();
+                s.draft_q.clear();
                 if g == 0 || s.hlast.is_empty() {
                     continue;
                 }
-                match model.mtp_draft(s.next_tok, g, &s.hlast) {
+                // A sampled request needs its drafts drawn from a distribution
+                // it can hand to the verifier; a greedy one needs argmax, and
+                // handing it a sampled draft would break `accept_run`'s
+                // sequence-identity with greedy decoding.
+                let drafted = if s.sampler.temp > 0.0 {
+                    model.mtp_draft_sampled(s.next_tok, g, &s.hlast, &mut s.sampler).map(|(d, q)| {
+                        s.draft_q = q;
+                        d
+                    })
+                } else {
+                    model.mtp_draft(s.next_tok, g, &s.hlast)
+                };
+                match drafted {
                     Ok(d) => s.draft = d,
-                    Err(e) => peregrine_core::note_advisory_err("mtp draft", &e),
+                    // A partial `draft_q` from a failed draft must not survive:
+                    // the next verify would score this tick's rows against it.
+                    Err(e) => {
+                        s.draft_q.clear();
+                        peregrine_core::note_advisory_err("mtp draft", &e);
+                    }
                 }
             }
         }
@@ -890,6 +1055,19 @@ fn run_tuned(
                 eprintln!("peregrine: reheat failed: {e}");
             }
         }
+        // Publish this tick's view for `GET /metrics`. The engine thread owns
+        // the model exclusively, so this is the only place these numbers can be
+        // read from; a handler cannot reach `Model` at all.
+        *telemetry.lock() = EngineTelemetry {
+            runtime: model.telemetry(),
+            lane_last: model.last_lane_timings(),
+            lane_ewma: model.lane_ewma(),
+            active: active.len(),
+            pending: pending.len(),
+            steps: steps as u64,
+            ecache: model.ecache_stats(),
+            prefetch_reads: model.ecache_prefetch_reads().unwrap_or(0),
+        };
     }
     // Shutdown: report what the prefix cache absorbed. Silent when it is off, so
     // a default run's output is unchanged.
@@ -901,6 +1079,156 @@ fn run_tuned(
             prefix.entries.len(),
             prefix.used as f64 / (1024.0 * 1024.0)
         );
+    }
+    // Warm-tier and prefetch effectiveness. This has to happen *here* — the engine
+    // thread owns the `Model`, so `main` cannot ask it anything after the server
+    // stops, and the model is dropped the moment this function returns.
+    //
+    // The stdio binary has printed these since the feature landed and the HTTP
+    // server never did, so on the serving path — the only path with per-sequence
+    // prefetch, and therefore the only one where prefetch lanes mean anything —
+    // there was no way to see whether prefetch was earning its keep. Deliberately
+    // just the two aggregate lines: the per-layer breakdown, gate stats, look-ahead
+    // and predictor scoreboard the stdio binary also prints are a larger reporting
+    // surface than this needs, and belong in a change of their own.
+    //
+    // Silent without a warm cache (`ecache_stats` is `None`), so a resident-mode
+    // run's output is unchanged.
+    if let Some((resolved, mergeable)) = model.expert_map_stats() {
+        let share = 100.0 * mergeable as f64 / resolved.max(1) as f64;
+        let reads = 6 * (resolved - mergeable) + 2 * mergeable;
+        eprintln!(
+            "[expertmap] indexed={resolved} coalescing={mergeable} ({share:.1}%) \
+             -> {reads} reads per full sweep vs {} unmerged",
+            6 * resolved
+        );
+    }
+    // The hit rate below is not interpretable without this: under one token's
+    // working set a layer sweep drives any recency policy to zero, so a low
+    // number is the budget talking, not the policy.
+    if let Some((per_token, protect)) = model.expert_working_set() {
+        eprintln!(
+            "[workingset] {:.2} GB per token; prefetch-protect {}",
+            per_token as f64 / (1u64 << 30) as f64,
+            if protect { "on (budget cannot hold a pass)" } else { "off (budget holds a pass)" }
+        );
+    }
+    // Where the time actually went. The four lane counters have always been
+    // collected — `moe_forward_concurrent` bumps them per layer — but the only
+    // consumer was the bubble tuner, and `snapshot_and_reset` wipes them every
+    // forward, so no operator could ever ask "was that run I/O-bound?".
+    {
+        let (t, forwards) = model.lane_totals();
+        if forwards > 0 {
+            let s = |us: u64| us as f64 / 1e6;
+            let (io, cpu, gpu, red) = (s(t.io_us), s(t.cpu_us), s(t.gpu_us), s(t.reduce_us));
+            let sum = (io + cpu + gpu + red).max(1e-9);
+            let pct = |v: f64| 100.0 * v / sum;
+            eprintln!(
+                "[lane] {forwards} forwards: io {io:.1}s ({:.0}%) cpu {cpu:.1}s ({:.0}%) \
+                 gpu {gpu:.1}s ({:.0}%) reduce {red:.1}s ({:.0}%)",
+                pct(io),
+                pct(cpu),
+                pct(gpu),
+                pct(red)
+            );
+            // Per forward is the number that maps onto a decode token, and the
+            // caveat is load-bearing: these are summed over lanes that run at the
+            // same time, so `sum / wall` is the overlap achieved, not overhead.
+            // A sum close to wall clock means the lanes are serialising.
+            eprintln!(
+                "[lane] per forward: io {:.2}s cpu {:.2}s (lane-summed, so compare \
+                 sum/wall for the overlap achieved)",
+                io / forwards as f64,
+                cpu / forwards as f64,
+            );
+            // The duty cycles. `io_us` is summed over one thread per ring, so the
+            // I/O lane's occupancy is `io_us / (rings x lane_wall)`. Below ~1.0 the
+            // rings are idle inside the MoE call; and `lane_wall` against the
+            // token's own wall clock is how much of a token is in the MoE lane at
+            // all, the rest being attention, the router and the reduce.
+            let wall = s(t.lane_wall_us);
+            if wall > 0.0 {
+                let rings = std::env::var("COLI_IO_RINGS").ok()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .filter(|&n| n > 0.0)
+                    .unwrap_or(4.0);
+                eprintln!(
+                    "[lane] moe wall {wall:.1}s over {forwards} forwards ({:.2}s each); \
+                     io duty {:.0}% of {rings:.0} rings, cpu {:.1} workers busy",
+                    wall / forwards as f64,
+                    100.0 * io / (rings * wall),
+                    cpu / wall,
+                );
+            }
+            if t.cpu_us > 0 && t.cpu_bytes > 0 {
+                eprintln!(
+                    "[lane] cpu-lane bandwidth {:.2} GB/s over {:.1} GB of expert slabs",
+                    t.cpu_bytes as f64 / 1e9 / s(t.cpu_us),
+                    t.cpu_bytes as f64 / 1e9,
+                );
+            }
+            // Cache-lock contention, thread-summed like io_us. Read it against
+            // io thread time: a few percent is bookkeeping, tens of percent is
+            // rings queueing on the mutex — the evidence a sharded cache needs.
+            if t.cache_wait_us > 0 && t.io_us > 0 {
+                eprintln!(
+                    "[lane] cache-lock wait {:.2}s ({:.1}% of io thread time)",
+                    s(t.cache_wait_us),
+                    100.0 * t.cache_wait_us as f64 / t.io_us as f64,
+                );
+            }
+        }
+    }
+    if let Some((h, m, d)) = model.ecache_stats() {
+        let hr = 100.0 * h as f64 / (h + m).max(1) as f64;
+        let pf = model.ecache_prefetch_reads().unwrap_or(0);
+        eprintln!("[ecache] hits={h} misses={m} disk_reads={d} prefetch_reads={pf} hit_rate={hr:.1}%");
+        // Occupancy, because a ~0% hit rate has two opposite causes and the line
+        // above cannot distinguish them: a full cache is evicting the working set
+        // before it can be reused; an empty one is not admitting in the first place.
+        if let Some((slots, used, budget)) = model.ecache_occupancy() {
+            let fill = if budget > 0 { 100.0 * used as f64 / budget as f64 } else { 0.0 };
+            eprintln!(
+                "[ecache] resident: {slots} slots, {:.2} GB of {:.2} GB budget ({fill:.1}% full)",
+                used as f64 / 1e9,
+                budget as f64 / 1e9
+            );
+        }
+        let (used, wasted) = model.ecache_prefetch_effectiveness().unwrap_or((0, 0));
+        let acc = 100.0 * model.prefetch_accuracy().unwrap_or(0.0);
+        let fadv = model.ecache_fadvise_hints().unwrap_or(0);
+        let vm = model.ecache_verify_mismatch().unwrap_or(0);
+        // `accuracy` is `used/(used+wasted)`, and **`wasted` is only incremented on
+        // eviction** (`warmcache.rs`): a prefetched slab still resident at shutdown
+        // is neither used nor wasted, so it is not in that denominator at all. On the
+        // first serving-path run 433 reads were issued and only 64 were classified,
+        // which makes a bare `accuracy` a survivorship-biased view of a much smaller
+        // effective yield — 21.9% of the classified, 3.2% of the issued. Both are
+        // printed, with the unclassified remainder, so neither can be quoted alone.
+        //
+        // Worth knowing when reading it: `PrefetchTuner` (`COLI_PREFETCH_TUNE`) EWMAs
+        // the same used/wasted pair, so it is steering on the classified slice only.
+        // Whether that biases the tuner is a real question and not answered here.
+        let unclassified = pf.saturating_sub(used + wasted);
+        let yield_pct = if pf > 0 { 100.0 * used as f64 / pf as f64 } else { 0.0 };
+        eprintln!(
+            "[prefetch] used={used} wasted={wasted} unclassified={unclassified} \
+             accuracy={acc:.1}% (of {} classified) yield={yield_pct:.1}% (of {pf} issued) \
+             fadvise={fadv} verify_mismatch={vm}",
+            used + wasted
+        );
+        // How much of the cache speculation is *holding* — the unclassified slabs
+        // above, as bytes. This is the quantity that competes with demand data for
+        // the budget, and no counter reported it before 2026-08-09.
+        if let Some((bytes, slots, budget)) = model.ecache_speculative_resident() {
+            let share = if budget > 0 { 100.0 * bytes as f64 / budget as f64 } else { 0.0 };
+            eprintln!(
+                "[prefetch] resident-unused: {slots} slots, {:.2} GB of {:.2} GB budget ({share:.1}%)",
+                bytes as f64 / 1e9,
+                budget as f64 / 1e9
+            );
+        }
     }
 }
 
@@ -996,6 +1324,7 @@ fn admit_pending(model: &Model, pending: &mut VecDeque<Prefilling>, req: EngineR
         out: req.out,
         max_new: req.max_new,
         hist: Mutex::new(model.new_route_history()),
+        seq_id: NEXT_SEQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
 }
 
@@ -1061,11 +1390,11 @@ fn finish_prefill_chunk(
     prefix: &mut PrefixCache,
 ) {
     let OutputCfg { vocab, stop_ids } = out_cfg;
-    let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist } = p;
+    let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist, seq_id } = p;
     let chunk_len = end - pos;
     if end < prompt.len() {
         // more chunks to go — round-robin with the others
-        pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new, hist });
+        pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new, hist, seq_id });
         return;
     }
     // Prefill complete. Snapshot it before the KV moves into the active set, so
@@ -1090,6 +1419,7 @@ fn finish_prefill_chunk(
     active.push(SeqState {
         seq,
         hist,
+        seq_id,
         pos: prompt.len(),
         next_tok: t0,
         sampler,
@@ -1098,6 +1428,7 @@ fn finish_prefill_chunk(
         max_new,
         // No draft yet: the first verify produces the hidden a draft needs.
         draft: Vec::new(),
+        draft_q: Vec::new(),
         hlast: Vec::new(),
     });
 }
@@ -1187,6 +1518,77 @@ mod tests {
             tok = argmax(&lg[..vocab]) as i32;
         }
         Ok(out)
+    }
+
+    #[test]
+    fn a_retiring_sequence_does_not_renumber_the_streams_behind_it() -> Result<(), Error> {
+        // Until 2026-08-08 the prefetch lane was keyed on a sequence's index in
+        // `active`, which the decode loop compacts with `retain` every tick. When a
+        // middle stream retired, every stream behind it slid down one index and so
+        // changed lane mid-flight, leaving its queued reads split across two
+        // io_uring rings with no ordering between them. Prefetch is
+        // correctness-neutral, so nothing failed — the lane key just stopped
+        // meaning what the design said it meant.
+        let dir = tiny_dir("seqid")?;
+        let model = Model::load(&dir)?;
+        let mut pending: VecDeque<Prefilling> = VecDeque::new();
+        let mut prefix = PrefixCache::new(0);
+        let mut keepalive = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            keepalive.push(rx); // hold the receivers so no send sees a dropped client
+            admit_pending(
+                &model,
+                &mut pending,
+                EngineRequest {
+                    prompt: vec![3i32, 7],
+                    max_new: 4,
+                    sampler: Sampler::new(0.0, 0.9, 1),
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                },
+                &mut prefix,
+            );
+        }
+        let ids: Vec<usize> = pending.iter().map(|p| p.seq_id).collect();
+        assert_eq!(ids.len(), 3, "three admissions");
+        assert!(ids[0] < ids[1] && ids[1] < ids[2], "admission order gives increasing ids, got {ids:?}");
+
+        // Promote them the way `finish_prefill_chunk` does — the point is that the
+        // id set at admission is what reaches `active`, not a fresh one.
+        let mut active: Vec<SeqState> = pending
+            .into_iter()
+            .map(|p| SeqState {
+                seq: p.seq,
+                hist: p.hist,
+                seq_id: p.seq_id,
+                pos: 0,
+                next_tok: 1,
+                sampler: p.sampler,
+                out: p.out,
+                produced: 1,
+                max_new: p.max_new,
+                draft: Vec::new(),
+                draft_q: Vec::new(),
+                hlast: Vec::new(),
+            })
+            .collect();
+        assert_eq!(active.iter().map(|s| s.seq_id).collect::<Vec<_>>(), ids, "promotion preserves the id");
+
+        // The middle stream retires, exactly as the decode loop's `retain` does.
+        let keep = [true, false, true];
+        let mut k = keep.iter();
+        active.retain(|_| *k.next().unwrap_or(&true));
+
+        assert_eq!(active.len(), 2, "one retired");
+        assert_eq!(active[0].seq_id, ids[0], "the leader is untouched");
+        // The survivor *did* slide down an index — that is the compaction the old
+        // scheme keyed on — but its lane key is still the one it was admitted with.
+        assert_eq!(active.iter().position(|s| s.seq_id == ids[2]), Some(1), "it slid to index 1");
+        assert_eq!(active[1].seq_id, ids[2], "…and kept its lane across the retire");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
@@ -1442,6 +1844,58 @@ mod tests {
         Ok(())
     }
 
+    /// The engine must actually publish telemetry, not just own a struct.
+    ///
+    /// `PlanOptimizer::snapshot` and `BubbleTuner::ewma_snapshot` both documented
+    /// themselves as existing "for /metrics" while no such handler and no
+    /// publishing path existed. This asserts the seam end to end: after real
+    /// decode steps, the handle-side snapshot carries this engine's work.
+    #[test]
+    fn engine_publishes_telemetry_for_metrics() -> Result<(), Error> {
+        let dir = tiny_dir("metrics_pub")?;
+        let (handle, join) = spawn_tuned(Model::load_streaming_ecache(&dir, true, 8 << 20)?, 4, false, Some(0))?;
+        // Before any tick, the snapshot is all zeros — the honest answer.
+        assert_eq!(handle.telemetry().steps, 0, "no steps published before the first tick");
+
+        let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+        handle.submit(EngineRequest {
+            prompt: vec![1i32, 5, 9, 2],
+            max_new: 6,
+            sampler: Sampler::new(0.0, 0.9, 1),
+            out: tx,
+            priority: Priority::Normal,
+            class: peregrine_model::TokenClass::Prose,
+        })?;
+        let mut rx = rx;
+        let mut produced = 0usize;
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                EngineOut::Token(_) => produced += 1,
+                EngineOut::Error(e) => return Err(Error::Format(e)),
+            }
+        }
+        let t = handle.telemetry();
+        drop(handle);
+        // The engine thread's join result carries no value and a panic there
+        // would already have failed the test; ignore it explicitly by matching
+        // rather than with `let _ =`, which the audit's [B] section flags.
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+        std::fs::remove_dir_all(&dir)?;
+
+        assert!(produced > 0, "sanity: the request decoded something");
+        assert!(t.steps > 0, "the engine must publish its step count; got {}", t.steps);
+        // Lane timings come from the model, so a non-zero value proves the
+        // publish path reaches `Model`, not just that a counter incremented.
+        assert!(
+            t.lane_last.reduce_us + t.lane_last.io_us + t.lane_last.cpu_us > 0,
+            "published lane timings must be the model's, not a default: {:?}",
+            t.lane_last
+        );
+        Ok(())
+    }
+
     #[test]
     fn speculation_does_not_change_the_served_token_stream() -> Result<(), Error> {
         // **The contract.** Speculation buys wall clock, never different
@@ -1508,23 +1962,99 @@ mod tests {
         Ok(())
     }
 
+    /// The engine half of `COLI_DRAFT_SAMPLED`: a temperature > 0 request must
+    /// actually draft, actually verify, and still serve a complete stream.
+    ///
+    /// Deliberately **not** an equality assertion against unspeculated decode —
+    /// there is no such equality to assert, and writing one would either fail or
+    /// (worse) pass by the drafts never being taken. Rejection sampling draws
+    /// two uniforms per draft where plain decode draws one per token, so the RNG
+    /// stream diverges the moment a draft exists. What must hold is that the
+    /// stream is complete, in-vocabulary, and reproducible from its seed.
     #[test]
-    fn a_sampled_request_never_speculates() -> Result<(), Error> {
+    fn sampled_speculation_serves_a_complete_reproducible_stream() -> Result<(), Error> {
+        let dir = tiny_dir("spec_sampled_engine")?;
+        let prompt = vec![1i32, 5, 9, 2];
+        let n = 8usize;
+
+        let run_engine = |spec: SpecOverride| -> Result<Vec<u32>, Error> {
+            let (handle, join) = spawn_spec(Model::load(&dir)?, 4, false, spec)?;
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: prompt.clone(),
+                max_new: n,
+                // Temperature > 0: the case the default path refuses to draft for.
+                sampler: Sampler::new(0.8, 0.95, 4242),
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            drop(handle);
+            let mut toks = Vec::new();
+            let mut rx = rx;
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Error(e) => return Err(Error::Format(e)),
+                }
+            }
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok(toks)
+        };
+
+        let on = SpecOverride { depth: Some(4), sampled: Some(true) };
+        let got = run_engine(on)?;
+        assert!(!got.is_empty(), "sampled speculation generated nothing");
+        assert!(got.len() <= n, "served {} tokens for max_new {n}", got.len());
+        let vocab = Model::load(&dir)?.cfg.vocab as u32;
+        assert!(got.iter().all(|&t| t < vocab), "a served token is out of vocabulary: {got:?}");
+
+        // Same seed, same knobs, same stream: the accept path must consume the
+        // RNG deterministically, or a seeded request is not reproducible.
+        assert_eq!(run_engine(on)?, got, "sampled speculation is not reproducible from its seed");
+
+        // And the knob is a knob: with it off, the same request takes the
+        // historical one-row path, whose stream differs precisely because the
+        // RNG is consumed differently.
+        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false) })?;
+        assert!(!off.is_empty(), "the unspeculated path generated nothing");
+        assert_ne!(
+            off, got,
+            "sampled speculation must consume the RNG differently from plain decode — \
+             identical streams mean no draft was ever taken and the test proves nothing"
+        );
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_sampled_request_never_speculates_unless_asked_to() -> Result<(), Error> {
         // Accepting on argmax makes speculation *sequence*-identical to greedy
         // decoding. At temperature > 0 it is only distribution-preserving, and
         // quietly changing which tokens a sampled request emits is not a
-        // speedup — it is a different answer. So a sampled request drafts
-        // nothing and takes the historical one-row path, in the same batch as
-        // greedy ones, with no special casing anywhere else.
-        assert_eq!(draft_depth_for(4, true, 0.7, 100), 0, "temperature > 0 must not speculate");
-        assert_eq!(draft_depth_for(4, true, 0.0, 100), 4, "greedy may");
-        assert_eq!(draft_depth_for(4, false, 0.0, 100), 0, "…but not without an MTP head");
-        assert_eq!(draft_depth_for(0, true, 0.0, 100), 0, "…nor with the knob off");
+        // speedup — it is a different answer. So by default a sampled request
+        // drafts nothing and takes the historical one-row path, in the same
+        // batch as greedy ones, with no special casing anywhere else.
+        assert_eq!(draft_depth_for(4, true, 0.7, 100, false), 0, "temperature > 0 must not speculate");
+        assert_eq!(draft_depth_for(4, true, 0.0, 100, false), 4, "greedy may");
+        assert_eq!(draft_depth_for(4, false, 0.0, 100, false), 0, "…but not without an MTP head");
+        assert_eq!(draft_depth_for(0, true, 0.0, 100, false), 0, "…nor with the knob off");
         // Never draft past what the request can still emit: a draft accepted
         // beyond `max_new` is work done to produce a token that is discarded.
-        assert_eq!(draft_depth_for(4, true, 0.0, 3), 2, "budget of 3 leaves room for 2 drafts");
-        assert_eq!(draft_depth_for(4, true, 0.0, 1), 0, "the last token needs no draft");
-        assert_eq!(draft_depth_for(4, true, 0.0, 0), 0);
+        assert_eq!(draft_depth_for(4, true, 0.0, 3, false), 2, "budget of 3 leaves room for 2 drafts");
+        assert_eq!(draft_depth_for(4, true, 0.0, 1, false), 0, "the last token needs no draft");
+        assert_eq!(draft_depth_for(4, true, 0.0, 0, false), 0);
+
+        // `COLI_DRAFT_SAMPLED` opens the temperature > 0 path — and only that
+        // one. Every other reason to refuse still refuses, so the knob cannot
+        // become a way to draft without an MTP head or past the token budget.
+        assert_eq!(draft_depth_for(4, true, 0.7, 100, true), 4, "sampled speculation is opt-in, not impossible");
+        assert_eq!(draft_depth_for(4, false, 0.7, 100, true), 0, "…still needs an MTP head");
+        assert_eq!(draft_depth_for(0, true, 0.7, 100, true), 0, "…still needs COLI_DRAFT");
+        assert_eq!(draft_depth_for(4, true, 0.7, 3, true), 2, "…still respects the budget");
         Ok(())
     }
 

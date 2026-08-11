@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use peregrine_core::{Cfg, Context, Error, QtInfo, SafeTensors};
-use peregrine_io::{Bytes, Reactor, ReadReq, WarmCache};
+use peregrine_io::{Bytes, CacheHit, OwnedReadReq, Reactor, ReadReq, RegionDone, WarmCache};
 
 use crate::gpu::{GpuTier, HeatTable};
 use crate::lane::LaneTimingsAccum;
@@ -58,10 +58,18 @@ pub struct ForwardCtx<'a> {
     /// speculative-draft forwards (so drafts don't pollute the main-stream
     /// prediction) and when prefetch is off.
     pub route_log: Option<&'a Mutex<RouteHistory>>,
-    /// Per-**sequence** routing history for batched decode: `route_log_multi[s]` is
-    /// sequence `s`'s own history (position `s` ↔ sequence `s`), so each concurrent
-    /// stream predicts and prefetches from its *own* routing rather than the weak
-    /// cross-sequence union. `None` on the single-stream path (which uses `route_log`).
+    /// Per-**row** routing history for batched decode: `route_log_multi[r]` receives
+    /// row `r`'s own routed set, so each concurrent stream predicts and prefetches
+    /// from its *own* routing rather than the weak cross-sequence union. `None` on the
+    /// single-stream path (which uses `route_log`).
+    ///
+    /// Indexed by row, **not** by sequence — the two differ whenever a sequence
+    /// contributes more than one row (speculative drafts, a fused prefill chunk), and
+    /// this said "per-sequence" until 2026-08-08 while the write loop below indexed by
+    /// row. Mapping sequences onto rows is the caller's job:
+    /// `peregrine-serve`'s `batch.rs` expands one entry per sequence into `1 + drafts`
+    /// entries, pointing the speculated rows at a scratch history so a rejected draft
+    /// never reaches the predictor. `forward_rows_inner` requires `len() == s_n`.
     pub route_log_multi: Option<&'a [&'a Mutex<RouteHistory>]>,
     /// Stream expert reads via O_DIRECT (bypass the page cache) when the shards
     /// opened O_DIRECT fds. Bytes are identical to the buffered path; only the
@@ -97,6 +105,12 @@ pub struct ForwardCtx<'a> {
     /// hyperedge components grouped into the same io-batch claim window.
     /// Bit-identical — only submission/claim order changes.
     pub affinity: Option<&'a AffinityHints>,
+    /// Load-time `(layer, expert)` → plans/extents map. When present, expert
+    /// lookup is a bounds-checked index instead of re-deriving the tensor
+    /// locations and quantized format per request. `None` falls back to
+    /// [`tplan`], which is what every path did before the index existed —
+    /// same bytes either way.
+    pub expert_index: Option<&'a ExpertIndex>,
 }
 
 /// Per-layer co-activation ordering hints, rebuilt periodically by the model
@@ -190,6 +204,265 @@ struct TPlan {
     gs: usize,
 }
 
+/// One contiguous on-disk span covering several adjacent regions at once.
+#[derive(Clone, Copy)]
+struct Extent {
+    fd: RawFd,
+    /// O_DIRECT twin for `fd`, when every merged region had one.
+    fd_direct: Option<RawFd>,
+    off: u64,
+    len: usize,
+}
+
+/// One routed expert, fully resolved once at load: its three tensor plans — which
+/// carry the on-disk regions *and* the quantized format and group size, the
+/// "type" a request needs — plus the merged extents that let six reads become two.
+///
+/// Measured on the GLM-5.2 container: an expert's three weight regions form one
+/// contiguous run (18,874,368 bytes at int4, 37,748,736 on the int8 MTP layer)
+/// and its three `.qs` scales form another, for all but the ~0.45 % that straddle
+/// a shard boundary. Those keep `None` and read their six regions as before.
+#[derive(Clone, Copy)]
+struct ExpertEntry {
+    /// gate, up, down — in the order the read path expects them, which is **not**
+    /// the order they sit on disk (that is alphabetical: down, gate, up). Every
+    /// split of a merged extent must therefore be computed from each plan's own
+    /// offset, never from position in this array.
+    plans: [TPlan; 3],
+    w_run: Option<Extent>,
+    s_run: Option<Extent>,
+}
+
+/// Merge one expert's three weight (or three scale) regions into a single extent
+/// when they are adjacent on one fd. Returns `None` the moment the run breaks —
+/// a different shard, a gap, or an overlap — so a straddling expert falls back to
+/// the unmerged six regions rather than reading the wrong bytes.
+fn merge_run(plans: &[TPlan; 3], weights: bool) -> Option<Extent> {
+    let part = |t: &TPlan| {
+        if weights {
+            (t.w_fd, t.w_fd_direct, t.w_off, t.w_len)
+        } else {
+            (t.s_fd, t.s_fd_direct, t.s_off, t.s_len)
+        }
+    };
+    let mut r: [(RawFd, Option<RawFd>, u64, usize); 3] = [part(&plans[0]), part(&plans[1]), part(&plans[2])];
+    r.sort_by_key(|&(fd, _, off, _)| (fd, off));
+    let (fd, fd_direct, off, _) = r[0];
+    let mut end = off;
+    for &(f, fd_d, o, l) in r.iter() {
+        // Same shard, exactly abutting, and agreeing about the O_DIRECT twin — a
+        // merged read issues against one fd, so a region whose twin differs
+        // cannot be folded in.
+        if f != fd || o != end || fd_d != fd_direct {
+            return None;
+        }
+        end = o.checked_add(l as u64)?;
+    }
+    Some(Extent { fd, fd_direct, off, len: usize::try_from(end.checked_sub(off)?).ok()? })
+}
+
+/// Whether to coalesce an expert's adjacent regions into one read per run.
+/// `COLI_EXPERT_MERGE=0` reverts to six reads per expert without reverting the
+/// expert map, so the two can be A/B'd against a bit-identity assertion.
+fn expert_merge_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_EXPERT_MERGE").as_deref(), Ok("0")))
+}
+
+/// Load-time map from `(layer, expert)` to its resolved tensor plans.
+///
+/// This replaces re-deriving both on every request. [`tplan`] costs four
+/// `format!` allocations, a [`QtInfo::detect`] (which re-infers the quantized
+/// format from byte counts, group-size probe loop included) and ~7 hash probes,
+/// and was paid per expert, per sparse layer, per forward, at all three call
+/// sites — the demand path, [`prefetch_item`] and [`prefetch_hint_item`].
+///
+/// Dense `Vec` indexed `layer * n_experts + expert` — the same flattening
+/// `heat_counts` already uses — so a lookup is a bounds check rather than a hash.
+/// Entries are `None` for dense layers and for any expert whose tensors do not
+/// resolve; both fall back to the original [`tplan`] path, so an unusual
+/// container behaves exactly as it did before this existed.
+pub struct ExpertIndex {
+    n_experts: usize,
+    entries: Vec<Option<ExpertEntry>>,
+}
+
+impl ExpertIndex {
+    /// Resolve every routed expert once, up front.
+    ///
+    /// Best-effort by design: an expert whose tensors are missing or unquantized
+    /// stores `None` instead of failing the load, because the caller falls back
+    /// to [`tplan`] and would raise the identical error there. Building it here
+    /// must not turn a container that used to run into one that will not load.
+    pub fn build(st: &SafeTensors, cfg: &Cfg) -> ExpertIndex {
+        let n_experts = cfg.n_experts.max(0) as usize;
+        let n_layers = cfg.n_layers.max(0) as usize;
+        let first_dense = cfg.first_dense.clamp(0, cfg.n_layers) as usize;
+        let hidden = cfg.hidden as usize;
+        let mi = cfg.moe_inter as usize;
+        // `n_layers + 1` rows, and the loop is inclusive of `n_layers`: the MTP
+        // head sits at layer index `cfg.n_layers` and carries a full set of
+        // routed experts. On this container those 256 are stored at **int8**
+        // while every other sparse layer is int4, so an exclusive bound would
+        // leave the one layer whose format differs unindexed — exactly the case
+        // the map exists to get right. (`HeatTable` has the off-by-one this
+        // avoids: it is sized `n_layers × n_experts`, so the MTP layer's experts
+        // have never accumulated heat.)
+        let mut entries = vec![None; (n_layers + 1).saturating_mul(n_experts)];
+        for layer in first_dense..=n_layers {
+            for e in 0..n_experts {
+                let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
+                let plans = match (
+                    tplan(st, &p("gate_proj.weight"), mi, hidden),
+                    tplan(st, &p("up_proj.weight"), mi, hidden),
+                    tplan(st, &p("down_proj.weight"), hidden, mi),
+                ) {
+                    (Ok(g), Ok(u), Ok(d)) => [g, u, d],
+                    _ => continue,
+                };
+                entries[layer * n_experts + e] =
+                    Some(ExpertEntry { w_run: merge_run(&plans, true), s_run: merge_run(&plans, false), plans });
+            }
+        }
+        ExpertIndex { n_experts, entries }
+    }
+
+    /// The resolved entry for one expert, or `None` if it was not indexed.
+    fn get(&self, layer: usize, expert: usize) -> Option<&ExpertEntry> {
+        if expert >= self.n_experts {
+            return None;
+        }
+        self.entries.get(layer.checked_mul(self.n_experts)?.checked_add(expert)?)?.as_ref()
+    }
+
+    /// How many experts resolved — the denominator for the index-agreement test.
+    pub fn resolved(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_some()).count()
+    }
+
+    /// How many resolved experts can be read as two extents instead of six
+    /// regions. Reported by the census so the layout claim is checkable.
+    pub fn mergeable(&self) -> usize {
+        self.entries.iter().flatten().filter(|e| e.w_run.is_some() && e.s_run.is_some()).count()
+    }
+
+    /// Bytes one token's routing touches: `topk` experts in every sparse layer,
+    /// each sized from *its own* layer, since a precision-tiered container does
+    /// not have one expert size (this checkpoint stores the MTP layer at int8 and
+    /// the rest at int4).
+    ///
+    /// This is the number that decides which of capacity or policy binds. A
+    /// front-to-back layer sweep has no intra-pass reuse, so a budget below one
+    /// token's working set cannot hold a pass no matter how it evicts, while a
+    /// budget above it makes plain recency work. Measured either side of that
+    /// threshold on this engine, the same `COLI_PREFETCH_PROTECT` mechanism is
+    /// worth +193 hits below it and −381 above — which is why the engine needs to
+    /// know where it sits rather than picking one default for both.
+    pub fn per_token_bytes(&self, cfg: &Cfg) -> u64 {
+        let n_experts = self.n_experts;
+        let topk = cfg.topk.max(0) as u64;
+        let mut total = 0u64;
+        for layer in (cfg.first_dense.max(0) as usize)..=(cfg.n_layers.max(0) as usize) {
+            // One resolved expert stands in for its layer: within a layer every
+            // expert has the same shape and format.
+            let Some(base) = layer.checked_mul(n_experts) else { continue };
+            let Some(e) = self.entries.get(base..base.saturating_add(n_experts)).and_then(|r| r.iter().flatten().next())
+            else {
+                continue;
+            };
+            let per_expert: u64 = e.plans.iter().map(|t| t.w_len as u64 + t.s_len as u64).sum();
+            total = total.saturating_add(per_expert.saturating_mul(topk));
+        }
+        total
+    }
+}
+
+/// Resolve one expert, preferring the load-time index and falling back to
+/// deriving it when the index has no entry.
+fn entry_for(
+    index: Option<&ExpertIndex>,
+    st: &SafeTensors,
+    cfg: &Cfg,
+    layer: usize,
+    expert: usize,
+) -> Result<ExpertEntry, Error> {
+    if let Some(e) = index.and_then(|ix| ix.get(layer, expert)) {
+        return Ok(*e);
+    }
+    let hidden = cfg.hidden as usize;
+    let mi = cfg.moe_inter as usize;
+    let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{expert}.{t}");
+    let plans = [
+        tplan(st, &p("gate_proj.weight"), mi, hidden)?,
+        tplan(st, &p("up_proj.weight"), mi, hidden)?,
+        tplan(st, &p("down_proj.weight"), hidden, mi)?,
+    ];
+    Ok(ExpertEntry { w_run: merge_run(&plans, true), s_run: merge_run(&plans, false), plans })
+}
+
+/// The `(fd, offset, len)` regions to read for one expert, and how many there are.
+///
+/// Two when both runs merged and merging is on, six otherwise. The caller must
+/// pair this with [`pack_slab_from`], which re-splits whatever shape comes back.
+fn expert_regions(e: &ExpertEntry, direct: bool) -> Vec<(RawFd, u64, usize)> {
+    let pick = |fd: RawFd, twin: Option<RawFd>| if direct { twin.unwrap_or(fd) } else { fd };
+    if expert_merge_enabled() {
+        if let (Some(w), Some(s)) = (e.w_run, e.s_run) {
+            // Scales first: they sit at the front of the shard, so this issues in
+            // ascending offset order.
+            return vec![
+                (pick(s.fd, s.fd_direct), s.off, s.len),
+                (pick(w.fd, w.fd_direct), w.off, w.len),
+            ];
+        }
+    }
+    let mut out = Vec::with_capacity(6);
+    for t in e.plans.iter() {
+        out.push((pick(t.w_fd, t.w_fd_direct), t.w_off, t.w_len));
+        out.push((pick(t.s_fd, t.s_fd_direct), t.s_off, t.s_len));
+    }
+    out
+}
+
+/// Rebuild an [`peregrine_io::ExpertSlab`] from whatever [`expert_regions`] asked
+/// for: either the six unmerged regions in order, or two coalesced extents that
+/// get carved into six refcounted windows.
+///
+/// The carve is computed from each plan's **own** offset relative to the extent
+/// base, never from its position in `plans` — on disk the three projections sit
+/// in alphabetical order (down, gate, up), and after an `apply_layout` rewrite
+/// they can sit in any order at all. All three are same-sized int4 blobs, so a
+/// positional split would load gate's bytes into down's matrix and still produce
+/// plausible-looking activations.
+fn pack_slab_from(e: &ExpertEntry, mut got: Vec<Bytes>) -> Result<peregrine_io::ExpertSlab, Error> {
+    if got.len() == 6 {
+        return pack_slab(got);
+    }
+    let (Some(w), Some(s)) = (e.w_run, e.s_run) else {
+        return Err(Error::Format(format!("expert read returned {} regions with no merged extents", got.len())));
+    };
+    if got.len() != 2 {
+        return Err(Error::Format(format!("expert read returned wrong region count: {} (want 2 or 6)", got.len())));
+    }
+    let w_arc = got.pop().ok_or_else(|| Error::Format("merged weight extent missing".into()))?.into_arc();
+    let s_arc = got.pop().ok_or_else(|| Error::Format("merged scale extent missing".into()))?.into_arc();
+    let carve = |arc: &std::sync::Arc<[u8]>, base: u64, off: u64, len: usize, what: &str| {
+        let head = off
+            .checked_sub(base)
+            .and_then(|h| usize::try_from(h).ok())
+            .ok_or_else(|| Error::Format(format!("{what} region lies before its extent")))?;
+        Bytes::view(arc, head, len)
+            .ok_or_else(|| Error::Format(format!("{what} region [{head}, {head}+{len}) escapes its extent")))
+    };
+    let mut regions: Vec<Bytes> = Vec::with_capacity(6);
+    for t in e.plans.iter() {
+        regions.push(carve(&w_arc, w.off, t.w_off, t.w_len, "weight")?);
+        regions.push(carve(&s_arc, s.off, t.s_off, t.s_len, "scale")?);
+    }
+    pack_slab(regions)
+}
+
 /// One expert's streaming+compute plan: which rows route to it (+ gate weights),
 /// where its gate/up/down tensors live on disk, and its batch-union position
 /// (`pos`) for the deterministic ordered reduce (GPU-resident experts take the
@@ -199,9 +472,8 @@ struct EPlan {
     expert: usize,
     rows: Vec<usize>,
     rw: Vec<f32>,
-    gate: TPlan,
-    up: TPlan,
-    down: TPlan,
+    /// Where this expert's bytes are and what format they are, resolved once.
+    entry: ExpertEntry,
 }
 
 /// One GPU-resident expert's plan: its position, routed rows/weights, expert id,
@@ -212,6 +484,35 @@ struct GPlan {
     rows: Vec<usize>,
     rw: Vec<f32>,
     xg: Vec<f32>,
+}
+
+/// Fuse the layer-level gate-weighted accumulation for GPU-resident experts
+/// onto the device (`COLI_CUDA_FUSED_REDUCE`). Default **off**.
+///
+/// `expert_group` already fuses gate/up/silu/down, but returns `Σrows × hidden`
+/// floats for the host to accumulate. Reducing on the device sends `s_n × hidden`
+/// instead — at a saturated batch that is the expert-per-row factor, ~5× on the
+/// measured GLM-5.2 unions at B=16, and exactly 1× at B=1.
+///
+/// **Opt-in because it moves the GPU arm's low bits**, not because it is
+/// unfinished. GPU experts accumulate among themselves before meeting the CPU
+/// lane's contributions rather than interleaving with them in `pos` order, and
+/// `f32 +=` is not associative. It stays *stable* — the device reduce is CSR-
+/// ordered with no atomics — so a given configuration reproduces itself; it
+/// simply is not the same sum the host reduce computes. Every bit-identity
+/// anchor in the suite holds with the knob unset.
+fn fused_reduce_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("COLI_CUDA_FUSED_REDUCE").ok().as_deref(), Some("1") | Some("true")))
+}
+
+/// What a lane hands the collector.
+enum LaneMsg {
+    /// One expert's output, keyed by its batch-union position.
+    Slot(usize, EOut),
+    /// The GPU lane's device-reduced `[s_n, hidden]` partial, covering every
+    /// GPU-resident expert of this layer at once. At most one per forward.
+    GpuPartial(Vec<f32>),
 }
 
 /// A computed expert result, tagged with its batch-union position for the
@@ -226,6 +527,27 @@ fn tplan(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<TPlan, Erro
     let info = QtInfo::detect(st, name, o as i64, i as i64);
     let fmt = QuantFmt::from_qt(info.fmt)
         .ok_or_else(|| Error::Format(format!("{name}: unquantized (F32) has no compute path")))?;
+    // Refuse any tensor whose on-disk bytes are not the bytes the kernel expects.
+    // `tplan` is the single funnel for *streamed* expert regions, and the
+    // streaming path reads raw extents — only `SafeTensors::read_raw` un-permutes
+    // a `kblock` tiling or inflates zstd. A `kblock` expert therefore used to be
+    // handed to the kernel permuted, with no conversion and no error: wrong
+    // numbers that still look like plausible activations. Resident loading is
+    // unaffected (it goes through `read_raw`), and `has_compressed_tensors`
+    // already forces a compressed container resident, so this is a guard against
+    // the combination reaching the streaming lane rather than a new restriction.
+    if let Some((kind, gs)) = st.find(name).and_then(|t| t.layout.as_ref()) {
+        return Err(Error::Format(format!(
+            "{name}: on-disk layout '{kind}' (group {gs}) cannot be streamed — the streaming lane \
+             reads raw extents and would not un-permute it; load this container resident instead"
+        )));
+    }
+    if st.compression(name) != peregrine_core::Compression::None {
+        return Err(Error::Format(format!(
+            "{name}: compressed tensors cannot be streamed — the streaming lane reads raw extents; \
+             load this container resident instead"
+        )));
+    }
     let (w_fd, w_off, w_len) = st.region(name).ok_or_else(|| Error::Format(format!("missing tensor {name}")))?;
     let sname = format!("{name}.qs");
     let (s_fd, s_off, s_len) = st.region(&sname).ok_or_else(|| Error::Format(format!("missing tensor {sname}")))?;
@@ -252,13 +574,37 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
             .read_direct_aligned(regions)
             .ctx(|| "io_uring O_DIRECT zero-copy expert read".to_string());
     }
+    // The `regbuf` engine is exempt from splitting: its fixed buffers are sized
+    // per-slot from the largest request, and it exists as a measurement option —
+    // changing its request shape would change what it measures.
+    let split = match io_engine() {
+        IoEngine::RegBuf => 0,
+        _ => io_split_bytes(),
+    };
     let mut bufs: Vec<Vec<u8>> = regions.iter().map(|&(_, _, len)| vec![0u8; len]).collect();
     {
-        let mut reqs: Vec<ReadReq> = bufs
-            .iter_mut()
-            .zip(regions)
-            .map(|(b, &(fd, off, _))| ReadReq { fd, offset: off, buf: b.as_mut_slice(), tag: 0 })
-            .collect();
+        // One request per region, or several sub-requests over disjoint
+        // `split_at_mut` slices of the region's landing buffer when splitting
+        // is on (`COLI_IO_SPLIT_MB`). `meta` maps each request back to
+        // (region index, offset within region, length) for the short-read
+        // completion, which must resolve file offsets per sub-request.
+        let mut reqs: Vec<ReadReq> = Vec::with_capacity(regions.len());
+        let mut meta: Vec<(usize, usize, usize)> = Vec::with_capacity(regions.len());
+        for (i, (buf, &(fd, off, _))) in bufs.iter_mut().zip(regions).enumerate() {
+            let mut sub = 0usize;
+            let mut rest: &mut [u8] = buf.as_mut_slice();
+            loop {
+                let take = if split > 0 && rest.len() > split { split } else { rest.len() };
+                let (head, tail) = rest.split_at_mut(take);
+                reqs.push(ReadReq { fd, offset: off + sub as u64, buf: head, tag: 0 });
+                meta.push((i, sub, take));
+                sub += take;
+                rest = tail;
+                if rest.is_empty() {
+                    break;
+                }
+            }
+        }
         // Same request set either way, so the two engines are directly
         // comparable and produce byte-identical results — only the syscall shape
         // differs. The short-read completion below is shared, because a
@@ -289,14 +635,15 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
             }
             IoEngine::Uring => r.read_many(&mut reqs).ctx(|| "io_uring batched expert read".to_string())?,
         };
-        for (i, &n) in res.iter().enumerate() {
+        for (j, &n) in res.iter().enumerate() {
             if n < 0 {
                 return Err(Error::Io(std::io::Error::from_raw_os_error((-n) as i32)));
             }
+            let (i, sub, len) = meta[j];
             let done = n as usize;
-            if done < bufs[i].len() {
+            if done < len {
                 let (fd, off, _) = regions[i];
-                r.read_exact(fd, off + done as u64, &mut bufs[i][done..])
+                r.read_exact(fd, off + (sub + done) as u64, &mut bufs[i][sub + done..sub + len])
                     .ctx(|| "io_uring short-read completion".to_string())?;
             }
         }
@@ -385,6 +732,28 @@ fn pread_threads() -> usize {
     })
 }
 
+/// Split threshold for large streamed reads (`COLI_IO_SPLIT_MB`, MiB; 0 = off,
+/// the default). Regions larger than this are submitted as several sub-reads
+/// into disjoint slices of the same landing buffer.
+///
+/// Why: a decode claim is 2 merged experts ≈ 4 in-flight reads per ring, while
+/// `iobench` reaches the device's 1.12 GB/s at 8-deep — the submit depth, not
+/// the claim size, is the suspect for the lane's 0.80 GB/s. Splitting a ~9.5 MB
+/// merged region into 4 MiB pieces takes a ring's depth to ~10 without touching
+/// claim sizing, and on LUKS each in-flight read is also an independent
+/// dm-crypt decryption unit. Byte-identical trivially: the same bytes land at
+/// the same offsets of the same buffer, in however many pieces.
+fn io_split_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_IO_SPLIT_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n << 20)
+            .unwrap_or(0)
+    })
+}
+
 /// Pack six in-order region [`Bytes`] into an [`ExpertSlab`] (gate/up/down ×
 /// weight+scale). Errors (rather than panics) if the reader returned the wrong
 /// count — keeps the no-unwrap gate satisfied.
@@ -401,19 +770,9 @@ fn pack_slab(six: Vec<Bytes>) -> Result<peregrine_io::ExpertSlab, Error> {
 /// a **single batched submit**. Zero-copy on the O_DIRECT lane (see [`read_regions`]);
 /// byte-identical to six `read_exact`s either way, so the streamed output stays
 /// bit-identical to the resident path.
-fn read_expert(r: &mut Reactor, gate: &TPlan, up: &TPlan, down: &TPlan, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
-    // pick the weight/scale fd for a tensor: O_DIRECT twin when `direct`, else buffered.
-    let wfd = |t: &TPlan| if direct { t.w_fd_direct.unwrap_or(t.w_fd) } else { t.w_fd };
-    let sfd = |t: &TPlan| if direct { t.s_fd_direct.unwrap_or(t.s_fd) } else { t.s_fd };
-    let regions = [
-        (wfd(gate), gate.w_off, gate.w_len),
-        (sfd(gate), gate.s_off, gate.s_len),
-        (wfd(up), up.w_off, up.w_len),
-        (sfd(up), up.s_off, up.s_len),
-        (wfd(down), down.w_off, down.w_len),
-        (sfd(down), down.s_off, down.s_len),
-    ];
-    pack_slab(read_regions(r, &regions, direct)?)
+fn read_expert(r: &mut Reactor, e: &ExpertEntry, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
+    let regions = expert_regions(e, direct);
+    pack_slab_from(e, read_regions(r, &regions, direct)?)
 }
 
 /// How many experts' reads to submit to the ring at once. 6 regions/expert, so
@@ -473,17 +832,15 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
     // one (fd, offset, len) per region, in gate/up/down × (weight, scale) order. In
     // direct mode use the O_DIRECT twin fd (falling back per-region if a twin is
     // somehow missing); the reader applies the block alignment.
+    // Two regions per expert when its runs coalesced, six when they did not, so
+    // the flat list is no longer uniformly `6 * n` — `counts` records how many
+    // each expert contributed so the results can be re-split.
     let mut regions: Vec<(RawFd, u64, usize)> = Vec::with_capacity(6 * n);
+    let mut counts: Vec<usize> = Vec::with_capacity(n);
     for p in plans {
-        for t in [&p.gate, &p.up, &p.down] {
-            let (wfd, sfd) = if direct {
-                (t.w_fd_direct.unwrap_or(t.w_fd), t.s_fd_direct.unwrap_or(t.s_fd))
-            } else {
-                (t.w_fd, t.s_fd)
-            };
-            regions.push((wfd, t.w_off, t.w_len));
-            regions.push((sfd, t.s_off, t.s_len));
-        }
+        let r = expert_regions(&p.entry, direct);
+        counts.push(r.len());
+        regions.extend_from_slice(&r);
     }
     // Buffered path: hint the kernel to start readahead on every region before the
     // batched read. The advice fires from the same ring in one submit, so it costs
@@ -512,9 +869,9 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
     };
     let mut bytes = bytes.into_iter();
     let mut slabs: Vec<peregrine_io::ExpertSlab> = Vec::with_capacity(n);
-    for _ in 0..n {
-        let six: Vec<Bytes> = bytes.by_ref().take(6).collect();
-        slabs.push(pack_slab(six)?);
+    for (p, &k) in plans.iter().zip(counts.iter()) {
+        let got: Vec<Bytes> = bytes.by_ref().take(k).collect();
+        slabs.push(pack_slab_from(&p.entry, got)?);
     }
     // Optional page-cache release for long-running RSS-bounded workloads. Only
     // useful when the warm cache is off / cold — a hit would otherwise re-read the
@@ -566,6 +923,168 @@ fn read_regions_with_retry(r: &mut Reactor, regions: &[(RawFd, u64, usize)]) -> 
     Ok(out)
 }
 
+/// Whether the I/O lane forwards each expert as its own regions complete (the
+/// owned-completion lane) instead of waiting for the whole claim's wave.
+/// Default on; `COLI_IO_COMPLETION=0` restores the wave path byte-for-byte.
+/// `COLI_IO_ENGINE=pread|regbuf` also implies the wave path — those engines are
+/// wave-shaped measurement arms, and reshaping their requests would change what
+/// they measure.
+fn completion_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COLI_IO_COMPLETION").as_deref(), Ok("0") | Ok("false")))
+}
+
+/// Stream a claim of experts through the owned-completion lane: submit every
+/// region with Reactor-owned buffers, reap completions incrementally, and hand
+/// each expert to `forward` the moment its last region lands — no whole-claim
+/// barrier, so the CPU pool starts on expert 1 while experts 2..N are still on
+/// the wire. Bytes are byte-identical to [`read_experts_batched`]: same
+/// regions, same offsets, same [`pack_slab_from`] carve; only delivery timing
+/// differs, which the `pos`-keyed reduce is built to absorb.
+///
+/// `forward(k, slab)` receives the index into `plans` and the packed slab; it
+/// returns `false` when the consumer is gone, which stops the stream. Returns
+/// `Ok(false)` in that case, `Ok(true)` when every expert was forwarded. On
+/// any early exit the lane is quiesced before returning, so the ring is clean
+/// for the next claim.
+///
+/// On a read error with `COLI_IO_RECOVERY` on (buffered only), the experts not
+/// yet forwarded are re-read individually with the retry ladder; the ones
+/// already forwarded keep their delivered bytes.
+fn stream_experts_completion(
+    r: &mut Reactor,
+    plans: &[&EPlan],
+    direct: bool,
+    mut forward: impl FnMut(usize, peregrine_io::ExpertSlab) -> bool,
+) -> Result<bool, Error> {
+    let n = plans.len();
+    if n == 0 {
+        return Ok(true);
+    }
+    // One owned request per region; `tag` packs (expert k, region slot j) so a
+    // completion routes back without a lookup table. Region counts differ per
+    // expert (2 coalesced, 6 not) — `remaining` tracks each expert's countdown.
+    let mut reqs: Vec<OwnedReadReq> = Vec::with_capacity(6 * n);
+    let mut parts: Vec<Vec<Option<Bytes>>> = Vec::with_capacity(n);
+    let mut remaining: Vec<usize> = Vec::with_capacity(n);
+    let mut all_regions: Vec<(RawFd, u64, usize)> = Vec::with_capacity(6 * n);
+    for (k, p) in plans.iter().enumerate() {
+        let regs = expert_regions(&p.entry, direct);
+        remaining.push(regs.len());
+        parts.push((0..regs.len()).map(|_| None).collect());
+        for (j, &(fd, off, len)) in regs.iter().enumerate() {
+            reqs.push(OwnedReadReq { fd, offset: off, len, tag: ((k as u64) << 32) | j as u64 });
+        }
+        all_regions.extend_from_slice(&regs);
+    }
+    let mut forwarded = vec![false; n];
+    let outcome: Result<bool, Error> = (|| {
+        r.submit_owned(reqs, direct).ctx(|| "owned-completion expert submit".to_string())?;
+        let mut done_buf: Vec<RegionDone> = Vec::new();
+        while r.pending_owned() > 0 {
+            r.reap_some(&mut done_buf).ctx(|| "owned-completion expert reap".to_string())?;
+            for d in done_buf.drain(..) {
+                let k = (d.tag >> 32) as usize;
+                let j = (d.tag & 0xffff_ffff) as usize;
+                let slot = parts
+                    .get_mut(k)
+                    .and_then(|p| p.get_mut(j))
+                    .ok_or_else(|| Error::Format(format!("owned completion for unknown region {k}/{j}")))?;
+                if slot.is_some() {
+                    return Err(Error::Format(format!("duplicate owned completion for region {k}/{j}")));
+                }
+                *slot = Some(d.bytes);
+                let rem = remaining
+                    .get_mut(k)
+                    .ok_or_else(|| Error::Format(format!("owned completion for unknown expert {k}")))?;
+                *rem -= 1; // safe: the duplicate guard above means each region decrements once
+                if *rem == 0 {
+                    let got: Option<Vec<Bytes>> = parts[k].iter_mut().map(|o| o.take()).collect();
+                    let got =
+                        got.ok_or_else(|| Error::Format(format!("expert {k} completed with a region missing")))?;
+                    let slab = pack_slab_from(&plans[k].entry, got)?;
+                    forwarded[k] = true;
+                    if !forward(k, slab) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    })();
+    // Whatever happened, leave the lane empty: owned reads left in flight would
+    // poison the next claim on this ring (and, at drop, dangle their buffers).
+    if r.pending_owned() > 0 {
+        let mut scratch: Vec<RegionDone> = Vec::new();
+        if let Err(e) = r.quiesce_owned(&mut scratch) {
+            peregrine_io::note_advisory_err("owned-lane quiesce after early exit", &e);
+        }
+    }
+    match outcome {
+        Ok(true) => {
+            // Optional page-cache release for long-running RSS-bounded loads —
+            // advisory, riding spare ring slots (see `fadvise_drop_enabled`).
+            if !direct && fadvise_drop_enabled() {
+                r.queue_dontneed(&all_regions);
+            }
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(e) if io_recovery_enabled() && !direct => {
+            // Retry ladder, scoped to the experts that never made it out: the
+            // accounting knows exactly which those are, so a transient failure
+            // does not force re-reading (or re-forwarding) the delivered ones.
+            eprintln!("[io-recovery] completion-lane read failed ({e}); retrying unfinished experts individually");
+            for (k, p) in plans.iter().enumerate() {
+                if forwarded[k] {
+                    continue;
+                }
+                let regs = expert_regions(&p.entry, false);
+                let bytes = read_regions_with_retry(r, &regs)?;
+                let slab = pack_slab_from(&p.entry, bytes)?;
+                forwarded[k] = true;
+                if !forward(k, slab) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-stream one expert with the blocking oracle reader ([`pread_many`]),
+/// looping out short reads. Only for the corruption-recovery path on a CPU
+/// worker (which owns no ring): a warm-cache slot failed to decode, the slot
+/// has been dropped, and these bytes replace it straight from disk. Rare by
+/// construction — non-zero traffic here means real bit rot (see
+/// `WarmCache::decode_failures`).
+fn restream_expert_blocking(e: &ExpertEntry) -> Result<peregrine_io::ExpertSlab, Error> {
+    let regions = expert_regions(e, false);
+    let mut bufs: Vec<Vec<u8>> = regions.iter().map(|&(_, _, len)| vec![0u8; len]).collect();
+    for (buf, &(fd, off, len)) in bufs.iter_mut().zip(regions.iter()) {
+        let mut done = 0usize;
+        while done < len {
+            let n = {
+                let mut req =
+                    [ReadReq { fd, offset: off + done as u64, buf: &mut buf[done..], tag: 0 }];
+                peregrine_io::pread_many(&mut req).first().copied().unwrap_or(-5)
+            };
+            if n < 0 {
+                return Err(Error::Io(std::io::Error::from_raw_os_error((-n) as i32)));
+            }
+            if n == 0 {
+                return Err(Error::Format(format!(
+                    "corrupt-slot re-stream hit EOF at {done} of {len} bytes @ off={off}"
+                )));
+            }
+            done += n as usize;
+        }
+    }
+    pack_slab_from(e, bufs.into_iter().map(Bytes::from).collect())
+}
+
 fn rebuild(t: &TPlan, wb: Bytes, sb: Bytes) -> QtWeight {
     // scale bytes → f32 (a copy inherent to the reinterpret; scales are tiny). The
     // weight bytes `wb` move into the QtWeight with no copy — zero-copy end to end
@@ -584,6 +1103,100 @@ fn rebuild(t: &TPlan, wb: Bytes, sb: Bytes) -> QtWeight {
 /// faster). With a GPU tier, GPU-resident experts compute in f32 on the device
 /// concurrently — those experts' values differ from the CPU int4 path (higher
 /// precision), documented in [`crate::gpu`].
+/// A pluggable MoE expert-dispatch implementation.
+///
+/// **Exists because `peregrine-sched` cannot be called directly.** That crate
+/// depends on `peregrine-model` (`peregrine-sched/Cargo.toml`), so a
+/// `peregrine-model → peregrine-sched` dependency is a cycle and Cargo rejects
+/// it for normal dependencies. The dependency has to be inverted: this crate
+/// declares the shape, `peregrine-sched` implements it, and a *binary* — which
+/// may depend on both — installs the implementation.
+///
+/// Selecting an alternative engine is an operator decision with real cost
+/// (`peregrine-sched`'s `moe_streamed` is the two-lane ancestor: no GPU lane, no
+/// warm cache, no prefetch), which is why nothing installs one by default.
+pub trait MoeEngine: Send + Sync {
+    /// Same contract as [`moe_forward_concurrent`]: `[s_n, hidden]` output for
+    /// this layer's routed experts plus the shared expert.
+    fn moe_forward(&self, ctx: &ForwardCtx, call: MoeCall) -> Result<Vec<f32>, Error>;
+
+    /// Short name for reporting, e.g. `"sched"`. Read by [`moe_engine_name`] so
+    /// `/metrics` can say which implementation is *dispatching* rather than
+    /// which one the environment asked for — the two diverge whenever an
+    /// install fails, which is exactly when an operator needs to be told.
+    fn name(&self) -> &'static str;
+}
+
+/// One layer's MoE inputs, bundled.
+///
+/// `moe_forward_concurrent` already sits at clippy's seven-argument limit, and a
+/// trait method's `&self` puts it one over — so this exists partly for that. It
+/// is the better shape regardless: five of the six travel together everywhere
+/// and an engine implementation reads them by name instead of by position.
+pub struct MoeCall<'a> {
+    pub layer: usize,
+    pub x: &'a [f32],
+    pub router_w: &'a [f32],
+    pub router_bias: &'a [f32],
+    pub shared: Option<&'a Mlp>,
+    pub s_n: usize,
+}
+
+static MOE_ENGINE: std::sync::OnceLock<Box<dyn MoeEngine>> = std::sync::OnceLock::new();
+
+/// Install the process-wide MoE engine. First call wins; later calls are
+/// rejected (returning `false`) rather than silently swapping the dispatch path
+/// out from under a forward already in flight.
+///
+/// Called by the binaries when `COLI_MOE_ENGINE` selects a non-default engine.
+pub fn install_moe_engine(engine: Box<dyn MoeEngine>) -> bool {
+    MOE_ENGINE.set(engine).is_ok()
+}
+
+/// Whether an alternative engine is installed.
+///
+/// The binaries call this **after** their install attempt, because
+/// [`install_moe_engine`] returning `true` and the dispatch path actually
+/// changing are different facts: the `OnceLock` is process-global and first-call-
+/// wins, so a second installer (a test harness, a library embedding the engine)
+/// silently loses. Reporting the env var instead would print "engine = sched"
+/// for a process dispatching through [`moe_forward_concurrent`].
+pub fn moe_engine_installed() -> bool {
+    MOE_ENGINE.get().is_some()
+}
+
+/// The name of the engine [`moe_forward_dispatch`] will actually route through:
+/// the installed engine's own [`MoeEngine::name`], or `"concurrent"` for the
+/// built-in three-lane path. Reported on `GET /metrics`.
+pub fn moe_engine_name() -> &'static str {
+    match MOE_ENGINE.get() {
+        Some(engine) => engine.name(),
+        None => "concurrent",
+    }
+}
+
+/// The MoE dispatch entry point every forward goes through.
+///
+/// Routes to an installed [`MoeEngine`] when one exists, else to the default
+/// three-lane [`moe_forward_concurrent`]. With nothing installed this is one
+/// `OnceLock` load per sparse layer and the path is unchanged.
+pub fn moe_forward_dispatch(
+    ctx: &ForwardCtx,
+    layer: usize,
+    x: &[f32],
+    router_w: &[f32],
+    router_bias: &[f32],
+    shared: Option<&Mlp>,
+    s_n: usize,
+) -> Result<Vec<f32>, Error> {
+    match MOE_ENGINE.get() {
+        Some(engine) => {
+            engine.moe_forward(ctx, MoeCall { layer, x, router_w, router_bias, shared, s_n })
+        }
+        None => moe_forward_concurrent(ctx, layer, x, router_w, router_bias, shared, s_n),
+    }
+}
+
 pub fn moe_forward_concurrent(
     ctx: &ForwardCtx,
     layer: usize,
@@ -598,13 +1211,20 @@ pub fn moe_forward_concurrent(
     let workers = ctx.workers;
     let cfg = ctx.cfg;
     let ecache = ctx.ecache; // Copy `Option<&Mutex<WarmCache>>`; captured only by the I/O lane
+    // Lock-free residency filter, fetched once per layer call (one brief lock),
+    // so each ring can answer "definitely absent → stream it" without queueing
+    // on the cache mutex behind every other ring's probe and insert.
+    let cache_hint = ecache.map(|c| c.lock().hint());
+    let cache_hint = &cache_hint;
     let use_direct = ctx.direct; // O_DIRECT streaming (page-cache-bypassing); Copy bool
     let reactors = ctx.reactors;
     if reactors.is_empty() {
         return Err(Error::Format("streaming mode without io_uring reactors".into()));
     }
     let hidden = cfg.hidden as usize;
-    let (e_n, mi, k) = (cfg.n_experts as usize, cfg.moe_inter as usize, cfg.topk as usize);
+    // `moe_inter` is no longer read here: the expert map (or `plans_for`'s
+    // fallback) owns the tensor shapes now.
+    let (e_n, k) = (cfg.n_experts as usize, cfg.topk as usize);
     let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale, min_share: crate::router::route_min_share() });
 
     // Partition the batch-union into GPU-resident (compute on device) and disk
@@ -678,29 +1298,37 @@ pub fn moe_forward_concurrent(
             }
             gplans.push(GPlan { pos: this_pos, e, rows, rw, xg });
         } else {
-            let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
-            plans.push(EPlan {
-                pos: this_pos,
-                expert: e,
-                rows,
-                rw,
-                gate: tplan(st, &p("gate_proj.weight"), mi, hidden)?,
-                up: tplan(st, &p("up_proj.weight"), mi, hidden)?,
-                down: tplan(st, &p("down_proj.weight"), hidden, mi)?,
-            });
+            let entry = entry_for(ctx.expert_index, st, cfg, layer, e)?;
+            plans.push(EPlan { pos: this_pos, expert: e, rows, rw, entry });
         }
     }
     let n = pos;
 
-    // Apply the layout schedule: reorder the streamed `EPlan`s by the schedule's
-    // rank of each expert. This changes only the io_uring submit order — the
-    // deterministic reduce uses `pos` (batch-union index) as its scatter key, so
-    // outputs stay bit-identical. Experts not in the schedule keep their
-    // original ordering, appended at the end. No-op when there is no schedule.
-    if let Some(sched) = ctx.layout_schedule {
+    // Order the streamed `EPlan`s so the batched submit issues ascending-offset
+    // reads. This changes only the io_uring submit order — the deterministic
+    // reduce uses `pos` (batch-union index) as its scatter key, so outputs stay
+    // bit-identical either way.
+    //
+    // Sort on the **real** `(fd, offset)` when the expert map has resolved them.
+    // `schedule.json`'s rank is a routing-community order that only coincides with
+    // disk order after a `peregrine-layout-reorg --apply` rewrite — and that tool
+    // is single-shard only, so it cannot run on a sharded container at all. This
+    // sort claimed to issue "contiguous-offset reads first" while sorting by
+    // community until 2026-08-09; on the GLM-5.2 checkpoint, whose tensors sit in
+    // lexicographic name order (expert 14 between 139 and 140), the two orders are
+    // unrelated. The schedule stays as the fallback for the case where no map was
+    // built, which is the only case where its proxy is the best available signal.
+    if ctx.expert_index.is_some() {
+        plans.sort_by_key(|p| {
+            let t = &p.entry.plans[0];
+            (p.entry.w_run.map_or(t.w_fd, |r| r.fd), p.entry.w_run.map_or(t.w_off, |r| r.off))
+        });
+    } else if let Some(sched) = ctx.layout_schedule {
         if let Some(row) = sched.get(layer) {
             let rank: std::collections::HashMap<u32, usize> =
                 row.iter().enumerate().map(|(i, &e)| (e, i)).collect();
+            // Experts absent from the schedule keep their original relative order,
+            // appended at the end.
             plans.sort_by_key(|p| rank.get(&(p.expert as u32)).copied().unwrap_or(usize::MAX));
         }
     }
@@ -711,13 +1339,30 @@ pub fn moe_forward_concurrent(
         apply_affinity_order(&mut plans, layer, aff);
     }
 
-    // job: (disk-plan index, streamed gate/up/down bytes) from I/O lane → CPU pool.
-    // `Bytes` regions so an O_DIRECT read can hand its aligned DMA buffer over the
-    // channel with no copy (== peregrine_io::ExpertSlab).
+    // job: work for one CPU worker, keyed by disk-plan index. `Bytes` regions so
+    // an O_DIRECT read can hand its aligned DMA buffer over the channel with no
+    // copy (`Bytes3` == peregrine_io::ExpertSlab).
     type Bytes3 = [(Bytes, Bytes); 3];
-    let (job_tx, job_rx) = crossbeam_channel::bounded::<(usize, Bytes3)>(workers.max(1) * 2);
-    // result: (pos, computed expert) from any lane → main reducer
-    let (res_tx, res_rx) = crossbeam_channel::bounded::<Result<(usize, EOut), Error>>(workers.max(1) * 2);
+    enum Job {
+        /// Freshly streamed from disk: compute, and admit to the warm cache on
+        /// the worker — the zstd encode runs here, not on the I/O lane.
+        Stream(usize, Bytes3),
+        /// Warm hit, raw slot: compute only.
+        CacheRaw(usize, Bytes3),
+        /// Warm hit, compressed slot: the refcounted frames decode on the
+        /// worker — the decode used to run on the I/O lane *inside* the cache
+        /// lock, serializing every lane behind one zstd pass.
+        CacheZ(usize, std::sync::Arc<peregrine_io::CompressedSlab>),
+    }
+    let (job_tx, job_rx) = crossbeam_channel::bounded::<Job>(workers.max(1) * 2);
+    // result: one computed expert keyed by `pos`, or — under
+    // `COLI_CUDA_FUSED_REDUCE` — the GPU lane's single pre-accumulated
+    // `[s_n, hidden]` partial standing in for all of its experts at once.
+    let (res_tx, res_rx) = crossbeam_channel::bounded::<Result<LaneMsg, Error>>(workers.max(1) * 2);
+    // Whether the GPU lane reduces on the device. Resolved once here rather than
+    // per lane so the collector's expected message count and the lane's
+    // behaviour cannot disagree.
+    let fused_reduce = gpu.is_some() && !gplans.is_empty() && fused_reduce_enabled();
 
     let completed = AtomicUsize::new(0);
     // Shared cursor the I/O rings atomically claim expert-batches from (lock-free
@@ -738,8 +1383,23 @@ pub fn moe_forward_concurrent(
     // default) admits everything.
     let heat_ref = ctx.heat;
     let admit_min_heat = cache_admit_min_heat();
+    // Completion lane vs wave, resolved once: pread/regbuf are wave-shaped
+    // measurement arms whose request shape *is* what they measure, so only the
+    // uring engine streams per-expert. `COLI_IO_COMPLETION=0` is the escape
+    // hatch back to the wave on uring too.
+    let completion = completion_enabled() && matches!(io_engine(), IoEngine::Uring);
+    // Fixed at cache construction; read once here so workers can run the zstd
+    // encode (`WarmCache::prepare_insert`) without touching the cache lock.
+    let cache_compress = ecache.map(|c| c.lock().compress_on_admit()).unwrap_or(false);
 
-    let results: Result<Vec<Option<EOut>>, Error> = std::thread::scope(|scope| {
+    // `(per-expert slots, the GPU lane's device-reduced partial)`. The partial is
+    // `None` unless `COLI_CUDA_FUSED_REDUCE` is on and the layer had GPU experts.
+    type LaneResults = (Vec<Option<EOut>>, Option<Vec<f32>>);
+    // Wall clock of the 3-lane region. Every other lane counter is summed over
+    // *threads*, which cannot distinguish a saturated lane from an idle one; this
+    // is the denominator that makes them duty cycles.
+    let t_lane = std::time::Instant::now();
+    let results: Result<LaneResults, Error> = std::thread::scope(|scope| {
         // ---- I/O lanes: N io_uring rings in PARALLEL, lock-free (atomic) work-stealing ----
         // One thread per ring. Each atomically claims a batch of experts off `io_work`,
         // serves warm-tier hits immediately, and streams the misses through *its own*
@@ -747,12 +1407,29 @@ pub fn moe_forward_concurrent(
         // dm-crypt decryption on encrypted volumes). The `pos`-ordered reduce is
         // order-independent, so which ring reads which expert never changes the output.
         let n_plans = plans_ref.len();
+        // Claim size, sized so **every ring gets work**.
+        //
+        // `experts_per_batch()` (`COLI_IO_BATCH`, default 16) is a submit-depth
+        // ceiling chosen for prefill, where a chunk's routed union is ~69 experts
+        // per layer. A *decode* token routes 8. With a fixed batch of 16, ring 0's
+        // `fetch_add(16)` returns start 0 and claims all 8; rings 1..N get starts
+        // 16/32/48, every one `>= n_plans`, and break without issuing a single
+        // read. One ring then does the work of four — measured at **24% io duty
+        // across 4 rings**, and ~0.6 GB/s where the same device gives 1.12 GB/s at
+        // 4 rings under `iobench`.
+        //
+        // Ceil-divide instead, keeping the configured value as an upper bound:
+        // decode gets ceil(8/4) = 2 and all four rings run; prefill gets
+        // ceil(69/4) = 18, clamped back to 16, so its deep submits are unchanged.
+        // Measured on GLM-5.2: decode 21.8 -> 14.8 s/tok, ttft 157 -> 116 s, io
+        // duty 24% -> 90%.
+        let n_rings = reactors.len().max(1);
+        let batch = experts_per_batch().min(n_plans.div_ceil(n_rings)).max(1);
         for ring in reactors.iter() {
             let job_tx = job_tx.clone();
             let res_tx = res_tx.clone();
             scope.spawn(move || {
                 loop {
-                    let batch = experts_per_batch();
                     let start = io_work_ref.fetch_add(batch, Ordering::Relaxed);
                     if start >= n_plans {
                         break; // no work left for this ring
@@ -763,10 +1440,38 @@ pub fn moe_forward_concurrent(
                     let mut miss: Vec<usize> = Vec::new();
                     for (idx, plan) in plans_ref.iter().enumerate().take(end).skip(start) {
                         let key = (layer as u32, plan.expert as u32);
-                        let hit = ecache.and_then(|c| c.lock().get(key));
+                        // Filter first: on "definitely absent" skip the mutex
+                        // entirely and go straight to disk. Races are byte-safe
+                        // (see `ResidencyHint`); the wait on the lock we do
+                        // take is metered as evidence for/against sharding.
+                        let hit = ecache.and_then(|c| {
+                            match cache_hint.as_ref() {
+                                Some(h) if !h.might_contain(key) => {
+                                    h.note_fast_miss();
+                                    None
+                                }
+                                _ => {
+                                    let t_lock = std::time::Instant::now();
+                                    let mut g = c.lock();
+                                    if let Some(t) = timings_ref {
+                                        t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
+                                    }
+                                    g.get_hit(key)
+                                }
+                            }
+                        });
                         match hit {
-                            Some(bytes) => {
-                                if job_tx.send((idx, bytes)).is_err() {
+                            // Raw slot: bytes are ready — straight to a worker.
+                            Some(CacheHit::Raw(bytes)) => {
+                                if job_tx.send(Job::CacheRaw(idx, *bytes)).is_err() {
+                                    return;
+                                }
+                            }
+                            // Compressed slot: ship the refcounted frames; the
+                            // zstd decode runs on the worker, not on this lane
+                            // (and no longer inside the cache lock).
+                            Some(CacheHit::Compressed(frames)) => {
+                                if job_tx.send(Job::CacheZ(idx, frames)).is_err() {
                                     return;
                                 }
                             }
@@ -778,6 +1483,55 @@ pub fn moe_forward_concurrent(
                     }
                     let chunk_plans: Vec<&EPlan> = miss.iter().map(|&i| &plans_ref[i]).collect();
                     let t_io = std::time::Instant::now();
+                    if completion {
+                        // Owned-completion lane: each expert is forwarded the
+                        // moment its last region lands, so the CPU pool starts
+                        // on expert 1 while the rest are still on the wire.
+                        //
+                        // Sending on `job_tx` under this ring's lock cannot
+                        // deadlock: workers never take a ring mutex, and iotune
+                        // locks rings only between forwards. `add_io` spans the
+                        // reap loop here, so io duty includes the per-expert
+                        // forwarding — accepted semantics shift vs the wave.
+                        let mut r = ring.lock(); // this ring, uncontended (owned by this thread)
+                        if !use_direct && fadvise_main_enabled() {
+                            // Hint the NEXT claim window while this one streams
+                            // — genuinely ahead of its reads, unlike the wave
+                            // path's same-wave hint. Best-effort: the window may
+                            // be claimed by another ring, which only means the
+                            // readahead lands in the page cache it shares.
+                            let ahead_end = (end + batch).min(n_plans);
+                            let mut ahead: Vec<(RawFd, u64, usize)> = Vec::new();
+                            for p in &plans_ref[end..ahead_end] {
+                                ahead.extend_from_slice(&expert_regions(&p.entry, false));
+                            }
+                            if !ahead.is_empty() {
+                                r.queue_willneed(&ahead);
+                            }
+                        }
+                        let streamed = stream_experts_completion(&mut r, &chunk_plans, use_direct, |k, slab| {
+                            job_tx.send(Job::Stream(miss[k], slab)).is_ok()
+                        });
+                        if let Some(t) = timings_ref {
+                            t.add_io(t_io.elapsed().as_micros() as u64);
+                        }
+                        match streamed {
+                            Ok(true) => continue,
+                            // A dropped receiver means the collector saw an
+                            // error and the forward is unwinding.
+                            Ok(false) => return,
+                            Err(e) => {
+                                if res_tx.send(Err(e)).is_err() {
+                                    peregrine_io::note_advisory_err("io lane error forward", &"collector already gone");
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    // Wave path: the `COLI_IO_COMPLETION=0` escape hatch and the
+                    // pread/regbuf measurement arms. One blocking submit for the
+                    // whole claim; admission still runs on the worker
+                    // (`Job::Stream`), unified with the completion lane.
                     let slabs = {
                         let mut r = ring.lock(); // this ring, uncontended (owned by this thread)
                         read_experts_batched(&mut r, &chunk_plans, use_direct)
@@ -795,21 +1549,7 @@ pub fn moe_forward_concurrent(
                         }
                     };
                     for (&idx, bytes) in miss.iter().zip(slabs) {
-                        if let Some(c) = ecache {
-                            let expert = plans_ref[idx].expert;
-                            // Admission gate: only cache experts with demonstrated
-                            // reuse (routing heat ≥ threshold). Heat is bumped after
-                            // the reduce, so a first-ever routing reads 0 here —
-                            // threshold 1 = "cache from the second routing on".
-                            let admit = admit_min_heat == 0
-                                || heat_ref.is_some_and(|h| h.get(layer, expert) >= admit_min_heat);
-                            let mut c = c.lock();
-                            c.note_disk_read(layer as u32);
-                            if admit {
-                                c.insert((layer as u32, expert as u32), bytes.clone());
-                            }
-                        }
-                        if job_tx.send((idx, bytes)).is_err() {
+                        if job_tx.send(Job::Stream(idx, bytes)).is_err() {
                             return;
                         }
                     }
@@ -825,25 +1565,45 @@ pub fn moe_forward_concurrent(
                 scope.spawn(move || {
                     let jobs: Vec<(usize, Vec<f32>)> = gplans_ref.iter().map(|p| (p.e, p.xg.clone())).collect();
                     let t_gpu = std::time::Instant::now();
-                    let result = g.compute(layer, &jobs, hidden);
+                    // Fused: the device folds every GPU expert into one
+                    // `[s_n, hidden]` partial, so `dst`/`weights` describe the
+                    // gathered rows in the same flattened order `jobs` builds
+                    // them — plan by plan, rows within a plan in plan order.
+                    let fused = if fused_reduce {
+                        let dst: Vec<usize> = gplans_ref.iter().flat_map(|p| p.rows.iter().copied()).collect();
+                        let rw: Vec<f32> = gplans_ref.iter().flat_map(|p| p.rw.iter().copied()).collect();
+                        Some(g.compute_reduced(layer, &jobs, hidden, &dst, &rw, s_n))
+                    } else {
+                        None
+                    };
+                    let plain = if fused.is_none() { Some(g.compute(layer, &jobs, hidden)) } else { None };
                     if let Some(t) = timings_ref {
                         t.add_gpu(t_gpu.elapsed().as_micros() as u64);
                     }
-                    match result {
-                        Ok(hs) => {
+                    let sent = match (fused, plain) {
+                        (Some(Ok(partial)), _) => {
+                            // One message for the whole lane: every GPU expert's
+                            // contribution is already inside it.
+                            completed_ref.fetch_add(gplans_ref.len(), Ordering::Relaxed);
+                            res_tx.send(Ok(LaneMsg::GpuPartial(partial)))
+                        }
+                        (_, Some(Ok(hs))) => {
+                            let mut last = Ok(());
                             for (gp, h) in gplans_ref.iter().zip(hs) {
                                 completed_ref.fetch_add(1, Ordering::Relaxed);
                                 let out = EOut { rows: gp.rows.clone(), rw: gp.rw.clone(), h };
-                                if res_tx.send(Ok((gp.pos, out))).is_err() {
+                                last = res_tx.send(Ok(LaneMsg::Slot(gp.pos, out)));
+                                if last.is_err() {
                                     break;
                                 }
                             }
+                            last
                         }
-                        Err(e) => {
-                            if res_tx.send(Err(e)).is_err() {
-                                peregrine_io::note_advisory_err("gpu lane error forward", &"collector already gone");
-                            }
-                        }
+                        (Some(Err(e)), _) | (_, Some(Err(e))) => res_tx.send(Err(e)),
+                        (None, None) => Ok(()), // unreachable: exactly one of the two ran
+                    };
+                    if sent.is_err() {
+                        peregrine_io::note_advisory_err("gpu lane error forward", &"collector already gone");
                     }
                 });
             }
@@ -858,9 +1618,93 @@ pub fn moe_forward_concurrent(
                     // `recv`'s only error is `Disconnected`, which is this
                     // pool's shutdown signal: every ring has finished and
                     // dropped its sender.
-                    let (idx, bytes) = match job_rx.recv() {
+                    let job = match job_rx.recv() {
                         Ok(job) => job,
                         Err(crossbeam_channel::RecvError) => break,
+                    };
+                    let (idx, bytes) = match job {
+                        Job::CacheRaw(idx, bytes) => (idx, bytes),
+                        Job::CacheZ(idx, frames) => match frames.materialize() {
+                            Some(slab) => (idx, slab),
+                            None => {
+                                // Undecodable slot: drop it (with its
+                                // decode-failure accounting) and re-stream from
+                                // disk with the blocking oracle reader — this
+                                // worker owns no ring. Rare by construction:
+                                // non-zero traffic here means real bit rot.
+                                let plan = &plans_ref[idx];
+                                if let Some(c) = ecache {
+                                    let t_lock = std::time::Instant::now();
+                                    let mut g = c.lock();
+                                    if let Some(t) = timings_ref {
+                                        t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
+                                    }
+                                    g.remove_corrupt((layer as u32, plan.expert as u32));
+                                }
+                                match restream_expert_blocking(&plan.entry) {
+                                    Ok(slab) => (idx, slab),
+                                    Err(e) => {
+                                        if res_tx.send(Err(e)).is_err() {
+                                            peregrine_io::note_advisory_err(
+                                                "cpu lane error forward",
+                                                &"collector already gone",
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        },
+                        Job::Stream(idx, bytes) => match ecache {
+                            None => (idx, bytes),
+                            Some(c) => {
+                                // Admission moved here from the I/O lane: the
+                                // zstd encode (`prepare_insert`) runs before the
+                                // lock; only map insert + eviction run under it.
+                                //
+                                // Admission gate: only cache experts with demonstrated
+                                // reuse (routing heat ≥ threshold). Heat is bumped after
+                                // the reduce, so a first-ever routing reads 0 here —
+                                // threshold 1 = "cache from the second routing on".
+                                //
+                                // **No heat table means the gate cannot be evaluated, so it
+                                // does not apply.** It used to be `is_some_and`, i.e. "no
+                                // table → admit nothing": `heat` is `Some` only when a GPU
+                                // tier exists (`model.rs`), so on any CPU-only run setting
+                                // this knob to 1 silently turned the demand path's cache
+                                // admission off entirely — while the prefetch lane, which
+                                // has no such gate, went on admitting everything. A knob
+                                // documented as "filter one-off experts" instead inverted
+                                // which lane owned the cache.
+                                let expert = plans_ref[idx].expert;
+                                let admit = admit_min_heat == 0
+                                    || heat_ref.is_none_or(|h| h.get(layer, expert) >= admit_min_heat);
+                                if admit {
+                                    // Share-convert once: the cache slot and this
+                                    // worker's compute alias the same refcounted
+                                    // bytes. (The old ring-thread admission
+                                    // deep-copied the whole slab instead.)
+                                    let shared = bytes.map(|(w, s)| (w.into_shared(), s.into_shared()));
+                                    let prepared = WarmCache::prepare_insert(shared.clone(), cache_compress);
+                                    let t_lock = std::time::Instant::now();
+                                    let mut g = c.lock();
+                                    if let Some(t) = timings_ref {
+                                        t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
+                                    }
+                                    g.note_disk_read(layer as u32);
+                                    g.insert_prepared((layer as u32, expert as u32), prepared);
+                                    (idx, shared)
+                                } else {
+                                    let t_lock = std::time::Instant::now();
+                                    let mut g = c.lock();
+                                    if let Some(t) = timings_ref {
+                                        t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
+                                    }
+                                    g.note_disk_read(layer as u32);
+                                    (idx, bytes)
+                                }
+                            }
+                        },
                     };
                     let plan = &plans_ref[idx];
                     // Slab bytes consumed by this expert — the bandwidth-governor
@@ -872,9 +1716,9 @@ pub fn moe_forward_concurrent(
                     let [(gw, gs), (uw, us), (dw, ds)] = bytes;
                     let t_cpu = std::time::Instant::now();
                     let mlp = Mlp {
-                        gate: rebuild(&plan.gate, gw, gs),
-                        up: rebuild(&plan.up, uw, us),
-                        down: rebuild(&plan.down, dw, ds),
+                        gate: rebuild(&plan.entry.plans[0], gw, gs),
+                        up: rebuild(&plan.entry.plans[1], uw, us),
+                        down: rebuild(&plan.entry.plans[2], dw, ds),
                     };
                     let nr = plan.rows.len();
                     let mut xg = vec![0f32; nr * hidden];
@@ -887,7 +1731,7 @@ pub fn moe_forward_concurrent(
                     }
                     completed_ref.fetch_add(1, Ordering::Relaxed);
                     let out = EOut { rows: plan.rows.clone(), rw: plan.rw.clone(), h };
-                    if res_tx.send(Ok((plan.pos, out))).is_err() {
+                    if res_tx.send(Ok(LaneMsg::Slot(plan.pos, out))).is_err() {
                         break;
                     }
                 }
@@ -902,6 +1746,17 @@ pub fn moe_forward_concurrent(
 
         let mut slots: Vec<Option<EOut>> = (0..n).map(|_| None).collect();
         let mut got = 0usize;
+        // Under the fused reduce the GPU lane sends **one** message covering all
+        // of its experts, so the collector expects that many fewer slots plus
+        // exactly one partial. Deriving both from the same `fused_reduce` flag
+        // the lane read is what keeps "how many messages are coming" from being
+        // two independent opinions that can disagree and hang the forward.
+        let gpu_slots = if fused_reduce { gplans_ref.len() } else { 0 };
+        let want_slots = n - gpu_slots;
+        let mut gpu_partial: Option<Vec<f32>> = None;
+        let complete = |got: usize, partial: &Option<Vec<f32>>| {
+            got == want_slots && (!fused_reduce || partial.is_some())
+        };
         // A lane error must NOT return straight out of this closure: `res_rx`
         // lives in the caller's frame, so leaving it undrained lets the still-
         // running lanes fill the bounded result channel and block forever in
@@ -912,7 +1767,7 @@ pub fn moe_forward_concurrent(
         let mut failure: Option<Error> = None;
         loop {
             match res_rx.recv() {
-                Ok(Ok((pos, eo))) => {
+                Ok(Ok(LaneMsg::Slot(pos, eo))) => {
                     // Two results for one position would silently drop an
                     // expert's contribution from the layer output.
                     match slots.get_mut(pos) {
@@ -931,7 +1786,27 @@ pub fn moe_forward_concurrent(
                         }
                     }
                     got += 1;
-                    if got == n {
+                    if complete(got, &gpu_partial) {
+                        break;
+                    }
+                }
+                Ok(Ok(LaneMsg::GpuPartial(p))) => {
+                    // Exactly one is expected; a second would double-count every
+                    // GPU expert's contribution into the layer output.
+                    if gpu_partial.is_some() {
+                        failure = Some(Error::Format("concurrent MoE: duplicate GPU reduce partial".into()));
+                        break;
+                    }
+                    if p.len() != s_n * hidden {
+                        failure = Some(Error::Format(format!(
+                            "concurrent MoE: GPU reduce partial is {} floats, expected {}",
+                            p.len(),
+                            s_n * hidden
+                        )));
+                        break;
+                    }
+                    gpu_partial = Some(p);
+                    if complete(got, &gpu_partial) {
                         break;
                     }
                 }
@@ -941,16 +1816,17 @@ pub fn moe_forward_concurrent(
                 }
                 // channel closed: fine only if every expert already arrived
                 Err(recv_err) => {
-                    if got == n {
+                    if complete(got, &gpu_partial) {
                         break;
                     }
                     // `completed` counts what the lanes finished computing, which
                     // distinguishes "a lane died before computing" from "results
                     // were computed but never delivered".
                     let done = completed_ref.load(Ordering::Relaxed);
+                    let missing_partial = if fused_reduce && gpu_partial.is_none() { " (GPU partial missing)" } else { "" };
                     failure = Some(Error::Format(format!(
-                        "concurrent MoE: io/cpu lane ended early ({got}/{n} experts collected, \
-                         {done} computed): {recv_err}"
+                        "concurrent MoE: io/cpu lane ended early ({got}/{want_slots} experts collected, \
+                         {done} computed){missing_partial}: {recv_err}"
                     )));
                     break;
                 }
@@ -961,20 +1837,88 @@ pub fn moe_forward_concurrent(
             while res_rx.recv().is_ok() {}
             return Err(e);
         }
-        Ok(slots)
+        Ok((slots, gpu_partial))
     });
-    let slots = results?;
+    // Recorded before `?` would return: a layer that failed still consumed wall
+    // clock, and dropping it would flatter the duty cycle exactly when something
+    // has gone wrong.
+    if let Some(t) = timings_ref {
+        t.add_lane_wall(t_lane.elapsed().as_micros() as u64);
+    }
+    let (slots, gpu_partial) = results?;
 
     // ---- deterministic reduce: scatter in fixed batch-union order ----
+    //
+    // Per-row parallel scatter, bit-identical to the historical serial loop:
+    // `f32 +=` is not associative, so changing the order experts contribute to a
+    // shared `out[s * hidden + d]` would change the result bits. The contract
+    // (`moe_forward_parallel_matches_serial` in `mlp.rs`) is that **per row**
+    // experts accumulate in batch-union (`pos`) order, so each row's sum is
+    // bit-identical to the serial loop; rows are independent, so scattering rows
+    // in parallel is bit-identical too. That is the only ordering the bit-identity
+    // anchors actually pin, and this is the only ordering this code uses.
+    //
+    // The shape that made this safe to lift: each `EOut` carries its own rows
+    // (always ascending `s`, first matching `kk`) so the per-row contribution
+    // lists are built by walking `slots` in `pos` order and pushing each expert's
+    // contribution into the row it claims. Then the `out[s * hidden..]` slot is
+    // written from exactly one `par_rows_mut` worker, with no inter-worker aliasing.
     let t_reduce = std::time::Instant::now();
     let mut out = vec![0f32; s_n * hidden];
-    for eo in slots.into_iter().flatten() {
+    // `row_contribs[s]` = ordered list of `(slice_of_hidden, weight)` in batch-union
+    // order. `Box<[&f32]>` would be ideal but we need owned slices to ship across
+    // the pool boundary; `&[f32]` inside the closure captures by reference, which
+    // is the shape `par_rows_mut` was already designed around.
+    let mut row_contribs: Vec<Vec<(&[f32], f32)>> = (0..s_n).map(|_| Vec::new()).collect();
+    for eo in slots.iter().flatten() {
         for (ri, (&s, &wgt)) in eo.rows.iter().zip(&eo.rw).enumerate() {
-            let dst = &mut out[s * hidden..s * hidden + hidden];
             let src = &eo.h[ri * hidden..ri * hidden + hidden];
-            for d in 0..hidden {
-                dst[d] += wgt * src[d];
+            if let Some(slot) = row_contribs.get_mut(s) {
+                slot.push((src, wgt));
             }
+        }
+    }
+    // Note: `par_rows_mut` accepts a closure Fn(usize, &mut [f32]) and runs each row
+    // on a pool worker. The `+ Sync` bound on the closure is what lets the
+    // contribution lists be borrowed across workers safely (read-only access).
+    if s_n >= peregrine_par::PAR_ROWS_MIN {
+        // borrowed once across workers — the closure reads `row_contribs[s]`
+        let contribs: &[Vec<(&[f32], f32)>] = &row_contribs;
+        peregrine_par::par_rows_mut(
+            &mut out,
+            hidden,
+            s_n,
+            peregrine_par::PAR_ROWS_MIN,
+            |s, dst| {
+                for &(src, wgt) in contribs[s].iter() {
+                    for d in 0..hidden {
+                        dst[d] += wgt * src[d];
+                    }
+                }
+            },
+        );
+    } else {
+        for s in 0..s_n {
+            let dst = &mut out[s * hidden..s * hidden + hidden];
+            for &(src, wgt) in row_contribs[s].iter() {
+                for d in 0..hidden {
+                    dst[d] += wgt * src[d];
+                }
+            }
+        }
+    }
+    drop(row_contribs);
+    // Drop the actual `EOut` slab ownership (the slices above were references
+    // into `eo.h`; we still need `slots` for nothing else, so free it now).
+    drop(slots);
+    // The device-reduced GPU partial, added in a **fixed position** — after
+    // every CPU contribution, in its own pass — rather than wherever the lane
+    // happened to finish. Arrival order must not reach the arithmetic: that
+    // would make the output depend on machine timing, which is the one thing no
+    // adaptive path in this engine is allowed to do.
+    if let Some(p) = gpu_partial {
+        for (o, v) in out.iter_mut().zip(&p) {
+            *o += v;
         }
     }
     if let Some(sh) = shared {
@@ -1017,7 +1961,7 @@ pub fn moe_forward_concurrent(
 /// [`prefetch_read`] on the prefetch lane's own ring.
 pub struct PrefetchItem {
     key: (u32, u32),
-    plans: [TPlan; 3],
+    entry: ExpertEntry,
 }
 
 impl PrefetchItem {
@@ -1028,22 +1972,25 @@ impl PrefetchItem {
 }
 
 /// Build the streaming plan for one routed expert (gate/up/down), for the prefetch
-/// lane. Mirrors the disk-plan construction in [`moe_forward_concurrent`].
-pub fn prefetch_item(st: &SafeTensors, cfg: &Cfg, layer: usize, expert: usize) -> Result<PrefetchItem, Error> {
-    let hidden = cfg.hidden as usize;
-    let mi = cfg.moe_inter as usize;
-    let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{expert}.{t}");
-    let gate = tplan(st, &p("gate_proj.weight"), mi, hidden)?;
-    let up = tplan(st, &p("up_proj.weight"), mi, hidden)?;
-    let down = tplan(st, &p("down_proj.weight"), hidden, mi)?;
-    Ok(PrefetchItem { key: (layer as u32, expert as u32), plans: [gate, up, down] })
+/// lane. Mirrors the disk-plan construction in [`moe_forward_concurrent`], including
+/// its use of the load-time [`ExpertIndex`] — the two must agree, or a prefetched
+/// slab would not be the one a later demand read expects.
+pub fn prefetch_item(
+    index: Option<&ExpertIndex>,
+    st: &SafeTensors,
+    cfg: &Cfg,
+    layer: usize,
+    expert: usize,
+) -> Result<PrefetchItem, Error> {
+    let entry = entry_for(index, st, cfg, layer, expert)?;
+    Ok(PrefetchItem { key: (layer as u32, expert as u32), entry })
 }
 
 /// Stream one prefetch item's six regions through `reactor` into an owned slab
 /// (one batched submit) — the exact bytes the I/O lane would read, so a later hit
 /// is bit-identical.
 pub fn prefetch_read(reactor: &mut Reactor, item: &PrefetchItem, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
-    read_expert(reactor, &item.plans[0], &item.plans[1], &item.plans[2], direct)
+    read_expert(reactor, &item.entry, direct)
 }
 
 /// One expert queued for a page-cache *hint* (`fadvise(WILLNEED)`): its six
@@ -1051,12 +1998,13 @@ pub fn prefetch_read(reactor: &mut Reactor, item: &PrefetchItem, direct: bool) -
 /// low-confidence multi-path predictions, where a full prefetch isn't worth the
 /// bandwidth but a cheap page-cache hint may still help a later miss.
 pub struct HintItem {
-    regions: [(RawFd, u64, usize); 6],
+    regions: Vec<(RawFd, u64, usize)>,
 }
 
 impl HintItem {
-    /// The six `(fd, offset, len)` regions (gate/up/down × weight+scale) to hint.
-    pub fn regions(&self) -> &[(RawFd, u64, usize); 6] {
+    /// The `(fd, offset, len)` regions to hint: two when the expert's runs
+    /// coalesced, six otherwise.
+    pub fn regions(&self) -> &[(RawFd, u64, usize)] {
         &self.regions
     }
 }
@@ -1064,22 +2012,16 @@ impl HintItem {
 /// Build a [`HintItem`] for one expert's six regions. Uses the **buffered** fds:
 /// `fadvise` only populates the page cache, so it's a no-op for O_DIRECT reads and
 /// the caller gates hints off under direct I/O.
-pub fn prefetch_hint_item(st: &SafeTensors, cfg: &Cfg, layer: usize, expert: usize) -> Result<HintItem, Error> {
-    let hidden = cfg.hidden as usize;
-    let mi = cfg.moe_inter as usize;
-    let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{expert}.{t}");
-    let gate = tplan(st, &p("gate_proj.weight"), mi, hidden)?;
-    let up = tplan(st, &p("up_proj.weight"), mi, hidden)?;
-    let down = tplan(st, &p("down_proj.weight"), hidden, mi)?;
-    let regions = [
-        (gate.w_fd, gate.w_off, gate.w_len),
-        (gate.s_fd, gate.s_off, gate.s_len),
-        (up.w_fd, up.w_off, up.w_len),
-        (up.s_fd, up.s_off, up.s_len),
-        (down.w_fd, down.w_off, down.w_len),
-        (down.s_fd, down.s_off, down.s_len),
-    ];
-    Ok(HintItem { regions })
+pub fn prefetch_hint_item(
+    index: Option<&ExpertIndex>,
+    st: &SafeTensors,
+    cfg: &Cfg,
+    layer: usize,
+    expert: usize,
+) -> Result<HintItem, Error> {
+    let entry = entry_for(index, st, cfg, layer, expert)?;
+    // `direct: false` — this is the buffered-fd list by construction.
+    Ok(HintItem { regions: expert_regions(&entry, false) })
 }
 
 #[cfg(test)]
@@ -1088,6 +2030,112 @@ mod tests {
     use crate::weight::QuantFmt;
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
+
+    /// A fresh tiny-model checkpoint on disk. Mirrors `model.rs`'s `tmp_model_dir`:
+    /// this crate has no `tempfile` dependency, and the tests are per-process.
+    fn tmp_expert_index_dir(tag: &str) -> Result<std::path::PathBuf, Error> {
+        let d = std::env::temp_dir().join(format!("peregrine_expert_index_{}_{}", std::process::id(), tag));
+        if d.exists() {
+            std::fs::remove_dir_all(&d).map_err(Error::Io)?;
+        }
+        crate::testkit::build_tiny_model(&d)?;
+        Ok(d)
+    }
+
+    /// The index is only safe if it resolves an expert to exactly what deriving it
+    /// per request would have. Field for field, every expert — this is the whole
+    /// correctness argument for replacing `tplan` with a lookup, and it is what
+    /// catches a transposition slip like `down_proj` being `(hidden, mi)` while
+    /// gate/up are `(mi, hidden)`.
+    #[test]
+    fn expert_index_agrees_with_deriving_per_request() -> Result<(), Error> {
+        let dir = tmp_expert_index_dir("agree")?;
+        let st = SafeTensors::open(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+        let index = ExpertIndex::build(&st, &cfg);
+        assert!(index.resolved() > 0, "fixture indexed no experts at all");
+
+        let hidden = cfg.hidden as usize;
+        let mi = cfg.moe_inter as usize;
+        let mut checked = 0usize;
+        for layer in (cfg.first_dense as usize)..=(cfg.n_layers as usize) {
+            for e in 0..(cfg.n_experts as usize) {
+                let Some(entry) = index.get(layer, e) else { continue };
+                let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
+                let want = [
+                    tplan(&st, &p("gate_proj.weight"), mi, hidden)?,
+                    tplan(&st, &p("up_proj.weight"), mi, hidden)?,
+                    tplan(&st, &p("down_proj.weight"), hidden, mi)?,
+                ];
+                for (got, want) in entry.plans.iter().zip(want.iter()) {
+                    assert_eq!((got.w_fd, got.w_off, got.w_len), (want.w_fd, want.w_off, want.w_len));
+                    assert_eq!((got.s_fd, got.s_off, got.s_len), (want.s_fd, want.s_off, want.s_len));
+                    assert_eq!((got.w_fd_direct, got.s_fd_direct), (want.w_fd_direct, want.s_fd_direct));
+                    // The shape/format half — the "correct type" the request needs.
+                    assert_eq!((got.fmt, got.o, got.i, got.gs), (want.fmt, want.o, want.i, want.gs));
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, index.resolved(), "walked a different set than the index holds");
+        Ok(())
+    }
+
+    /// One token's working set is `topk` experts per sparse layer, sized from
+    /// each layer's own experts. This is the threshold the protect default and
+    /// the capacity-vs-policy reading both hang off, so it has to be derived, not
+    /// assumed uniform — a precision-tiered container stores different layers at
+    /// different widths.
+    #[test]
+    fn per_token_bytes_counts_topk_experts_in_every_sparse_layer() -> Result<(), Error> {
+        let dir = tmp_expert_index_dir("workingset")?;
+        let st = SafeTensors::open(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+        let index = ExpertIndex::build(&st, &cfg);
+
+        let layers: Vec<usize> = ((cfg.first_dense as usize)..=(cfg.n_layers as usize))
+            .filter(|&l| (0..cfg.n_experts as usize).any(|e| index.get(l, e).is_some()))
+            .collect();
+        assert!(!layers.is_empty(), "fixture has no sparse layers");
+
+        // Independently: sum each sparse layer's own per-expert bytes × topk.
+        let mut want = 0u64;
+        for &l in &layers {
+            let e = (0..cfg.n_experts as usize).find_map(|e| index.get(l, e)).ok_or_else(|| {
+                Error::Format("layer reported sparse but resolved no expert".into())
+            })?;
+            let per: u64 = e.plans.iter().map(|t| t.w_len as u64 + t.s_len as u64).sum();
+            want += per * cfg.topk.max(0) as u64;
+        }
+        assert_eq!(index.per_token_bytes(&cfg), want);
+        assert!(want > 0);
+        Ok(())
+    }
+
+    /// A `None` entry must be indistinguishable from never having had an index:
+    /// `plans_for` falls back to deriving, so an unusual container behaves exactly
+    /// as it did before the map existed.
+    #[test]
+    fn absent_index_entry_falls_back_to_deriving() -> Result<(), Error> {
+        let dir = tmp_expert_index_dir("fallback")?;
+        let st = SafeTensors::open(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+        let index = ExpertIndex::build(&st, &cfg);
+        let layer = cfg.first_dense as usize;
+
+        let with = entry_for(Some(&index), &st, &cfg, layer, 0)?.plans;
+        let without = entry_for(None, &st, &cfg, layer, 0)?.plans;
+        for (a, b) in with.iter().zip(without.iter()) {
+            assert_eq!((a.w_fd, a.w_off, a.w_len), (b.w_fd, b.w_off, b.w_len));
+            assert_eq!((a.s_fd, a.s_off, a.s_len), (b.s_fd, b.s_off, b.s_len));
+            assert_eq!((a.fmt, a.o, a.i, a.gs), (b.fmt, b.o, b.i, b.gs));
+        }
+        // Out of range on either axis resolves to `None` rather than panicking or
+        // reading a neighbouring expert's row.
+        assert!(index.get(layer, cfg.n_experts as usize).is_none());
+        assert!(index.get(cfg.n_layers as usize + 1, 0).is_none());
+        Ok(())
+    }
 
     #[test]
     fn read_expert_batched_bytes_identical() -> Result<(), Error> {
@@ -1124,7 +2172,11 @@ mod tests {
             i: 1,
             gs: 0,
         };
-        let (gate, up, down) = (tp(0, 1), tp(2, 3), tp(4, 5));
+        let plans = [tp(0, 1), tp(2, 3), tp(4, 5)];
+        // Weights and scales alternate in this fixture, so neither run is
+        // contiguous and the expert deliberately takes the six-region path.
+        let entry = ExpertEntry { w_run: merge_run(&plans, true), s_run: merge_run(&plans, false), plans };
+        assert!(entry.w_run.is_none() && entry.s_run.is_none(), "interleaved fixture must not coalesce");
 
         let mut reactor = match Reactor::new(16) {
             Ok(r) => r,
@@ -1134,7 +2186,7 @@ mod tests {
                 return Ok(());
             }
         };
-        let slab = read_expert(&mut reactor, &gate, &up, &down, false)?;
+        let slab = read_expert(&mut reactor, &entry, false)?;
         // slab regions are `Bytes`; compare their exposed byte slices to the source
         assert_eq!(&slab[0].0[..], &regions[0][..]);
         assert_eq!(&slab[0].1[..], &regions[1][..]);
@@ -1142,6 +2194,230 @@ mod tests {
         assert_eq!(&slab[1].1[..], &regions[3][..]);
         assert_eq!(&slab[2].0[..], &regions[4][..]);
         assert_eq!(&slab[2].1[..], &regions[5][..]);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// A coalesced read must be split by each tensor's own offset, not by its
+    /// position. This fixture reproduces the real container's layout — the three
+    /// `.qs` scales pooled first, then the three weights, both groups in
+    /// **alphabetical** order (down, gate, up) rather than the gate/up/down order
+    /// the slab wants — so a positional split silently loads gate's bytes into
+    /// down's matrix. Every region carries distinct content so that swap fails
+    /// here instead of turning into plausible-looking activations.
+    #[test]
+    fn coalesced_read_splits_by_offset_not_position() -> Result<(), Error> {
+        let path = std::env::temp_dir().join(format!("peregrine_merge_{}", std::process::id()));
+        // disk order: ds, gs, us, dw, gw, uw — scales pooled at the front.
+        let regions: [Vec<u8>; 6] = [
+            vec![0xD5; 24], // down scale
+            vec![0x65; 8],  // gate scale
+            vec![0x55; 8],  // up scale
+            vec![0xDD; 96], // down weight
+            vec![0x66; 96], // gate weight
+            vec![0x5A; 96], // up weight
+        ];
+        let mut f = std::fs::File::create(&path)?;
+        let mut offs = [0u64; 6];
+        let mut cur = 0u64;
+        for (i, r) in regions.iter().enumerate() {
+            offs[i] = cur;
+            f.write_all(r)?;
+            cur += r.len() as u64;
+        }
+        f.sync_all()?;
+        let rf = std::fs::File::open(&path)?;
+        let fd = rf.as_raw_fd();
+        let tp = |wi: usize, si: usize| TPlan {
+            w_fd: fd,
+            w_off: offs[wi],
+            w_len: regions[wi].len(),
+            s_fd: fd,
+            s_off: offs[si],
+            s_len: regions[si].len(),
+            w_fd_direct: None,
+            s_fd_direct: None,
+            fmt: QuantFmt::Int4,
+            o: 1,
+            i: 1,
+            gs: 0,
+        };
+        // gate, up, down — pointing at their scattered-on-disk homes.
+        let plans = [tp(4, 1), tp(5, 2), tp(3, 0)];
+        let entry = ExpertEntry { w_run: merge_run(&plans, true), s_run: merge_run(&plans, false), plans };
+        let w = entry.w_run.ok_or_else(|| Error::Format("weights should coalesce".into()))?;
+        let s = entry.s_run.ok_or_else(|| Error::Format("scales should coalesce".into()))?;
+        assert_eq!((w.off, w.len), (offs[3], 96 * 3));
+        assert_eq!((s.off, s.len), (offs[0], 24 + 8 + 8));
+        assert_eq!(expert_regions(&entry, false).len(), 2, "coalesced expert must issue two reads");
+
+        let mut reactor = match Reactor::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let slab = read_expert(&mut reactor, &entry, false)?;
+        // gate/up/down, each paired with its own scale — the split has to undo
+        // the alphabetical on-disk ordering.
+        assert_eq!(&slab[0].0[..], &regions[4][..], "gate weight");
+        assert_eq!(&slab[0].1[..], &regions[1][..], "gate scale");
+        assert_eq!(&slab[1].0[..], &regions[5][..], "up weight");
+        assert_eq!(&slab[1].1[..], &regions[2][..], "up scale");
+        assert_eq!(&slab[2].0[..], &regions[3][..], "down weight");
+        assert_eq!(&slab[2].1[..], &regions[0][..], "down scale");
+
+        // The six views tile their two extents exactly, so the cache budgets a
+        // coalesced expert at its real size rather than treble-counting it.
+        let total: usize = slab.iter().map(|(w, s)| w.footprint() + s.footprint()).sum();
+        assert_eq!(total, w.len + s.len);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// Build the completion-lane fixture: one file holding an interleaved
+    /// (six-region) expert and a coalesced (two-region) expert, so a single
+    /// claim mixes both per-expert region counts. Returns the open file (keeps
+    /// the fd alive), its path, and the two entries.
+    fn completion_fixture(
+        tag: &str,
+    ) -> Result<(std::fs::File, std::path::PathBuf, ExpertEntry, ExpertEntry), Error> {
+        let path = std::env::temp_dir().join(format!("peregrine_completion_{}_{}", std::process::id(), tag));
+        // Expert A: weight/scale alternate on disk → merge_run finds no
+        // contiguous run and the expert reads six regions. Expert B mirrors the
+        // real container: scales pooled, then weights, both alphabetical
+        // (down, gate, up) → two coalesced regions. Distinct fills per region
+        // so a positional mix-up fails loudly.
+        let a_regions: Vec<Vec<u8>> = (0..6usize)
+            .map(|k| (0..(24 + k * 11)).map(|b| (b as u8).wrapping_mul(3).wrapping_add(k as u8 * 37)).collect())
+            .collect();
+        let b_regions: [Vec<u8>; 6] = [
+            vec![0xD5; 24], // down scale
+            vec![0x65; 8],  // gate scale
+            vec![0x55; 8],  // up scale
+            vec![0xDD; 96], // down weight
+            vec![0x66; 96], // gate weight
+            vec![0x5A; 96], // up weight
+        ];
+        let mut f = std::fs::File::create(&path)?;
+        let mut offs: Vec<u64> = Vec::new();
+        let mut cur = 0u64;
+        for r in a_regions.iter().chain(b_regions.iter()) {
+            offs.push(cur);
+            f.write_all(r)?;
+            cur += r.len() as u64;
+        }
+        f.sync_all()?;
+        let rf = std::fs::File::open(&path)?;
+        let fd = rf.as_raw_fd();
+        let lens: Vec<usize> = a_regions.iter().chain(b_regions.iter()).map(Vec::len).collect();
+        let tp = |wi: usize, si: usize| TPlan {
+            w_fd: fd,
+            w_off: offs[wi],
+            w_len: lens[wi],
+            s_fd: fd,
+            s_off: offs[si],
+            s_len: lens[si],
+            w_fd_direct: None,
+            s_fd_direct: None,
+            fmt: QuantFmt::Int4,
+            o: 1,
+            i: 1,
+            gs: 0,
+        };
+        let a_plans = [tp(0, 1), tp(2, 3), tp(4, 5)];
+        let entry_a = ExpertEntry { w_run: merge_run(&a_plans, true), s_run: merge_run(&a_plans, false), plans: a_plans };
+        assert!(entry_a.w_run.is_none() && entry_a.s_run.is_none(), "interleaved expert must not coalesce");
+        // gate, up, down — pointing at their scattered-on-disk homes (offsets
+        // 6.. are expert B's block).
+        let b_plans = [tp(6 + 4, 6 + 1), tp(6 + 5, 6 + 2), tp(6 + 3, 6)];
+        let entry_b = ExpertEntry { w_run: merge_run(&b_plans, true), s_run: merge_run(&b_plans, false), plans: b_plans };
+        assert!(entry_b.w_run.is_some() && entry_b.s_run.is_some(), "pooled expert must coalesce");
+        assert_eq!(expert_regions(&entry_b, false).len(), 2);
+        Ok((rf, path, entry_a, entry_b))
+    }
+
+    fn eplan(expert: usize, entry: ExpertEntry) -> EPlan {
+        EPlan { pos: expert, expert, rows: Vec::new(), rw: Vec::new(), entry }
+    }
+
+    /// The owned-completion lane must deliver exactly the bytes the blocking
+    /// wave path delivers — same regions, same carve — for both the six-region
+    /// and the coalesced two-region expert shapes, with each expert forwarded
+    /// exactly once. Delivery *order* is explicitly unspecified (completions
+    /// may arrive in any order); byte content is not.
+    #[test]
+    fn completion_lane_bytes_identical_to_wave() -> Result<(), Error> {
+        let (_rf, path, entry_a, entry_b) = completion_fixture("ident")?;
+        let mut reactor = match Reactor::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        // Oracle first: the wave path (untouched code) on the same entries.
+        let want_a = read_expert(&mut reactor, &entry_a, false)?;
+        let want_b = read_expert(&mut reactor, &entry_b, false)?;
+
+        let eplans = [eplan(0, entry_a), eplan(1, entry_b)];
+        let plan_refs: Vec<&EPlan> = eplans.iter().collect();
+        let mut got: Vec<(usize, peregrine_io::ExpertSlab)> = Vec::new();
+        let all = stream_experts_completion(&mut reactor, &plan_refs, false, |k, slab| {
+            got.push((k, slab));
+            true
+        })?;
+        assert!(all, "every expert must be forwarded when the consumer stays");
+        got.sort_by_key(|(k, _)| *k);
+        let ks: Vec<usize> = got.iter().map(|(k, _)| *k).collect();
+        assert_eq!(ks, vec![0, 1], "each expert forwarded exactly once");
+        for ((_, got), want) in got.iter().zip([&want_a, &want_b]) {
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert_eq!(&g.0[..], &w.0[..], "weight bytes identical to the wave path");
+                assert_eq!(&g.1[..], &w.1[..], "scale bytes identical to the wave path");
+            }
+        }
+        // The lane must leave the ring clean: the legacy wave path (which
+        // refuses to run while owned reads are in flight) works right after.
+        let again = read_expert(&mut reactor, &entry_a, false)?;
+        for (g, w) in again.iter().zip(want_a.iter()) {
+            assert_eq!(&g.0[..], &w.0[..]);
+            assert_eq!(&g.1[..], &w.1[..]);
+        }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// A consumer that disappears mid-stream (dropped channel → `forward`
+    /// returns false) stops the stream with `Ok(false)` — and the quiesce on
+    /// the way out leaves the ring reusable, not poisoned by in-flight owned
+    /// reads.
+    #[test]
+    fn completion_lane_stops_cleanly_when_consumer_gone() -> Result<(), Error> {
+        let (_rf, path, entry_a, entry_b) = completion_fixture("gone")?;
+        let mut reactor = match Reactor::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let eplans = [eplan(0, entry_a), eplan(1, entry_b)];
+        let plan_refs: Vec<&EPlan> = eplans.iter().collect();
+        let mut forwards = 0usize;
+        let all = stream_experts_completion(&mut reactor, &plan_refs, false, |_, _| {
+            forwards += 1;
+            false // consumer gone after the first delivery
+        })?;
+        assert!(!all, "a gone consumer must report Ok(false), not success");
+        assert_eq!(forwards, 1, "the stream must stop at the refusing forward");
+        // Ring must be clean for the next claim on this lane.
+        let want_a = read_expert(&mut reactor, &entry_a, false)?;
+        assert_eq!(want_a[0].0.len(), entry_a.plans[0].w_len);
         std::fs::remove_file(&path)?;
         Ok(())
     }

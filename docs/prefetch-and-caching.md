@@ -40,12 +40,27 @@ rather than a compromise: 92.2 % precision at rank 1, 81.4 % cumulative at 6,
 — it is roughly five useful reads and one wasted one per layer.
 
 **Those are their numbers, on their model.** Nothing here was adopted on their
-say-so, and nothing above has been reproduced on a peregrine container yet.
-`COLI_PREDICT_EVAL=1` is the instrument that settles it locally: it scores the
-look-ahead, the configured `PredictSource` and a previous-token baseline against
-the routing that actually happened, on the same forward, and prints recall and
-precision-by-rank at shutdown. **Run it before trusting the table above**, and
-before assuming the statistical predictors are still worth their complexity.
+say-so. **One row has now been reproduced on a peregrine container** (2026-08-09,
+`bench-data/2026-08-09-prefetch-causes/`): `peregrine route-stats` over a 24-token
+real-text trace of GLM-5.2 int4 measures consecutive-token overlap at **33.55 %**
+against an independence null of **3.12 %** — 10.7× the null, over ~1 725 layer
+transitions. That is the "previous token's set" row (WASTE: 29.5 %), and it
+reproduces.
+
+The consequence is larger than the row. This repo carried the opposite as an
+*inference* — that routing entropy was high enough to explain the 0.6 % warm-cache
+hit rate, colibrì's neutral PILOT prefetch and MTP's net loss — while flagging in
+`benchmarks.md` that the overlap had never actually been measured. **It has now,
+and the entropy story is wrong**: routing is strongly predictable from the previous
+token, so a low hit rate has to be explained by capacity or policy, not by the
+router.
+
+Still unreproduced: the router-lookahead row (59.0 %), which is the interesting one
+and the only arm that cannot be scored from a trace — `route_ranks` needs the
+hidden state, and a trace records only routed ids. `COLI_PREDICT_EVAL=1` is the
+instrument for it, and **it is currently reachable only from the stdio `GEN` path**
+— there is no hook in `forward_rows_inner`, so neither `peregrine bench` nor
+`peregrine-serve` can produce the number, which is why it never has.
 
 **It cannot change a token.** The authoritative router still runs at layer `L+1`
 and still decides; the look-ahead only starts I/O. `router_lookahead_cannot_move_a_token`
@@ -81,7 +96,13 @@ badly, and would change the meaning of every hit-rate figure in the engine.
     momentum.
   - **PhaseAware** — wraps any inner source; when the Jaccard distance between
     the two newest frames exceeds `COLI_PHASE_THRESHOLD`, folds a heavy vote
-    onto the newest frame (routing phase shift → trust recency).
+    onto the newest frame (routing phase shift → trust recency). "Heavy" is
+    derived, not chosen: `predict::phase_boost(depth)` returns the full momentum
+    scale `depth·(depth+1)/2`, which outranks any expert absent from the newest
+    frame by construction. It shipped as a hardcoded `2` until 2026-08-08 — at
+    depth 4 that merely *tied* an expert that had just dropped out, so the
+    feature did approximately nothing while both its unit tests passed on a
+    hand-built `boost: 100`. Opt-in via `COLI_PREDICT_SOURCE=phase-aware`.
   - **WithMacro** — blends `MacroTable` macro-states: consecutive identical
     top-k sets collapse into dwell-counted states with state→state
     transitions (`macrostates.json`, built by `galactic`).
@@ -103,10 +124,52 @@ badly, and would change the meaning of every hit-rate figure in the engine.
   `_HINT_PATHS_` twins.
 - **Per-sequence prefetch in batched serving** — each concurrent stream
   predicts from its own routing history on a parallel prefetch-lane pool
-  (`COLI_PREFETCH_LANES`).
+  (`COLI_PREFETCH_LANES`, **default 1 — the pool is a single lane unless you
+  raise it**). The lane is keyed on a sequence id assigned at admission, not on
+  the sequence's index in the active set: that index slides down whenever an
+  earlier sequence retires, which until 2026-08-08 migrated live streams between
+  lanes mid-flight and split their queued reads across two rings.
+  `peregrine-serve`'s `batch.rs` is the only caller that uses a lane other than
+  0 — see [`COLI_PREFETCH_LANES`](configuration.md) for why the other emitters
+  deliberately do not.
 - **Verification** — opt-in `COLI_PREFETCH_VERIFY` re-reads and byte-compares
   every speculative load (a `verify_mismatch` counter, never a panic) and logs
   used/wasted/accuracy at shutdown.
+
+### Reading the shutdown counters
+
+```
+[ecache]   hits= misses= disk_reads= prefetch_reads= hit_rate=
+[ecache]   resident: N slots, X GB of Y GB budget (Z% full)
+[prefetch] used= wasted= unclassified= accuracy=…(of C classified) yield=…(of R issued)
+[prefetch] resident-unused: N slots, X GB of Y GB budget (Z%)
+```
+
+Four things that are easy to misread, all learned the hard way on 2026-08-09:
+
+- **`accuracy` is not yield.** It is `used/(used+wasted)`, and `wasted` only
+  increments **on eviction** — a prefetched slab still resident is in neither
+  term. Quote `yield` (used per *issued*) alongside it or not at all; on the first
+  serving-path run they read 21.9 % and 3.2 % for the same fetches.
+- **`unclassified` mixes units.** It is `reads − used − wasted`, but
+  `prefetch_reads` counts read *operations* (an expert re-predicted after eviction
+  is read again) while `used`/`wasted` count slot *events*. Treat it as a loose
+  upper bound. `resident-unused` is the unambiguous one.
+- **`resident` tells you which failure you have.** A ~0 % hit rate with the cache
+  **100 % full** is an eviction/ordering problem; the same hit rate with it near
+  empty is an admission problem. Nothing else in the output distinguishes them,
+  and both prior investigations guessed.
+- **Neither line separates the two emitters.** `WarmCache` tracks one
+  `from_prefetch` bool and both `PrefetchCtx::emit_layer` and `LookaheadCtx::emit`
+  feed the same lane, so `used`/`wasted`/`yield` are a blend of the history
+  predictor and the router look-ahead. Isolating them needs
+  `COLI_ROUTER_LOOKAHEAD=0` as its own arm, or per-emitter tagging.
+
+And one about the workload rather than the counters: **`hit_rate` is over all
+lookups, including prefill**, which has no cross-token reuse by construction. A
+short completion on a long prompt is mostly prefill, so its hit rate is capped far
+below what the routing supports — a 12-token prompt with a 2-token completion caps
+at ~3 % however well the cache behaves.
 
 ## The warm RAM cache (`peregrine-io/src/warmcache.rs`)
 
@@ -114,10 +177,30 @@ Budgeted by `COLI_ECACHE_GB` (default: 10 % of available RAM, capped at
 2 GiB). Holds quantized expert bytes verbatim — a hit returns a byte-identical
 slab.
 
+**Size it against one decode token's working set.** That is
+`sparse_layers × topk × bytes_per_expert` — on GLM-5.2 int4, 75 × 8 × 18.9 MB ≈
+**11.3 GB**. Under LRU a slab has to survive a full cycle back to its own layer to
+be reused on the next token, so below that figure cross-token reuse is
+structurally impossible *however good the predictor is*, and above it reuse
+appears immediately. Measured 2026-08-09 on a real container, prefetch off in both
+arms so only the budget differed:
+
+| budget | slots | hit rate | disk reads |
+|---|---:|---:|---:|
+| 4.29 GB | 227 | 1.9 % | 9751 |
+| 12.88 GB | 681 | **5.7 %** | **9380** |
+
+This was the only knob tested in that pass that reduced `disk_reads` at all — for
+comparison, the prefetcher issued ~420 reads to save ~20. Multiply the figure by
+the number of concurrent decode streams whose routed sets do not overlap, and read
+it against the `COLI_ECACHE_GB` row in [configuration](configuration.md): more
+cache is still not monotonically better, because past the point where it competes
+with the resident trunk a hit becomes a page fault.
+
 | Feature | Gate | What it does |
 |---|---|---|
-| Bloom filter | always on | 2048-bit, two hashes, short-circuits the miss path in `WarmCache::get`; rebuilt on eviction so the hint stays tight |
-| Transparent zstd | `COLI_CACHE_COMPRESS=1` | compress slabs on admit (~1.2× smaller resident footprint — measured), decode on hit |
+| Residency filter | always on | counting filter, 65,536 atomic byte counters, two hashes, shared as an `Arc` outside the cache mutex. The I/O rings answer "definitely absent → stream it" without locking, and it also short-circuits the miss path inside `WarmCache::get`. Replaced the 2048-bit Bloom (2026-08-09), which had a ~24 % false-positive rate at ~700 residents and needed an O(residents) rebuild **under the mutex** on every full-cache admission; counters decrement on evict instead, so nothing is ever rebuilt. Lock-free misses are counted in a separate atomic — stat readers must use `total_misses()`, not the raw `misses` field. Time spent acquiring the cache mutex from the rings is metered as `cache_wait_us` and reported in the `[lane] cache-lock wait` shutdown line: a few percent of io thread time is bookkeeping, tens of percent would be the evidence a sharded cache needs (unmeasured as of the swap — the first sweep on the new layout fills this in) |
+| Transparent zstd | `COLI_CACHE_COMPRESS=1` | compress slabs on admit (~1.2× smaller resident footprint — measured), decode on hit. Since 2026-08-10 both halves run **off the cache lock and off the I/O lane**: the demand path's encode runs on the CPU worker before the lock (`WarmCache::prepare_insert` → `insert_prepared`), and a hit hands out refcounted frames (`get_hit` → `CacheHit::Compressed`) that the worker decodes — previously every ring serialized behind one zstd pass inside the mutex |
 | Idle recompression | `COLI_CACHE_COMPRESS_IDLE=1` | the serve engine converts the coldest raw slot to zstd per idle tick, interruptible the moment a request arrives |
 | Negative TTL | `COLI_CACHE_NEGATIVE_TTL=<N>` | evict never-hit slots older than N clock ticks ahead of LRU order (unprotected slots only; always keeps at least one) |
 | Admission gate | `COLI_CACHE_ADMIT_MIN_HEAT=<N>` | admit an expert only once its routing heat reaches N (heat bumps post-reduce, so `1` = "cache from the second routing on", filtering one-off experts; `0` = admit all) |
@@ -127,15 +210,51 @@ slab.
 
 - **Warm-cache eviction** (`peregrine-io/src/warmcache.rs::evict_to_budget`):
   the victim is the lowest `(priority, recency)` — a **priority-weighted LRU**.
-  Heat does not enter the victim score.
+  Heat does not enter the victim score at the default.
 - **LFRU tier scoring** (`peregrine-io/src/tier.rs`) computes
-  `(heat << 8) | recency` with hysteresis, and **nothing calls it.** It is
-  written, tested, and unreachable — the `[R]` defect class in
-  [BAD_PATTERNS](BAD_PATTERNS.md). This page previously described it, in the
-  present tense, as the policy in force; it never has been. Wire it into
-  `evict_to_budget` or delete the module — but do not read it as live.
+  `(heat << 8) | recency` with hysteresis. It was written, tested and
+  unreachable — the `[R]` defect class in [BAD_PATTERNS](BAD_PATTERNS.md) — and
+  this page once described it, in the present tense, as the policy in force.
+  **Wired 2026-08-06 behind `COLI_CACHE_LFRU=1`**: `lfru_score` becomes the
+  second component of the victim key and `decay` halves accumulated frequency
+  every 4096 hits. Priority stays primary, so LFRU reorders *within* a
+  protection class rather than overriding `COLI_PREFETCH_PROTECT`.
+
+  **Frequency comes from the cache, not from `HeatTable`.** A `Slot` counts its
+  own hits. Sourcing it from the model's heat table would have been the obvious
+  wiring and the wrong one: that table is constructed only when a GPU tier is
+  (`model.rs`), so on every CPU-only run — which is every run on a box without
+  `COLI_GPU` — the policy would have silently degraded to the LRU it was meant
+  to replace, while the knob read as enabled. A hit *is* a routing that found
+  its expert resident, which is the same quantity, measured over exactly the
+  slots the victim choice ranges over.
+
+  Still unreachable, deliberately: `pick_lfru` and `pick_swap` are the
+  **fixed-slot swap** form of the same policy — a pinned set of constant size,
+  which is the GPU tier's shape (`reheat`), not a byte-budgeted cache's. They
+  are a `reheat` question and are tracked there, not force-fitted here.
 - **Heat table** (`gpu.rs::HeatTable`): lock-free atomic routing-frequency
   counters, the substrate every residency/admission decision reads.
+
+  > **⚠ Heat exists only when the GPU tier does.** `model.rs` allocates it as
+  > `gpu.as_ref().map(|_| HeatTable::new(cfg.n_layers + 1, cfg.n_experts))`, so on a
+  > CPU-only binary — or a CUDA binary run without `COLI_GPU=1` — `self.heat` is
+  > `None` and `route_stats.json` persists `"heat": null`. The *accumulation* is not
+  > GPU-specific (`concurrent.rs` bumps it on the CPU MoE path); only the allocation
+  > is.
+  >
+  > Two consequences bite in practice. `COLI_CACHE_ADMIT_MIN_HEAT` needs a GPU tier
+  > (see its [note](configuration.md#coli_cache_admit_min_heat)). And
+  > `peregrine-requantize --tier-hot-frac` — a purely **storage-side** decision about
+  > which experts keep int4 precision — cannot get its input without a GPU run.
+  > `scripts/heat-pass.sh` automates that pass: `COLI_GPU=1`,
+  > `COLI_ROUTE_STATS_PERSIST=1`, varied prompts, and SIGINT rather than SIGKILL
+  > because the file is written at `Drop`.
+  >
+  > The table is `n_layers + 1` rows: the MTP head sits at index `n_layers` and
+  > routes a full set of experts. Consumers must expect the extra row — see
+  > [Tools](tools.md#two-fixes-worth-knowing-about-2026-08-09) for the mismatch that
+  > made heat-tiering impossible until 2026-08-09.
 - **Dynamic VRAM residency**: `reheat()` re-selects the hottest experts every
   256 steps; initial placement is a greedy heat/bytes knapsack
   (`solve_residency_sized`) with deterministic ties, seeded from the previous

@@ -2,14 +2,14 @@
 
 # Testing & quality gates
 
-**482 tests passing, 0 warnings, clippy clean** (debug + release), plus a
+**604 tests passing (18 ignored), 0 warnings, clippy clean** (debug + release), plus a
 strict bad-patterns audit. This page is what to run, what each gate enforces,
 and the correctness philosophy behind the test suite.
 
 ## The gates
 
 ```bash
-cargo test --workspace                     # 482 tests, CPU-only, no GPU needed
+cargo test --workspace                     # 604 tests, CPU-only, no GPU needed
 cargo clippy --workspace --all-targets     # clean
 scripts/audit-bad-patterns.sh --strict     # panic / UB / suppression / Cargo gate (CI)
 scripts/audit-reachability.py --list       # [R] shipped-but-unreachable pass
@@ -38,16 +38,26 @@ The suite is built around **bit-identity anchors** rather than tolerances:
   per-row attention, and every matmul — fixed-order reduces make this
   possible.
 - **Concurrent == sequential.** Deterministic position-keyed reduce, so lane
-  interleaving cannot change the result. Read the anchor carefully though:
-  `concurrent_matches_sequential` lives in `peregrine-sched` and exercises
-  `moe_streamed` — the **two-lane ancestor no crate links**. The production
-  3-lane path (`peregrine-model/concurrent.rs`) is covered at the attention
-  level by `batched_matches_sequential`, not by the test whose name implies it.
+  interleaving cannot change the result. The production 3-lane path
+  (`peregrine-model/concurrent.rs`) is covered at the attention level by
+  `batched_matches_sequential`.
+- **Streamed == production, across engines.** `peregrine-sched`'s
+  `streamed_matches_the_production_concurrent_path` (2026-08-06) runs
+  `moe_streamed` and `moe_forward_concurrent` over **the same container bytes**
+  — this crate's `DiskQt`s are built from `SafeTensors::region`, the same
+  triples `concurrent.rs`'s private `tplan` uses — with the router passed to
+  both, so routing is identical by construction and only the expert path is
+  compared. This is the check that gives the two-lane ancestor a reason to stay
+  in the workspace; before it, nothing compared the two implementations.
+  Tolerance, not bits: the lanes accumulate in different orders and `f32 +=` is
+  not associative. That crate's older `concurrent_matches_sequential` compared
+  `moe_streamed` against the **resident** reference while reading as if it were
+  the cross-engine check; it is now `streamed_matches_the_resident_reference`.
 - **Chunked == whole.** Chunked prefill is bit-identical to whole-prompt
   prefill (`engine_chunked_prefill_matches_reference`).
 - **Adaptive knobs are bit-identical when off.** Almost all are also
   correctness-neutral when on — they may change latency or residency, never
-  token values. **Five deliberate exceptions:**
+  token values. **Eight deliberate exceptions:**
   - `COLI_ROUTE_MIN_SHARE` drops routed experts carrying a negligible share of the
     gate mass, which removes a real (if small) term from the MoE sum. It is off by
     default, and it is gated by `Model::prediction_flip_rate` rather than by an
@@ -88,10 +98,61 @@ The suite is built around **bit-identity anchors** rather than tolerances:
     `dsa_selects_a_subset_once_context_exceeds_index_topk` asserts that it
     *does* — a sparse-attention flag whose test would pass unchanged if
     selection did nothing is not testing selection.
+  - `COLI_CUDA_FUSED_REDUCE` accumulates GPU-resident experts on the device
+    instead of in the host reduce. Nothing is dropped or approximated — the same
+    products are summed — but they are summed in a different **order**: GPU
+    experts among themselves first, then the CPU lane's contributions, instead of
+    interleaved in batch-union order. `f32 +=` is not associative, so that is a
+    real difference in the low bits. What it must *not* be is unstable, and that
+    is the assertion: `fused_reduce_is_bit_stable_across_repeats` runs identical
+    input three times and requires identical bits, which is the test an atomic
+    scatter fails while every tolerance-based test around it keeps passing.
+  - `COLI_CUDA_AUTOTUNE` selects among three WMMA fragment shapes for the W4A16
+    arm. All three share `K = 16` and the same k-loop, so identical per-element
+    sum order is *expected* — but that is reasoning about hardware reduction
+    order, not a measurement, and nothing has run on a GPU here to check it.
+    Listed as an exception because the honest status is "unverified", not
+    "verified equal".
+  - `COLI_DRAFT_SAMPLED` extends speculation to temperature > 0 via rejection
+    sampling. The emitted **distribution** is exactly the request's own —
+    `sampled_speculation_emits_the_requests_own_distribution` asserts it over
+    40 000 draws against the sampler's own transform — but the emitted
+    **sequence** is not what the same seed produces unspeculated, because the
+    accept path draws two uniforms per draft where plain decode draws one per
+    token. A distributional guarantee is not a reproducibility guarantee, and a
+    caller pinning outputs by seed would see different text with nothing
+    erroring. `COLI_CUDA_GRAPH` and `COLI_GPU_TIER_SWAP`, by contrast, are *not*
+    on this list: the first replays the same kernels with the same arguments in
+    the same order, and the second only changes which experts are resident.
   - **A requantized checkpoint** (`peregrine-requantize`) changes token values by
     existing, not by being toggled, so it has no knob row. int4 → int2 is a double
     quantization; measure it with `prediction_flip_rate` against the source
     container rather than assuming the halved bytes are free.
+
+    **How to actually run that** (wired 2026-08-08 — before then the converter
+    told operators to measure a thing no binary could):
+
+    ```bash
+    peregrine flip-rate <source-dir> <candidate-dir> --text sample.txt --tokens 512
+    ```
+
+    It loads the two containers **one at a time** — two streaming loads would put
+    two warm caches against one page cache and measure the slower container while
+    the faster one evicted it. `--text` tokenizes with the *source* container's
+    `tokenizer.json`; without it the run uses uniform-random ids and says so
+    loudly, because a flip rate over ids the model never saw in training is a
+    harness smoke test, not a quality figure.
+
+    **Pick `--tokens` large.** The gate runs under teacher forcing — one forward
+    over the whole prompt, one argmax per position — and the bytes read are the
+    routed *union*, which saturates: at top-8 over 256 experts a 128-position
+    forward already touches ~98 % of the container, so 512 positions cost ~2 %
+    more bytes than 128 and buy 4× the statistics. Reading this as a per-token
+    cost is what made an available measurement look hardware-blocked for a day.
+
+    Top-1 agreement on one text is a **floor** on quality, not a summary: a
+    container can hold argmax everywhere and still shift the distribution
+    underneath.
 - **Format round-trips.** Config / safetensors index / QT formats / dtype
   round-trips; zstd and kblock layouts decode byte-identically;
   `apply_layout_is_bit_identical` gates the physical checkpoint rewrite with
@@ -106,6 +167,24 @@ The suite is built around **bit-identity anchors** rather than tolerances:
 - **Tokenizer parity.** Id-for-id equality with the HF `tokenizers` oracle
   over an edge-case corpus (`crates/peregrine-serve/tests/tokenizer_parity.rs`);
   the HF crate exists *only* as this test oracle.
+- **The lossy-container gate, gated itself**
+  (`crates/peregrine-tools/tests/flip_rate_gate.rs`). `prediction_flip_rate` is
+  the repo's only non-equality check, which makes it the one gate whose
+  *sensitivity* a passing suite cannot demonstrate: a flip rate stuck at 0.000
+  would be indistinguishable from a lossless conversion and would license a
+  container on a broken measurement. So both directions are asserted — a
+  container against itself must flip nothing, and a deliberately lossy
+  requantization must flip something.
+- **The engine report follows dispatch, not the environment**
+  (`crates/peregrine-model/tests/moe_engine_report.rs`). It has to be an
+  integration test: the MoE engine is a process-global `OnceLock`, so installing
+  one inside the library's unit-test binary would change dispatch for every
+  other test in that binary, order-dependently.
+- **The HTTP tool-calling surface** (`crates/peregrine-serve/src/main.rs`'s
+  `mod tests`). Prompt assembly, `tool_choice`, content-part flattening, and the
+  OpenAI response shape. Worth naming here because until 2026-08-08 `main.rs`
+  had **no test module at all**, so the whole wiring between `tools.rs` and the
+  wire format was reachable only through a running server with a loaded model.
 - **Statistical gates** where exactness isn't the contract:
   `speculative_sample` rejection sampling is statistically lossless.
 

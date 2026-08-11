@@ -160,6 +160,23 @@ impl Momentum {
     }
 }
 
+/// The [`PredictSource::PhaseAware`] boost that makes *every* expert in the newest
+/// frame outrank *every* expert absent from it, for a history of `depth` frames.
+///
+/// This is derived rather than tuned, because a hand-picked constant is exactly how
+/// the feature shipped inert: production used `boost: 2` while the unit tests used
+/// `boost: 100`, so the tests proved the mechanism and said nothing about the
+/// constant. `momentum_vote` weighs frame `i` at `considered - i`, so an expert in
+/// every frame *but* the newest scores at most `considered·(considered-1)/2`, while
+/// any newest-frame expert scores at least `considered`. Returning the full momentum
+/// scale `depth·(depth+1)/2` dominates that for every `considered <= depth` — the
+/// boost outranks the entire weighting, so it stays correct if the weight shape
+/// changes. Saturating, so an absurd `COLI_ROUTE_HIST_DEPTH` cannot overflow.
+pub fn phase_boost(depth: usize) -> u32 {
+    let d = depth as u64;
+    (d.saturating_mul(d.saturating_add(1)) / 2).min(u32::MAX as u64) as u32
+}
+
 /// A first-order expert-transition automaton, built offline from a routing corpus.
 /// Per layer it counts how often expert `from` (routed at token *t*) is followed by
 /// expert `to` (routed at token *t+1*). At runtime, given the current routed set it
@@ -491,10 +508,14 @@ pub enum PredictSource {
     Automaton { table: Arc<TransitionTable>, fallback: Momentum },
     /// Phase-aware wrapper: delegate to `inner` normally, but when a phase-shift
     /// is detected (Jaccard distance between the newest two frames exceeds
-    /// `threshold_bp / 10000`), fold in an extra momentum vote weighted heavily
-    /// on the newest frame so prefetch tracks the new routing distribution
-    /// faster than steady-state momentum would. Correctness-neutral — the
-    /// scores are still sorted by (score-desc, expert-asc).
+    /// `threshold_bp / 10000`), add `boost` to every expert in the newest frame
+    /// so prefetch tracks the new routing distribution faster than steady-state
+    /// momentum would. Correctness-neutral — the scores are still sorted by
+    /// (score-desc, expert-asc).
+    ///
+    /// `boost` only does the thing the name promises if it outranks the momentum
+    /// scale; build it with [`phase_boost`] rather than picking a number, and see
+    /// `phase_boost_outranks_every_stale_expert` for what a too-small one costs.
     PhaseAware { inner: Box<PredictSource>, threshold_bp: u32, boost: u32 },
     /// Macro-state wrapper: blend the offline [`MacroTable`]'s dwell/transition
     /// prediction (state-level, stronger than per-frame momentum during a dwell)
@@ -853,6 +874,47 @@ mod tests {
         };
         let got = src.predict_layer(0, &h);
         assert_eq!(got, expected, "steady-state PhaseAware == inner passthrough");
+    }
+
+    #[test]
+    fn phase_boost_outranks_every_stale_expert() {
+        // The two tests above hand-pick `boost: 100` and so only prove the
+        // *mechanism*. Production builds `PhaseAware` in
+        // `model.rs::apply_predictor_override`, and shipped `boost: 2` — at which
+        // a newest-frame expert merely *tied* one that had just dropped out
+        // (depth-4 momentum scores the stale one 3+2+1 = 6, the fresh one 4+2 = 6),
+        // with the tie broken by ascending expert id. So "trust recency on a phase
+        // shift" did nothing, and no test noticed. This pins the derived constant
+        // that production now uses.
+        for depth in 2..=8usize {
+            let mut h = RouteHistory::new(1, depth);
+            // `1` is in every frame but the newest — the strongest possible
+            // competitor from before the shift. `9` appears only in the newest.
+            for _ in 0..depth - 1 {
+                h.push_layer(0, vec![1]);
+            }
+            h.push_layer(0, vec![9]);
+            let src = PredictSource::PhaseAware {
+                inner: Box::new(PredictSource::Momentum(Momentum { window: 0 })),
+                threshold_bp: 6000,
+                boost: phase_boost(depth),
+            };
+            let ranked = src.predict_layer(0, &h);
+            let pos = |e: u32| ranked.iter().position(|&(x, _)| x == e);
+            let (fresh, stale) = (pos(9), pos(1));
+            assert!(
+                matches!((fresh, stale), (Some(f), Some(s)) if f < s),
+                "depth {depth}: the newest frame's expert must outrank the stale one, got {ranked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_boost_is_never_zero_and_does_not_overflow() {
+        assert_eq!(phase_boost(0), 0, "no history → no boost to give");
+        assert_eq!(phase_boost(1), 1);
+        assert_eq!(phase_boost(4), 10, "depth-4 momentum tops out at 4+3+2+1");
+        assert_eq!(phase_boost(usize::MAX), u32::MAX, "saturates instead of wrapping");
     }
 
     #[test]

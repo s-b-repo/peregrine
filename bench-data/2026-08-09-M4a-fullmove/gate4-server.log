@@ -1,0 +1,15 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 42.4 GB | resident 10.9 + KV 0.7 + stream 4.2 + slack 1.4 + cache 0.0 -> peak 17.2 GB
+peregrine: [workingset] one token routes 10.85 GB of experts against a 0.00 GB cache (0% of a pass) — no eviction order can hold a pass; prefetch-protect on
+[tokenizer] gigatoken BPE active, vocab=154856
+peregrine-serve listening on http://127.0.0.1:8131
+peregrine-serve shutting down
+[expertmap] indexed=19456 coalescing=19200 (98.7%) -> 39936 reads per full sweep vs 116736 unmerged
+[workingset] 10.85 GB per token; prefetch-protect on (budget cannot hold a pass)
+[lane] 45 forwards: io 944.6s (85%) cpu 165.4s (15%) gpu 0.0s (0%) reduce 6.9s (1%)
+[lane] per forward: io 20.99s cpu 3.68s (lane-summed, so compare sum/wall for the overlap achieved)
+[lane] moe wall 575.7s over 45 forwards (12.79s each); io duty 82% of 2 rings, cpu 0.3 workers busy
+[lane] cpu-lane bandwidth 3.09 GB/s over 510.7 GB of expert slabs

@@ -11,6 +11,8 @@
 //! cache").
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::Bytes;
 
@@ -34,13 +36,53 @@ fn share_slab(s: ExpertSlab) -> ExpertSlab {
     s.map(|(w, sc)| (w.into_shared(), sc.into_shared()))
 }
 
-/// Compress each of a slab's six regions into a `SlotBytes::Compressed`
-/// variant. Returns `None` on a codec failure (the caller then stores the raw
-/// slab). The Compressed variant also carries `orig_lens` so decompression
-/// can pre-size and validate.
-fn encode_slab(s: &ExpertSlab) -> Option<(SlotBytes, usize)> {
-    // 6 regions in gate/up/down × (weight, scale) order — the layout the reader
-    // and the `pack_slab` builder both use, so the six-Vec array preserves it.
+/// Refcounted zstd frames for one expert slab: six regions in gate/up/down ×
+/// (weight, scale) order — the layout the reader and the `pack_slab` builder
+/// both use — plus each region's decoded length for pre-sizing and validation.
+///
+/// Refcounted so a cache hit can hand out an `Arc` clone under the mutex and
+/// the decode runs wherever the Arc travels (a CPU worker), instead of on the
+/// I/O lane while the cache lock is held — which used to serialize every I/O
+/// lane behind one zstd decode.
+#[derive(Clone)]
+pub struct CompressedSlab {
+    six: [Vec<u8>; 6],
+    orig_lens: [usize; 6],
+}
+
+impl CompressedSlab {
+    /// Decode into a byte-identical [`ExpertSlab`].
+    ///
+    /// Returns `None` when any region fails to decode or comes back the wrong
+    /// length. That must NOT be papered over with empty bytes: the consumer
+    /// feeds the slab straight into `QtWeight`, which reads it as an `[o, i]`
+    /// weight — a zero-length region then indexes out of bounds (an abort,
+    /// under `panic = "abort"`) or silently contributes garbage. The holder of
+    /// a failed decode reports it via [`WarmCache::remove_corrupt`] and
+    /// re-streams from disk — a miss is the correct degradation.
+    pub fn materialize(&self) -> Option<ExpertSlab> {
+        let decode = |i: usize| -> Option<Bytes> {
+            match zstd::stream::decode_all(&self.six[i][..]) {
+                Ok(v) if v.len() == self.orig_lens[i] => Some(Bytes::from(v)),
+                _ => None,
+            }
+        };
+        Some([
+            (decode(0)?, decode(1)?),
+            (decode(2)?, decode(3)?),
+            (decode(4)?, decode(5)?),
+        ])
+    }
+
+    /// Total compressed bytes — the resident footprint of this representation.
+    fn nbytes(&self) -> usize {
+        self.six.iter().map(|v| v.len()).sum()
+    }
+}
+
+/// Compress each of a slab's six regions. Returns `None` on a codec failure
+/// (the caller then stores the raw slab).
+fn encode_slab(s: &ExpertSlab) -> Option<CompressedSlab> {
     let mut six: [Vec<u8>; 6] = Default::default();
     let mut orig: [usize; 6] = [0; 6];
     let mut idx = 0usize;
@@ -54,47 +96,44 @@ fn encode_slab(s: &ExpertSlab) -> Option<(SlotBytes, usize)> {
         six[idx] = es;
         idx += 1;
     }
-    let compressed_bytes: usize = six.iter().map(|v| v.len()).sum();
-    Some((SlotBytes::Compressed { six, orig_lens: orig }, compressed_bytes))
-}
-
-/// Materialize an `ExpertSlab` from a stored `SlotBytes`. For `Raw` this clones
-/// six refcounts (the regions are shared). For `Compressed` it decodes each
-/// region into a fresh `Vec` and assembles the three (weight, scale) pairs.
-///
-/// Returns `None` when any region fails to decode or comes back the wrong
-/// length. That must NOT be papered over with empty bytes: the caller counts
-/// the lookup as a hit and feeds the slab straight into `QtWeight`, which reads
-/// it as an `[o, i]` weight — a zero-length region then indexes out of bounds
-/// (an abort, under `panic = "abort"`) or silently contributes garbage. A miss
-/// is the correct degradation: the expert is simply re-streamed from disk.
-fn materialize(sb: &SlotBytes) -> Option<ExpertSlab> {
-    match sb {
-        SlotBytes::Raw(s) => Some(s.clone()),
-        SlotBytes::Compressed { six, orig_lens } => {
-            let decode = |i: usize| -> Option<Bytes> {
-                match zstd::stream::decode_all(&six[i][..]) {
-                    Ok(v) if v.len() == orig_lens[i] => Some(Bytes::from(v)),
-                    _ => None,
-                }
-            };
-            Some([
-                (decode(0)?, decode(1)?),
-                (decode(2)?, decode(3)?),
-                (decode(4)?, decode(5)?),
-            ])
-        }
-    }
+    Some(CompressedSlab { six, orig_lens: orig })
 }
 
 /// A cached expert slab, held either verbatim or transparently zstd-compressed.
 /// `Compressed` shrinks resident footprint at the cost of one zstd decode per
 /// hit; the choice per slot is fixed at admission time by `COLI_CACHE_COMPRESS`.
 /// Callers never observe the difference — [`WarmCache::get`] materializes a
-/// byte-identical [`ExpertSlab`] either way.
+/// byte-identical [`ExpertSlab`] either way, and [`WarmCache::get_hit`] hands
+/// the refcounted frames out for the caller to materialize off the lock.
+/// `Raw` is boxed so the enum stays pointer-sized next to the `Arc` variant
+/// (an inline `ExpertSlab` is ~288 bytes of `Bytes` headers); slots are
+/// long-lived, so the one admission-time allocation is noise.
 enum SlotBytes {
-    Raw(ExpertSlab),
-    Compressed { six: [Vec<u8>; 6], orig_lens: [usize; 6] },
+    Raw(Box<ExpertSlab>),
+    Compressed(Arc<CompressedSlab>),
+}
+
+/// A warm-cache hit as handed to the streaming lane by [`WarmCache::get_hit`]:
+/// either the raw refcounted slab (ready to compute) or the refcounted
+/// compressed frames — decoded on a CPU worker, not on the I/O lane under the
+/// cache lock. Byte-identical to [`WarmCache::get`] either way.
+pub enum CacheHit {
+    /// Boxed for the same size-parity reason as `SlotBytes::Raw` — the box is
+    /// the clone [`WarmCache::get_hit`] hands out, not an extra copy.
+    Raw(Box<ExpertSlab>),
+    Compressed(Arc<CompressedSlab>),
+}
+
+/// A slab prepared for admission **off the lock**: shared (refcounted) regions,
+/// already encoded when compression is on, plus the footprint numbers
+/// [`WarmCache::insert_prepared`] books. Built by [`WarmCache::prepare_insert`]
+/// on a compute worker so the zstd encode never runs under the cache mutex.
+pub struct PreparedInsert {
+    data: SlotBytes,
+    /// resident footprint the eviction policy sees.
+    incoming: usize,
+    /// pre-encode footprint (compression-ratio accounting).
+    raw_bytes: usize,
 }
 
 struct Slot {
@@ -113,27 +152,65 @@ struct Slot {
     /// never bumps `used`/`clock`, so with all priorities equal the policy is
     /// byte-for-byte the original LRU.
     prio: u32,
+    /// Cache hits this slot has served since admission — the *frequency* half of
+    /// LFRU, and the reason `COLI_CACHE_LFRU` needs no `HeatTable`. The model's
+    /// heat table only exists when a GPU tier does (`model.rs`), so sourcing
+    /// frequency from it would make the policy silently degrade to LRU on every
+    /// CPU-only run. A hit is exactly "this expert was routed and we had it", so
+    /// counting hits per slot measures the same thing for the slots the victim
+    /// choice actually ranges over — the resident ones.
+    ///
+    /// Reset to 0 when a slot is *refreshed* (re-admitted from a new fetch), for
+    /// the same reason `ever_hit` is: the payload is a fresh fetch and its
+    /// predecessor's popularity is not evidence about it.
+    heat: u32,
 }
 
-/// Small Bloom filter over currently-resident `(layer, expert)` keys. Two hash
-/// positions per key, 2048 bits (256 bytes). Optimizes the miss path — if the
-/// bloom returns "definitely not present" we skip the HashMap probe. False
-/// positives fall through to the HashMap so correctness is unchanged.
+/// Lock-free residency hint over currently-resident `(layer, expert)` keys: a
+/// **counting filter** of 65,536 atomic byte counters, two hash positions per
+/// key, shared as an `Arc` so the I/O lanes can answer "definitely absent"
+/// without touching the cache mutex at all.
 ///
-/// Rebuilt after each eviction batch (via [`Bloom::rebuild`]) so we don't have
-/// to track per-slot removal (a counting Bloom would double the space).
-struct Bloom {
-    bits: [u64; 32],
+/// This replaces the old in-lock 2048-bit Bloom, which had two structural
+/// costs: at ~700 resident slots its false-positive rate was ~24 % (so the
+/// "fast" path degraded to the map probe anyway), and being a plain bitmap it
+/// had to be **rebuilt from the whole resident set after every eviction
+/// batch** — an O(slots) scan under the same mutex four I/O rings contend on,
+/// on every miss-insert once the cache runs full (which on this workload is
+/// always). Counters decrement on evict instead, so nothing is ever rebuilt.
+///
+/// Concurrency contract, and why every race is byte-safe:
+/// - increments happen while the inserting thread holds the cache mutex, but
+///   *readers don't take it*. A reader that sees "absent" for a key another
+///   thread is concurrently inserting simply streams the expert from disk —
+///   the same bytes the cache would have served. One redundant read, never a
+///   wrong one.
+/// - a false "present" (collision or concurrent removal) falls through to the
+///   locked exact map, which is the truth.
+/// - a counter that reaches 255 becomes **sticky**: with 65,536 slots against
+///   a few thousand residents no honest count gets near 255, but if it ever
+///   did, decrementing a saturated counter could manufacture a false "absent"
+///   for a still-resident key — a correctness-neutral but silent extra read.
+///   Sticky-at-255 degrades to "always probe", which is merely the old cost.
+pub struct ResidencyHint {
+    counts: Box<[AtomicU8]>,
+    /// Misses the I/O lane resolved lock-free ("definitely absent", stream it).
+    /// Folded into miss totals by [`WarmCache::hit_rate`]/stat readers.
+    pub fast_misses: AtomicU64,
 }
 
-impl Bloom {
-    const N_BITS: u32 = 32 * 64; // 2048
+impl ResidencyHint {
+    const N_SLOTS: u32 = 65_536;
 
-    fn new() -> Bloom {
-        Bloom { bits: [0; 32] }
+    fn new() -> Arc<ResidencyHint> {
+        ResidencyHint {
+            counts: (0..Self::N_SLOTS).map(|_| AtomicU8::new(0)).collect(),
+            fast_misses: AtomicU64::new(0),
+        }
+        .into()
     }
 
-    fn hashes(key: (u32, u32)) -> (u32, u32) {
+    fn hashes(key: (u32, u32)) -> (usize, usize) {
         // Two independent, cheap non-cryptographic hashes derived by FNV-like
         // mixing. Sufficient for a hint at this scale.
         let mut a = 0x811c9dc5u32;
@@ -148,26 +225,61 @@ impl Bloom {
         b ^= key.0.rotate_left(7);
         b = b.wrapping_mul(0x9e3779b1);
 
-        (a % Self::N_BITS, b % Self::N_BITS)
+        ((a % Self::N_SLOTS) as usize, (b % Self::N_SLOTS) as usize)
     }
 
-    fn add(&mut self, key: (u32, u32)) {
+    fn bump(c: &AtomicU8) {
+        // `Err` is not a failure here: the closure declining to store IS the
+        // saturation rule (stick at 255), so both arms leave the counter
+        // holding its intended value.
+        match c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| (v < u8::MAX).then(|| v + 1)) {
+            Ok(_) => {}
+            Err(saturated) => debug_assert_eq!(saturated, u8::MAX),
+        }
+    }
+
+    fn drop_one(c: &AtomicU8) {
+        // 0 is defensive (an unpaired remove would otherwise wrap to 255);
+        // 255 is the sticky saturation described on the type. As in `bump`,
+        // `Err` means the floor/ceiling rule held — the intended outcome.
+        match c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            (v != 0 && v != u8::MAX).then(|| v - 1)
+        }) {
+            Ok(_) => {}
+            Err(pinned) => debug_assert!(pinned == 0 || pinned == u8::MAX),
+        }
+    }
+
+    fn add(&self, key: (u32, u32)) {
         let (h1, h2) = Self::hashes(key);
-        self.bits[(h1 / 64) as usize] |= 1u64 << (h1 % 64);
-        self.bits[(h2 / 64) as usize] |= 1u64 << (h2 % 64);
+        Self::bump(&self.counts[h1]);
+        Self::bump(&self.counts[h2]);
     }
 
-    /// `false` ⇒ definitely absent; `true` ⇒ probably present (fall through to
-    /// the exact map).
-    fn probably_contains(&self, key: (u32, u32)) -> bool {
+    fn remove(&self, key: (u32, u32)) {
         let (h1, h2) = Self::hashes(key);
-        let b1 = self.bits[(h1 / 64) as usize] & (1u64 << (h1 % 64)) != 0;
-        let b2 = self.bits[(h2 / 64) as usize] & (1u64 << (h2 % 64)) != 0;
-        b1 && b2
+        Self::drop_one(&self.counts[h1]);
+        Self::drop_one(&self.counts[h2]);
     }
 
-    fn clear(&mut self) {
-        self.bits = [0; 32];
+    /// `false` ⇒ definitely absent (skip the mutex, stream from disk);
+    /// `true` ⇒ probably present (take the lock and ask the exact map).
+    pub fn might_contain(&self, key: (u32, u32)) -> bool {
+        let (h1, h2) = Self::hashes(key);
+        self.counts[h1].load(Ordering::Relaxed) > 0 && self.counts[h2].load(Ordering::Relaxed) > 0
+    }
+
+    /// Count a lock-free "definitely absent" decision (called by the I/O lane).
+    pub fn note_fast_miss(&self) {
+        self.fast_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        // Only sound when the resident set is known empty (cache clear): a full
+        // reset is the one case where sticky saturation can be forgiven.
+        for c in self.counts.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -177,9 +289,11 @@ pub struct WarmCache {
     used: usize,
     map: HashMap<(u32, u32), Slot>,
     clock: u64,
-    /// Bloom hint over resident keys. Rebuilt on evictions; consulted in the
-    /// miss-fast-path of `contains`/`get`.
-    bloom: Bloom,
+    /// Counting residency filter over resident keys, shared with the I/O lanes
+    /// (see [`ResidencyHint`]). Incremented on admission, decremented on
+    /// removal — never rebuilt. Consulted lock-free by the streaming lane and
+    /// in the miss-fast-path of `contains`/`get`.
+    hint: Arc<ResidencyHint>,
     /// Negative-cache TTL. Slots that haven't been hit in this many `clock`
     /// ticks become eligible for eager eviction ahead of pure LRU order. `0`
     /// disables (default). Set via `COLI_CACHE_NEGATIVE_TTL`.
@@ -224,7 +338,43 @@ pub struct WarmCache {
     pub uncompressed_bytes_seen: u64,
     /// Cumulative bytes actually admitted (post-compression when enabled).
     pub compressed_bytes_seen: u64,
+    /// Rank victims by LFRU (`tier::lfru_score` over per-slot hit frequency and
+    /// recency) instead of recency alone, within a priority class.
+    /// `COLI_CACHE_LFRU=1`; off = the historical `(prio, used)` tuple, unchanged
+    /// bit for bit. Fixed at construction.
+    lfru: bool,
+    /// Evict the **highest layer** first instead of the least-recently-used slot,
+    /// so the cache converges on a stable low-layer band. `COLI_CACHE_SWEEP=1`;
+    /// off = the historical tuple, unchanged. Fixed at construction.
+    ///
+    /// Exists because recency is the *worst* available signal for this access
+    /// pattern. Expert reads are a deterministic front-to-back layer sweep with no
+    /// intra-pass reuse, and `used` is a logical access ordinal that advances in
+    /// layer order (~624 ticks per token), so at the end of a pass the
+    /// minimum-`used` resident slot is by construction the earliest-layer expert —
+    /// exactly what layer 0 of the next token asks for first. LRU here does not
+    /// merely fail to help; it evicts precisely what is needed next.
+    ///
+    /// Measured on a real GLM-5.2 container at 227 slots against a 600-expert
+    /// working set: pure LRU returned **0 hits in 9944 lookups** with the cache
+    /// 100 % full throughout. Above the threshold (681 slots) the previous pass
+    /// fits entirely, there is no complement to retain, and LRU is fine — which is
+    /// why this is a knob and not a replacement.
+    sweep: bool,
+    /// Hits served since the last frequency decay. `tier::decay` halves every
+    /// slot's `heat` when this crosses [`LFRU_DECAY_HITS`], so the score tracks
+    /// *recent* popularity rather than a lifetime total — without it, a slot that
+    /// was hot early becomes unevictable no matter how cold it goes.
+    hits_since_decay: u64,
 }
+
+/// Hits between `tier::decay` sweeps under `COLI_CACHE_LFRU`. A constant rather
+/// than a knob: the value only sets how many hits of history the score carries,
+/// and one more env var to mis-set is worse than a defensible default. At 4096
+/// a slot's frequency half-life is a few thousand routings — long enough to rank
+/// stable hot experts, short enough that a phase change is not outvoted by one
+/// that ended.
+const LFRU_DECAY_HITS: u64 = 4096;
 
 impl WarmCache {
     /// A cache bounded to `budget_bytes` of resident expert slabs.
@@ -234,12 +384,17 @@ impl WarmCache {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
         let compress = matches!(std::env::var("COLI_CACHE_COMPRESS").as_deref(), Ok("1") | Ok("true"));
+        let lfru = matches!(std::env::var("COLI_CACHE_LFRU").as_deref(), Ok("1") | Ok("true"));
+        let sweep = matches!(std::env::var("COLI_CACHE_SWEEP").as_deref(), Ok("1") | Ok("true"));
         WarmCache {
+            lfru,
+            sweep,
+            hits_since_decay: 0,
             budget: budget_bytes,
             used: 0,
             map: HashMap::new(),
             clock: 0,
-            bloom: Bloom::new(),
+            hint: ResidencyHint::new(),
             negative_ttl: ttl,
             hits: 0,
             misses: 0,
@@ -264,6 +419,23 @@ impl WarmCache {
     /// threads sharing the process env.
     pub fn with_compression(mut self, on: bool) -> WarmCache {
         self.compress_on_admit = on;
+        self
+    }
+
+    /// Override the `COLI_CACHE_LFRU` gate. Same purpose as
+    /// [`Self::with_compression`]: the env is process-global and the test
+    /// binary is threaded, so a test that set the variable would decide the
+    /// policy for every other test running beside it.
+    pub fn with_lfru(mut self, on: bool) -> WarmCache {
+        self.lfru = on;
+        self
+    }
+
+    /// Override the `COLI_CACHE_SWEEP` gate, for the same reason as
+    /// [`Self::with_lfru`]: the env is process-global and the test binary is
+    /// threaded.
+    pub fn with_sweep(mut self, on: bool) -> WarmCache {
+        self.sweep = on;
         self
     }
 
@@ -306,19 +478,28 @@ impl WarmCache {
         let Some(key) = victim else { return 0 };
         let Some(slot) = self.map.get_mut(&key) else { return 0 };
         let SlotBytes::Raw(slab) = &slot.data else { return 0 };
-        let Some((compressed, new_bytes)) = encode_slab(slab) else { return 0 };
+        let Some(compressed) = encode_slab(slab) else { return 0 };
+        let new_bytes = compressed.nbytes();
         if new_bytes >= slot.bytes {
             return 0; // incompressible — leave raw (decode cost for no gain)
         }
         let saved = slot.bytes - new_bytes;
         self.used -= saved;
         slot.bytes = new_bytes;
-        slot.data = compressed;
+        slot.data = SlotBytes::Compressed(Arc::new(compressed));
         saved
     }
 
     pub fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// Bytes currently occupied by resident slabs. Pairs with [`Self::len`] and
+    /// [`Self::budget`] to say whether a low hit rate is an eviction problem (cache
+    /// full) or an admission problem (cache empty) — a distinction the hit/miss
+    /// counters cannot make.
+    pub fn used_bytes(&self) -> usize {
+        self.used
     }
 
     /// Lower the byte budget and evict down to it, returning bytes freed.
@@ -347,11 +528,18 @@ impl WarmCache {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+    /// Shared handle to the lock-free residency filter, for callers that want
+    /// to answer "definitely absent" without taking the cache mutex (the I/O
+    /// lane's per-plan probe). Clone once per forward, not per probe.
+    pub fn hint(&self) -> Arc<ResidencyHint> {
+        Arc::clone(&self.hint)
+    }
+
     pub fn contains(&self, key: (u32, u32)) -> bool {
-        // Bloom fast-path: a "definitely absent" answer skips the HashMap probe.
+        // Filter fast-path: a "definitely absent" answer skips the HashMap probe.
         // A "probably present" answer falls through to the exact map — false
         // positives are safe (the HashMap gives the true answer).
-        if !self.bloom.probably_contains(key) {
+        if !self.hint.might_contain(key) {
             return false;
         }
         self.map.contains_key(&key)
@@ -361,51 +549,86 @@ impl WarmCache {
     /// (possibly decompressed) [`ExpertSlab`] clone; on a miss returns `None`
     /// (the caller streams from disk, then [`Self::insert`]s). Returns owned
     /// because compressed slots materialize their bytes fresh per hit.
+    ///
+    /// This decodes **on the calling thread** — under whatever lock the caller
+    /// holds. The streaming lane uses [`Self::get_hit`] instead and decodes on
+    /// a CPU worker; this form remains for callers that want the slab in hand
+    /// (prefetch verify, tests, the sched oracle).
     pub fn get(&mut self, key: (u32, u32)) -> Option<ExpertSlab> {
+        match self.get_hit(key)? {
+            CacheHit::Raw(slab) => Some(*slab),
+            CacheHit::Compressed(frames) => match frames.materialize() {
+                Some(slab) => Some(slab),
+                None => {
+                    self.remove_corrupt(key);
+                    None
+                }
+            },
+        }
+    }
+
+    /// Look up an expert slab without decoding: a `Raw` hit clones six
+    /// refcounts, a `Compressed` hit clones one `Arc` — either way the lock
+    /// hold is O(1) in slab size, which is the whole point ([`CacheHit`]).
+    /// Recency/heat bookkeeping is identical to [`Self::get`].
+    ///
+    /// The hit is counted here, when the payload is handed out. A compressed
+    /// payload that later fails to decode is re-booked as a miss by
+    /// [`Self::remove_corrupt`]; the `prefetch_used` bump is not retracted on
+    /// that (rare, corruption-only) path.
+    pub fn get_hit(&mut self, key: (u32, u32)) -> Option<CacheHit> {
         self.clock += 1;
-        // Bloom fast-miss: skip the HashMap probe entirely on "definitely absent".
-        if !self.bloom.probably_contains(key) {
+        // Filter fast-miss: skip the HashMap probe entirely on "definitely absent".
+        if !self.hint.might_contain(key) {
             self.misses += 1;
             self.bloom_skips += 1;
             return None;
         }
         let now = self.clock;
-        // One probe: bump recency and materialize from the same borrow.
-        let (slab, first_prefetch_hit) = match self.map.get_mut(&key) {
+        let (hit, first_prefetch_hit) = match self.map.get_mut(&key) {
             Some(slot) => {
                 slot.used = now;
+                // Frequency half of LFRU. Bumped unconditionally, not under the
+                // `lfru` gate: the counter costs one add on a path that is about
+                // to hand out an expert slab, and gating it would make the
+                // knob's behavior depend on when it was switched on.
+                slot.heat = slot.heat.saturating_add(1);
                 let first = slot.from_prefetch && !slot.ever_hit;
                 if first {
                     slot.ever_hit = true;
                 }
-                (materialize(&slot.data), first)
+                let hit = match &slot.data {
+                    SlotBytes::Raw(s) => CacheHit::Raw(s.clone()),
+                    SlotBytes::Compressed(c) => CacheHit::Compressed(Arc::clone(c)),
+                };
+                (hit, first)
             }
             None => {
                 self.misses += 1;
                 return None;
             }
         };
-        match slab {
-            Some(slab) => {
-                self.hits += 1;
-                if first_prefetch_hit {
-                    self.prefetch_used += 1;
-                }
-                Some(slab)
-            }
-            None => {
-                // A resident slot whose payload will not decode is worse than no
-                // slot at all: drop it so the next lookup re-streams clean bytes,
-                // and count the lookup as the miss it effectively is.
-                crate::note_advisory_err("warm cache: undecodable slot dropped", &"zstd decode failed or wrong length");
-                self.decode_failures += 1;
-                if let Some(s) = self.map.remove(&key) {
-                    self.used = self.used.saturating_sub(s.bytes);
-                }
-                self.rebuild_bloom();
-                self.misses += 1;
-                None
-            }
+        self.hits += 1;
+        self.maybe_decay_heat();
+        if first_prefetch_hit {
+            self.prefetch_used += 1;
+        }
+        Some(hit)
+    }
+
+    /// A hit whose compressed payload would not decode, reported by whichever
+    /// thread tried ([`CompressedSlab::materialize`] → `None`). A resident slot
+    /// that cannot decode is worse than no slot at all: drop it so the next
+    /// lookup re-streams clean bytes, and re-book the optimistic hit
+    /// [`Self::get_hit`] counted as the miss it turned out to be.
+    pub fn remove_corrupt(&mut self, key: (u32, u32)) {
+        crate::note_advisory_err("warm cache: undecodable slot dropped", &"zstd decode failed or wrong length");
+        self.decode_failures += 1;
+        self.hits = self.hits.saturating_sub(1);
+        self.misses += 1;
+        if let Some(s) = self.map.remove(&key) {
+            self.used = self.used.saturating_sub(s.bytes);
+            self.hint.remove(key);
         }
     }
 
@@ -416,24 +639,24 @@ impl WarmCache {
         self.decode_failures
     }
 
+    /// A resident slot's accumulated hit frequency — the LFRU score's high bits.
+    /// Test-only: the policy is observable through eviction outcomes, and a
+    /// production reader would invite callers to depend on a counter that decays
+    /// out from under them.
+    #[cfg(test)]
+    fn heat_for_test(&self, key: (u32, u32)) -> Option<u32> {
+        self.map.get(&key).map(|s| s.heat)
+    }
+
     /// Corrupt a resident compressed slot's payload, to exercise the
     /// decode-failure path (bit rot in a multi-GB resident cache is exactly the
     /// scenario this guards). No-op for a raw slot.
     #[cfg(test)]
     fn corrupt_slot_for_test(&mut self, key: (u32, u32)) {
         if let Some(slot) = self.map.get_mut(&key) {
-            if let SlotBytes::Compressed { six, .. } = &mut slot.data {
-                six[0] = vec![0xFF; 8]; // not a valid zstd frame
+            if let SlotBytes::Compressed(c) = &mut slot.data {
+                Arc::make_mut(c).six[0] = vec![0xFF; 8]; // not a valid zstd frame
             }
-        }
-    }
-
-    /// Rebuild the Bloom hint from the current resident set. Called after any
-    /// eviction so the hint stays tight (deletes-invalidate the flat bit array).
-    fn rebuild_bloom(&mut self) {
-        self.bloom.clear();
-        for &key in self.map.keys() {
-            self.bloom.add(key);
         }
     }
 
@@ -474,6 +697,25 @@ impl WarmCache {
         self.prefetch_reads_by_layer.get(layer as usize).copied().unwrap_or(0)
     }
 
+    /// Bytes currently held by slabs the prefetch lane warmed and nothing has hit
+    /// yet, and how many slots that is: the speculative footprint, *right now*.
+    ///
+    /// Every other prefetch statistic here is a lifetime **count**, and the two that
+    /// look like an outcome — `prefetch_used`/`prefetch_wasted` — only classify a
+    /// slab when it is hit or evicted. A slab that is still resident is in neither,
+    /// so on the first serving-path measurement 335 of 412 speculative reads were
+    /// unaccounted, and that unaccounted portion is exactly the one occupying budget
+    /// that demand data could have used. This is the number that says how much of
+    /// the cache speculation is holding, as opposed to how often it guessed right.
+    ///
+    /// O(n) over resident slots, so call it at shutdown or in a test, not per read.
+    pub fn speculative_resident(&self) -> (usize, u64) {
+        self.map
+            .values()
+            .filter(|s| s.from_prefetch && !s.ever_hit)
+            .fold((0usize, 0u64), |(b, n), s| (b + s.bytes, n + 1))
+    }
+
     /// Record one low-confidence expert hinted to the page cache via `fadvise`.
     pub fn note_fadvise(&mut self) {
         self.fadvise_hints += 1;
@@ -489,7 +731,8 @@ impl WarmCache {
     pub fn clear(&mut self) {
         self.map.clear();
         self.used = 0;
-        self.bloom.clear();
+        self.hint.reset();
+        self.hint.fast_misses.store(0, Ordering::Relaxed);
         self.hits = 0;
         self.misses = 0;
         self.disk_reads = 0;
@@ -519,24 +762,81 @@ impl WarmCache {
         self.insert_inner(key, data, true);
     }
 
-    fn insert_inner(&mut self, key: (u32, u32), data: ExpertSlab, from_prefetch: bool) {
-        self.clock += 1;
-        let now = self.clock;
-        // Share once on admission: every later hit is a refcount bump instead of
-        // a full copy of the slab while the cache lock is held.
+    /// Whether new admissions encode (the `COLI_CACHE_COMPRESS` choice, fixed
+    /// at construction). Read it once outside the lock and feed it to
+    /// [`Self::prepare_insert`].
+    pub fn compress_on_admit(&self) -> bool {
+        self.compress_on_admit
+    }
+
+    /// The lock-free half of an admission: share the slab (every later hit is a
+    /// refcount bump instead of a full copy) and, when `compress` is set, run
+    /// the zstd encode. An encode failure degrades to storing raw, exactly as
+    /// [`Self::insert`] always has (correctness-neutral). An associated
+    /// function on purpose — it must be callable without the cache lock.
+    pub fn prepare_insert(data: ExpertSlab, compress: bool) -> PreparedInsert {
         let data = share_slab(data);
         let raw_bytes = slab_bytes(&data);
-        // Encode the payload into whichever SlotBytes representation is active.
         // `incoming` counts the resident footprint the eviction policy sees.
-        // Codec failure silently degrades to `Raw` (correctness-neutral).
-        let (slot_data, incoming) = if self.compress_on_admit {
+        let (slot_data, incoming) = if compress {
             match encode_slab(&data) {
-                Some((sb, compressed_bytes)) => (sb, compressed_bytes),
-                None => (SlotBytes::Raw(data), raw_bytes),
+                Some(cs) => {
+                    let n = cs.nbytes();
+                    (SlotBytes::Compressed(Arc::new(cs)), n)
+                }
+                None => (SlotBytes::Raw(Box::new(data)), raw_bytes),
             }
         } else {
-            (SlotBytes::Raw(data), raw_bytes)
+            (SlotBytes::Raw(Box::new(data)), raw_bytes)
         };
+        PreparedInsert { data: slot_data, incoming, raw_bytes }
+    }
+
+    /// The locked half of an admission prepared by [`Self::prepare_insert`]:
+    /// map insert + eviction only — no codec work runs under the caller's lock.
+    pub fn insert_prepared(&mut self, key: (u32, u32), prepared: PreparedInsert) {
+        self.insert_slot(key, prepared, false);
+    }
+
+    /// Sweep-mode admission control, and the eviction rule does not work without
+    /// it. Evicting the highest layer does not stop a high layer being
+    /// *admitted*: the newcomer is exempt from its own admission's eviction
+    /// (`keep`), so it displaces a band member and is then evicted by the next
+    /// insert — the band pays a slot for a slab nobody will read. Measured, that
+    /// is most of the band gone before a pass ends, and why victim order alone
+    /// moved the hit count from 0 to only 71.
+    ///
+    /// Refusing an admission from above the resident band is what keeps the band
+    /// still. Correctness-neutral: a slab that is not cached is re-read from
+    /// disk, which is exactly what a miss already does.
+    ///
+    /// Only once full — while there is room, admitting in sweep order *is* how
+    /// the band gets built, from layer 0 upward.
+    fn admission_refused(&self, key: (u32, u32)) -> bool {
+        self.sweep
+            && self.used >= self.budget
+            && !self.map.contains_key(&key)
+            && self.map.keys().map(|k| k.0).max().is_some_and(|top| key.0 > top)
+    }
+
+    fn insert_inner(&mut self, key: (u32, u32), data: ExpertSlab, from_prefetch: bool) {
+        // Check the gate before paying for share + encode (the worker-side
+        // `prepare_insert` path pays it before its gate — inherent to encoding
+        // off the lock, and sweep mode is the only case that wastes it).
+        if self.admission_refused(key) {
+            return;
+        }
+        let prepared = Self::prepare_insert(data, self.compress_on_admit);
+        self.insert_slot(key, prepared, from_prefetch);
+    }
+
+    fn insert_slot(&mut self, key: (u32, u32), prepared: PreparedInsert, from_prefetch: bool) {
+        if self.admission_refused(key) {
+            return;
+        }
+        self.clock += 1;
+        let now = self.clock;
+        let PreparedInsert { data: slot_data, incoming, raw_bytes } = prepared;
         self.uncompressed_bytes_seen = self.uncompressed_bytes_seen.saturating_add(raw_bytes as u64);
         self.compressed_bytes_seen = self.compressed_bytes_seen.saturating_add(incoming as u64);
         let was_new;
@@ -550,24 +850,23 @@ impl WarmCache {
                 // re-arm the used/wasted tracking from the new source.
                 slot.from_prefetch = from_prefetch;
                 slot.ever_hit = false;
+                slot.heat = 0;
                 was_new = false;
             }
             None => {
                 self.used += incoming;
                 self.map
-                    .insert(key, Slot { used: now, bytes: incoming, data: slot_data, from_prefetch, ever_hit: false, prio: 0 });
+                    .insert(key, Slot { used: now, bytes: incoming, data: slot_data, from_prefetch, ever_hit: false, prio: 0, heat: 0 });
                 was_new = true;
             }
         }
         if was_new {
-            self.bloom.add(key);
+            self.hint.add(key);
         }
-        let evicted = self.evict_to_budget(Some(key));
-        if evicted {
-            // Slot removals invalidate flat Bloom bits — rebuild from the current
-            // resident set. Cheap: ≤ 32 words × slot count.
-            self.rebuild_bloom();
-        }
+        // Removals decrement the counting filter inline (`evict_to_budget`), so
+        // there is no longer a rebuild pass here — the old flat Bloom cost an
+        // O(residents) rescan under this mutex on every full-cache admission.
+        self.evict_to_budget(Some(key));
     }
 
     /// Set one resident slot's eviction-protection score (no-op if not resident).
@@ -579,10 +878,24 @@ impl WarmCache {
         }
     }
 
-    /// Bulk [`Self::set_priority`]: protect every resident key in `keys` at `prio`.
+    /// Bulk [`Self::set_priority`]: apply `(key, prio)` pairs in one lock hold.
     /// Keys not currently resident are ignored (a miss re-streams them anyway).
-    pub fn set_protected(&mut self, keys: &[(u32, u32)], prio: u32) {
-        for &k in keys {
+    ///
+    /// **Takes per-key priorities, not one priority for a key slice.** The old
+    /// `(keys: &[(u32,u32)], prio: u32)` shape had no caller and could not have
+    /// had one: its only intended consumer, `Model::protect_from`, computes a
+    /// *different* score per expert (`pack_prio(predictor_score, heat)`), so a
+    /// single shared `prio` could not express what it needed. The signature was
+    /// written for a use that does not exist, which is its own explanation for
+    /// why it was never called.
+    ///
+    /// The point is the lock hold, not the loop. `protect_from` used to take the
+    /// cache lock and keep it across 78 layers × K predictions while also
+    /// holding the routing-history lock; the cache lock is contended by the
+    /// prefetch lane and every streamed read, so that window is expensive.
+    /// Building the pairs first and applying them here takes it once, briefly.
+    pub fn set_protected(&mut self, entries: &[((u32, u32), u32)]) {
+        for &(k, prio) in entries {
             self.set_priority(k, prio);
         }
     }
@@ -599,6 +912,39 @@ impl WarmCache {
     /// For introspection/tests.
     pub fn priority(&self, key: (u32, u32)) -> u32 {
         self.map.get(&key).map(|s| s.prio).unwrap_or(0)
+    }
+
+    /// Halve every slot's hit frequency once per [`LFRU_DECAY_HITS`] hits, so the
+    /// LFRU score reflects recent popularity rather than a lifetime total. Without
+    /// it a slab that was hot during one phase outranks everything forever and the
+    /// policy stops adapting — the failure mode plain LFU is known for.
+    ///
+    /// No-op unless `COLI_CACHE_LFRU` is set, so the default path pays one
+    /// comparison. Heats are gathered, decayed through [`crate::tier::decay`] and
+    /// written back **by key**, not by iteration position: `HashMap` order is
+    /// unspecified, and a gather/scatter that assumed it was stable would silently
+    /// hand each slab someone else's frequency.
+    fn maybe_decay_heat(&mut self) {
+        if !self.lfru {
+            return;
+        }
+        self.hits_since_decay += 1;
+        if self.hits_since_decay < LFRU_DECAY_HITS {
+            return;
+        }
+        self.hits_since_decay = 0;
+        let mut keys: Vec<(u32, u32)> = Vec::with_capacity(self.map.len());
+        let mut heats: Vec<u32> = Vec::with_capacity(self.map.len());
+        for (k, s) in self.map.iter() {
+            keys.push(*k);
+            heats.push(s.heat);
+        }
+        crate::tier::decay(&mut heats);
+        for (k, h) in keys.iter().zip(heats.iter()) {
+            if let Some(s) = self.map.get_mut(k) {
+                s.heat = *h;
+            }
+        }
     }
 
     /// Evict the least-recently-used slots until `used <= budget`, always keeping
@@ -625,6 +971,7 @@ impl WarmCache {
                 }
                 if let Some(s) = self.map.remove(&k) {
                     self.used -= s.bytes;
+                    self.hint.remove(k);
                     if s.from_prefetch && !s.ever_hit {
                         self.prefetch_wasted += 1;
                     }
@@ -639,15 +986,54 @@ impl WarmCache {
             // `prio: 0` while any predictor-protected slot is >= 1, so ordering
             // by `(prio, used)` would otherwise pick the newcomer first and make
             // every admission a silent no-op once anything is protected.
+            //
+            // Under `COLI_CACHE_LFRU` the second component becomes
+            // `tier::lfru_score`, which is `heat << 8 | (255 - age)` — one
+            // routing frequency count outweighs any recency advantage, so a
+            // merely-recent slab cannot displace a genuinely hotter one, while
+            // recency still breaks ties between equally-hot slabs. Priority stays
+            // the *primary* key either way: the protected set is a separate
+            // mechanism (`COLI_PREFETCH_PROTECT`) and LFRU reorders within a
+            // class rather than overriding it. Both arms are `(u32, u64)`, so the
+            // default arm is the historical tuple untouched.
+            // Under `COLI_CACHE_SWEEP` the second component inverts the **layer**,
+            // so the highest-layer slot is the victim and the cache converges on a
+            // stable low-layer band instead of the trailing edge of the last pass.
+            // The layer was always available here — it is the first half of the
+            // key — and was simply discarded by the closure until 2026-08-10.
+            //
+            // The third component is not decoration. `min_by_key` returns the
+            // first minimum in `HashMap` iteration order, which is unspecified;
+            // under LRU that never bites because `used` is unique per slot, but a
+            // layer-keyed score ties across all 8 experts of a layer and would
+            // otherwise pick a hash-order-dependent victim. `used` breaks it
+            // deterministically, and the historical arms pass 0 so their tuple is
+            // ordered exactly as before.
+            let lfru = self.lfru;
+            let sweep = self.sweep;
+            let clock = self.clock as u32;
             let victim = self
                 .map
                 .iter()
                 .filter(|(k, _)| Some(**k) != keep)
-                .min_by_key(|(_, s)| (s.prio, s.used))
+                .min_by_key(|(k, s)| {
+                    // `used` and `clock` are u64 counters truncated to u32 here;
+                    // `lfru_score` takes their wrapping difference, which is the
+                    // true age for any age below 2^32 — i.e. always.
+                    let (rank, tie) = if sweep {
+                        ((u32::MAX - k.0) as u64, s.used)
+                    } else if lfru {
+                        (crate::tier::lfru_score(s.heat, s.used as u32, clock), 0)
+                    } else {
+                        (s.used, 0)
+                    };
+                    (s.prio, rank, tie)
+                })
                 .map(|(k, _)| *k);
             let Some(vk) = victim else { break };
             if let Some(s) = self.map.remove(&vk) {
                 self.used -= s.bytes;
+                self.hint.remove(vk);
                 if s.from_prefetch && !s.ever_hit {
                     self.prefetch_wasted += 1;
                 }
@@ -657,8 +1043,16 @@ impl WarmCache {
         removed
     }
 
+    /// Misses across both paths: lookups the mutex-holding `get` resolved plus
+    /// "definitely absent" decisions the I/O lane made lock-free against the
+    /// residency filter. Callers wanting a true miss total must use this, not
+    /// the raw `misses` field, or the fast path's work goes uncounted.
+    pub fn total_misses(&self) -> u64 {
+        self.misses + self.hint.fast_misses.load(Ordering::Relaxed)
+    }
+
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
+        let total = self.hits + self.total_misses();
         if total == 0 {
             0.0
         } else {
@@ -728,6 +1122,56 @@ mod tests {
         // The cache stays usable afterwards.
         c.insert((0, 9), patterned_slab(4096, 128));
         assert!(c.get((0, 9)).is_some());
+    }
+
+    #[test]
+    fn get_hit_materialize_equals_get() -> Result<(), &'static str> {
+        // The two-phase hit (refcounted hand-out under the lock, decode on the
+        // consumer) must be byte-identical to the one-shot get(), for raw and
+        // compressed slots alike.
+        for compress in [false, true] {
+            let mut c = WarmCache::new(1 << 20).with_compression(compress);
+            c.insert((1, 2), patterned_slab(4096, 128));
+            let via_hit = match c.get_hit((1, 2)).ok_or("get_hit must hit")? {
+                CacheHit::Raw(s) => {
+                    assert!(!compress, "raw hit only when compression is off");
+                    *s
+                }
+                CacheHit::Compressed(frames) => {
+                    assert!(compress, "compressed hit only when compression is on");
+                    frames.materialize().ok_or("healthy frames must decode")?
+                }
+            };
+            let via_get = c.get((1, 2)).ok_or("get must hit")?;
+            for i in 0..3 {
+                assert_eq!(&via_hit[i].0[..], &via_get[i].0[..], "compress={compress} region {i} weight");
+                assert_eq!(&via_hit[i].1[..], &via_get[i].1[..], "compress={compress} region {i} scale");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remove_corrupt_counts_decode_failure() -> Result<(), &'static str> {
+        // The worker-side decode-failure path: get_hit hands out frames, the
+        // decode fails on the consumer, remove_corrupt re-books the optimistic
+        // hit as a miss and drops the slot so the next lookup re-streams.
+        let mut c = WarmCache::new(1 << 20).with_compression(true);
+        c.insert((3, 4), patterned_slab(4096, 128));
+        c.corrupt_slot_for_test((3, 4));
+        let hits_before = c.hits;
+        let misses_before = c.misses;
+        let frames = match c.get_hit((3, 4)).ok_or("expected a hit")? {
+            CacheHit::Compressed(f) => f,
+            CacheHit::Raw(_) => return Err("expected a compressed hit"),
+        };
+        assert!(frames.materialize().is_none(), "corrupted frames must fail decode");
+        c.remove_corrupt((3, 4));
+        assert_eq!(c.hits, hits_before, "the optimistic hit is retracted");
+        assert_eq!(c.misses, misses_before + 1, "re-booked as a miss");
+        assert_eq!(c.decode_failures(), 1);
+        assert!(!c.contains((3, 4)), "poisoned slot dropped, so the retry re-streams");
+        Ok(())
     }
 
     #[test]
@@ -904,6 +1348,152 @@ mod tests {
         assert_eq!(c.prefetch_wasted, 0);
     }
 
+    /// Drive a front-to-back layer sweep bigger than the budget, then force one
+    /// eviction and see who dies. Paired with the test below — same sequence,
+    /// opposite victim — because that is the only thing that proves the knob is a
+    /// knob.
+    fn sweep_then_evict(sweep: bool) -> Vec<(u32, u32)> {
+        // Budget fits 4 slabs; the sweep is 6 layers, so 2 must go.
+        let mut c = WarmCache::new(4 * 36).with_sweep(sweep);
+        for layer in 0..6u32 {
+            c.insert((layer, 0), slab(10, 2));
+        }
+        let mut resident: Vec<(u32, u32)> = c.map.keys().copied().collect();
+        resident.sort_unstable();
+        resident
+    }
+
+    #[test]
+    fn lru_evicts_the_earliest_layer_which_is_what_the_next_sweep_needs_first() {
+        // The pathology, pinned. `used` is a logical access ordinal that advances
+        // in layer order, so the least-recently-used slot at the end of a pass is
+        // layer 0 — precisely what the next token asks for first. LRU keeps the
+        // tail and throws away the head.
+        let resident = sweep_then_evict(false);
+        assert_eq!(resident, vec![(2, 0), (3, 0), (4, 0), (5, 0)], "LRU retains the trailing layers");
+        assert!(!resident.contains(&(0, 0)), "…and evicts layer 0, the next sweep's first lookup");
+    }
+
+    #[test]
+    fn sweep_keeps_the_low_layer_band_the_next_pass_starts_on() {
+        // Same sequence, opposite outcome: the highest layers are the victims, so
+        // what survives is a band from layer 0 — the only subset a cyclic sweep
+        // can actually reuse. If this ever agrees with the test above, the knob
+        // has stopped being a knob.
+        //
+        // The band comes out **whole**, layers 0..3, because admission control
+        // turns layers 4 and 5 away rather than letting them in to displace a band
+        // member and be evicted a moment later. Before that check existed this same
+        // sequence left `(5, 0)` resident and `(3, 0)` gone — the newcomer is exempt
+        // from its own admission's eviction, so each doomed insert still cost the
+        // band one slot on the way through.
+        let resident = sweep_then_evict(true);
+        assert_eq!(resident, vec![(0, 0), (1, 0), (2, 0), (3, 0)]);
+        for gone in [(4, 0), (5, 0)] {
+            assert!(!resident.contains(&gone), "{gone:?} is above the band and must never be admitted");
+        }
+        // The whole point, stated against the paired test: LRU keeps 2..5 and
+        // discards layer 0; sweep keeps layer 0.
+        assert!(!sweep_then_evict(false).contains(&(0, 0)));
+        assert!(resident.contains(&(0, 0)));
+    }
+
+    #[test]
+    fn sweep_refuses_admissions_from_above_the_band() {
+        // The band has to survive the rest of the pass, and it only does if slabs
+        // from above it are never admitted. Fill to capacity with layers 0..3, then
+        // offer layers 4..20 the way a real sweep would: every one must bounce, and
+        // the band must be untouched afterwards.
+        let mut c = WarmCache::new(4 * 36).with_sweep(true);
+        for layer in 0..4u32 {
+            c.insert((layer, 0), slab(10, 2));
+        }
+        let band: Vec<(u32, u32)> = {
+            let mut v: Vec<_> = c.map.keys().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(band, vec![(0, 0), (1, 0), (2, 0), (3, 0)], "band built from layer 0 up");
+
+        for layer in 4..21u32 {
+            c.insert((layer, 0), slab(10, 2));
+            assert!(!c.contains((layer, 0)), "layer {layer} is above the band and must not be admitted");
+        }
+        let after: Vec<(u32, u32)> = {
+            let mut v: Vec<_> = c.map.keys().copied().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(after, band, "17 doomed admissions must not have cost the band a single slot");
+
+        // A *lower* layer still gets in — the band tracks the sweep's start, it is
+        // not frozen. It displaces the top of the band, which is the whole point.
+        c.insert((0, 7), slab(10, 2));
+        assert!(c.contains((0, 7)), "a layer inside the band is still admitted");
+        assert!(!c.contains((3, 0)), "…by displacing the highest band member");
+    }
+
+    #[test]
+    fn sweep_admission_control_is_off_without_the_gate() {
+        // The paired opposite: same sequence, gate off, and every high layer lands.
+        // If this ever starts refusing, the knob has leaked into the default.
+        let mut c = WarmCache::new(4 * 36).with_sweep(false);
+        for layer in 0..4u32 {
+            c.insert((layer, 0), slab(10, 2));
+        }
+        for layer in 4..8u32 {
+            c.insert((layer, 0), slab(10, 2));
+            assert!(c.contains((layer, 0)), "plain LRU admits everything, including layer {layer}");
+        }
+    }
+
+    #[test]
+    fn sweep_eviction_is_deterministic_across_experts_of_one_layer() {
+        // All 8 experts of a layer tie on the layer term, and `min_by_key` returns
+        // the first minimum in unspecified `HashMap` order — so without the
+        // `used` tie-break the victim would depend on hash iteration. Same input,
+        // same survivors, every time.
+        let run = || {
+            let mut c = WarmCache::new(4 * 36).with_sweep(true);
+            for e in 0..6u32 {
+                c.insert((7, e), slab(10, 2)); // one layer, six experts
+            }
+            let mut r: Vec<(u32, u32)> = c.map.keys().copied().collect();
+            r.sort_unstable();
+            r
+        };
+        let first = run();
+        for _ in 0..8 {
+            assert_eq!(run(), first, "victim selection must not depend on HashMap order");
+        }
+    }
+
+    #[test]
+    fn speculative_resident_reports_what_used_and_wasted_cannot() {
+        // The gap this exists to close: a prefetched slab that has been neither hit
+        // nor evicted is counted by *neither* `prefetch_used` nor `prefetch_wasted`,
+        // so the pair can read as a clean 0/0 while speculation holds the budget.
+        let mut c = WarmCache::new(1 << 20);
+        c.insert_prefetched((0, 0), slab(10, 2));
+        c.insert_prefetched((0, 1), slab(10, 2));
+        c.insert((0, 2), slab(10, 2)); // demand-loaded — never speculative
+        assert_eq!((c.prefetch_used, c.prefetch_wasted), (0, 0), "nothing hit, nothing evicted");
+        let (bytes, slots) = c.speculative_resident();
+        assert_eq!(slots, 2, "both prefetched slabs are resident and unused");
+        assert!(bytes > 0 && bytes < c.budget());
+
+        // A hit reclassifies one: it is no longer speculative footprint.
+        assert!(c.get((0, 0)).is_some());
+        let (bytes_after, slots_after) = c.speculative_resident();
+        assert_eq!(slots_after, 1);
+        assert!(bytes_after < bytes, "hitting a slab removes it from the unused footprint");
+
+        // A cache with no prefetch at all reports nothing.
+        let mut d = WarmCache::new(1 << 20);
+        d.insert((0, 0), slab(10, 2));
+        assert_eq!(d.speculative_resident(), (0, 0));
+    }
+
     #[test]
     fn priority_protects_older_slab_from_eviction() {
         // budget fits two 36-byte slabs. Protect the OLDER one; a third insert must
@@ -930,6 +1520,102 @@ mod tests {
         assert!(c.contains((0, 0)));
         assert!(!c.contains((0, 1))); // LRU victim, exactly as byte_budget_evicts_lru
         assert!(c.contains((0, 2)));
+    }
+
+    /// The default must be the historical policy, and the strongest way to say so
+    /// is to run the sequence the LFRU test uses and require the *opposite*
+    /// outcome. If this ever agrees with `lfru_keeps_the_hotter_slab_...`, the
+    /// knob has stopped being a knob.
+    #[test]
+    fn lfru_off_evicts_the_least_recent_however_hot_it_is() {
+        let mut c = WarmCache::new(80).with_lfru(false);
+        c.insert((0, 0), slab(10, 2));
+        c.insert((0, 1), slab(10, 2));
+        // (0,0) is hit three times, (0,1) once and last — so (0,0) is hotter but
+        // older, the exact case the two policies disagree about.
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 1)).is_some());
+        c.insert((0, 2), slab(10, 2));
+        assert!(!c.contains((0, 0)), "LRU must evict the least-recently-used slab, frequency notwithstanding");
+        assert!(c.contains((0, 1)));
+        assert!(c.contains((0, 2)));
+    }
+
+    #[test]
+    fn lfru_keeps_the_hotter_slab_over_the_more_recent_one() {
+        let mut c = WarmCache::new(80).with_lfru(true);
+        c.insert((0, 0), slab(10, 2));
+        c.insert((0, 1), slab(10, 2));
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 0)).is_some());
+        assert!(c.get((0, 0)).is_some()); // heat 3
+        assert!(c.get((0, 1)).is_some()); // heat 1, but most recent
+        c.insert((0, 2), slab(10, 2));
+        // heat occupies bits 8+ of the score and recency only the low 8, so three
+        // routings (3 << 8 = 768) cannot be overtaken by any recency (max 255).
+        assert!(c.contains((0, 0)), "the hotter slab must survive being the least recent");
+        assert!(!c.contains((0, 1)), "the merely-recent slab is the victim under LFRU");
+        assert!(c.contains((0, 2)));
+    }
+
+    /// LFRU reorders *within* a priority class; it must not override the
+    /// protected set. A predictor-protected slab that is both cold and stale
+    /// still outranks a hot unprotected one.
+    #[test]
+    fn priority_still_dominates_under_lfru() {
+        let mut c = WarmCache::new(80).with_lfru(true);
+        c.insert((0, 0), slab(10, 2)); // will be protected, never hit → heat 0
+        c.insert((0, 1), slab(10, 2));
+        assert!(c.get((0, 1)).is_some());
+        assert!(c.get((0, 1)).is_some()); // hot and recent, but unprotected
+        c.set_priority((0, 0), 1);
+        c.insert((0, 2), slab(10, 2));
+        assert!(c.contains((0, 0)), "protection is the primary key under LFRU too");
+        assert!(!c.contains((0, 1)), "the hot unprotected slab is still the victim");
+    }
+
+    /// A slab hot in one phase must not stay unevictable forever. After a decay
+    /// sweep its frequency is halved, so a slab that has since become hotter
+    /// outranks it.
+    #[test]
+    fn lfru_frequency_decays_so_a_dead_phase_stops_winning() {
+        let mut c = WarmCache::new(1 << 20).with_lfru(true);
+        c.insert((0, 0), slab(10, 2));
+        for _ in 0..8 {
+            assert!(c.get((0, 0)).is_some());
+        }
+        let hot_before = c.heat_for_test((0, 0));
+        assert_eq!(hot_before, Some(8));
+        // Drive past the decay interval. Every hit lands on (0,0), so without
+        // decay its heat would only ever grow.
+        for _ in 0..LFRU_DECAY_HITS {
+            assert!(c.get((0, 0)).is_some());
+        }
+        let after = c.heat_for_test((0, 0)).unwrap_or(u32::MAX);
+        assert!(
+            after < (8 + LFRU_DECAY_HITS as u32),
+            "decay must halve accumulated frequency; got {after} against an undecayed {}",
+            8 + LFRU_DECAY_HITS as u32
+        );
+    }
+
+    /// `set_protected` must apply a *different* priority per key. Its previous
+    /// shape took one `prio` for a whole key slice, which no caller could use —
+    /// the one intended consumer scores each expert separately.
+    #[test]
+    fn set_protected_applies_a_distinct_priority_per_key() {
+        let mut c = WarmCache::new(1 << 20);
+        c.insert((0, 0), slab(10, 2));
+        c.insert((0, 1), slab(10, 2));
+        c.insert((0, 2), slab(10, 2));
+        c.set_protected(&[((0, 0), 5), ((0, 1), 9), ((9, 9), 7)]);
+        assert_eq!(c.priority((0, 0)), 5);
+        assert_eq!(c.priority((0, 1)), 9, "each key keeps its own score");
+        assert_eq!(c.priority((0, 2)), 0, "keys not listed are untouched");
+        assert_eq!(c.priority((9, 9)), 0, "a non-resident key is ignored, not inserted");
+        assert!(!c.contains((9, 9)), "protecting a missing key must not create it");
     }
 
     #[test]
