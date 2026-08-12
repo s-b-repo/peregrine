@@ -178,6 +178,12 @@ pub struct Model {
     /// Optional MTP head for speculative decode; `None` unless the checkpoint has
     /// the `model.layers.{n_layers}.eh_proj` tensors.
     mtp: Option<MtpHead>,
+    /// RLM controller (always present; inert when `COLI_RLM` is unset, in which
+    /// case [`crate::rlm::RLMController::should_recurse`] always returns `false`
+    /// and the emitted token stream is byte-identical to the non-RLM path).
+    /// Decides when a token's forward needs recursive refinement passes; the
+    /// recursive pass itself is [`Self::forward_hidden_recursive`].
+    rlm: crate::rlm::RLMController,
     /// Routing-frequency accumulator driving heat-ranked VRAM residency; `Some`
     /// only when a GPU tier exists (bumped during the forward, read by `reheat`).
     heat: Option<HeatTable>,
@@ -2373,6 +2379,7 @@ impl Model {
             last_forward_at: Mutex::new(None),
             checkpoint_dir: dir.to_path_buf(),
             layout_schedule: load_layout_schedule(dir),
+            rlm: crate::rlm::RLMController::new(),
         };
         // Upgrade the predictor to the offline transition automaton if a matching
         // `automaton.json` sits next to the checkpoint (else stay on momentum),
@@ -2514,6 +2521,8 @@ impl Model {
         if let Some(c) = &self.ecache {
             c.lock().clear_priorities();
         }
+        // RLM: reset per-token recursion state so the new sequence starts clean.
+        self.rlm.reset();
     }
 
     /// Set the current workload class (from the serving layer's prompt
@@ -3943,6 +3952,80 @@ impl Model {
         Ok(self.lm_head.apply_vec(&xf, s_n))
     }
 
+    /// **RLM recursive pass** — re-runs the last `K = COLI_RLM_LAYERS` transformer
+    /// layers of the main stack on a refined `h`, returning refined logits
+    /// `[s_n, vocab]`. Used by [`Self::generate`] and [`Self::generate_speculative`]
+    /// when [`crate::rlm::RLMController::should_recurse`] indicates the first-pass
+    /// logits are uncertain.
+    ///
+    /// The recursive pass **never appends to the main KV** — the cross-layer
+    /// attention it performs reads the same cache a regular decode at `pos_base`
+    /// would, but writes nothing to it. This matches the property used by the MTP
+    /// draft path (`mtp_draft_with`), and keeps "one extra pass on this token" from
+    /// silently inflating context length or breaking the truncate-rewind contract in
+    /// speculative decode.
+    ///
+    /// Routing is **not logged** into `route_hist` (the `forward_ctx()` context sets
+    /// `route_log: None`), for the same reason drafts must not overwrite the
+    /// main-stream router history — recursive refinement at one token must not
+    /// skew the prefetch predictor against future tokens. The 3-lane scheduler and
+    /// warm cache still serve the recursive pass normally — on the second pass for a
+    /// contested token, most routed experts are already warm in `ecache`, which is
+    /// the cache-amortization win that makes RLM a net speedup rather than a slowdown
+    /// in the disk-bound regime (see `README.md` "warm cache 3.58× on repeat forward").
+    ///
+    /// When `COLI_RLM` is unset, callers never invoke this (the controller's
+    /// `should_recurse` returns `false`), so this path has zero effect on bit-identity
+    /// gates. Off-by-default correctness is therefore structural, not a runtime
+    /// branch in the hot path.
+    pub(crate) fn forward_hidden_recursive(
+        &self,
+        h: &mut [f32],
+        s_n: usize,
+        pos_base: usize,
+    ) -> Result<Vec<f32>, Error> {
+        let n_layers = self.cfg.n_layers as usize;
+        let k = crate::rlm::rlm_layers().min(n_layers);
+        let start = n_layers - k;
+        let d = self.cfg.hidden as usize;
+        let eps = self.cfg.eps;
+        // Fresh local KV per replay layer — **not** `LayerKv::new()`, but
+        // `clone_prefix(pos_base)` of the real per-layer cache: `mla_attention`
+        // always appends at `pos_base`, so the throwaway must see all `pos_base`
+        // positions already populated. `clone_prefix` shares those rows by
+        // `Arc` (zero-copy on the shared-prefix path) and gives the replay its
+        // own private tail to append position `pos_base` into — the recursive
+        // pass's attention reads the real cached past and writes nothing back,
+        // exactly like `mtp_draft_with` on a fresh local KV. Bit-identical KV
+        // state on the real cache because we never touch its tail.
+        let mut kv_local: Vec<LayerKv> = (0..k).map(|i| self.kv[start + i].clone_prefix(pos_base)).collect();
+        // Build a route-logging-off ForwardCtx (the prefill/draft shape), reusing
+        // the resident scheduler, GPU lane and warm cache. Replays do not touch
+        // the lane telemetry (timings = None), so bubble/IO tuners stay on the
+        // main forward's signal. Scoped so the `&self` borrow ends before the
+        // `lm_head` re-borrow (clippy: a `drop` here would be a `drop_non_drop`
+        // noise — the lifetime, not the destructor, is what we want to bound).
+        let lg = {
+            let ctx = self.forward_ctx();
+            for (i, l) in self.layers[start..].iter().enumerate() {
+                forward_layer(l, start + i, &mut kv_local[i], &ctx, h, s_n, pos_base)?;
+            }
+            // Drop `kv_local` here is unnecessary — it owns no shared `&self`
+            // borrow; the constraint is just `ctx` going out of scope.
+            let xf = rmsnorm_rows(h, &self.final_norm, s_n, d, eps);
+            self.lm_head.apply_vec(&xf, s_n)
+        };
+        Ok(lg)
+    }
+
+    /// RLM controller telemetry — recursive passes triggered this run, and the
+    /// number of tokens that triggered at least one. `(0, 0)` unless `COLI_RLM=1`.
+    /// Intended for the `/metrics` scrape path or the engine-shutdown summary,
+    /// same role as `lookahead_issued()` for the router look-ahead.
+    pub fn rlm_stats(&self) -> (u64, u64) {
+        (self.rlm.passes_emitted(), self.rlm.tokens_recursed())
+    }
+
     /// Build the per-forward compute context from the resident model state with
     /// prefetch/route-logging **disabled** — the shape the external-KV batched and
     /// prefill paths use (the B-way expert union is not a useful next-token
@@ -4293,8 +4376,26 @@ impl Model {
         }
         self.reset();
         let vocab = self.cfg.vocab as usize;
-        let logits = self.forward_step(prompt, 0)?;
-        let mut next = sampler.pick(&logits[(prompt.len() - 1) * vocab..prompt.len() * vocab], -1) as i32;
+        let d = self.cfg.hidden as usize;
+        let eps = self.cfg.eps;
+
+        // Inline forward+head without `forward_step` so we keep the pre-final-norm
+        // hidden (`h_last`) in hand for RLM recursion. `forward_step` stays
+        // unchanged — same algebra, bit-identical.
+        let mut x_all = self.forward_hidden(prompt, 0)?;
+        let xf = rmsnorm_rows(&x_all, &self.final_norm, prompt.len(), d, eps);
+        let logits = self.lm_head.apply_vec(&xf, prompt.len());
+        let mut h_last = x_all[(prompt.len() - 1) * d..prompt.len() * d].to_vec();
+        let mut lg = logits[(prompt.len() - 1) * vocab..prompt.len() * vocab].to_vec();
+        // RLM refinement loop: each pass refines `h_last` and recomputes the head.
+        // `should_recurse` returns `false` for the whole call site when `COLI_RLM`
+        // is unset, so the block below is the bit-identical pass-0 logits sample.
+        while self.rlm.should_recurse(&lg, sampler.temp) {
+            self.forward_hidden_recursive(&mut h_last, 1, prompt.len() - 1)?;
+            let xf2 = rmsnorm_rows(&h_last, &self.final_norm, 1, d, eps);
+            lg = self.lm_head.apply_vec(&xf2, 1);
+        }
+        let mut next = sampler.pick(&lg, -1) as i32;
         let mut out = vec![next];
         // Stop ids end generation here as they do on the speculative path. They
         // used to be honored only by `generate_speculative`, so the same model
@@ -4305,8 +4406,21 @@ impl Model {
         }
         for step in 1..n_new {
             let pos = prompt.len() + step - 1; // first decode attends at prompt.len()
-            let lg = self.forward_step(&[next], pos)?;
-            next = sampler.pick(&lg[..vocab], -1) as i32;
+            // RLM: reset per-token recursion at the start of each step.
+            self.rlm.reset();
+            // Forward to last-layer hidden with the single next token.
+            x_all = self.forward_hidden(&[next], pos)?;
+            h_last = x_all[..d].to_vec();
+            let xf = rmsnorm_rows(&x_all, &self.final_norm, 1, d, eps);
+            lg = self.lm_head.apply_vec(&xf, 1);
+            // RLM recursion: refine `h_last` and recompute logits while the
+            // controller says to. No-op (structurally — see `rlm.rs:114`) when off.
+            while self.rlm.should_recurse(&lg, sampler.temp) {
+                self.forward_hidden_recursive(&mut h_last, 1, pos)?;
+                let xf2 = rmsnorm_rows(&h_last, &self.final_norm, 1, d, eps);
+                lg = self.lm_head.apply_vec(&xf2, 1);
+            }
+            next = sampler.pick(&lg, -1) as i32;
             out.push(next);
             if step.is_multiple_of(RSS_GUARD_EVERY) {
                 self.rss_guard();
@@ -4544,9 +4658,37 @@ impl Model {
                     break;
                 }
             }
-            // the model's prediction at position k is the next token to process
-            next = crate::sample::argmax(&logits_b[k * vocab..(k + 1) * vocab]) as i32;
+            // the model's prediction at position k is the next token to process.
+            // (Recomputed after the RLM refinement below if the controller
+            // requested extra passes; the logits/route history is held to the
+            // same exclusion `mtp_draft_with` enforces on drafts — `route_log`
+            // is `None` via `forward_ctx`.)
             hlast = xb[k * d..(k + 1) * d].to_vec();
+            // MTP + RLM composition — only the post-acceptance contested position.
+            // We just emitted positions `[next, draft[..k]]`. `next` for the next
+            // round is set to `logits_b[k]`'s argmax. If that footing was
+            // uncertain (greedy top-2 margin < `COLI_RLM_MARGIN`), refine
+            // `hlast = xb[k*d..]` with a recursive pass and recompute `next`.
+            //
+            // Self-consistent bounds:
+            // - we never resume from a rejected draft token (it was already
+            //   wrong for a reason; one more pass on a wrong-but-now-rejected
+            //   position is the born-corrected case)
+            // - we never recurse on row 0 — `next` was already committed as
+            //   argmax earlier in this same block (`out.push(next)` above)
+            //   and is treated as confirmed
+            //
+            // Bit-identical to plain `generate_speculative` when `COLI_RLM`
+            // unset: `should_recurse` returns `false` for the whole loop.
+            self.rlm.reset();
+            let mut lb_k = logits_b[k * vocab..(k + 1) * vocab].to_vec();
+            while self.rlm.should_recurse(&lb_k, 0.0) {
+                self.forward_hidden_recursive(&mut hlast, 1, pos + k)?;
+                let xf2 = rmsnorm_rows(&hlast, &self.final_norm, 1, d, eps);
+                let lg2 = self.lm_head.apply_vec(&xf2, 1);
+                lb_k = lg2[..vocab].to_vec();
+            }
+            next = crate::sample::argmax(&lb_k) as i32;
             // committed this round: `next` (already emitted) + k accepted drafts
             let committed = 1 + k;
             self.truncate_kv(pos + committed);
