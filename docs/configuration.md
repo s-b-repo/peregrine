@@ -20,7 +20,7 @@ every default is in the code at the path given.
 **Most knobs are output-neutral**: they change how fast a token arrives, never
 which token it is. Those can be A/B'd freely against a bit-identity assertion.
 
-**Five knobs change token values.** They are real quality/performance trades, not
+**Six knobs change token values.** They are real quality/performance trades, not
 tuning, and each must be gated with `Model::prediction_flip_rate` against the
 unmodified configuration before you rely on it:
 
@@ -30,6 +30,7 @@ unmodified configuration before you rely on it:
 | [`COLI_ROUTE_MIN_SHARE`](#coli_route_min_share) | drops low-gate experts from the MoE sum |
 | [`COLI_DSA`](#coli_dsa) | attends only the indexer's top-k cached positions |
 | [`COLI_MLA_ABSORB`](#coli_mla_absorb) | absorb and dense agree algebraically, not numerically |
+| [`COLI_RLM`](#coli_rlm--recursive-refinement-at-contested-decode-positions) | recursive refinement of contested decode positions, may shift the argmax |
 | [`COLI_CUDA_FUSED_REDUCE`](#coli_cuda_fused_reduce) | low bits only — `f32 +=` is not associative |
 
 > Earlier revisions of this page opened by claiming *"every one of them affects
@@ -584,6 +585,59 @@ single-sequence decode.
 *cache*, and in a decode batch every sequence has its own, so nothing is shared and
 the cost grows with context — which is the problem absorb exists to solve. That is now
 your decision against a documented default rather than one the code took silently.
+
+### `COLI_RLM` — recursive refinement at contested decode positions
+
+Enable the **Recursive Language Model** controller in the decode loop. After a token's
+ordinary forward produces logits, the controller inspects them (top-2 margin for
+greedy, distribution entropy for sampled) and, if the pass was *uncertain*, triggers
+one or more recursive passes that re-run a configurable subset of transformer layers
+on the refined hidden state, then recompute the head. Easy tokens terminate after
+pass 0 (the ordinary forward); contested tokens spend extra compute for sharper
+logits. Same horizontal-vs-vertical dynamicity split as MTP, on a different axis:
+MTP runs layers ahead *across positions*, RLM runs layers *deeper at one position*.
+
+| Sub-knob | Default | Effect |
+|---|---|---|
+| `COLI_RLM` | off | master switch |
+| `COLI_RLM_DEPTH` | 2 | max recursive passes per token (cap 4) |
+| `COLI_RLM_LAYERS` | 4 | how many of the last transformer layers each pass re-runs |
+| `COLI_RLM_MARGIN` | 0.1 | greedy: top-2 logit gap below which to recurse |
+| — | — | sampled: recursion threshold is entropy > 0.5 (hardcoded, see `rlm.rs:128`) |
+
+**Why this is the right shape for peregrine specifically.** The recursive pass
+re-runs the warm/expert-cache-hot path, **not** the cold-disk path. On the second pass
+for a contested token the routed expert set is mostly the same as pass 1 (the hidden
+has barely moved), so the warm cache serves most of it — measured at 100 % hit on a
+repeated forward (README's "warm cache 3.58×" figure). The recursive pass therefore
+runs from `ecache`, not SSD: extra compute for one contested token costs a fraction of
+its first-pass time. This is also why the recursive pass goes through `forward_ctx()`
+with `route_log: None` and `timings: None` — drafts must not skew the prefetch
+predictor (`modeled after `mtp_draft_with`'s isolation contract).
+
+**Composition with MTP** — `generate_speculative` recurses only at the
+post-acceptance contested position (the row whose logits decide the next round's
+`next`): drafted tokens are accepted/rejected by argmax of the verify forward, and
+any accepted or rejected position is *already decided* — recursion there would either
+contradict the spec-decode contract or burn compute on a token that won't be emitted.
+Position 0 (`next`) is committed as argmax before the recursion loop and is left
+alone. The contract `speculative_matches_greedy` enforces (each token is the model's
+argmax) holds: the refined `next` is still just an argmax, of a sharper
+distribution.
+
+**Telemetry.** `Model::rlm_stats()` returns `(recursive_passes_emitted,
+tokens_that_triggered_at_least_one_pass)` — theshutdown/`/metrics`-style surface, same
+role as `lookahead_issued()` for the router look-ahead. `(0, 0)` when `COLI_RLM` is
+unset.
+
+**Status**: wired (`model.rs::generate`, `model.rs::generate_speculative`,
+`model.rs::forward_hidden_recursive`); arity / margin decisions in
+`crates/peregrine-model/src/rlm.rs`. Off-by-default, structurally inert (the
+controller's `should_recurse` returns `false` for the whole call site when `COLI_RLM`
+is unset, so the bit-identity gates stay byte-identical). **Quality unmeasured on a
+real checkpoint.** Size the trade against `Model::prediction_flip_rate` — that is
+the offline metric for "did recursion move the argmax on contested tokens" — which
+is exactly what an operator considering `COLI_RLM=1` wants to know first.
 
 ---
 

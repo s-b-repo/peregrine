@@ -264,6 +264,7 @@ token stream is unchanged. (Annotated reference with deep-dive links:
 | `COLI_KV_BUDGET_MB` | 0 (off) | Resident-KV byte ceiling for admission, alongside the `--max-batch` count |
 | `COLI_KV_DTYPE` | `f32` | KV latent element type; `f16` halves resident KV (**changes token values** — pair with `COLI_MLA_ABSORB`) |
 | `COLI_DSA` | off | DSA lightning-indexer sparse attention, where the checkpoint carries an indexer (**changes token values**) |
+| `COLI_RLM` | off | Recursive Language Model: refine contested decode positions by re-running the last `COLI_RLM_LAYERS` layers (default 4) up to `COLI_RLM_DEPTH` times (default 2). Greedy recurses when top-2 logit gap < `COLI_RLM_MARGIN` (0.1). Pass-2 experts come from the warm cache, not SSD. Composes with `COLI_DRAFT`: recurses only at the post-acceptance contested position (**changes token values**) |
 | `COLI_ROUTE_MIN_SHARE` | 0 (off) | Drop negligible-gate-share routed experts (**changes token values**) |
 
 #### Governors & learning
