@@ -187,6 +187,13 @@ pub struct Model {
     /// Routing-frequency accumulator driving heat-ranked VRAM residency; `Some`
     /// only when a GPU tier exists (bumped during the forward, read by `reheat`).
     heat: Option<HeatTable>,
+    /// Deferred-spill log (`COLI_GPU_SPILL`): `(layer, expert)` pairs the lane
+    /// balancer verdicted [`crate::lane::Placement::GpuSpill`] mid-forward.
+    /// Acting on the verdict needs `&mut GpuTier`, which a forward holds by `&`,
+    /// so the pairs queue here and [`Self::reheat`] drains them between forwards
+    /// into the heat snapshot ahead of the ranking. `Some` only when the knob is
+    /// on and a GPU tier exists.
+    spill_log: Option<Mutex<Vec<(usize, usize)>>>,
     /// Per-lane wall-time accumulator. `moe_forward_concurrent` bumps this each
     /// layer; the model reads and resets it between forwards to feed the bubble
     /// tuner. Always present (cheap — four atomic counters).
@@ -283,6 +290,29 @@ pub struct SeqKv {
 /// An unrecognised value is **reported and ignored**, not silently coerced: a
 /// typo'd dtype that quietly halved precision would change token values with
 /// nothing in the output saying so.
+/// `COLI_GPU_SPILL=1`: act on the lane balancer's [`crate::lane::Placement::GpuSpill`]
+/// verdicts by queueing the spilled `(layer, expert)` pairs for the next
+/// residency generation (see `Model::spill_log`). Off by default — the verdict
+/// stays advisory, the historical behavior.
+fn gpu_spill_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("COLI_GPU_SPILL").as_deref(), Ok("1") | Ok("true")))
+}
+
+/// Fold drained spill verdicts into a heat snapshot ahead of the residency
+/// ranking: each spill event bumps its expert's count by one, so an expert the
+/// balancer kept wanting resident outranks an equally-routed one it never
+/// asked for — proportional to how often it was asked, rather than jumping the
+/// whole queue on a single verdict. Pure so the arithmetic is testable without
+/// a GPU.
+fn merge_spills(counts: &mut [u32], spills: &[(usize, usize)], n_experts: usize) {
+    for &(layer, e) in spills {
+        if let Some(c) = counts.get_mut(layer * n_experts + e) {
+            *c = c.saturating_add(1);
+        }
+    }
+}
+
 pub fn kv_dtype() -> KvDtype {
     static V: std::sync::OnceLock<KvDtype> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -2371,6 +2401,9 @@ impl Model {
             prefetch,
             gpu,
             mtp,
+            // `heat` is `Some` exactly when a GPU tier exists, which is also
+            // the only world where a spill verdict can mean anything.
+            spill_log: (gpu_spill_enabled() && heat.is_some()).then(|| Mutex::new(Vec::new())),
             heat,
             lane_timings: Arc::new(crate::lane::LaneTimingsAccum::new()),
             lane_totals: Arc::new(crate::lane::LaneTimingsAccum::new()),
@@ -3776,7 +3809,7 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, expert_index, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, lane_timings, layout_schedule, absorb, dsa, ..
+                cfg, layers, kv, st, expert_index, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, ..
             } = self;
             let ctx = ForwardCtx {
                 st,
@@ -3792,6 +3825,7 @@ impl Model {
                 route_log_multi: None,
                 direct: *direct,
                 heat: heat.as_ref(),
+                spill: spill_log.as_ref(),
                 timings: Some(lane_timings.as_ref()),
                 balancer: balancer.as_ref(),
                 heat_counts: heat_snapshot.as_deref(),
@@ -4136,6 +4170,8 @@ impl Model {
             route_log_multi: None,
             direct: self.direct,
             heat: self.heat.as_ref(),
+            // No balancer in this context, so no spill verdict can occur.
+            spill: None,
             timings: None,
             balancer: None,
             heat_counts: None,
@@ -4394,6 +4430,7 @@ impl Model {
             route_log_multi: histories,
             direct: self.direct,
             heat: self.heat.as_ref(),
+            spill: self.spill_log.as_ref(),
             timings: Some(self.lane_timings.as_ref()),
             balancer: balancer.as_ref(),
             heat_counts: heat_snapshot.as_deref(),
@@ -4444,9 +4481,19 @@ impl Model {
         // Frequency, recency and clock read together: `COLI_GPU_TIER_SWAP=lfru`
         // scores the first two against the third, and three separate reads would
         // let a generation age its stamps against a clock from another forward.
-        let Some((counts, last, clock)) = self.heat.as_ref().map(|h| h.snapshot_all()) else {
+        let Some((mut counts, last, clock)) = self.heat.as_ref().map(|h| h.snapshot_all()) else {
             return Ok(());
         };
+        // Drain the deferred-spill log (`COLI_GPU_SPILL`) into this generation's
+        // snapshot before the ranking: every mid-forward `GpuSpill` verdict since
+        // the last reheat bumps its expert, so what the balancer kept asking for
+        // finally outranks what it never did. The uploads still go through the
+        // ranking's own budgeted path (`admit_uploads`, `COLI_PCIE_BUDGET_MB`) —
+        // this changes the order of candidates, not the spend limit.
+        if let Some(log) = self.spill_log.as_ref() {
+            let drained = std::mem::take(&mut *log.lock());
+            merge_spills(&mut counts, &drained, self.cfg.n_experts as usize);
+        }
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.reheat(&self.st, &self.cfg, &crate::gpu::HeatView { counts: &counts, last: &last, clock })?;
         }
@@ -4641,6 +4688,7 @@ impl Model {
             route_log_multi: None,
             direct: *direct,
             heat: None, // speculative drafts must not skew residency heat
+            spill: None, // drafts must not queue uploads for a speculative future
             timings: None, // drafts must not skew the main-stream lane balance
             balancer: None, // drafts run under the plain static residency policy
             heat_counts: None,
@@ -4814,6 +4862,23 @@ mod tests {
     use crate::sample::argmax;
     use crate::testkit::build_tiny_model;
     use std::path::PathBuf;
+
+    #[test]
+    fn merge_spills_bumps_by_multiplicity_and_ignores_out_of_range() {
+        // 2 layers × 4 experts. Expert (1,2) spilled three times, (0,0) once;
+        // a stale pair past the table must be ignored, not panic or wrap.
+        let mut counts = vec![10u32, 0, 0, 0, 0, 0, 5, 0];
+        merge_spills(&mut counts, &[(1, 2), (0, 0), (1, 2), (1, 2), (7, 3)], 4);
+        assert_eq!(counts, vec![11, 0, 0, 0, 0, 0, 8, 0]);
+        // Saturation, not overflow, at the ceiling.
+        let mut hot = vec![u32::MAX];
+        merge_spills(&mut hot, &[(0, 0)], 1);
+        assert_eq!(hot, vec![u32::MAX]);
+        // Empty drain is a no-op.
+        let mut same = vec![3u32, 4];
+        merge_spills(&mut same, &[], 2);
+        assert_eq!(same, vec![3, 4]);
+    }
 
     /// The protect default has to flip at one token's working set, because the
     /// mechanism measured +193 hits below that line and −381 above it. Pinning
