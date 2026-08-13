@@ -46,10 +46,52 @@ comments.
 - One process-persistent instance behind a mutex; encode is `&mut` because
   the pretoken memo cache learns — so the cache **warms across requests**,
   and repeated chat-template prefixes encode from cache.
-- Streaming decodes the id list per emitted token and handles partial UTF-8
-  at token boundaries via lossy conversion (a token that doesn't lengthen the
-  decoded text emits no SSE chunk).
+- **Streaming decode does not touch that mutex** (2026-08-13): each stream
+  takes a `DecodeHandle` — a one-`Arc` immutable view of the vocab — and
+  decodes per emitted token with no lock and no allocation
+  (`token_bytes(id) -> Option<&[u8]>`; out-of-vocab is `None`, the lenient
+  skip that keeps a padded-`lm_head` sample from killing a stream). Partial
+  UTF-8 at token boundaries is still joined by `IncrementalDecoder`.
+- Per-worker *encode* forks were considered and deliberately **not** built:
+  after the decode handle, the mutex is held once per request for a µs-scale
+  whole-prompt encode against a seconds-per-token engine, and forking would
+  split the cross-request memo cache for no measurable win.
 - Boot prints `[tokenizer] gigatoken BPE active, vocab=<n>`.
+
+## 2026-08-13 speed pass
+
+Three engine-level costs measured and removed, ids byte-identical throughout
+(GPT-2 + GLM parity suites before and after):
+
+1. **Per-segment scratch** — the probe/emit machinery zero-initialized an
+   8.7 KB `SpanBatch` per call, and `for_each_piece` makes one call per
+   added-token segment (~11 per GLM chat prompt). The scratch now lives on the
+   `Tokenizer` (upstream's `EncodeState` shape).
+2. **Batch handout** — `encode_batch` split input into exactly one chunk per
+   worker, so every call finished at the slowest worker's pace. Now ~16 chunks
+   per worker with a finer tail, self-paced off an atomic cursor, and the
+   per-document id copy is gone. Engage gate 2 MiB → 1 MiB per worker.
+3. **Streaming decode** — the per-token lock + three allocations per token per
+   stream (above).
+
+Same box (i5-1235U), GLM-5.2 vocab, 64.9 MB mixed doc/code corpus (repetitive —
+memo-cache-friendly, so the parallel rows read higher than the prose tables
+below), best of 3:
+
+| Row | before | after | Δ |
+|---|---:|---:|---|
+| `gigatoken/line` | 111.9 | 133.7 | **+19 %** |
+| `gigatoken/whole` | 295.6 | 318.4 | +8 % |
+| `gigatoken/par12 p2` | 1662.7 | 1917.7 | **+15 %** |
+
+`COLI_TOK_MERGE_SIMD={auto|scalar|avx2|avx512}` re-opens upstream's
+scalar-beats-vector verdict on the x86 short-merge as a one-env-var
+measurement (upstream measured Zen 5 + GPT-2's 50k merges; this box is an
+AVX2-only i5 on GLM's 321k merges). Measured here: **AVX2 is a wash**
+(±1 %, within noise) — the scalar default stands, now with a local number
+behind it. An opt-in `RUSTFLAGS="-C target-cpu=x86-64-v3"` build would
+const-fold the runtime tier dispatch; not a workspace default (engine
+bit-identity anchors outrank a tokenizer few-%).
 
 ## Throughput anatomy
 
@@ -65,12 +107,14 @@ differs is everything around the engine:
    scan, output alloc) that dominates ~50-byte inputs. One call over a whole
    document runs ~3× faster on the same core, same code.
 2. **Parallelism.** Upstream ships a batch layer (dropped in vendoring —
-   serve encodes one prompt at a time). The facade now restores its shape as
-   [`encode_batch`](../crates/peregrine-token/src/lib.rs): contiguous
-   byte-balanced chunks over a **persistent pool of `fork`ed workers**
-   (pre-sized caches, built once, warm across calls), id-for-id identical to
-   serial, with a serial fallback if a worker dies. Small inputs
-   (< 2 MB/worker) stay serial — worker construction only pays on bulk.
+   serve encodes one prompt at a time). The facade restores its shape as
+   [`encode_batch`](../crates/peregrine-token/src/lib.rs): ~16 contiguous
+   chunks per worker (finer over the last ~20 % of bytes so the straggler
+   tail is a quarter-chunk), handed out self-paced off an atomic cursor to a
+   **persistent pool of `fork`ed workers** (pre-sized caches, built once,
+   warm across calls), id-for-id identical to serial, with a serial redo of
+   any chunk a dead worker dropped. Small inputs (< 1 MiB/worker) stay
+   serial — worker construction only pays on bulk.
 3. **Hardware.** Reference numbers elsewhere in these docs came from
    laptop/desktop-class AVX2 machines; upstream's came from a Zen 5 X3D,
    an M4 Max, and a 288-thread EPYC.

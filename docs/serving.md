@@ -75,28 +75,32 @@ Prompts are built with the GLM chat template: `[gMASK]<sop>` then
 **Non-streaming response** (`200`):
 
 ```json
-{"id":"chatcmpl-<nanos>","object":"chat.completion","model":"glm-5.2",
+{"id":"chatcmpl-<nanos>","object":"chat.completion","created":1755100000,
+ "model":"glm-5.2",
  "choices":[{"index":0,"message":{"role":"assistant","content":"..."},
-             "finish_reason":"stop"}]}
+             "finish_reason":"stop"}],
+ "usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}
 ```
 
-`finish_reason` is always `"stop"` (never `"length"`); there is no `usage` or
-`created` field.
+`finish_reason` is `"stop"`, or `"tool_calls"` when the generation produced
+tool calls (see §Tool calling); `"length"` is never emitted.
 
 **Streaming response** (`200`, `text/event-stream`; keep-alive comment every
-15 s). Content chunks:
+15 s). The first chunk carries the assistant role delta; every chunk carries
+the completion `id` and `created`. Content chunks:
 
 ```
-data: {"object":"chat.completion.chunk","model":"glm-5.2","choices":[{"index":0,"delta":{"content":"<text>"},"finish_reason":null}]}
+data: {"id":"chatcmpl-<nanos>","object":"chat.completion.chunk","created":...,"model":"glm-5.2","choices":[{"index":0,"delta":{"content":"<text>"},"finish_reason":null}]}
 ```
 
-then a final `finish_reason:"stop"` chunk with an empty delta, then
-`data: [DONE]`. There is no initial role delta and chunks carry no `id`.
+then a final finish chunk with an empty delta, then `data: [DONE]`.
 Deltas are decoded-text suffixes — a token that doesn't lengthen the decoded
 string emits no chunk. If an engine error occurs mid-stream, the stream emits
 `data: {"error":{"message":"..."}}` and ends without a finish chunk or
 `[DONE]`. A client disconnect aborts the request and the sequence is retired
-on the next engine step.
+on the next engine step. A submit against a full admission queue
+(`COLI_QUEUE_DEPTH` set) is refused up front with an OpenAI-shaped `503`
+`overloaded_error` — retry later.
 
 **Errors** use the OpenAI shape `{"error":{"message":"…","type":"…"}}`:
 
@@ -194,10 +198,22 @@ never stored: a truncated answer replayed as a complete one is worse than no mem
 
 ## Continuous batching
 
-- **Chunked prefill:** prompts advance 64 tokens per engine tick, round-robin,
-  interleaved with decode — admitting a long prompt never stalls the in-flight
-  batch. Bit-identical to whole-prompt prefill (asserted by
+- **Chunked prefill:** one pending prompt advances per engine tick (round-robin
+  across pending prompts), interleaved with decode — admitting a long prompt
+  never stalls the in-flight batch. The chunk grows geometrically with position
+  (`max(64, pos/4)`; `COLI_PREFILL_CHUNK_DIV`, `0` = fixed 64), which keeps
+  total prefill work linear in prompt length instead of quadratic.
+  Bit-identical to whole-prompt prefill (asserted by
   `engine_chunked_prefill_matches_reference`).
+- **Fused prefill (default on):** the prefill chunk rides the decode batch's
+  forward, sharing one routed-expert union instead of streaming two disjoint
+  ones (`COLI_FUSE_PREFILL=0` restores the two-forward tick).
+  `COLI_MAX_BATCH_ROWS` optionally bounds the fused forward's total rows
+  (chunk yields first; draft depth bounds itself to fit).
+- **Prefix cache (default 2048 MB):** completed prompts *and their generated
+  tokens* seed later requests sharing a token prefix — a multi-turn client's
+  next request is a refcount bump, not a re-prefill (`COLI_PREFIX_CACHE_MB`,
+  `0` disables). Matching is exact-token comparison, never a hash.
 - **Working cap:** `--max-batch` is the ceiling. With `COLI_BATCH_SLA_MS=<ms>`
   an EWMA of per-step wall time shrinks the cap when over the SLA and regrows
   it (up to the ceiling) when comfortably under.
@@ -215,6 +231,35 @@ never stored: a truncated answer replayed as a complete one is worse than no mem
 Why batching pays: decoding B sequences together reads each routed expert
 **once per step and shares it across the batch** — a measured 4.4× aggregate
 gain at B=16 on the real 744B model. See [Benchmarks](benchmarks.md).
+
+## Observability: `GET /metrics`
+
+Unauthenticated JSON snapshot, published by the engine thread once per tick
+(the thread owns the `Model`; handlers only clone the latest snapshot). Fields
+beyond the lane timings and cache counters documented in
+[configuration.md](configuration.md): `spec` (MTP drafts
+`proposed`/`accepted`/`accept_rate` — each proposed draft is a verify row of
+expert reads, so the accept rate is what says whether `COLI_DRAFT`'s depth
+pays), `rlm` (recursive-refinement passes and tokens, `COLI_RLM`),
+`io_slab_in_use` (O_DIRECT landing buffers in flight; pinned at the pool cap
+means reads are serializing on buffers), and `memo` (response-memo counters).
+Cumulative counters are meant to be delta'd across two scrapes. At shutdown
+the engine prints `[prefix-cache]`, `[spec]` and `[rlm]` summary lines to
+stderr (each silent when its feature never engaged).
+
+## Speculation and refinement
+
+With an MTP head in the checkpoint, `COLI_DRAFT=<g>` drafts `g` tokens per
+sequence per tick and verifies them in the same batched forward (greedy
+requests take argmax-identity acceptance; sampled requests join only under
+`COLI_DRAFT_SAMPLED`, via distribution-preserving rejection sampling).
+`COLI_RLM=1` additionally refines *uncertain* decision rows (top-2 margin /
+entropy policy, `COLI_RLM_*` knobs) with recursive replay passes over the
+request's own KV before the token is picked — composed with speculation
+exactly as the stdio engine's `generate_speculative` does: raw logits decide
+acceptance, only the post-acceptance contested row refines, sampled
+speculative runs are never refined. Both are off by default and structurally
+bit-identical when off.
 
 ## Runtime tokenizer
 

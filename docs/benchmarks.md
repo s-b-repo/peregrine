@@ -627,3 +627,33 @@ printf 'GEN 64 1 2 3\nQUIT\n' | COLI_PREDICT_EVAL=1 COLI_PREDICT_EVAL_N=16 pereg
 `COLI_PREDICT_EVAL_N=16` makes it comparable with the WASTE recall@16 table; the
 default is the model's topk (8 on GLM-5.2). Getting the number from `bench` or from
 the server needs a hook in `forward_rows_inner`, not a gate change.
+
+## Benchmark pass — 2026-08-10 (serve-path batch knee, recorded 2026-08-13)
+
+The freshest aggregate numbers come from the HTTP serve path
+(`scripts/bench-serve-batch.sh`, `COLI_ECACHE_GB=8 COLI_FUSE_PREFILL=1
+COLI_IO_BATCH=8 COLI_KV_BUDGET_MB=4096`, `max_tokens=32`, git `18c14e0`), and
+they went unrecorded here for three days:
+
+| B | tokens | wall | aggregate | streams ok |
+|---:|---:|---:|---:|---|
+| 16 | 512 | 6017.0 s | **0.085 tok/s** | 16/16 |
+| 32 | 832 | 10800.2 s (guillotine) | 0.077 | 26/32 — **arm failed** |
+| 48 | 0 | 7627.8 s | — | **failed** |
+| 64 | 288 | 10800.2 s (guillotine) | 0.027 | 9/64 — **failed** |
+
+**0.085 tok/s at B=16 is the freshest serve-path aggregate**, and the batch
+knee sits at or below B=32 — the B≥32 arms die on the 3600 s per-stream
+guillotine before finishing. The headline-table numbers above come from the
+stdio bench path under different conditions; the two are not comparable
+row-for-row. An earlier same-file run at git `2a262c1` read 0.07 at B=16.
+
+## Tokenizer pass — 2026-08-13
+
+`--bench-tokenizer` rows are now **best-of-3** per row (single passes on this
+box swing more than the effects under test). The vendored-engine speed pass
+(scratch hoist, batch handout, lock-free stream decode) measured **+19 %**
+line, **+8 %** whole, **+15 %** warm-parallel on the GLM vocab, ids
+byte-identical; the `COLI_TOK_MERGE_SIMD=avx2` arm is a wash (±1 %), so the
+scalar default stands with a local number behind it. Full table and method:
+[tokenizer.md → 2026-08-13 speed pass](tokenizer.md#2026-08-13-speed-pass).

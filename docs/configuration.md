@@ -237,7 +237,7 @@ the oracle test already compares. `COLI_IO_DEPTH` sets its ring depth.
 | `COLI_REPLICATE_K` | 0 | top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
 | `COLI_NUMA_PIN` | off | pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
 | `COLI_SHAPE_SPECIALIZE` | off | per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
-| `COLI_PREFILL_CHUNK_DIV` | 0 | prefill chunk becomes `max(64, pos/d)` — [note](#coli_prefill_chunk_div) |
+| `COLI_PREFILL_CHUNK_DIV` | **4** (2026-08-13) | prefill chunk becomes `max(64, pos/d)`; `0` = fixed 64 — [note](#coli_prefill_chunk_div) |
 
 ### `COLI_PREFILL_CHUNK_DIV`
 
@@ -426,11 +426,14 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 |---|---|---|
 | `COLI_BATCH_SLA_MS` | unset | shrink the working batch cap on latency overrun; regrow on slack |
 | `COLI_ADAPTIVE_WINDOW` | 1 | run prefill every Nth engine tick (decode-heavy window) |
-| `COLI_FUSE_PREFILL` | off | prefill chunk rides the decode batch's forward — [note](#coli_fuse_prefill) |
+| `COLI_FUSE_PREFILL` | **on** (2026-08-13) | prefill chunk rides the decode batch's forward; `=0` restores two forwards — [note](#coli_fuse_prefill) |
 | `COLI_MEMO_ENTRIES` / `COLI_MEMO_MB` | 32 / 64 | exact response memo — [note](#coli_memo_entries--coli_memo_mb) |
 | `COLI_KV_BUDGET_MB` | 0 | resident-KV byte ceiling for admission — [note](#coli_kv_budget_mb) |
 | `COLI_KV_POOL_MB` | 0 | recycle a retired sequence's KV allocations — [note](#coli_kv_pool_mb) |
-| `COLI_PREFIX_CACHE_MB` | 0 | cross-request KV prefix cache; matched by comparing tokens, not hashing |
+| `COLI_PREFIX_CACHE_MB` | **2048** (2026-08-13) | cross-request KV prefix cache (`0` disables); caches prompts *and* generated tokens, matched by comparing tokens, not hashing |
+| `COLI_MAX_BATCH_ROWS` | 0 | ceiling on rows in one fused forward (chunk yields first; bounds draft depth); `0` = uncapped |
+| `COLI_QUEUE_DEPTH` | 0 | admission backlog cap; a submit at the cap gets an OpenAI-shaped 503 instead of queueing forever; `0` = unbounded |
+| `COLI_TOK_MERGE_SIMD` | auto | tokenizer short-merge tier A/B (`auto`\|`scalar`\|`avx2`\|`avx512`); auto = measured scalar default — see [tokenizer.md](tokenizer.md) |
 | `COLI_DRAFT` | 0 | MTP speculative-decode depth — [note](#coli_draft) |
 | `COLI_DRAFT_SAMPLED` | off | extend speculation to temperature > 0 — [note](#coli_draft_sampled) |
 | `X-Peregrine-Priority` | (HTTP header) | `high`/`1`/`true` → drained ahead of normal-priority requests |
@@ -626,18 +629,22 @@ argmax) holds: the refined `next` is still just an argmax, of a sharper
 distribution.
 
 **Telemetry.** `Model::rlm_stats()` returns `(recursive_passes_emitted,
-tokens_that_triggered_at_least_one_pass)` — theshutdown/`/metrics`-style surface, same
-role as `lookahead_issued()` for the router look-ahead. `(0, 0)` when `COLI_RLM` is
-unset.
+tokens_that_triggered_at_least_one_pass)`, surfaced on serve's `/metrics`
+(`rlm` object), the engine `[rlm]` shutdown line, and `(0, 0)` when `COLI_RLM`
+is unset — same role as `lookahead_issued()` for the router look-ahead.
 
-**Status**: wired (`model.rs::generate`, `model.rs::generate_speculative`,
-`model.rs::forward_hidden_recursive`); arity / margin decisions in
-`crates/peregrine-model/src/rlm.rs`. Off-by-default, structurally inert (the
-controller's `should_recurse` returns `false` for the whole call site when `COLI_RLM`
-is unset, so the bit-identity gates stay byte-identical). **Quality unmeasured on a
-real checkpoint.** Size the trade against `Model::prediction_flip_rate` — that is
-the offline metric for "did recursion move the argmax on contested tokens" — which
-is exactly what an operator considering `COLI_RLM=1` wants to know first.
+**Status**: wired in both decode surfaces (2026-08-13) — the stdio engine via
+`model.rs::generate` / `generate_speculative`, and `peregrine-serve`'s batched
+accept loop via `Model::rlm_refine_external` over each request's own KV (same
+policy, same depth cap, local depth counter; composed with MTP exactly as the
+model-resident path: raw logits decide acceptance, only the post-acceptance
+contested row refines, sampled speculative runs are never refined). Arity /
+margin decisions in `crates/peregrine-model/src/rlm.rs`. Off-by-default,
+structurally inert (the enabled check precedes any copy or clone, so the
+bit-identity gates stay byte-identical). **Quality unmeasured on a real
+checkpoint.** Size the trade against `Model::prediction_flip_rate` — that is
+the offline metric for "did recursion move the argmax on contested tokens" —
+which is exactly what an operator considering `COLI_RLM=1` wants to know first.
 
 ---
 
