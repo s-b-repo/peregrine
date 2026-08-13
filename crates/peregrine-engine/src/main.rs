@@ -322,10 +322,19 @@ fn run() -> Result<(), Error> {
         // warm caches and two resident sets against one page cache, and the
         // slower container would be measured while the faster one evicted it.
         // Peak RSS here is one model's, not two.
+        //
+        // `--candidate-env KEY=VAL` (repeatable) applies a knob to the
+        // candidate arm only, by running that arm in a child process — the
+        // knobs worth gating this way latch once per process
+        // (`route_min_share` is a `OnceLock`), so an exported var would set
+        // both arms and the gate would compare the knob to itself: 0.000,
+        // indistinguishable from a lossless candidate. This is how todo.md's
+        // "knob set on the candidate side, unset on the source, same container
+        // both times" is actually run.
         Some("flip-rate") => {
             let usage = || {
                 Error::Format(
-                    "usage: peregrine flip-rate <source-dir> <candidate-dir> [--text FILE] [--tokens N]".into(),
+                    "usage: peregrine flip-rate <source-dir> <candidate-dir> [--text FILE] [--tokens N] [--candidate-env KEY=VAL]...".into(),
                 )
             };
             let src = args.get(2).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
@@ -334,6 +343,7 @@ fn run() -> Result<(), Error> {
             let n_tokens: usize = flag_value(&args, "--tokens")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256);
+            let cand_env = candidate_env_pairs(&args)?;
 
             let toks = match &text {
                 // The tokenizer comes from the *source* container: the ids must be
@@ -370,7 +380,11 @@ fn run() -> Result<(), Error> {
                 Ok((out, t))
             };
             let (a, used) = run(src, &toks)?;
-            let (b, _) = run(cand, &used)?;
+            let b = if cand_env.is_empty() {
+                run(cand, &used)?.0
+            } else {
+                run_candidate_arm(cand, &used, &cand_env)?
+            };
 
             let rate = Model::prediction_flip_rate(&a, &b)
                 .ok_or_else(|| Error::Format("flip-rate: the two runs disagree on length".into()))?;
@@ -386,6 +400,64 @@ fn run() -> Result<(), Error> {
                 "peregrine: flip-rate is top-1 agreement under teacher forcing on ONE text. \
                  A low rate does not license the container on its own."
             );
+            Ok(())
+        }
+        // `flip-arm <dir>`: the candidate half of `flip-rate --candidate-env`,
+        // deliberately absent from the usage line — it is an internal protocol
+        // (token ids in on stdin, argmax predictions out on stdout, one id per
+        // line), and the flag on `flip-rate` is the operator surface. A child
+        // process rather than a second in-process load because the knobs this
+        // exists to A/B latch once per process; see `candidate_env_pairs`.
+        Some("flip-arm") => {
+            let dir = args
+                .get(2)
+                .ok_or_else(|| Error::Format("flip-arm (internal): peregrine flip-arm <model-dir> < token-ids".into()))?;
+            // The knobs this arm actually ran with, read back from its own
+            // environment rather than trusted from the parent's argv: a parent
+            // that failed to pass the env would measure a candidate identical
+            // to the source and print a flawless 0.000 — the vacuous-gate
+            // failure `flip_rate_gate.rs` exists to rule out. This line is what
+            // the CLI test pins.
+            let mut knobs: Vec<String> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("COLI_"))
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            knobs.sort();
+            let knobs = if knobs.is_empty() { "(no COLI_* set)".into() } else { knobs.join(" ") };
+            eprintln!("peregrine: flip-arm: env: {knobs}");
+            let mut toks = Vec::new();
+            for line in std::io::stdin().lock().lines() {
+                let line = line.map_err(|e| Error::Format(format!("flip-arm: stdin: {e}")))?;
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                toks.push(
+                    t.parse::<i32>()
+                        .map_err(|e| Error::Format(format!("flip-arm: not a token id: {t:?} ({e})")))?,
+                );
+            }
+            if toks.is_empty() {
+                return Err(Error::Format("flip-arm: no token ids arrived on stdin".into()));
+            }
+            let mut m = Model::load_streaming(Path::new(dir), true)?;
+            let t0 = std::time::Instant::now();
+            let out = m.teacher_forcing(&toks)?;
+            // Same shape as the in-process arm's timing line, so a two-arm log
+            // reads the same whichever way the candidate ran.
+            eprintln!(
+                "peregrine: flip-rate: {dir} — {} positions in one forward, {:.1}s",
+                out.len(),
+                t0.elapsed().as_secs_f64()
+            );
+            let mut w = String::new();
+            for p in &out {
+                w.push_str(&p.to_string());
+                w.push('\n');
+            }
+            std::io::stdout()
+                .write_all(w.as_bytes())
+                .map_err(|e| Error::Format(format!("flip-arm: stdout: {e}")))?;
             Ok(())
         }
         Some("route-stats") => {
@@ -450,6 +522,98 @@ fn run() -> Result<(), Error> {
 /// do not justify pulling one in.
 fn flag_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// Every `--candidate-env KEY=VAL` occurrence, refusing any key that is also
+/// set in this process's environment.
+///
+/// The knobs these exist for latch in process-global `OnceLock`s
+/// (`route_min_share` is the motivating one), so "set on the candidate side
+/// only" cannot be done by exporting the var: it would latch identically in
+/// both arms and the gate would compare the knob to itself — reading 0.000
+/// exactly as a lossless candidate would. The candidate arm therefore runs in
+/// a child process (`flip-arm`), and a key the parent also holds is refused
+/// rather than warned about, because the source arm would silently run with it
+/// too and the warning would scroll past a flawless-looking number.
+fn candidate_env_pairs(args: &[String]) -> Result<Vec<(String, String)>, Error> {
+    let mut pairs = Vec::new();
+    let values = args
+        .iter()
+        .zip(args.iter().skip(1))
+        .filter(|(a, _)| *a == "--candidate-env")
+        .map(|(_, v)| v);
+    for kv in values {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| Error::Format(format!("flip-rate: --candidate-env wants KEY=VAL, got {kv:?}")))?;
+        if std::env::var_os(k).is_some() {
+            return Err(Error::Format(format!(
+                "flip-rate: {k} is set in this environment, so the source arm would run with it too \
+                 and the flip rate would compare the knob to itself. Unset it and pass it only \
+                 through --candidate-env."
+            )));
+        }
+        pairs.push((k.to_string(), v.to_string()));
+    }
+    Ok(pairs)
+}
+
+/// Run the candidate arm of `flip-rate` in a child process with `env` applied.
+///
+/// The fresh process is the point, not a convenience — see
+/// `candidate_env_pairs`. Token ids go down on stdin and predictions come back
+/// on stdout, one per line: no temp files to leak, and the library crates keep
+/// stdout clean (diagnostics are stderr-only), which stays inherited so the
+/// arm's banner and timing land in the same log as the parent's. No deadlock
+/// at any corpus size: the arm reads stdin to EOF before it writes anything.
+fn run_candidate_arm(dir: &str, toks: &[i32], env: &[(String, String)]) -> Result<Vec<i32>, Error> {
+    let exe =
+        std::env::current_exe().map_err(|e| Error::Format(format!("flip-rate: current_exe: {e}")))?;
+    for (k, v) in env {
+        eprintln!("peregrine: flip-rate: candidate arm only: {k}={v}");
+    }
+    let mut child = std::process::Command::new(exe)
+        .arg("flip-arm")
+        .arg(dir)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| Error::Format(format!("flip-rate: spawn flip-arm: {e}")))?;
+    {
+        let mut sin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Format("flip-rate: the flip-arm child has no stdin".into()))?;
+        let mut buf = String::new();
+        for t in toks {
+            buf.push_str(&t.to_string());
+            buf.push('\n');
+        }
+        sin.write_all(buf.as_bytes())
+            .map_err(|e| Error::Format(format!("flip-rate: write tokens to flip-arm: {e}")))?;
+        // Dropped here: EOF is how the arm knows the corpus is complete.
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Error::Format(format!("flip-rate: wait for flip-arm: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Format(format!("flip-rate: the candidate arm failed ({})", out.status)));
+    }
+    let text = String::from_utf8(out.stdout)
+        .map_err(|e| Error::Format(format!("flip-rate: candidate arm stdout: {e}")))?;
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            l.parse::<i32>().map_err(|e| {
+                Error::Format(format!(
+                    "flip-rate: the candidate arm wrote a non-token line to stdout: {l:?} ({e})"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Encode a text file into token ids with the tokenizer that travels with the

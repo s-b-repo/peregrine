@@ -1,0 +1,22 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 8.0 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 39.1 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.4 + cache 2.1 -> peak 26.6 GB
+peregrine: [workingset] one token routes 10.85 GB of experts against a 2.00 GB cache (18% of a pass) — no eviction order can hold a pass; prefetch-protect on
+peregrine: flip-rate: /home/cortix/models/GLM-5.2 — 512 positions in one forward, 658.0s
+peregrine: flip-rate: candidate arm only: COLI_ROUTE_MIN_SHARE=0.02
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 5.0 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: flip-arm: env: COLI_ROUTE_MIN_SHARE=0.02 COLI_ROUTE_STATS_PERSIST=0
+peregrine: [ram] avail 29.3 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.4 + cache 2.1 -> peak 26.6 GB
+peregrine: [workingset] one token routes 10.85 GB of experts against a 1.77 GB cache (16% of a pass) — no eviction order can hold a pass; prefetch-protect on
+peregrine: flip-rate: /home/cortix/models/GLM-5.2 — 512 positions in one forward, 684.3s
+positions   512
+flips       106
+flip_rate   0.207031
+source      /home/cortix/models/GLM-5.2
+candidate   /home/cortix/models/GLM-5.2
+peregrine: flip-rate is top-1 agreement under teacher forcing on ONE text. A low rate does not license the container on its own.

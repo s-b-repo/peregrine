@@ -601,6 +601,38 @@ extern "C" int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_
     return cuda_ok(cudaMemGetInfo(free_bytes, total_bytes), "memory info");
 }
 
+/* Largest single device allocation that currently succeeds, by binary search
+ * over real cudaMalloc/cudaFree probes. This is the number the defrag-pool
+ * question (todo.md §2) turns on: fragmentation is `free - largest`, and a
+ * cudaMallocAsync pool is justified only if that gap is material after real
+ * churn. Diagnostic only — every probe step is a live allocation, so this must
+ * never run on a forward path. The failed probes leave a sticky error which is
+ * cleared here so a later `cuda_ok` does not report an OOM that was ours. */
+extern "C" int coli_cuda_largest_free_block(int device, size_t *out) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!out || !select_ctx(ctx)) return 0;
+    size_t free_b = 0, total_b = 0;
+    if (!cuda_ok(cudaMemGetInfo(&free_b, &total_b), "memory info")) return 0;
+    /* Invariant: `lo` allocates, `hi` does not (free-bytes itself never quite
+     * does — the runtime holds headroom). 2 MB grain: finer than any block this
+     * engine allocates, and it bounds the search at ~13 probes on a 12 GB card. */
+    size_t lo = 0, hi = free_b + 1;
+    const size_t grain = (size_t)2 << 20;
+    while (hi - lo > grain) {
+        size_t mid = lo + (hi - lo) / 2;
+        void *p = NULL;
+        if (cudaMalloc(&p, mid) == cudaSuccess) {
+            cudaFree(p);
+            lo = mid;
+        } else {
+            cudaGetLastError();
+            hi = mid;
+        }
+    }
+    *out = lo;
+    return 1;
+}
+
 extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {
     size_t count = 0, bytes = 0;
     for (int i = 0; i < g_nctx; i++) if (device < 0 || g_ctx[i].device == device) {

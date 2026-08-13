@@ -17,7 +17,7 @@ concurrent CPU/GPU/SSD scheduler + `io_uring`.
 
 | Scope | ✅ Done | 🟡 Partial | ⬜ Not started | Total | Completion |
 |---|---:|---:|---:|---:|---:|
-| **Full roadmap** | 127 | 1 | 9 | 137 | **~93% strict · ~93% weighted** |
+| **Full roadmap** | 128 | 1 | 8 | 137 | **~93% strict · ~94% weighted** |
 | **Priority shortlist** | 17 | 0 | 3 | 20 | **85% strict · 85% weighted** |
 
 *Strict = Done ÷ Total. Weighted = (Done + ½·Partial) ÷ Total. "Fast matrix multiplication" is excluded.
@@ -30,7 +30,7 @@ which is the honest reading: the roadmap was ~89% done against a scope that excl
 strict figure has barely moved since because each wave opens roughly as much as it closes. Counts are generated from the checkboxes below — recount with
 `awk '/^## 1\./,/^## ❄️/' todo.md | grep -c '^- \[x\]'`.*
 
-**Per-section:** Prefetch **11/11 ✅** · GPU 8/10 · Caching **13/13 ✅** · I/O 10/11 · Memory/NUMA
+**Per-section:** Prefetch **11/11 ✅** · GPU 9/10 · Caching **13/13 ✅** · I/O 10/11 · Memory/NUMA
 **8/8 ✅** · Scheduling 16/18 · Disk-layout **10/10 ✅** · Workload **5/5 ✅** · Compilation
 **5/5 ✅** · Self-optimizing **10/10 ✅** · Multi-GPU 0/4 · Attention/serving **7/7 ✅** ·
 Workload-reduction **15/16**.
@@ -43,9 +43,9 @@ response memo in §12. The borrowed **negative** results are recorded in
 per-expert bit allocation, routed-tail truncation and prefill-path look-ahead, and they put an
 open question against §1's entire statistical predictor stack.*
 
-## 📌 What is actually left (2026-08-08)
+## 📌 What is actually left (2026-08-08; defrag closed 2026-08-13)
 
-**Ten roadmap line-items (1 partial + 9 not started).** The 2026-08-08 wave
+**Nine roadmap line-items (1 partial + 8 not started).** The 2026-08-08 wave
 closed §2's CUDA-graph decode wiring and its GPU-side fused reduce — the last
 two engineering 🟡s — and took the `[R]` dead-code count **29 → 22** by wiring
 `moe_engine_installed`, `pick_lfru`/`pick_swap`, `speculative_sample`, and
@@ -86,12 +86,17 @@ rather than an implementation on spec:
   defeats the `scratch_gen` guard, whose whole mechanism is *discard and
   recapture* and you cannot discard a running kernel. Reasons recorded in
   `docs/gpu-cuda.md` so this is not reopened without new evidence.
-- **`cudaMallocAsync` defrag pool — measure first, and expect to close it.**
-  There are exactly **two** distinct block sizes (`int4_bytes`, `f32_bytes`) and
-  startup is a monotone allocation burst, which is the textbook non-fragmenting
-  workload. The decisive number is largest-free-block vs free-bytes, which
-  `coli_cuda_mem_info` is one binary-searched `cudaMalloc` away from reporting.
-  Build the probe, not the pool.
+- **`cudaMallocAsync` defrag pool — measured 2026-08-13, and it closed exactly
+  as predicted.** There are exactly **two** distinct block sizes (`int4_bytes`,
+  `f32_bytes`) and startup is a monotone allocation burst, which is the textbook
+  non-fragmenting workload. The probe was built instead of the pool:
+  `coli_cuda_largest_free_block` binary-searches real `cudaMalloc` probes
+  (~13 at a 2 MB grain), and after three rounds of the worst churn the engine
+  can produce — interleaved frees of the two block sizes, every gap refilled at
+  the *other* format — the RTX 3060 still returns **96.7 % of free VRAM as one
+  block**. `vram_churn_of_the_two_expert_block_sizes_leaves_free_memory_in_one_block`
+  pins it at a ≥ 50 % bar, so a future allocator regression reopens the item by
+  test failure rather than by hunch. Closed as a measured negative; see §2.
 - **Idle-cycle GPU compute — the item was two items, and one of them is
   declined.** *Engine-idle* GPU warming has a ready-made hook
   (`Model::idle_maintenance`) and a result already in the tree against it:
@@ -109,15 +114,28 @@ weight matrices on an engine whose whole problem is bytes. A timing-independent
 `COLI_SPLIT_FRAC` would have fixed the determinism objection while leaving both
 of those intact. What replaces it, by the same test:
 
-- **`COLI_ROUTE_MIN_SHARE`, sized by the flip-rate gate — no new code.** The
-  2026-08-07 counters give it a real ceiling for the first time: at B=16,
-  **12.5 % of routed selections carry under 5 % of the gate mass**
-  (`below_0.5%=1.0%`, `below_1%=1.3%`, `below_2%=2.4%`, `below_5%=12.5%`). The
-  knob ships and is off only because nobody had a quality number, and the number
-  is now one command away — run `peregrine flip-rate` with the knob set on the
-  candidate side and unset on the source, *same container both times*, so there
-  is no conversion cost at all. This is the highest value-per-hour item on the
-  roadmap.
+- **`COLI_ROUTE_MIN_SHARE`, sized by the flip-rate gate — MEASURED 2026-08-13,
+  and the answer at the setting that mattered is no.** The 2026-08-07 counters
+  gave it a real ceiling: at B=16, **12.5 % of routed selections carry under
+  5 % of the gate mass** (`below_0.5%=1.0%`, `below_1%=1.3%`, `below_2%=2.4%`,
+  `below_5%=12.5%`). Two corrections from actually running it. First, "the
+  number is one command away — no new code" was wrong: `route_min_share()`
+  latches in a process-global `OnceLock` and both flip-rate arms ran in one
+  process, so setting the env var truncated *both* arms and the gate read a
+  vacuous 0.000 — `flip-rate` had to grow `--candidate-env` (the candidate arm
+  as a child process, refusing any key the parent also holds; pinned by three
+  CLI tests). Second, the result: **τ=0.05 flips 27.9 % of top-1 predictions
+  and τ=0.02 flips 20.7 %** (143/512 and 106/512, real prose, same container
+  both arms —
+  [bench-data/2026-08-13-route-min-share](bench-data/2026-08-13-route-min-share/README.md)).
+  The weak-gate tail carries real signal, and the near-flat curve between the
+  two settings says the damage sits in the *thinnest* slice of the tail —
+  experts under 2 % of a position's gate mass are still load-bearing for the
+  argmax, and τ=0.02's byte ceiling was only ~2.4 % of selections to begin
+  with. **Closed as a measured negative at every useful setting.** With
+  routing slack (this) and precision slack (int2) both measured absent, the
+  workload-reduction menu narrows to formats that keep every expert but
+  shrink its bytes: int3-g64 remains the untested rung.
 - **int2-g64 is not the answer** — measured this pass at `flip_rate = 1.000`.
   See §13. `int3-g64` (12.7 % smaller than int4) is the untested rung.
 - Speculative, named so it is not rediscovered: expert-delta or shared-basis
@@ -539,7 +557,7 @@ thing that owns the model — **the first numbers ever seen from the serving pat
 - [x] ✅ **Router look-ahead** (2026-08-03) — every predictor above is a statistic over the router's *past answers*; this one asks the router. At the end of layer `L`, apply layer `L+1`'s own `post_ln` + router to layer `L`'s output and prefetch that ranking's top `COLI_ROUTER_LOOKAHEAD_N` (default 6) — one extra `E×D` matvec against resident weights, no artifact, no format change, works on the first token of a cold process where every history-based predictor is still empty. Correctness-neutral: the authoritative router still runs at `L+1` and still decides, pinned by `router_lookahead_cannot_move_a_token` (streamed decode bit-identical to resident). **Decode only** — WASTE built the prefill-chunk version and measured bytes read +6.9 % with flat wall clock, because a chunk layer's speculative records are exactly what eviction takes first and its readers are never idle. Speculative reads stay out of `misses`. `model.rs::LookaheadCtx`, `router.rs::route_ranks`; `COLI_ROUTER_LOOKAHEAD` _(★★★★★ · Medium)_
 - [x] ✅ **Predictor scoreboard** (2026-08-03) — `COLI_PREDICT_EVAL=1` scores the router look-ahead, the configured `PredictSource` and a previous-token baseline against the routing that actually happened, and prints recall + precision-by-rank at shutdown (`[predict-eval]`). Built because the §1 spine is entirely correctness-neutral, which means **no test can catch a predictor that has degraded to noise** — it costs throughput silently. Pure and unit-tested (`predeval.rs`); an arm that abstains is counted as silent rather than wrong, and recall counts distinct coverage so a degenerate arm cannot report >1. **This is the open question against every other item in this section**: WASTE measured held-out co-occurrence at 29.0 % recall@16 against "reuse the previous token's set" at 29.5 %, i.e. no better than the baseline the cache already exploits for free. Whether `automaton.json` / `macrostates.json` beat it *here* is now measurable and unmeasured `predeval.rs`, `model.rs::score_and_stash`
 
-## 2. GPU Execution — 7/9
+## 2. GPU Execution — 8/9
 
 - [ ] ⬜ Persistent CUDA kernels _(★★★★★ · Hard, CUDA-only)_ — kernels launched per-batch, no threadblock loop
 - [x] ✅ CUDA Graphs into decode (`COLI_CUDA_GRAPH`) — per-shape capture/replay of the `expert_group` launch sequence; see the shortlist entry for the `scratch_gen` invalidation guard and the two excluded arms. The whole-`forward_layer` graph remains open and is tracked under §2's device-resident work, not here `backend_cuda.cu`, `peregrine-cuda/src/lib.rs` _(★★★★☆ · Medium, CUDA-only)_
@@ -547,7 +565,7 @@ thing that owns the model — **the first numbers ever seen from the serving pat
 - [x] ✅ Zero-copy GPU uploads via pinned memory `backend_cuda.cu:356-359,610-611` _(★★★☆☆ · Easy)_
 - [x] ✅ Persistent GPU memory pools — 24 pre-allocated scratch slots reused across layers `backend_cuda.cu:892-899`
 - [x] ✅ Format-split expert dispatch — `all_s4` is computed over the whole routed group (`backend_cuda.cu:638,645`), so **one** wider-precision resident dropped every expert in that `expert_group` call off the int4 Tensor-Core and packed-W4 fast paths. `GpuTier::compute` now issues one `expert_group` per residency format via the pure `partition_by_format` / `scatter_by_index` pair, restoring job order before returning so `concurrent.rs`'s positional zip and the `pos`-keyed reduce are untouched. Repeated calls per layer are safe: the kernel syncs before returning (`backend_cuda.cu:745-750`) and scratch is per-device grow-only (`:341-359`). Partition/scatter pure and unit-tested (round-trip is a bijection, malformed input errors rather than misaligning); the dispatch loop is type-checked under `--features cuda`. **Does not always reach Tensor Cores** — `:674` additionally gates TC on *every* job in the call clearing `tc_min` rows, a separate partition axis `gpu.rs` _(★★★☆☆ · Medium, CUDA-only)_
-- [ ] ⬜ GPU memory defragmentation during decode — residents fixed at startup; `cudaMallocAsync` pool is the planned fix (CUDA-only)
+- [x] ✅ **GPU memory defragmentation during decode — CLOSED on measurement (2026-08-13): there is nothing to defragment.** The planned fix was a `cudaMallocAsync` pool; the roadmap's own note said to build the probe first and expect the answer to be no. It was: `coli_cuda_largest_free_block` (binary search over live `cudaMalloc` probes, 2 MB grain) reports **96.7 % of free VRAM allocatable as a single block** after three rounds of interleaved alloc/free of the two expert block sizes with each gap refilled at the other format — the worst churn `reheat`'s precision ladder can produce, and the only interleaving this workload has. The ~3 % gap is runtime headroom, which a pool cannot return. Guarded by `vram_churn_of_the_two_expert_block_sizes_leaves_free_memory_in_one_block` (bar at 50 % — three orders above the ~24 MB collapse real fragmentation would show), so the item reopens by test failure if a driver ever regresses coalescing `cuda/backend_cuda.cu`, `peregrine-cuda/src/lib.rs`
 - [x] ✅ Online kernel autotuning for GEMM tile sizes — `WmmaTuner` records per-shape kernel_ms and picks the best tile config, persists as `kernel_tuning.json`; the CUDA-side dispatch selector is a follow-up `wmma_tune.rs`
 - [x] ✅ Runtime SIMD kernel selection (CPU) — AVX2 vs AVX-VNNI chosen at runtime `idot.rs:40-61`
 - [x] ✅ **Stream-ordering defect in the `pipe_*` primitives — found while preparing graph capture, and it was not only a capture problem** (2026-08-07). `ctx->stream` is created `cudaStreamNonBlocking`, so it does **not** implicitly synchronize with the legacy default stream. `pipe_rmsnorm`, `pipe_rmsnorm_s`, `pipe_rope`, `pipe_rope_base`, `pipe_rows_add`, `pipe_gemm` and `pipe_copy2d` all launched with no stream argument — i.e. on the default stream — while `pipe_silu_mul` and `pipe_add` used `ctx->stream`. **Any chain mixing them had no ordering guarantee at all**: a `silu_mul` could read a buffer a `rmsnorm` had not finished writing. Nothing was wrong in practice only because no live path builds such a chain; it would have surfaced the moment the device-resident forward wired one, as intermittently wrong logits with no failing test. Two further instances in the **live** GPU path: `tensor_upload` and `tensor_update` convert int4 offset-encoded weights with a default-stream kernel whose consumers (`expert_group`) run on `ctx->stream` — a `reheat` refresh has a far shorter window than a startup upload — now synchronized before return, which is the contract every caller already assumed. Pinned by `graph_capture_records_ops_only_from_the_context_stream`, which is deterministic rather than race-dependent: capture records `ctx->stream`, so an op on another stream is silently **absent from the graph**, and the test replays onto a poisoned buffer so a skipped normalization cannot pass on leftovers from the eager pass `cuda/backend_cuda.cu`, `peregrine-cuda/src/lib.rs`
@@ -799,7 +817,7 @@ change, and needs the two shipped measurement items first.*
 
 - [x] ✅ Gate-mass measurement — every routed expert costs a full ~18.9 MB read regardless of its gate weight, and nothing had ever inspected that weight: the reduce multiplies it in and moves on. `gate_share_below` tallies, per position, how many kept experts carry a share below 0.5/1/2/5% of the position's gate mass; `COLI_GATE_STATS=1` accumulates process-wide and the engine prints `[gate] routed=… below_1%=…`. Shares are relative to the kept sum, so the figure is invariant to `norm_topk` and `routed_scale`. Pure and unit-tested, including the flat-router case that correctly reports *no* tail `router.rs`
 - [x] ✅ Prediction flip-rate gate — the suite is built entirely on bit-identity anchors, so a deliberately lossy change fails every existing assertion by construction and there was no way to say what it cost. `Model::prediction_flip_rate` reports the fraction of teacher-forcing positions two runs disagree on, returning `None` on a length mismatch so "no data" cannot read as "no change". Top-1 agreement only — a distributional metric (NLL/KL) needs per-position logit capture, which `teacher_forcing` does not expose `model.rs`
-- [x] ✅ Adaptive top-k / expert-budget truncation — `COLI_ROUTE_MIN_SHARE=<τ>` drops trailing selections carrying less than τ of a position's gate mass. Every routed expert costs a full ~18.9 MB read regardless of weight, so an expert carrying 1% of the mass costs what the top expert costs. Truncation happens inside `route()` *before* normalization, so the existing `norm_topk` block renormalizes the survivors and the MoE sum keeps its original scale rather than quietly shrinking by the dropped mass. Only a **trailing run** is dropped and slot order is preserved — selection ranks by the bias-augmented `choice` while the stored weight is the plain sigmoid, so weights are not monotonic, and the batch-union plus position-keyed reduce both depend on that order. At least one expert always survives. `keff` already existed and is honored at all four consumption sites, so no plumbing was needed. **This is the first knob in the engine that changes token values** — off by default; size it with `COLI_GATE_STATS`, gate it with `prediction_flip_rate` `router.rs`
+- [x] ✅ Adaptive top-k / expert-budget truncation — `COLI_ROUTE_MIN_SHARE=<τ>` drops trailing selections carrying less than τ of a position's gate mass. Every routed expert costs a full ~18.9 MB read regardless of weight, so an expert carrying 1% of the mass costs what the top expert costs. Truncation happens inside `route()` *before* normalization, so the existing `norm_topk` block renormalizes the survivors and the MoE sum keeps its original scale rather than quietly shrinking by the dropped mass. Only a **trailing run** is dropped and slot order is preserved — selection ranks by the bias-augmented `choice` while the stored weight is the plain sigmoid, so weights are not monotonic, and the batch-union plus position-keyed reduce both depend on that order. At least one expert always survives. `keff` already existed and is honored at all four consumption sites, so no plumbing was needed. **This is the first knob in the engine that changes token values** — off by default; size it with `COLI_GATE_STATS`, gate it with `prediction_flip_rate`. **Gated on the real checkpoint 2026-08-13 and it stays off: τ=0.05 flips 27.9 % and τ=0.02 flips 20.7 % of top-1 predictions** (512 positions of prose, same container both arms, via `flip-rate --candidate-env`); the tail the gate-mass counters called negligible is negligible in *mass*, not in *effect* `router.rs`
 - [x] ✅ **Gate-mass mixed-precision loading — CLOSED on measurement (2026-08-07). The ceiling is 0.5% of reads at B=16.** Measured on the real GLM-5.2 checkpoint, one batch size per fresh process:
 
   | B | selections | distinct reads | share | all-low-gate | fraction |
@@ -813,7 +831,7 @@ change, and needs the two shipped measurement items first.*
 
   Internal consistency check that the number is real: at B=1 the all-low-gate fraction (1.3 %) equals the independently-computed `[gate] below_1%` (1.3 %) exactly, as it must — with one row, "every row wants it weakly" *is* "the gate share is below 1 %".
 
-  **What the same run did size is the honest lever.** `[gate] below_5%` measured **12.5–14.3 %**, so `COLI_ROUTE_MIN_SHARE=0.05` drops about an eighth of routed selections — the first time that knob has had a real-checkpoint number to be set from. Gate it with `prediction_flip_rate` before using it; it is still the only knob in the engine that changes token values.
+  **What the same run did size is the honest lever.** `[gate] below_5%` measured **12.5–14.3 %**, so `COLI_ROUTE_MIN_SHARE=0.05` drops about an eighth of routed selections — the first time that knob has had a real-checkpoint number to be set from. Gate it with `prediction_flip_rate` before using it; it is still the only knob in the engine that changes token values. **Gated 2026-08-13: τ=0.05 flips 27.9 % of top-1 predictions on real prose and τ=0.02 flips 20.7 % — the lever fails at every setting worth having.** See [bench-data/2026-08-13-route-min-share](bench-data/2026-08-13-route-min-share/README.md).
 
   *(Original entry, kept because the reasoning is what the measurement confirmed.)* The idea: threshold the router's gate magnitudes and load a low-gate expert at int2-g64 instead of dropping it, which is strictly better than `COLI_ROUTE_MIN_SHARE`'s binary keep/drop. **Three structures stand in the way, all verified in source**: `prefetch_hint_item(st, cfg, layer, expert)` locates an expert's 6 regions with no precision variant; the warm cache is keyed `(u32, u32)` = (layer, expert), so two precisions of one expert collide; and `batch_union` unions expert *ids* across rows, discarding which row wanted them — so at the moment the read is issued, the gate weight that would select a precision is already gone. **But the deeper problem is not plumbing.** A read is issued once per *union entry*, not once per row. An expert one row leans on and another barely wants must be read at the higher precision, because one of its consumers needs it. So the saving exists only for experts that are low-gate for **every** row routing them — and that share shrinks as the batch grows. Per-token precision selection is in direct tension with the batch-union amortization the engine already depends on. `union_all_low_gate` measures exactly that ceiling and `batching_erases_the_per_token_precision_decision` pins the mechanism: the same expert with the same gate weights is a low-precision candidate alone and is not when batched, purely because of who it shares a read with. `COLI_UNION_STATS=1` now prints `all-low-gate reads=…/…` at shutdown beside the sharing figure. **Next step is the measurement, not the feature**: if that fraction is small at realistic batch sizes, the dual-precision container, the cache re-keying and the region-locator variant buy nothing, and `COLI_ROUTE_MIN_SHARE` remains the honest lever.
 
