@@ -459,6 +459,19 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
             "hits": h, "misses": m, "disk_reads": d, "prefetch_reads": t.prefetch_reads,
         })),
         "routing_entropy_ewma": t.runtime.entropy_ewma,
+        // MTP speculation: delta across scrapes for a live accept rate. Every
+        // proposed draft is a verify row in the batched forward; the accept
+        // rate is what says whether COLI_DRAFT's depth pays for those rows.
+        "spec": {
+            "proposed": t.spec_proposed,
+            "accepted": t.spec_accepted,
+            "accept_rate": if t.spec_proposed > 0 {
+                t.spec_accepted as f64 / t.spec_proposed as f64
+            } else { 0.0 },
+        },
+        // RLM recursive refinement (COLI_RLM): passes emitted and tokens that
+        // triggered at least one.
+        "rlm": { "passes": t.rlm.0, "tokens_recursed": t.rlm.1 },
         // Which implementation is dispatching, read from the dispatch path
         // itself — not from `COLI_MOE_ENGINE`, which says what was requested.
         "moe_engine": peregrine_model::concurrent::moe_engine_name(),
