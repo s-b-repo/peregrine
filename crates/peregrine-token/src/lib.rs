@@ -84,13 +84,14 @@ impl GigaTokenizer {
     ///
     /// Worker construction (a vocab-seeded cache table per fork) only pays
     /// for itself on bulk input, so small batches run serially on `self`:
-    /// parallelism engages at ≥ 2 MB of input per worker. `workers` is a
-    /// ceiling; pass `std::thread::available_parallelism()`. Workers persist
-    /// on this instance after the first call (construction amortizes across
-    /// calls, caches stay warm) — a `GigaTokenizer` that has done batch work
-    /// holds that pool's memory until dropped.
+    /// parallelism engages at ≥ 1 MB of input per worker (upstream's minimum
+    /// chunk grain). `workers` is a ceiling; pass
+    /// `std::thread::available_parallelism()`. Workers persist on this
+    /// instance after the first call (construction amortizes across calls,
+    /// caches stay warm) — a `GigaTokenizer` that has done batch work holds
+    /// that pool's memory until dropped.
     pub fn encode_batch(&mut self, texts: &[&str], workers: usize) -> Vec<Vec<u32>> {
-        self.encode_batch_with(texts, workers, 2 << 20)
+        self.encode_batch_with(texts, workers, 1 << 20)
     }
 
     fn encode_batch_with(
@@ -110,61 +111,107 @@ impl GigaTokenizer {
             return texts.iter().map(|t| self.encode(t)).collect();
         }
 
-        // Contiguous chunks balanced by bytes (order-preserving).
-        let target = total / n + 1;
+        // Contiguous doc-boundary chunks, ~16 per worker instead of one:
+        // exactly one chunk per worker made the call finish at the slowest
+        // worker's pace (one heavy chunk = every other core idle at the
+        // tail). Many small chunks + the self-paced handout below is
+        // upstream's batch-layer shape: a fast core just takes more chunks.
+        // The last ~20% of bytes splits 4× finer so the straggler tail is a
+        // quarter-chunk, not a chunk (upstream's LPT-ish front-loading), and
+        // a 1 MiB floor keeps chunks worth a handout each.
+        // The floor tracks the amortize gate so a test that forces the
+        // parallel path with `min_bytes_per_worker = 0` also exercises
+        // multi-chunk handout instead of collapsing to one chunk.
+        let floor = min_bytes_per_worker.clamp(1, 1 << 20);
+        let coarse = (total / (n * 16)).max(floor);
+        let fine_after = total - total / 5;
         let mut bounds = vec![0usize];
         let mut acc = 0usize;
+        let mut consumed = 0usize;
         for (i, t) in texts.iter().enumerate() {
-            if acc >= target && bounds.len() < n {
+            let target = if consumed < fine_after { coarse } else { (coarse / 4).max(floor) };
+            if acc >= target {
                 bounds.push(i);
                 acc = 0;
             }
             acc += t.len();
+            consumed += t.len();
         }
         bounds.push(texts.len());
+        let chunks: Vec<std::ops::Range<usize>> =
+            bounds.windows(2).map(|w| w[0]..w[1]).filter(|r| !r.is_empty()).collect();
 
-        // Grow the persistent pool to n workers, each pre-sized for an even
-        // share of this input (a capacity hint — tables still grow past it).
-        // Construction happens once; later calls reuse the warm workers.
-        while self.pool.len() < n {
+        // Grow the persistent pool (a capacity hint — tables still grow past
+        // it). Construction happens once; later calls reuse the warm workers.
+        let spawn_n = n.min(chunks.len());
+        while self.pool.len() < spawn_n {
             self.pool.push(self.inner.fork_sized(total / n));
         }
 
-        let mut results: Vec<Option<Vec<Vec<u32>>>> = Vec::new();
-        let chunks: Vec<&[&str]> = bounds.windows(2).map(|w| &texts[w[0]..w[1]]).collect();
+        // Self-paced handout: workers pull the next chunk index off a shared
+        // atomic cursor until none remain. In-order pickup, per-chunk result
+        // slots, so output order never depends on which worker ran what.
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let mut per_worker: Vec<Option<Vec<(usize, Vec<Vec<u32>>)>>> = Vec::new();
         std::thread::scope(|s| {
             let handles: Vec<_> = self
                 .pool
                 .iter_mut()
-                .zip(&chunks)
-                .map(|(worker, chunk)| {
+                .take(spawn_n)
+                .map(|worker| {
+                    let cursor = &cursor;
+                    let chunks = &chunks;
                     s.spawn(move || {
-                        let mut ids: Vec<Vec<u32>> = Vec::with_capacity(chunk.len());
-                        let mut flat: Vec<u32> = Vec::new();
-                        for t in *chunk {
-                            flat.clear();
-                            worker.encode_with_added_tokens_flat(t.as_bytes(), &mut flat);
-                            ids.push(flat.clone());
+                        let mut mine: Vec<(usize, Vec<Vec<u32>>)> = Vec::new();
+                        loop {
+                            let ci = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(range) = chunks.get(ci) else { break };
+                            let mut ids: Vec<Vec<u32>> = Vec::with_capacity(range.len());
+                            for t in &texts[range.clone()] {
+                                // Sized so the common case is one allocation
+                                // moved into the output — the old shape
+                                // (reused scratch + `clone` per doc) paid an
+                                // exact-size allocation AND a full copy.
+                                let mut flat: Vec<u32> = Vec::with_capacity(t.len() / 3);
+                                worker.encode_with_added_tokens_flat(t.as_bytes(), &mut flat);
+                                ids.push(flat);
+                            }
+                            mine.push((ci, ids));
                         }
-                        ids
+                        mine
                     })
                 })
                 .collect();
-            results = handles.into_iter().map(|h| h.join().ok()).collect();
+            per_worker = handles.into_iter().map(|h| h.join().ok()).collect();
         });
 
-        let mut out: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+        let mut slots: Vec<Option<Vec<Vec<u32>>>> = chunks.iter().map(|_| None).collect();
         let mut poisoned = false;
-        for (chunk, r) in chunks.iter().zip(results) {
-            match r {
-                Some(ids) => out.extend(ids),
+        for w in per_worker {
+            match w {
+                Some(mine) => {
+                    for (ci, ids) in mine {
+                        if let Some(slot) = slots.get_mut(ci) {
+                            *slot = Some(ids);
+                        }
+                    }
+                }
                 // A worker thread died (it cannot return an error, only
-                // panic); redo its chunk serially so the call still returns
-                // the full, correct id stream, and rebuild the pool next
-                // call rather than reuse a worker of unknown state.
+                // panic), taking its finished chunks down with it; the redo
+                // below covers them, and the pool is rebuilt next call
+                // rather than reusing a worker of unknown state.
+                None => poisoned = true,
+            }
+        }
+        let mut out: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+        for (range, slot) in chunks.iter().zip(slots) {
+            match slot {
+                Some(ids) => out.extend(ids),
+                // Unclaimed or lost to a panic: redo serially so the call
+                // still returns the full, correct id stream.
                 None => {
                     poisoned = true;
-                    out.extend(chunk.iter().map(|t| self.encode(t)));
+                    out.extend(texts[range.clone()].iter().map(|t| self.encode(t)));
                 }
             }
         }
