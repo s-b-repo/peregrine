@@ -26,9 +26,21 @@ fn run() -> Result<(), Error> {
     let mut method: String = "cluster".to_string();
     let mut optimize = false;
     let mut apply = false;
+    let mut compress: Option<peregrine_core::Compression> = None;
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--compress" => {
+                i += 1;
+                match args.get(i).map(|s| s.as_str()) {
+                    Some("zstd") => compress = Some(peregrine_core::Compression::Zstd),
+                    other => {
+                        return Err(Error::Format(format!(
+                            "--compress supports 'zstd', got {other:?}"
+                        )));
+                    }
+                }
+            }
             "--routes" => {
                 i += 1;
                 routes_path = args.get(i).map(PathBuf::from);
@@ -64,11 +76,21 @@ fn run() -> Result<(), Error> {
         }
     }
     write_schedule(&out, &ordered)?;
+    if compress.is_some() && !apply {
+        return Err(Error::Format("--compress only means something with --apply".to_string()));
+    }
     if apply {
         // Self-reorganizing rewrite: turn the schedule into physical disk
         // adjacency inside model.safetensors (bit-identical reads after).
-        peregrine_tools::apply_layout(&out, &ordered)?;
-        eprintln!("applied physical re-layout to {}/model.safetensors", out.display());
+        // `--compress zstd` additionally re-encodes the routed-expert payloads
+        // while they pass through memory (the reader decompresses per-tensor
+        // transparently); non-expert tensors keep their scheme.
+        peregrine_tools::apply_layout_with(&out, &ordered, compress)?;
+        eprintln!(
+            "applied physical re-layout to {}/model.safetensors{}",
+            out.display(),
+            if compress.is_some() { " (experts zstd-compressed)" } else { "" }
+        );
     }
     eprintln!(
         "wrote per-layer schedule for {} layers to {}/schedule.json",
@@ -81,6 +103,6 @@ fn run() -> Result<(), Error> {
 fn usage() {
     eprintln!(
         "usage: peregrine-layout-reorg --routes <routes.json> --out <model_dir> \
-    [--method cluster|greedy|louvain|spectral|hilbert] [--optimize] [--apply]"
+    [--method cluster|greedy|louvain|spectral|hilbert] [--optimize] [--apply] [--compress zstd]"
     );
 }

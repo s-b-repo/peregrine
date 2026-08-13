@@ -43,3 +43,47 @@ fn apply_layout_is_bit_identical() -> Result<(), peregrine_core::Error> {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+#[test]
+fn apply_layout_with_zstd_compresses_experts_and_stays_bit_identical() -> Result<(), peregrine_core::Error> {
+    // The `--compress zstd` arm of the rewrite: expert payloads re-encode
+    // while they pass through memory, the reader decompresses transparently,
+    // and predictions must not move. Non-expert tensors keep their scheme.
+    let dir = std::env::temp_dir().join(format!("peregrine_apply_zstd_{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    peregrine_model::testkit::build_tiny_model(&dir)?;
+    let toks = [3i32, 7, 1, 4, 9, 2];
+    let want = {
+        let mut m = Model::load(&dir)?;
+        m.teacher_forcing(&toks)?
+    };
+
+    let ordered: Vec<Vec<i32>> = (0..2usize).map(|_| (0..4i32).collect()).collect();
+    peregrine_tools::apply_layout_with(&dir, &ordered, Some(peregrine_core::Compression::Zstd))?;
+
+    let st = peregrine_core::SafeTensors::open(&dir)?;
+    let expert = "model.layers.1.mlp.experts.0.gate_proj.weight";
+    let t = st
+        .find(expert)
+        .ok_or_else(|| peregrine_core::Error::Format(format!("{expert} missing after rewrite")))?;
+    assert_eq!(
+        t.compression,
+        peregrine_core::Compression::Zstd,
+        "expert tensor carries the zstd compression tag"
+    );
+    assert_ne!(
+        st.find("model.embed_tokens.weight").map(|t| t.compression),
+        Some(peregrine_core::Compression::Zstd),
+        "non-expert tensors keep their scheme"
+    );
+
+    let got = {
+        let mut m = Model::load(&dir)?;
+        m.teacher_forcing(&toks)?
+    };
+    assert_eq!(got, want, "zstd-compressed rewrite must not change any prediction");
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}

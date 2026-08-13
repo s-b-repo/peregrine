@@ -736,6 +736,11 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
     // which is what `COLI_PREDICT_EVAL`'s scoreboard needs to be actionable.
     if let Some(name) = model.apply_predictor_override() {
         eprintln!("peregrine: prefetch predictor = {name} (COLI_PREDICT_SOURCE)");
+    } else if model.predictor_is_automaton() {
+        // Load's own pick is silent, and whether the automaton engaged depends
+        // on artifacts (`route_stats.json` transition history) that vary run to
+        // run — say so, so a log can tell an automaton run from a baseline one.
+        eprintln!("peregrine: prefetch predictor = automaton (from route-stats history)");
     }
     out.write_all(READY)?;
     out.flush()?;
@@ -811,9 +816,21 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                             .collect();
                         per.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                         if !per.is_empty() {
-                            let top: Vec<String> =
-                                per.iter().take(5).map(|(l, n)| format!("L{l}={n}")).collect();
-                            eprintln!("[ecache] busiest layers by disk reads: {}", top.join(" "));
+                            // The prefetch column beside the demand column: a
+                            // layer whose reads are mostly `pf` is being served
+                            // by the speculative lane; one with a big demand
+                            // count and no `pf` is where look-ahead is missing.
+                            // (`ecache_prefetch_reads_for_layer` is the demand
+                            // twin's counterpart and had no production caller.)
+                            let top: Vec<String> = per
+                                .iter()
+                                .take(5)
+                                .map(|(l, n)| {
+                                    let pf = model.ecache_prefetch_reads_for_layer(*l).unwrap_or(0);
+                                    format!("L{l}={n}+{pf}pf")
+                                })
+                                .collect();
+                            eprintln!("[ecache] busiest layers by disk+prefetch reads: {}", top.join(" "));
                         }
                         // prefetch effectiveness: how many speculative reads paid off,
                         // plus fadvise hints and (opt-in) verify mismatches.

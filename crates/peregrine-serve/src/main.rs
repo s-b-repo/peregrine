@@ -472,6 +472,9 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
         // RLM recursive refinement (COLI_RLM): passes emitted and tokens that
         // triggered at least one.
         "rlm": { "passes": t.rlm.0, "tokens_recursed": t.rlm.1 },
+        // O_DIRECT slab buffers in flight (null when experts are resident);
+        // pinned at the pool cap = reads serializing on buffer availability.
+        "io_slab_in_use": t.io_slab_in_use,
         // Which implementation is dispatching, read from the dispatch path
         // itself — not from `COLI_MOE_ENGINE`, which says what was requested.
         "moe_engine": peregrine_model::concurrent::moe_engine_name(),

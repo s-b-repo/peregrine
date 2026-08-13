@@ -312,6 +312,10 @@ pub struct EngineTelemetry {
     /// RLM recursive refinement `(passes_emitted, tokens_recursed)`,
     /// cumulative — `(0, 0)` unless `COLI_RLM=1`.
     pub rlm: (u64, u64),
+    /// O_DIRECT slab buffers currently checked out across the streaming rings
+    /// (`None` when experts are resident). Stuck at the pool cap = reads are
+    /// serializing on buffer availability.
+    pub io_slab_in_use: Option<usize>,
 }
 
 /// Handle for submitting requests to the engine thread. Cheap to clone and
@@ -1164,6 +1168,7 @@ fn run_tuned(
             spec_proposed,
             spec_accepted,
             rlm: model.rlm_stats(),
+            io_slab_in_use: model.io_slab_in_use(),
         };
     }
     // Shutdown: report what the prefix cache absorbed. Silent when it is off, so
