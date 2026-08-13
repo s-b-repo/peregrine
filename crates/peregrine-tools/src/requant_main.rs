@@ -23,7 +23,11 @@ fn usage() -> i32 {
         "usage: peregrine-requantize <indir> <outdir> [options]\n\
          \n\
          options:\n\
-         \x20 --target <scheme>    int8 | int4 | int4-g<N> | int2   (default int2)\n\
+         \x20 --target <scheme>    int8 | int4 | int4-g<N> | int3-g64 | int2-g64 | int2\n\
+         \x20                      (default int2 — per-row, effectively ternary; prefer\n\
+         \x20                      int2-g64, and see todo.md §13 before either: int2-g64\n\
+         \x20                      measured flip_rate 1.000 on GLM-5.2, int3-g64 is the\n\
+         \x20                      untested rung)\n\
          \x20 --include <substr>   only tensors containing this      (default .mlp.experts.)\n\
          \x20 --shard-bytes <N>    roll output shards at N bytes     (default 5000000000)\n\
          \x20 --dry-run            report the size plan from headers, write nothing\n\

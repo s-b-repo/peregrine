@@ -79,7 +79,7 @@ The one-shot offline preprocessing pass: ONE corpus run emits every artifact —
 `COLI_TIER_VRAM_MB` and/or `COLI_TIER_RAM_MB` are set), and a
 `route_stats.json` seed. All are picked up automatically at the next load.
 
-### `flip-rate <source-dir> <candidate-dir> [--text FILE] [--tokens N]`
+### `flip-rate <source-dir> <candidate-dir> [--text FILE] [--tokens N] [--candidate-env KEY=VAL]...`
 
 The quality gate for a **lossy** container — a `peregrine-requantize` output
 measured against the checkpoint it was converted from. Every other gate in this
@@ -90,6 +90,21 @@ its place. Prints `positions`, `flips` and `flip_rate` on stdout.
 ```bash
 peregrine flip-rate ~/models/GLM-5.2-int4 /mnt/models/GLM-5.2-int2g64 \
   --text sample.txt --tokens 512
+```
+
+It also gates a **lossy knob** against the same container:
+`--candidate-env KEY=VAL` (repeatable) applies the vars to the candidate arm
+only, by running that arm in a child process (`flip-arm`, an internal
+subcommand — token ids on stdin, predictions on stdout). A child process is
+the mechanism, not a convenience: knobs like `COLI_ROUTE_MIN_SHARE` latch in a
+process-global `OnceLock`, so an exported var would set **both** arms and the
+gate would read 0.000 exactly as a harmless knob would. For the same reason a
+key that is also set in the parent's environment is refused, not warned about.
+The arm echoes the `COLI_*` environment it actually ran with on stderr.
+
+```bash
+peregrine flip-rate ~/models/GLM-5.2 ~/models/GLM-5.2 \
+  --text sample.txt --tokens 512 --candidate-env COLI_ROUTE_MIN_SHARE=0.05
 ```
 
 - **The models load one at a time.** Two streaming loads would hold two warm
