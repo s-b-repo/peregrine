@@ -882,20 +882,38 @@ fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Resul
 
     let mbs = |b: usize, s: f64| b as f64 / 1e6 / s.max(1e-9);
 
-    let t0 = std::time::Instant::now();
+    // Three passes per row, best-of reported: a single pass on this box swings
+    // by more than the few-percent effects the tokenizer changes under test
+    // produce (same discipline as docs/measurement.md, scaled down to
+    // milliseconds). Min, not mean — the floor is the machine's capability;
+    // the excursions above it are scheduler noise.
+    const PASSES: usize = 3;
+
     let mut line_ids = 0usize;
-    for l in &lines {
-        line_ids += giga.encode(l).len();
+    let mut line_s = f64::INFINITY;
+    for _ in 0..PASSES {
+        let t0 = std::time::Instant::now();
+        line_ids = 0;
+        for l in &lines {
+            line_ids += giga.encode(l).len();
+        }
+        line_s = line_s.min(t0.elapsed().as_secs_f64());
     }
-    let line_s = t0.elapsed().as_secs_f64();
-    println!("gigatoken/line  : {:8.2} MB/s  ({line_ids} ids, {line_s:.3}s)", mbs(bytes, line_s));
+    println!(
+        "gigatoken/line  : {:8.2} MB/s  ({line_ids} ids, best of {PASSES}: {line_s:.3}s)",
+        mbs(bytes, line_s)
+    );
 
     let mut out: Vec<u32> = Vec::with_capacity(text.len() / 3);
-    let t0 = std::time::Instant::now();
-    giga.encode_into(&text, &mut out);
-    let whole_s = t0.elapsed().as_secs_f64();
+    let mut whole_s = f64::INFINITY;
+    for _ in 0..PASSES {
+        out.clear();
+        let t0 = std::time::Instant::now();
+        giga.encode_into(&text, &mut out);
+        whole_s = whole_s.min(t0.elapsed().as_secs_f64());
+    }
     println!(
-        "gigatoken/whole : {:8.2} MB/s  ({} ids, {whole_s:.3}s)",
+        "gigatoken/whole : {:8.2} MB/s  ({} ids, best of {PASSES}: {whole_s:.3}s)",
         mbs(text.len(), whole_s),
         out.len()
     );
@@ -927,17 +945,28 @@ fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Resul
         }
     };
     // p1 pays one-time worker construction (the pool persists on the
-    // instance); p2 is the steady state a long batch run sees.
-    for pass in 1..=2 {
+    // instance) and is inherently a single observation; p2 is the steady
+    // state a long batch run sees, best of PASSES.
+    let t0 = std::time::Instant::now();
+    let par_ids: usize = giga.encode_batch(&docs, workers).iter().map(|v| v.len()).sum();
+    let par_s = t0.elapsed().as_secs_f64();
+    println!(
+        "gigatoken/par{workers:<2} p1: {:8.2} MB/s  ({} docs, {par_ids} ids, {par_s:.3}s)",
+        mbs(text.len(), par_s),
+        docs.len()
+    );
+    let mut par_s = f64::INFINITY;
+    let mut par_ids = 0usize;
+    for _ in 0..PASSES {
         let t0 = std::time::Instant::now();
-        let par_ids: usize = giga.encode_batch(&docs, workers).iter().map(|v| v.len()).sum();
-        let par_s = t0.elapsed().as_secs_f64();
-        println!(
-            "gigatoken/par{workers:<2} p{pass}: {:8.2} MB/s  ({} docs, {par_ids} ids, {par_s:.3}s)",
-            mbs(text.len(), par_s),
-            docs.len()
-        );
+        par_ids = giga.encode_batch(&docs, workers).iter().map(|v| v.len()).sum();
+        par_s = par_s.min(t0.elapsed().as_secs_f64());
     }
+    println!(
+        "gigatoken/par{workers:<2} p2: {:8.2} MB/s  ({} docs, {par_ids} ids, best of {PASSES}: {par_s:.3}s)",
+        mbs(text.len(), par_s),
+        docs.len()
+    );
     Ok(())
 }
 

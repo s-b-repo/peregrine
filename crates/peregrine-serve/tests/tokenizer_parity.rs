@@ -49,6 +49,89 @@ const CORPUS: &[&str] = &[
     "a",
 ];
 
+/// The real GLM-5.2 `tokenizer.json` (154 820 vocab / 321 649 merges / 36 added
+/// tokens — the scheme serve actually runs, on the `Olmo3` fast arm), or `None`
+/// to skip: the checkpoint is 20 MB and lives outside the repo, so this gate
+/// runs where the model does (`COLI_MODEL`, else the box-conventional
+/// `~/models/GLM-5.2`) and skips — never fails — elsewhere. The GPT-2 fixture
+/// tests above keep the committed-corpus bar; these keep the production-vocab
+/// bar.
+fn glm_tokenizer_bytes() -> Option<Vec<u8>> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::var("COLI_MODEL") {
+        candidates.push(std::path::PathBuf::from(dir).join("tokenizer.json"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join("models/GLM-5.2/tokenizer.json"));
+    }
+    candidates.into_iter().find_map(|p| std::fs::read(&p).ok())
+}
+
+/// GLM-specific additions to [`CORPUS`]: the real chat markers (genuine added
+/// tokens in this vocab, unlike under GPT-2 where the same strings tokenize as
+/// plain text), digit runs against the `\p{N}{1,3}` pretokenizer arm, CJK-heavy
+/// prose, and the newline-run arm (`\s*[\r\n]+`) that distinguishes Olmo3 from
+/// the GPT-4 family.
+const GLM_EXTRA: &[&str] = &[
+    "[gMASK]<sop><|system|>\nYou are a helpful assistant.<|user|>\nhi<|assistant|>\n",
+    "<|user|>\n<|assistant|>\n<|observation|>\n<|endoftext|>",
+    "12345678901234567890 and 1 22 333 4444 55555",
+    "你好世界。这是一个中文句子，包含标点符号！还有数字１２３和English混排。",
+    "line\n\n\nruns\r\n\r\nof\n \n newlines",
+    "    indented code block\n\tdef f(x):\n\t\treturn x ** 2\n",
+    "混合 mixed 语言 language 文本 text ，。！？【】《》",
+];
+
+#[test]
+fn glm_matches_hf_id_for_id() -> Result<(), String> {
+    let Some(bytes) = glm_tokenizer_bytes() else {
+        eprintln!("skipping: GLM tokenizer.json absent (set COLI_MODEL or place ~/models/GLM-5.2)");
+        return Ok(());
+    };
+    let (mut giga, hf) = both(&bytes)?;
+    for text in CORPUS.iter().chain(GLM_EXTRA) {
+        let g: Vec<u32> = giga.encode(text);
+        let encoded = hf.encode(*text, false).map_err(|e| format!("hf encode {text:?}: {e}"))?;
+        assert_eq!(g, encoded.get_ids().to_vec(), "encode mismatch on {text:?}");
+        let decoded = giga.decode(&g);
+        assert_eq!(String::from_utf8_lossy(&decoded), *text, "decode round trip on {text:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn glm_encode_into_and_batch_match_encode() -> Result<(), String> {
+    let Some(bytes) = glm_tokenizer_bytes() else {
+        eprintln!("skipping: GLM tokenizer.json absent (set COLI_MODEL or place ~/models/GLM-5.2)");
+        return Ok(());
+    };
+    let (mut giga, _hf) = both(&bytes)?;
+
+    // `encode_into` is the same engine entry as `encode` minus the fresh Vec —
+    // assert it anyway, so a future fast path through one and not the other
+    // cannot drift silently.
+    let mut buf: Vec<u32> = Vec::new();
+    for text in CORPUS.iter().chain(GLM_EXTRA) {
+        buf.clear();
+        giga.encode_into(text, &mut buf);
+        assert_eq!(buf, giga.encode(text), "encode_into mismatch on {text:?}");
+    }
+
+    // Bulk documents big enough to clear the per-worker byte gate, so the
+    // parallel path (chunking + worker handout) actually engages rather than
+    // silently falling back to the serial loop it is being compared against.
+    let base: String = CORPUS.iter().chain(GLM_EXTRA).flat_map(|s| s.chars()).collect();
+    let doc: String = std::iter::repeat_with(|| base.as_str()).take(64).collect();
+    let docs: Vec<&str> = std::iter::repeat_with(|| doc.as_str()).take(48).collect();
+    let par = giga.encode_batch(&docs, 2);
+    assert_eq!(par.len(), docs.len(), "one id vector per document");
+    let serial = giga.encode(&doc);
+    for (i, ids) in par.iter().enumerate() {
+        assert_eq!(ids, &serial, "encode_batch doc {i} mismatch vs serial encode");
+    }
+    Ok(())
+}
+
 #[test]
 fn giga_matches_hf_id_for_id() -> Result<(), String> {
     let bytes = fixture_bytes()?;
