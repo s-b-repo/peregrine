@@ -298,7 +298,21 @@ fn submit_request(
     let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
     let prompt: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
     let sampler = Sampler::new(temperature, top_p, seed());
-    state.inner.engine.submit(EngineRequest { prompt, max_new, sampler, out: tx, priority, class })?;
+    state
+        .inner
+        .engine
+        .submit(EngineRequest { prompt, max_new, sampler, out: tx, priority, class })
+        .map_err(|r| match r {
+            // Backpressure, not failure: the backlog is at COLI_QUEUE_DEPTH and
+            // the honest answer is "retry", not a queue that grows until the
+            // client times out anyway.
+            batch::SubmitRefused::Full => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "engine queue is full; retry later",
+            ),
+            batch::SubmitRefused::Down(m) => ApiError::internal(format!("batch engine is not running: {m}")),
+        })?;
     Ok(rx)
 }
 

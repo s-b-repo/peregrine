@@ -49,12 +49,15 @@ static NEXT_SEQ_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// [`prefill_chunk`].
 const PREFILL_CHUNK: usize = 64;
 
-/// Divisor for the adaptive prefill chunk (`COLI_PREFILL_CHUNK_DIV`). `0`/unset
-/// keeps the historical fixed [`PREFILL_CHUNK`].
+/// Divisor for the adaptive prefill chunk (`COLI_PREFILL_CHUNK_DIV`).
+/// Default **4** (2026-08-13): geometric chunk boundaries keep the total
+/// dense-path reconstruction linear in prompt length instead of quadratic —
+/// see [`prefill_chunk`], whose math is what this default buys. `0` restores
+/// the historical fixed [`PREFILL_CHUNK`] exactly.
 fn prefill_chunk_div() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("COLI_PREFILL_CHUNK_DIV").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+        std::env::var("COLI_PREFILL_CHUNK_DIV").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(4)
     })
 }
 
@@ -71,8 +74,9 @@ fn prefill_chunk_div() -> usize {
 /// **Chunk size cannot change the output** — each token still attends exactly its
 /// causal prefix, which is what `engine_chunked_prefill_matches_reference` and
 /// `prefill_seq_matches_forward_step` already assert. The only thing traded is how
-/// long one prefill step blocks the decode batch, so this stays opt-in and the
-/// default reproduces the historical fixed chunk exactly.
+/// long one prefill step blocks the decode batch — which is why the divisor is a
+/// knob (`COLI_PREFILL_CHUNK_DIV=0` restores the historical fixed chunk exactly)
+/// even though the default is now the geometric schedule.
 /// Pure so the schedule is unit-testable — `iotune.rs` documents why a
 /// process-wide `OnceLock` for an enable flag makes a feature untestable.
 fn prefill_chunk(pos: usize, div: usize) -> usize {
@@ -83,16 +87,20 @@ fn prefill_chunk(pos: usize, div: usize) -> usize {
 }
 
 /// Byte budget for the cross-request prefix cache (`COLI_PREFIX_CACHE_MB`).
-/// `0`/unset disables it, which is the historical behaviour: every request
-/// prefills its whole prompt from scratch.
+/// Default **2048 MB** (2026-08-13): prefix reuse is bit-identical by
+/// construction (refcounted rows, same math), so the only trade is RAM, and
+/// 2 GB buys multi-turn conversations their assistant turns back on an engine
+/// where every re-prefilled token streams ~11 GB of experts. `0` disables it —
+/// the historical behaviour: every request prefills its whole prompt from
+/// scratch.
 fn prefix_cache_budget() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("COLI_PREFIX_CACHE_MB")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
-            .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or(0)
+            .unwrap_or(2048)
+            .saturating_mul(1024 * 1024)
     })
 }
 
@@ -326,18 +334,51 @@ pub struct EngineHandle {
     tx_high: mpsc::UnboundedSender<EngineRequest>,
     /// Published by the engine thread each tick; read by `/metrics`.
     telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
+    /// Requests sent but not yet drained by the engine (see [`queue_depth_cap`]).
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Resolved [`queue_depth_cap`]; 0 = unbounded.
+    queue_cap: usize,
+}
+
+/// Why [`EngineHandle::submit`] refused a request.
+#[derive(Debug)]
+pub enum SubmitRefused {
+    /// `COLI_QUEUE_DEPTH` backpressure — the backlog is at its cap; the client
+    /// should retry (HTTP 503), and nothing about the request was wrong.
+    Full,
+    /// The engine thread is gone (shutdown or crash).
+    Down(String),
+}
+
+impl From<SubmitRefused> for Error {
+    fn from(r: SubmitRefused) -> Error {
+        match r {
+            SubmitRefused::Full => Error::Format("engine queue is full (COLI_QUEUE_DEPTH)".into()),
+            SubmitRefused::Down(m) => Error::Format(format!("batch engine is not running: {m}")),
+        }
+    }
 }
 
 impl EngineHandle {
     /// Submit a request at its `priority` — the engine drains high-priority
-    /// requests before normal ones each tick. Errors only if the engine thread
-    /// has already shut down.
-    pub fn submit(&self, req: EngineRequest) -> Result<(), Error> {
+    /// requests before normal ones each tick. Refuses with
+    /// [`SubmitRefused::Full`] against a backlog at `COLI_QUEUE_DEPTH`, or
+    /// [`SubmitRefused::Down`] once the engine thread has shut down.
+    pub fn submit(&self, req: EngineRequest) -> Result<(), SubmitRefused> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Approximate on purpose: two racing submits can both pass a cap-1
+        // check. The cap is overload shedding, not an admission invariant —
+        // off-by-a-few under race is fine, silently unbounded is not.
+        if self.queue_cap > 0 && self.queued.load(Relaxed) >= self.queue_cap {
+            return Err(SubmitRefused::Full);
+        }
         let ch = match req.priority {
             Priority::High => &self.tx_high,
             Priority::Normal => &self.tx_normal,
         };
-        ch.send(req).map_err(|send_err| Error::Format(format!("batch engine is not running: {send_err}")))
+        ch.send(req).map_err(|send_err| SubmitRefused::Down(send_err.to_string()))?;
+        self.queued.fetch_add(1, Relaxed);
+        Ok(())
     }
 
     /// The engine's most recent published telemetry. All-zero before the first
@@ -345,6 +386,13 @@ impl EngineHandle {
     pub fn telemetry(&self) -> EngineTelemetry {
         self.telemetry.lock().clone()
     }
+}
+
+/// State shared between the engine thread and its [`EngineHandle`], bundled
+/// so `run_tuned` stays within the argument count its own comment defends.
+struct EngineShared {
+    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Spawn the engine on a dedicated OS thread that owns `model`, batching up to
@@ -356,12 +404,13 @@ pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle
     let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
     let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
-    let tel = telemetry.clone();
+    let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shared = EngineShared { telemetry: telemetry.clone(), queued: queued.clone() };
     let join = std::thread::Builder::new()
         .name("peregrine-batch".to_string())
-        .spawn(move || run(model, rx_normal, rx_high, cap, fuse_prefill(), tel))
+        .spawn(move || run(model, rx_normal, rx_high, cap, fuse_prefill(), shared))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high, telemetry }, join))
+    Ok((EngineHandle { tx_normal, tx_high, telemetry, queued, queue_cap: queue_depth_cap() }, join))
 }
 
 /// [`spawn`] with the prefill/decode fusion forced on or off.
@@ -416,12 +465,13 @@ fn spawn_spec(
     let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
     let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
-    let tel = telemetry.clone();
+    let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shared = EngineShared { telemetry: telemetry.clone(), queued: queued.clone() };
     let join = std::thread::Builder::new()
         .name("peregrine-batch-test".to_string())
-        .spawn(move || run_tuned(model, rx_normal, rx_high, cap, fuse, spec, tel))
+        .spawn(move || run_tuned(model, rx_normal, rx_high, cap, fuse, spec, shared))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high, telemetry }, join))
+    Ok((EngineHandle { tx_normal, tx_high, telemetry, queued, queue_cap: queue_depth_cap() }, join))
 }
 
 /// Latency SLA target for adaptive batching, in milliseconds. When set
@@ -488,22 +538,51 @@ fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize, 
 }
 
 /// Fuse a prefill chunk into the same forward as the decode batch
-/// (`COLI_FUSE_PREFILL`). Default **off** — the historical two-forward tick.
+/// (`COLI_FUSE_PREFILL`). Default **on** (2026-08-13); `=0` restores the
+/// historical two-forward tick.
 ///
-/// On a tick with both, the engine runs `forward_prefill_seq` *and*
+/// On a tick with both, the unfused engine runs `forward_prefill_seq` *and*
 /// `forward_step_batched`: two disjoint forwards, each streaming its own
 /// routed-expert union off disk, ~11.3 GB per token apiece at GLM-5.2 shapes.
 /// The MoE lane is row-batch-union'd and does not care which sequence a row
-/// belongs to, so the two can share one set of expert reads.
+/// belongs to, so the two share one set of expert reads instead.
 ///
 /// **Output-neutral, and proven so rather than argued**:
 /// `a_fused_chunk_is_indistinguishable_from_two_separate_forwards` (model) and
-/// `fused_prefill_emits_the_same_tokens_as_the_two_forward_tick` (here). It is
-/// still opt-in because the win is a *byte* win that this workspace cannot
-/// measure — see `docs/validation-runbook.md`.
+/// `fused_prefill_emits_the_same_tokens_as_the_two_forward_tick` (here). The
+/// byte win that justified flipping the default is a union-share measurement
+/// (`COLI_UNION_STATS`); the serve-path A/B recipe is in
+/// `docs/validation-runbook.md`.
 fn fuse_prefill() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("COLI_FUSE_PREFILL").ok().as_deref(), Some("1") | Some("true")))
+    *V.get_or_init(|| !matches!(std::env::var("COLI_FUSE_PREFILL").ok().as_deref(), Some("0") | Some("false")))
+}
+
+/// Ceiling on rows in one fused forward (`COLI_MAX_BATCH_ROWS`); `0`/unset =
+/// uncapped, the historical behaviour. A fused tick's row count is
+/// `Σ(1 + drafts)` over the decode batch plus the prefill chunk, and nothing
+/// bounded the total: a geometric prefill chunk riding a full speculative
+/// batch could assemble an arbitrarily large forward. The cap shrinks the
+/// fused chunk first (always leaving one token of prefill progress) and
+/// bounds next-tick draft depth so the decode block itself fits. Purely a
+/// scheduling bound — which rows run when — never which tokens come out.
+fn max_batch_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_MAX_BATCH_ROWS").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+    })
+}
+
+/// Admission-queue depth cap (`COLI_QUEUE_DEPTH`); `0`/unset = unbounded, the
+/// historical behaviour. When set, a submit against a backlog this deep is
+/// refused ([`SubmitRefused::Full`] → HTTP 503) instead of queued forever —
+/// overload becomes visible backpressure rather than unbounded memory and a
+/// client timeout long after the fact.
+fn queue_depth_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_QUEUE_DEPTH").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+    })
 }
 
 /// Number of decode ticks per prefill tick when the adaptive window is on.
@@ -677,9 +756,9 @@ fn run(
     rx_high: mpsc::UnboundedReceiver<EngineRequest>,
     max_batch: usize,
     fuse: bool,
-    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
+    shared: EngineShared,
 ) {
-    run_tuned(model, rx_normal, rx_high, max_batch, fuse, SpecOverride::default(), telemetry)
+    run_tuned(model, rx_normal, rx_high, max_batch, fuse, SpecOverride::default(), shared)
 }
 
 /// [`run`] with the speculation knobs overridable, for tests. Each `None` reads
@@ -691,8 +770,9 @@ fn run_tuned(
     max_batch: usize,
     fuse: bool,
     spec: SpecOverride,
-    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
+    shared: EngineShared,
 ) {
+    let EngineShared { telemetry, queued } = shared;
     let vocab = model.cfg.vocab as usize;
     let stop_ids = model.cfg.stop_ids.clone();
     let mut active: Vec<SeqState> = Vec::new();
@@ -713,6 +793,8 @@ fn run_tuned(
     let mut prefix = PrefixCache::new(prefix_cache_budget());
     // Resolved once: the KV byte ceiling admission respects alongside the count.
     let kv_budget = kv_budget_bytes();
+    // Resolved once: the fused-forward row ceiling (0 = uncapped).
+    let max_rows = max_batch_rows();
     let mut working_cap = max_batch;
     let mut ewma_decode_us: u64 = 0;
     // Small current-thread runtime just for the priority-aware blocking recv.
@@ -736,14 +818,14 @@ fn run_tuned(
         // because every admission grows the resident set.
         while active.len() + pending.len() < working_cap && kv_headroom(&active, &pending, kv_budget) {
             match rx_high.try_recv() {
-                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix),
+                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix, &queued),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
         while active.len() + pending.len() < working_cap && kv_headroom(&active, &pending, kv_budget) {
             match rx_normal.try_recv() {
-                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix),
+                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix, &queued),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break, // drain, then exit
             }
@@ -759,14 +841,14 @@ fn run_tuned(
                 // is handled as shutdown by `recv_priority` below.
                 match rx_high.try_recv() {
                     Ok(req) => {
-                        admit_pending(&model, &mut pending, req, &mut prefix);
+                        admit_pending(&model, &mut pending, req, &mut prefix, &queued);
                         break;
                     }
                     Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
                 }
                 match rx_normal.try_recv() {
                     Ok(req) => {
-                        admit_pending(&model, &mut pending, req, &mut prefix);
+                        admit_pending(&model, &mut pending, req, &mut prefix, &queued);
                         break;
                     }
                     Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
@@ -778,7 +860,7 @@ fn run_tuned(
             let req = recv_priority(idle_rt.as_ref(), &mut rx_high, &mut rx_normal);
             match req {
                 Some(req) => {
-                    admit_pending(&model, &mut pending, req, &mut prefix);
+                    admit_pending(&model, &mut pending, req, &mut prefix, &queued);
                     continue;
                 }
                 None => break,
@@ -801,7 +883,14 @@ fn run_tuned(
             let fusable = fuse && !active.is_empty() && !pending.is_empty();
             match fusable.then(|| pending.pop_front()).flatten() {
                 Some(p) => {
-                    let end = chunk_end(p.pos, p.prompt.len(), chunk_div);
+                    let mut end = chunk_end(p.pos, p.prompt.len(), chunk_div);
+                    // COLI_MAX_BATCH_ROWS: the fused chunk yields first, down
+                    // to one token so the prefill always makes progress.
+                    if max_rows > 0 {
+                        let dec_rows: usize = active.iter().map(|s| 1 + s.draft.len()).sum();
+                        let room = max_rows.saturating_sub(dec_rows).max(1);
+                        end = end.min(p.pos + room);
+                    }
                     fused = Some((p, end));
                 }
                 None => prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids, chunk_div, &mut prefix),
@@ -1104,9 +1193,18 @@ fn run_tuned(
         // for that sequence rather than dropping the client.
         if depth > 0 {
             let sampled = sampled_spec;
+            // COLI_MAX_BATCH_ROWS bounds next tick's decode block too: B
+            // sequences each drafting g assemble B*(1+g) rows before any
+            // fused chunk is added.
+            let depth_cap = if max_rows > 0 && !active.is_empty() {
+                (max_rows / active.len()).saturating_sub(1)
+            } else {
+                usize::MAX
+            };
             for s in active.iter_mut() {
                 let g =
-                    draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new), sampled);
+                    draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new), sampled)
+                        .min(depth_cap);
                 s.draft.clear();
                 s.draft_q.clear();
                 if g == 0 || s.hlast.is_empty() {
@@ -1418,7 +1516,28 @@ fn recv_priority(
 /// The most recent admission's workload class becomes the model's active class —
 /// a pragmatic "latest wins" policy for a mixed batch (per-sequence classes would
 /// need per-sequence prefetch policies; the breadth knob is batch-global today).
-fn admit_pending(model: &Model, pending: &mut VecDeque<Prefilling>, req: EngineRequest, prefix: &mut PrefixCache) {
+fn admit_pending(
+    model: &Model,
+    pending: &mut VecDeque<Prefilling>,
+    req: EngineRequest,
+    prefix: &mut PrefixCache,
+    queued: &std::sync::atomic::AtomicUsize,
+) {
+    // The request has left the channel: it no longer counts against
+    // `COLI_QUEUE_DEPTH`. Saturating (a plain `fetch_sub` would wrap) because
+    // tests drive this function directly with a counter no submit incremented.
+    let mut cur = queued.load(std::sync::atomic::Ordering::Relaxed);
+    while cur > 0 {
+        match queued.compare_exchange_weak(
+            cur,
+            cur - 1,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(now) => cur = now,
+        }
+    }
     if req.prompt.is_empty() || req.max_new == 0 {
         return; // nothing to generate; dropping req.out closes the stream cleanly
     }
@@ -1682,6 +1801,50 @@ mod tests {
     }
 
     #[test]
+    fn queue_cap_refuses_at_depth_and_recovers_on_drain() {
+        // The COLI_QUEUE_DEPTH contract, driven directly (the knob itself is a
+        // process-wide OnceLock, so the cap is injected here the same way the
+        // spec/fuse overrides are): at the cap a submit refuses Full — nothing
+        // wrong with the request — and draining makes room again.
+        let (tx_normal, _rx_n) = mpsc::unbounded_channel::<EngineRequest>();
+        let (tx_high, _rx_h) = mpsc::unbounded_channel::<EngineRequest>();
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = EngineHandle {
+            tx_normal,
+            tx_high,
+            telemetry: std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default())),
+            queued: queued.clone(),
+            queue_cap: 2,
+        };
+        let req = || {
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            (
+                EngineRequest {
+                    prompt: vec![1, 2, 3],
+                    max_new: 1,
+                    sampler: Sampler::new(0.0, 0.9, 1),
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                },
+                rx,
+            )
+        };
+        let (r1, _k1) = req();
+        let (r2, _k2) = req();
+        let (r3, _k3) = req();
+        assert!(handle.submit(r1).is_ok(), "under the cap admits");
+        assert!(handle.submit(r2).is_ok(), "at cap-1 admits");
+        assert!(matches!(handle.submit(r3), Err(SubmitRefused::Full)), "at the cap refuses Full");
+        // The engine draining one request makes room for exactly one more.
+        queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let (r4, _k4) = req();
+        let (r5, _k5) = req();
+        assert!(handle.submit(r4).is_ok(), "drain restores one admission");
+        assert!(matches!(handle.submit(r5), Err(SubmitRefused::Full)), "and only one");
+    }
+
+    #[test]
     fn retiring_output_extends_the_prefix_cache_past_the_prompt() -> Result<(), Error> {
         // The multi-turn shape: a client's next request resends prompt+output
         // as its new prompt's head. Before the retire-time insert, the cache
@@ -1764,6 +1927,7 @@ mod tests {
                     class: peregrine_model::TokenClass::Prose,
                 },
                 &mut prefix,
+                &std::sync::atomic::AtomicUsize::new(0),
             );
         }
         let ids: Vec<usize> = pending.iter().map(|p| p.seq_id).collect();
