@@ -84,6 +84,16 @@ pub struct ForwardCtx<'a> {
     /// it between forwards so the `BubbleTuner` sees per-forward deltas.
     /// `None` disables the (very cheap) bracketing.
     pub timings: Option<&'a LaneTimingsAccum>,
+    /// Deferred-spill log (`COLI_GPU_SPILL`): a [`crate::lane::Placement::GpuSpill`]
+    /// verdict records its `(layer, expert)` here — the expert still computes on
+    /// the CPU lane *this* forward — and [`crate::Model::reheat`] drains the log
+    /// between forwards, boosting those pairs in the heat snapshot so the next
+    /// residency generation actually uploads what the balancer kept asking for.
+    /// Acting between forwards is what keeps this out of the mid-forward
+    /// `&mut GpuTier` problem the `GpuSpill` doc describes, at the cost of the
+    /// spill paying off next generation instead of this token. `None` = the
+    /// verdict stays advisory (the historical behavior).
+    pub spill: Option<&'a Mutex<Vec<(usize, usize)>>>,
     /// Optional adaptive CPU/GPU lane balancer. When `Some` (i.e. bias is
     /// non-`Balanced` and `COLI_LANE_BALANCE=1`), the scheduler downgrades cold
     /// GPU-resident experts to the CPU lane when the GPU is the bottleneck.
@@ -1279,13 +1289,23 @@ pub fn moe_forward_concurrent(
         let route_to_gpu = match (ctx.balancer, ctx.heat_counts) {
             (Some(bal), Some(counts)) => {
                 let heat = counts.get(layer * n_experts_layer + e).copied().unwrap_or(0);
-                // Exhaustive on purpose: `GpuSpill` would need a mid-forward
-                // upload path that does not exist, so it resolves to the CPU
-                // lane. Spelling it out means adding a real spill is a compile
-                // error here rather than a verdict that silently does nothing.
+                // Exhaustive on purpose: a *mid-forward* upload path still does
+                // not exist, so `GpuSpill` resolves to the CPU lane this
+                // forward. What changed (2026-08-13): the verdict is no longer
+                // discarded — with `COLI_GPU_SPILL` it records into `ctx.spill`
+                // and `Model::reheat` uploads the expert for the *next*
+                // generation. Spelling the variant out keeps a future real
+                // mid-forward spill a compile error here rather than a verdict
+                // that silently does nothing.
                 match bal.choose(gpu_resident, heat) {
                     crate::lane::Placement::Gpu => true,
-                    crate::lane::Placement::Cpu | crate::lane::Placement::GpuSpill => false,
+                    crate::lane::Placement::Cpu => false,
+                    crate::lane::Placement::GpuSpill => {
+                        if let Some(log) = ctx.spill {
+                            log.lock().push((layer, e));
+                        }
+                        false
+                    }
                 }
             }
             _ => gpu_resident,
