@@ -68,19 +68,36 @@ pub fn rlm_margin() -> f32 {
     })
 }
 
+/// The pure uncertainty test — the policy half of [`RLMController::should_recurse`],
+/// factored out so a `&self` driver (the serve engine's batched accept loop,
+/// which holds the `Model` shared while other sequences read it) can run the
+/// same decision with a **local** depth counter instead of the controller's
+/// per-token one. Greedy (`temp <= 0`): top-2 logit gap under `rlm_margin()`.
+/// Sampled: normalized entropy above 0.5.
+pub fn wants_recursion(logits: &[f32], temp: f32) -> bool {
+    if temp <= 0.0 {
+        let (top1, top2) = top_two_logits(logits);
+        (top1 - top2) < rlm_margin()
+    } else {
+        normalized_entropy(logits, temp) > 0.5
+    }
+}
+
 /// The RLM controller state.
 ///
 /// Holds the recursion counter for the current token-in-progress and
 /// accumulates per-session statistics (how often recursion fired, how many
-/// passes total) for telemetry.
+/// passes total) for telemetry. The statistics are atomics so a shared-`&self`
+/// driver (see [`wants_recursion`]) can record passes without exclusive access;
+/// `depth` stays plain because only the exclusive `should_recurse` path uses it.
 pub struct RLMController {
     /// Current depth of recursion for the token being generated (reset to 0
     /// at the start of each new token).
     depth: usize,
     /// Total recursive passes triggered across the session.
-    passes_emitted: u64,
+    passes_emitted: std::sync::atomic::AtomicU64,
     /// Total tokens that triggered at least one recursive pass.
-    tokens_recursed: u64,
+    tokens_recursed: std::sync::atomic::AtomicU64,
 }
 
 impl RLMController {
@@ -89,14 +106,25 @@ impl RLMController {
     pub fn new() -> Self {
         RLMController {
             depth: 0,
-            passes_emitted: 0,
-            tokens_recursed: 0,
+            passes_emitted: std::sync::atomic::AtomicU64::new(0),
+            tokens_recursed: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Reset depth at the start of a new token.
     pub fn reset(&mut self) {
         self.depth = 0;
+    }
+
+    /// Record one recursive pass in the session statistics. `first_for_token`
+    /// marks the first pass a given token triggered (feeds `tokens_recursed`).
+    /// Shared-access on purpose — external drivers hold the model by `&`.
+    pub fn note_pass(&self, first_for_token: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.passes_emitted.fetch_add(1, Relaxed);
+        if first_for_token {
+            self.tokens_recursed.fetch_add(1, Relaxed);
+        }
     }
 
     /// Decide whether to trigger a recursive pass for the current token,
@@ -117,23 +145,9 @@ impl RLMController {
         if self.depth >= rlm_max_depth() {
             return false;
         }
-
-        let need_recurse = if temp <= 0.0 {
-            // Greedy: check top-2 margin.
-            let (top1, top2) = top_two_logits(logits);
-            (top1 - top2) < rlm_margin()
-        } else {
-            // Sampled: check distribution entropy (normalized).
-            let ent = normalized_entropy(logits, temp);
-            ent > 0.5 // threshold: high entropy = uncertain
-        };
-
-        if need_recurse {
+        if wants_recursion(logits, temp) {
             self.depth += 1;
-            self.passes_emitted += 1;
-            if self.depth == 1 {
-                self.tokens_recursed += 1;
-            }
+            self.note_pass(self.depth == 1);
             true
         } else {
             false
@@ -147,12 +161,12 @@ impl RLMController {
 
     /// Session telemetry: total recursive passes triggered.
     pub fn passes_emitted(&self) -> u64 {
-        self.passes_emitted
+        self.passes_emitted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Session telemetry: total tokens that triggered at least one pass.
     pub fn tokens_recursed(&self) -> u64 {
-        self.tokens_recursed
+        self.tokens_recursed.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -274,6 +288,55 @@ mod tests {
     // `Model→forward_hidden_recursive→rlm_stats` surface directly, without env
     // mutation (see `mla_absorb_knob_is_inert_when_off_and_live_when_on` for why
     // `cargo test`'s parallel threads make env-var tests dangerous here).
+    #[test]
+    fn external_kv_replay_matches_the_model_resident_replay() -> Result<(), peregrine_core::Error> {
+        // The serve engine drives refinement over its own `SeqKv` while the
+        // stdio path drives it over the model-resident cache. Same prefix state
+        // must give bit-identical replays, or the two surfaces would disagree
+        // about what "refined" means. `teacher_forcing` populates the internal
+        // cache; `forward_prefill_seq` builds the external one from the same
+        // tokens — both are prefills of the same causal prefix.
+        use crate::model::SeqKv;
+        use crate::testkit::build_tiny_model;
+        use crate::Model;
+        let dir = std::env::temp_dir().join(format!(
+            "peregrine_rlm_extkv_{}_{}",
+            std::process::id(),
+            std::line!()
+        ));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        build_tiny_model(&dir)?;
+        let mut m = Model::load(&dir)?;
+        let toks: Vec<i32> = vec![3, 7, 1, 4, 2, 9];
+        m.teacher_forcing(&toks)?;
+        let mut seq = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&toks, &mut seq, 0)?;
+
+        let d = m.cfg.hidden as usize;
+        let mut h_int = vec![0.25f32; d];
+        let mut h_ext = h_int.clone();
+        let lg_int = m.forward_hidden_recursive(&mut h_int, 1, toks.len())?;
+        let lg_ext = m.forward_hidden_recursive_seq(&seq, &mut h_ext, 1, toks.len())?;
+        assert_eq!(lg_int, lg_ext, "external-KV replay must be bit-identical to the internal one");
+        assert_eq!(h_int, h_ext, "refined hidden must agree too");
+
+        // The public serve entry is a structural no-op with COLI_RLM unset:
+        // no pass runs, the row is untouched, and stats stay zero.
+        let vocab = m.cfg.vocab as usize;
+        let mut row = lg_ext[..vocab].to_vec();
+        let row_before = row.clone();
+        let refined = m.rlm_refine_external(&seq, toks.len(), &mut h_ext, &mut row, 0.0)?;
+        assert!(!refined, "COLI_RLM unset: rlm_refine_external must be inert");
+        assert_eq!(row, row_before, "inert means the logits row is untouched");
+        assert_eq!(m.rlm_stats(), (0, 0), "no passes recorded");
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn forward_hidden_recursive_runs_on_the_tiny_model() -> Result<(), peregrine_core::Error> {
         use crate::testkit::build_tiny_model;

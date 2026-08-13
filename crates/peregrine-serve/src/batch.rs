@@ -177,6 +177,18 @@ impl PrefixCache {
         if self.entries.iter().any(|e| e.tokens.len() >= prompt.len() && e.tokens.starts_with(prompt)) {
             return;
         }
+        // Entries the new one strictly covers are redundant — any lookup they
+        // could serve, the longer entry serves at least as well. Dropping them
+        // here keeps a conversation's turn-by-turn retires from accumulating
+        // one entry per turn (each a prefix of the next).
+        let used = &mut self.used;
+        self.entries.retain(|e| {
+            let covered = e.tokens.len() < prompt.len() && prompt.starts_with(&e.tokens);
+            if covered {
+                *used = used.saturating_sub(e.bytes);
+            }
+            !covered
+        });
         let snapshot = kv.clone_prefix(prompt.len());
         let bytes = snapshot.bytes();
         if bytes > self.budget {
@@ -290,6 +302,16 @@ pub struct EngineTelemetry {
     /// `None` without a warm cache.
     pub ecache: Option<(u64, u64, u64)>,
     pub prefetch_reads: u64,
+    /// MTP speculation, cumulative: drafts proposed and drafts the model's
+    /// accept rule kept. The ratio is the only number that says whether
+    /// `COLI_DRAFT`'s depth is earning its rows — each proposed draft is a
+    /// verify row in the batched forward, and a rejected one is a row of
+    /// wasted expert reads. Both zero when speculation is off.
+    pub spec_proposed: u64,
+    pub spec_accepted: u64,
+    /// RLM recursive refinement `(passes_emitted, tokens_recursed)`,
+    /// cumulative — `(0, 0)` unless `COLI_RLM=1`.
+    pub rlm: (u64, u64),
 }
 
 /// Handle for submitting requests to the engine thread. Cheap to clone and
@@ -632,6 +654,14 @@ struct SeqState {
     /// Pre-final-norm hidden at this sequence's last committed position: what
     /// the next draft continues from. Empty until the first verify produces it.
     hlast: Vec<f32>,
+    /// The fed-token log, row-aligned with `seq`: `toks[i]` is the token whose
+    /// feed produced KV row `i` (the prompt, then each committed decode/draft
+    /// token). Kept so a retiring sequence can hand `prompt + output` to the
+    /// prefix cache — a multi-turn client resends exactly that as the next
+    /// prompt's head, and without this entry it re-prefills the assistant turn
+    /// it just received. Invariant: `toks.len() == pos == seq.len()` at the
+    /// top of a decode step.
+    toks: Vec<i32>,
 }
 
 /// The engine loop: admit + prefill new requests, then decode all active
@@ -664,6 +694,9 @@ fn run_tuned(
     let mut active: Vec<SeqState> = Vec::new();
     let mut pending: VecDeque<Prefilling> = VecDeque::new();
     let mut steps = 0usize;
+    // MTP acceptance accounting (see `EngineTelemetry::spec_proposed`).
+    let mut spec_proposed: u64 = 0;
+    let mut spec_accepted: u64 = 0;
     // Adaptive-batching state. `working_cap` is the current admission ceiling
     // (starts at `max_batch`, shrinks under SLA overrun, grows on slack). EWMA
     // over per-forward wall time drives the adjustment.
@@ -921,6 +954,10 @@ fn run_tuned(
             } else {
                 (0, 0)
             };
+            if g > 0 {
+                spec_proposed += g as u64;
+                spec_accepted += k.min(g) as u64;
+            }
             // **`s.next_tok` was already emitted** — by the prefill that
             // promoted this sequence, or by the previous round. It is the token
             // being *fed* now, not one to send. What this round emits is
@@ -929,17 +966,49 @@ fn run_tuned(
             //
             // With no drafts that is a single token from row 0, which is the
             // historical decode step exactly.
+            //
+            // RLM composition (COLI_RLM, structural no-op when unset): refine
+            // the *decision* row before it becomes `final_next`, mirroring the
+            // model-resident composition in `generate_speculative` — accept
+            // decisions always use the raw logits; only the post-acceptance
+            // contested row (or the sole row of a non-drafting step) refines;
+            // and a sampled speculative run is skipped, because refining after
+            // `accept_run_sampled`'s residual draw would break its
+            // distribution-preserving guarantee.
+            let mut refined_hidden: Option<Vec<f32>> = None;
             let final_next = if g > 0 {
                 // Already chosen by whichever accept rule ran: `accept_run`'s
                 // argmax for a greedy request, `accept_run_sampled`'s residual
                 // or bonus draw for a sampled one. Re-picking here would take a
                 // second sample from the same row and emit a token the accept
-                // rule never verified against.
-                spec_next
+                // rule never verified against. (An RLM pass on the contested
+                // row recomputes the argmax from *refined* logits — a different
+                // footing, not a second sample from the same one.)
+                if s.sampler.temp <= 0.0 {
+                    let rows = ForwardRows { logits: &logits, hidden: &hidden, vocab, d_hidden };
+                    match rlm_refine_row(&model, &s.seq, s.pos + k, &rows, base + k, 0.0) {
+                        Some((lg, h)) => {
+                            refined_hidden = Some(h);
+                            peregrine_model::argmax(&lg) as i32
+                        }
+                        None => spec_next,
+                    }
+                } else {
+                    spec_next
+                }
             } else {
                 let lo = base * vocab;
                 match logits.get(lo..lo + vocab) {
-                    Some(r) => s.sampler.pick(r, -1) as i32,
+                    Some(r) => {
+                        let rows = ForwardRows { logits: &logits, hidden: &hidden, vocab, d_hidden };
+                        match rlm_refine_row(&model, &s.seq, s.pos, &rows, base, s.sampler.temp) {
+                            Some((lg, h)) => {
+                                refined_hidden = Some(h);
+                                s.sampler.pick(&lg, -1) as i32
+                            }
+                            None => s.sampler.pick(r, -1) as i32,
+                        }
+                    }
                     None => s.next_tok,
                 }
             };
@@ -973,6 +1042,11 @@ fn run_tuned(
             // the client never received.
             s.pos += 1 + drafts_emitted;
             s.seq.truncate(s.pos);
+            // The fed-token log commits the same rows: the token fed this tick
+            // (the *old* `next_tok`, so this must precede the overwrite below)
+            // plus the accepted drafts, keeping `toks` row-aligned with `seq`.
+            s.toks.push(s.next_tok);
+            s.toks.extend_from_slice(&s.draft[..drafts_emitted]);
             // `final_next` has been emitted but not yet fed, which is exactly
             // the pending-token invariant. Only meaningful when the sequence
             // survives; a retiring one is dropped below.
@@ -984,10 +1058,30 @@ fn run_tuned(
             // An absent row means the forward returned less than it was asked
             // for — clear the hidden rather than default it, so the next tick
             // skips drafting instead of drafting from zeros.
-            s.hlast = match hidden.get(hrow..hrow + d_hidden) {
-                Some(h) => h.to_vec(),
-                None => Vec::new(),
+            //
+            // A refined hidden replaces the raw row (the next MTP draft then
+            // continues from the refined footing, as the model composition
+            // does), but only when the emitted run wasn't cut short — the
+            // refinement sits at the decision row, which is `hrow` exactly
+            // when `drafts_emitted == k` (a cut-short run retires below, so
+            // nothing downstream reads a mismatched hidden either way).
+            s.hlast = match refined_hidden {
+                Some(h) if drafts_emitted == k.min(g) => h,
+                _ => match hidden.get(hrow..hrow + d_hidden) {
+                    Some(h) => h.to_vec(),
+                    None => Vec::new(),
+                },
             };
+            // A retiring sequence's KV is about to drop; freeze prompt+output
+            // first. This is what turns a multi-turn conversation's next
+            // request — the same ids plus a new user turn — into a refcount
+            // bump instead of a full re-prefill of the assistant turn. The
+            // 64-token floor and the LRU budget in `insert` apply unchanged,
+            // and exact-id matching means a client whose retokenization
+            // differs simply degrades to the prompt-prefix match it gets today.
+            if !alive {
+                prefix.insert(&s.toks[..s.pos.min(s.toks.len())], &s.seq);
+            }
             keep.push(alive);
         }
         let mut idx = 0usize;
@@ -1067,6 +1161,9 @@ fn run_tuned(
             steps: steps as u64,
             ecache: model.ecache_stats(),
             prefetch_reads: model.ecache_prefetch_reads().unwrap_or(0),
+            spec_proposed,
+            spec_accepted,
+            rlm: model.rlm_stats(),
         };
     }
     // Shutdown: report what the prefix cache absorbed. Silent when it is off, so
@@ -1079,6 +1176,19 @@ fn run_tuned(
             prefix.entries.len(),
             prefix.used as f64 / (1024.0 * 1024.0)
         );
+    }
+    // Speculation accounting, silent when speculation never ran. The accept
+    // rate is what says whether COLI_DRAFT's depth pays for its verify rows.
+    if spec_proposed > 0 {
+        eprintln!(
+            "[spec] proposed={spec_proposed} accepted={spec_accepted} accept_rate={:.1}%",
+            spec_accepted as f64 / spec_proposed as f64 * 100.0
+        );
+    }
+    // RLM refinement accounting, same shape ((0,0) prints nothing).
+    let (rlm_passes, rlm_tokens) = model.rlm_stats();
+    if rlm_passes > 0 {
+        eprintln!("[rlm] passes={rlm_passes} tokens_recursed={rlm_tokens}");
     }
     // Warm-tier and prefetch effectiveness. This has to happen *here* — the engine
     // thread owns the `Model`, so `main` cannot ask it anything after the server
@@ -1380,6 +1490,49 @@ fn chunk_end(pos: usize, prompt_len: usize, chunk_div: usize) -> usize {
 /// Split out of [`prefill_step`] so the fused tick, which produces these logits
 /// inside the *decode* forward, finishes a chunk by exactly the same rules. The
 /// two paths differing here is how a fusion silently changes served output.
+/// Borrowed row-indexed view of one batched forward's outputs (logits and
+/// pre-final-norm hidden, with their row strides).
+struct ForwardRows<'a> {
+    logits: &'a [f32],
+    hidden: &'a [f32],
+    vocab: usize,
+    d_hidden: usize,
+}
+
+/// RLM refinement of one decision row of a batched forward (COLI_RLM).
+///
+/// Copies the row's logits and pre-final-norm hidden only after the cheap
+/// enabled check, hands them to [`Model::rlm_refine_external`] (which loops
+/// the uncertainty policy over throwaway KV replays of `seq`'s causal prefix
+/// at `pos`), and returns the refined pair — `None` when RLM is off, the row
+/// is out of range, no pass triggered, or the replay failed (advisory, like a
+/// draft failure: refinement is a quality optimisation, never worth dropping
+/// a client over).
+fn rlm_refine_row(
+    model: &Model,
+    seq: &SeqKv,
+    pos: usize,
+    rows: &ForwardRows<'_>,
+    row: usize,
+    temp: f32,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if !peregrine_model::rlm::rlm_enabled() {
+        return None;
+    }
+    let r = rows.logits.get(row * rows.vocab..(row + 1) * rows.vocab)?;
+    let hsrc = rows.hidden.get(row * rows.d_hidden..(row + 1) * rows.d_hidden)?;
+    let mut lg = r.to_vec();
+    let mut h = hsrc.to_vec();
+    match model.rlm_refine_external(seq, pos, &mut h, &mut lg, temp) {
+        Ok(true) => Some((lg, h)),
+        Ok(false) => None,
+        Err(e) => {
+            peregrine_core::note_advisory_err("rlm refine", &e);
+            None
+        }
+    }
+}
+
 fn finish_prefill_chunk(
     p: Prefilling,
     end: usize,
@@ -1430,6 +1583,9 @@ fn finish_prefill_chunk(
         draft: Vec::new(),
         draft_q: Vec::new(),
         hlast: Vec::new(),
+        // The fed-token log starts as the prompt (row-aligned with `seq`,
+        // whose rows so far are exactly the prompt); `t0` joins it when fed.
+        toks: prompt,
     });
 }
 
@@ -1521,6 +1677,60 @@ mod tests {
     }
 
     #[test]
+    fn retiring_output_extends_the_prefix_cache_past_the_prompt() -> Result<(), Error> {
+        // The multi-turn shape: a client's next request resends prompt+output
+        // as its new prompt's head. Before the retire-time insert, the cache
+        // held prompt-only entries, so the assistant turn was re-prefilled
+        // every round trip. This drives the exact sequence the engine performs
+        // — prompt-only insert at prefill completion, fed-token log through
+        // decode, prompt+output insert at retire — and asserts the follow-up
+        // request matches past the original prompt, with the covered
+        // prompt-only entry dropped rather than accumulated.
+        let dir = tiny_dir("prefixgen")?;
+        let model = Model::load(&dir)?;
+        let vocab = model.cfg.vocab as usize;
+        let mut prefix = PrefixCache::new(1 << 20);
+
+        // A prompt over the 64-token floor, prefilled the way the engine does.
+        let prompt: Vec<i32> = (0..96).map(|i| (i * 5 % vocab.min(11)) as i32).collect();
+        let mut seq = SeqKv::new(&model.cfg);
+        let logits = model.forward_prefill_seq(&prompt, &mut seq, 0)?;
+        prefix.insert(&prompt, &seq); // finish_prefill_chunk's prompt-only entry
+        assert_eq!(prefix.entries.len(), 1, "prompt entry cached");
+
+        // Decode a few tokens, keeping the fed-token log the accept loop keeps.
+        let last = (prompt.len() - 1) * vocab;
+        let mut tok = argmax(&logits[last..last + vocab]) as i32;
+        let mut toks = prompt.clone();
+        let mut pos = prompt.len();
+        for _ in 0..4 {
+            let mut one: [&mut SeqKv; 1] = [&mut seq];
+            let lg = model.forward_step_batched(&[tok], &mut one, &[pos], None)?;
+            toks.push(tok);
+            pos += 1;
+            tok = argmax(&lg[..vocab]) as i32;
+        }
+        assert_eq!(toks.len(), seq.len(), "fed-token log stays row-aligned");
+
+        // Retire: insert prompt+output. The prompt-only entry is now covered.
+        prefix.insert(&toks, &seq);
+        assert_eq!(prefix.entries.len(), 1, "covered prompt-only entry dropped, not accumulated");
+        assert_eq!(prefix.entries[0].tokens, toks, "surviving entry is prompt+output");
+        let bytes_sum: usize = prefix.entries.iter().map(|e| e.bytes).sum();
+        assert_eq!(prefix.used, bytes_sum, "used-bytes accounting survives the cleanup");
+
+        // The next turn resends prompt+output plus new user tokens: the match
+        // must run past the original prompt — that is the whole point.
+        let mut next_turn = toks.clone();
+        next_turn.extend_from_slice(&[1, 2, 3]);
+        let (seeded, n) = prefix.lookup(&next_turn).ok_or(Error::Format("lookup must hit".into()))?;
+        assert_eq!(n, toks.len(), "match depth covers the generated tokens, not just the prompt");
+        assert!(n > prompt.len(), "deeper than any prompt-only entry could reach");
+        assert_eq!(seeded.len(), n, "seeded KV length equals the match");
+        Ok(())
+    }
+
+    #[test]
     fn a_retiring_sequence_does_not_renumber_the_streams_behind_it() -> Result<(), Error> {
         // Until 2026-08-08 the prefetch lane was keyed on a sequence's index in
         // `active`, which the decode loop compacts with `retain` every tick. When a
@@ -1572,6 +1782,7 @@ mod tests {
                 draft: Vec::new(),
                 draft_q: Vec::new(),
                 hlast: Vec::new(),
+                toks: p.prompt,
             })
             .collect();
         assert_eq!(active.iter().map(|s| s.seq_id).collect::<Vec<_>>(), ids, "promotion preserves the id");

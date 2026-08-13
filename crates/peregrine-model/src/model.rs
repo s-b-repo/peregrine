@@ -3984,6 +3984,33 @@ impl Model {
         s_n: usize,
         pos_base: usize,
     ) -> Result<Vec<f32>, Error> {
+        self.forward_hidden_recursive_with(h, s_n, pos_base, &|li| self.kv[li].clone_prefix(pos_base))
+    }
+
+    /// [`Self::forward_hidden_recursive`] over an **external** per-sequence KV
+    /// (the serve engine's [`SeqKv`]) instead of the model-resident cache. Same
+    /// exclusions, same throwaway-tail contract — the replay reads the cached
+    /// causal prefix `[0, pos_base)` of `seq` and writes nothing back.
+    pub(crate) fn forward_hidden_recursive_seq(
+        &self,
+        seq: &SeqKv,
+        h: &mut [f32],
+        s_n: usize,
+        pos_base: usize,
+    ) -> Result<Vec<f32>, Error> {
+        self.forward_hidden_recursive_with(h, s_n, pos_base, &|li| seq.layers[li].clone_prefix(pos_base))
+    }
+
+    /// Shared body of the two entries above, parameterized on where a replay
+    /// layer's KV prefix comes from (`kv_at` receives the **absolute** layer
+    /// index and returns a throwaway clone at `pos_base`).
+    fn forward_hidden_recursive_with(
+        &self,
+        h: &mut [f32],
+        s_n: usize,
+        pos_base: usize,
+        kv_at: &dyn Fn(usize) -> LayerKv,
+    ) -> Result<Vec<f32>, Error> {
         let n_layers = self.cfg.n_layers as usize;
         let k = crate::rlm::rlm_layers().min(n_layers);
         let start = n_layers - k;
@@ -3998,7 +4025,7 @@ impl Model {
         // pass's attention reads the real cached past and writes nothing back,
         // exactly like `mtp_draft_with` on a fresh local KV. Bit-identical KV
         // state on the real cache because we never touch its tail.
-        let mut kv_local: Vec<LayerKv> = (0..k).map(|i| self.kv[start + i].clone_prefix(pos_base)).collect();
+        let mut kv_local: Vec<LayerKv> = (0..k).map(|i| kv_at(start + i)).collect();
         // Build a route-logging-off ForwardCtx (the prefill/draft shape), reusing
         // the resident scheduler, GPU lane and warm cache. Replays do not touch
         // the lane telemetry (timings = None), so bubble/IO tuners stay on the
@@ -4024,6 +4051,43 @@ impl Model {
     /// same role as `lookahead_issued()` for the router look-ahead.
     pub fn rlm_stats(&self) -> (u64, u64) {
         (self.rlm.passes_emitted(), self.rlm.tokens_recursed())
+    }
+
+    /// RLM refinement for an external-KV driver (the serve engine): refine one
+    /// row's pre-final-norm hidden `h` and its `logits_row` in place, looping
+    /// the same uncertainty policy and depth cap as the model-resident
+    /// composition in [`Self::generate_speculative`]. Returns whether any pass
+    /// ran; `Ok(false)` immediately — no copies, no KV clones — when
+    /// `COLI_RLM` is unset, which is what keeps the serve path bit-identical
+    /// with RLM off.
+    ///
+    /// The depth counter is **local** (the controller's per-token `depth` needs
+    /// `&mut`, and the batched accept loop holds the model by `&`); the shared
+    /// statistics go through [`crate::rlm::RLMController::note_pass`], so
+    /// `/metrics` and the shutdown summary see external passes too.
+    pub fn rlm_refine_external(
+        &self,
+        seq: &SeqKv,
+        pos: usize,
+        h: &mut [f32],
+        logits_row: &mut [f32],
+        temp: f32,
+    ) -> Result<bool, Error> {
+        if !crate::rlm::rlm_enabled() {
+            return Ok(false);
+        }
+        let vocab = self.cfg.vocab as usize;
+        let max_depth = crate::rlm::rlm_max_depth();
+        let mut depth = 0usize;
+        while depth < max_depth && crate::rlm::wants_recursion(&logits_row[..vocab], temp) {
+            depth += 1;
+            self.rlm.note_pass(depth == 1);
+            // The replay returns final_norm + lm_head over the refined hidden —
+            // exactly the recompute the model-resident composition does.
+            let lg = self.forward_hidden_recursive_seq(seq, h, 1, pos)?;
+            logits_row[..vocab].copy_from_slice(&lg[..vocab]);
+        }
+        Ok(depth > 0)
     }
 
     /// Build the per-forward compute context from the resident model state with
