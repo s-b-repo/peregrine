@@ -636,11 +636,15 @@ fn encode_text_corpus(dir: &str, path: &str, n_tokens: usize, who: &str) -> Resu
         std::fs::read(&tj).map_err(|e| Error::Format(format!("{who}: --text needs {}: {e}", tj.display())))?;
     let mut tk = peregrine_token::GigaTokenizer::from_hf_json_bytes(&json)
         .map_err(|e| Error::Format(format!("{who}: tokenizer: {e}")))?;
-    let ids: Vec<i32> = tk.encode(&raw).iter().map(|&i| i as i32).collect();
+    // encode_into + in-place widen: one buffer, not encode's Vec<u32> plus a
+    // second collected Vec<i32> of the whole corpus.
+    let mut ids: Vec<u32> = Vec::with_capacity(raw.len() / 3);
+    tk.encode_into(&raw, &mut ids);
     if ids.is_empty() {
         return Err(Error::Format(format!("{who}: --text encoded to no tokens")));
     }
-    Ok(ids.into_iter().take(n_tokens).collect())
+    ids.truncate(n_tokens);
+    Ok(ids.into_iter().map(|i| i as i32).collect())
 }
 
 fn synth_corpus(vocab: usize, n: usize) -> Vec<i32> {
