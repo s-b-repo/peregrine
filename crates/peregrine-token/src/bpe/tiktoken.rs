@@ -17,6 +17,20 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+/// Local modification (vendoring): storage newtype for the reused
+/// [`SpanBatch`] chunk scratch (see the `span_scratch` field doc).
+///
+/// # Safety (the `Send` impl)
+/// `BatchEntry.ptr` makes `SpanBatch` `!Send` by default, which would make
+/// `Tokenizer` unsendable — but between encode calls the scratch is inert
+/// storage: the stale `ptr`s are never dereferenced (the only deref,
+/// [`SpanBatch::span`], is contract-bound to entries written by the current
+/// call's fill). A `Tokenizer` crossing threads carries dead integers here,
+/// nothing more.
+pub(crate) struct SpanScratch(Box<SpanBatch<'static>>);
+// SAFETY: see the type doc — the wrapped ptrs are inert between calls.
+unsafe impl Send for SpanScratch {}
+
 /// Byte-level BPE tokenizer (tiktoken / GPT-2 style).
 ///
 /// Initial symbols are individual bytes (0–255).  Merge priority is
@@ -63,6 +77,20 @@ pub struct Tokenizer {
     /// performs no per-pretoken allocations.
     merge_scratch: MergeScratch,
     symbol_scratch: Vec<TokenId>,
+    // Local modification (vendoring): reused chunk scratch for the
+    // probe/emit machinery. `SpanBatch` is 8.7 KB zero-initialized; it was
+    // built fresh in every `memoized_encode`/`memoized_encode_flat` call,
+    // and `for_each_piece` makes one such call *per added-token segment* —
+    // a chat-template prompt with ~11 markers paid ~11 constructions per
+    // encode. Held as `'static` only for storage: the entries' `ptr`s go
+    // stale the moment a call returns, and are never read again — every
+    // call's fill overwrites entries `[0, n)` before `span(i)` (the only
+    // deref, contract-bound to `i < n`) can observe them; stale slack
+    // entries are read purely as integers by the prefetch-ahead, which the
+    // `SPAN_BATCH_SLACK` contract already declares harmless. Upstream
+    // solves the same cost with its `EncodeState`; a field keeps the
+    // vendored call surface unchanged.
+    span_scratch: Option<SpanScratch>,
     /// Pretokenization scheme used by [`Self::encode_with_added_tokens`].
     pub(crate) pretokenizer_type: PretokenizerType,
     /// Added tokens (special and non-special), matched atomically in the raw
@@ -333,6 +361,7 @@ impl Tokenizer {
             pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
+            span_scratch: None, // Local modification (vendoring): see field doc
             pretokenizer_type: PretokenizerType::GPT2,
             added_tokens: Vec::new(),
             added_matcher: None,
@@ -691,6 +720,7 @@ impl Tokenizer {
             ),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
+            span_scratch: None, // Local modification (vendoring): see field doc
             pretokenizer_type: self.pretokenizer_type,
             added_tokens: self.added_tokens.clone(),
             added_matcher: self.added_matcher.clone(),
@@ -1019,17 +1049,21 @@ impl Tokenizer {
         mut pretokens: impl PretokenSpans<'i>,
         mut f: impl FnMut(&[TokenId]),
     ) {
-        let mut batch = SpanBatch::new();
+        // Local modification (vendoring): reuse the held scratch instead of
+        // zeroing 8.7 KB per call; see `take_span_scratch` for the
+        // lifetime-cast soundness argument.
+        let mut batch = self.take_span_scratch();
+        let batch_view = Self::scratch_view(&mut batch);
         let mut out: Vec<u32> = Vec::new();
         let mut ends = [0usize; PRETOKEN_CHUNK];
         loop {
             let cache = &self.pretoken_cache;
-            let n = pretokens.fill_spans_keyed(&mut batch, &|h| cache.prefetch_l2(h));
+            let n = pretokens.fill_spans_keyed(batch_view, &|h| cache.prefetch_l2(h));
             if n == 0 {
                 break;
             }
             out.clear();
-            self.probe_emit_chunk(&batch, n, &mut out, |i, w| ends[i] = w);
+            self.probe_emit_chunk(batch_view, n, &mut out, |i, w| ends[i] = w);
             let mut start = 0;
             for &end in &ends[..n] {
                 // SAFETY: TokenId is repr(transparent) over u32, and the
@@ -1046,6 +1080,7 @@ impl Tokenizer {
                 break;
             }
         }
+        self.span_scratch = Some(batch);
     }
 
     /// Flat variant of [`Self::memoized_encode`]: the identical token
@@ -1066,18 +1101,52 @@ impl Tokenizer {
         mut pretokens: impl PretokenSpans<'i>,
         out: &mut Vec<u32>,
     ) {
-        let mut batch = SpanBatch::new();
+        // Local modification (vendoring): reuse the held scratch instead of
+        // zeroing 8.7 KB per call — `for_each_piece` calls this once per
+        // added-token segment, so a chat-template prompt paid the
+        // construction ~once per marker. See `take_span_scratch`.
+        let mut batch = self.take_span_scratch();
+        let batch_view = Self::scratch_view(&mut batch);
         loop {
             let cache = &self.pretoken_cache;
-            let n = pretokens.fill_spans_keyed(&mut batch, &|h| cache.prefetch_l2(h));
+            let n = pretokens.fill_spans_keyed(batch_view, &|h| cache.prefetch_l2(h));
             if n == 0 {
                 break;
             }
-            self.probe_emit_chunk(&batch, n, out, |_, _| {});
+            self.probe_emit_chunk(batch_view, n, out, |_, _| {});
             if n < PRETOKEN_CHUNK {
                 break;
             }
         }
+        self.span_scratch = Some(batch);
+    }
+
+    /// Local modification (vendoring): the held [`SpanBatch`] scratch, or a
+    /// fresh one on first use / after a panic unwound past the put-back.
+    /// Callers reborrow it at the input lifetime via [`Self::scratch_view`]
+    /// and return it to `self.span_scratch` when done.
+    fn take_span_scratch(&mut self) -> SpanScratch {
+        self.span_scratch.take().unwrap_or_else(|| SpanScratch(Box::new(SpanBatch::new())))
+    }
+
+    /// Local modification (vendoring): reborrow the storage-lifetime scratch
+    /// at the current input lifetime.
+    ///
+    /// # Safety argument (why the cast is sound)
+    /// `SpanBatch`'s lifetime parameter exists only in `PhantomData`; the
+    /// entries hold raw `ptr`s, never references. A `&mut SpanBatch<'static>`
+    /// cannot coerce to `&mut SpanBatch<'i>` (mutable references are
+    /// invariant), so the reborrow is a pointer cast. It cannot be observed:
+    /// within one encode call, `fill_spans_keyed` overwrites entries `[0, n)`
+    /// before [`SpanBatch::span`] (the only place a `ptr` is dereferenced,
+    /// contract-bound to `i < n` of that same fill) reads any of them, and
+    /// after the call returns the stale `ptr`s are only ever *loaded as
+    /// integers* by the emit loop's prefetch-ahead on a later call — which
+    /// the [`SPAN_BATCH_SLACK`] contract already declares harmless for
+    /// never-written slack entries, the identical situation.
+    fn scratch_view<'i, 'b>(batch: &'b mut SpanScratch) -> &'b mut SpanBatch<'i> {
+        // SAFETY: lifetime-only cast; see the argument above.
+        unsafe { &mut *(batch.0.as_mut() as *mut SpanBatch<'static> as *mut SpanBatch<'i>) }
     }
 
     /// Probe-and-emit for one chunk: branchless flat emit with a single
