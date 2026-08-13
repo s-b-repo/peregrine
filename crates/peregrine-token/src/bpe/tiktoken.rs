@@ -6,6 +6,8 @@ use crate::bpe::{
 };
 #[cfg(target_arch = "aarch64")]
 use crate::bpe::bpe_merge_symbols_short_neon;
+#[cfg(target_arch = "x86_64")]
+use crate::bpe::{bpe_merge_symbols_short_avx2, bpe_merge_symbols_short_avx512};
 use crate::pretokenize::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer, PRETOKEN_CHUNK,
@@ -16,6 +18,34 @@ use eyre::Result;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+
+/// Local modification (vendoring): the x86 short-merge tier, latched once per
+/// process from `COLI_TOK_MERGE_SIMD` (`auto`|`scalar`|`avx2`|`avx512`).
+/// `auto`/unset keeps the measured default (scalar — see the dispatch comment
+/// in `merge_short`); a requested tier the CPU lacks falls back to scalar
+/// rather than UB. A/B by running the bench twice in separate processes, one
+/// arm per value — the latch-once shape is the same as the engine's
+/// `route_min_share`, and the same caveat applies: it cannot be flipped
+/// within a process.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+enum X86MergeTier {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_merge_tier() -> X86MergeTier {
+    static TIER: std::sync::OnceLock<X86MergeTier> = std::sync::OnceLock::new();
+    *TIER.get_or_init(|| {
+        match std::env::var("COLI_TOK_MERGE_SIMD").as_deref().map(str::trim) {
+            Ok("avx512") if std::arch::is_x86_feature_detected!("avx512f") => X86MergeTier::Avx512,
+            Ok("avx2") if std::arch::is_x86_feature_detected!("avx2") => X86MergeTier::Avx2,
+            _ => X86MergeTier::Scalar,
+        }
+    })
+}
 
 /// Local modification (vendoring): storage newtype for the reused
 /// [`SpanBatch`] chunk scratch (see the `span_scratch` field doc).
@@ -579,16 +609,38 @@ impl Tokenizer {
         match pair_ranks {
             #[cfg(target_arch = "aarch64")]
             Some(table) => bpe_merge_symbols_short_neon(table, buf, n),
-            // x86-64 stays scalar ON PURPOSE: the AVX-512/AVX2 ports of the
-            // min-rank scan (`bpe_merge_symbols_short_avx512/_avx2`, kept as
-            // tested reference) measured ~1% SLOWER on cold encode_st (Zen 5,
-            // gpt2, 100 MB and 1 GB OWT, interleaved min-of-5) — the x86
-            // horizontal reduce is a 4-step dependent chain plus a
-            // vector->GPR transfer on the serial merge chain, and the
-            // `target_feature` boundary blocks inlining, while the scalar
-            // scan's `rank < best` branches predict well on Zen 5. See
-            // profiling/x86_port_plan.md §6.
-            #[cfg(not(target_arch = "aarch64"))]
+            // x86-64 defaults to scalar ON PURPOSE: the AVX-512/AVX2 ports of
+            // the min-rank scan (`bpe_merge_symbols_short_avx512/_avx2`)
+            // measured ~1% SLOWER on cold encode_st (Zen 5, gpt2, 100 MB and
+            // 1 GB OWT, interleaved min-of-5) — the x86 horizontal reduce is
+            // a 4-step dependent chain plus a vector->GPR transfer on the
+            // serial merge chain, and the `target_feature` boundary blocks
+            // inlining, while the scalar scan's `rank < best` branches
+            // predict well on Zen 5. See profiling/x86_port_plan.md §6.
+            //
+            // Local modification (vendoring): that verdict is upstream's, on
+            // other silicon and a 50k-merge vocab. `COLI_TOK_MERGE_SIMD=
+            // {auto|scalar|avx2|avx512}` re-opens it as a measurement (this
+            // box: AVX2-only i5-1235U, GLM-5.2's 321k merges) without making
+            // an untested tier anyone's default — `auto`/unset keeps scalar,
+            // and a tier the CPU lacks falls back to scalar rather than UB.
+            // Both vector tiers are differential-tested against the scalar
+            // reference (`short_merges_match_vec_merge_loop`).
+            #[cfg(target_arch = "x86_64")]
+            Some(table) => match x86_merge_tier() {
+                // SAFETY: `x86_merge_tier` only returns a vector tier after
+                // `is_x86_feature_detected!` confirmed it on this CPU.
+                X86MergeTier::Avx512 => unsafe { bpe_merge_symbols_short_avx512(table, buf, n) },
+                // SAFETY: as above — AVX2 confirmed at tier selection.
+                X86MergeTier::Avx2 => unsafe { bpe_merge_symbols_short_avx2(table, buf, n) },
+                X86MergeTier::Scalar => bpe_merge_symbols_short_scalar(
+                    |a, b| table.rank(a, b),
+                    |a, b| table.prefetch_rank(a, b),
+                    buf,
+                    n,
+                ),
+            },
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             Some(table) => bpe_merge_symbols_short_scalar(
                 |a, b| table.rank(a, b),
                 |a, b| table.prefetch_rank(a, b),

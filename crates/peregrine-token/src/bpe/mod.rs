@@ -728,7 +728,7 @@ pub(crate) fn bpe_merge_symbols_short_neon(
 /// are identical to the NEON and scalar variants (see
 /// [`bpe_merge_symbols_short_neon`] for the lane-packing invariants).
 ///
-/// NOT dispatched by the miss path: measured ~1% slower than the scalar
+/// Not the default on the miss path: measured ~1% slower than the scalar
 /// scan on cold encode_st (Zen 5 / 9800X3D, gpt2, 100 MB and 1 GB OWT,
 /// interleaved min-of-5, runtime-dispatched baseline build). The x86
 /// horizontal reduce is a 4-dependent-op chain plus a vector→GPR `vmovd`
@@ -736,11 +736,12 @@ pub(crate) fn bpe_merge_symbols_short_neon(
 /// a real call per short merge (NEON needs no gate and inlines), and the
 /// scalar scan's `rank < best` branch predicts well on Zen 5 at typical
 /// n ≈ 4-6 — the mispredict pressure that made the NEON scan win on M4
-/// is absent. Kept, with the AVX2 tier below, as a tested reference
-/// (differential-covered by `short_merges_match_vec_merge_loop`); see
-/// profiling/x86_port_plan.md §6.
+/// is absent. Differential-covered by `short_merges_match_vec_merge_loop`;
+/// see profiling/x86_port_plan.md §6. Local modification (vendoring):
+/// dispatchable for re-measurement via `COLI_TOK_MERGE_SIMD=avx512` (see
+/// `x86_merge_tier` in `tiktoken.rs`) — upstream's verdict was other
+/// silicon and a 50k-merge vocab.
 #[cfg(target_arch = "x86_64")]
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "avx512f")]
 fn bpe_merge_symbols_short_avx512(
     table: &PairRankTable,
@@ -810,10 +811,10 @@ fn bpe_merge_symbols_short_avx512(
 /// kept: `n <= 8` reads one ymm and skips the cross-vector min. Packing,
 /// list surgery, and tie-break order are identical to the other variants.
 ///
-/// NOT dispatched — same measured-slower verdict as the AVX-512 tier
-/// above (whose doc has the numbers and the why).
+/// Not the default — same measured-slower verdict as the AVX-512 tier
+/// above (whose doc has the numbers, the why, and the
+/// `COLI_TOK_MERGE_SIMD` re-measurement knob).
 #[cfg(target_arch = "x86_64")]
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "avx2")]
 fn bpe_merge_symbols_short_avx2(
     table: &PairRankTable,
