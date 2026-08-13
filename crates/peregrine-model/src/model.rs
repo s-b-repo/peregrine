@@ -2190,6 +2190,23 @@ impl Model {
                 }
                 v.push(Mutex::new(r));
             }
+            // One boot line reporting what the rings actually run with, read
+            // back from the rings themselves rather than echoed from env: the
+            // sqpoll-on bench arm ran for a day with nothing in any log saying
+            // whether `COLI_SQPOLL` took, and `COLI_REGBUF` has a history of
+            // being inert — a knob whose effect no output can confirm is a
+            // knob that silently dies. `is_registered` verifies the first
+            // shard fd's fixed-file slot survived registration.
+            if let Some(first) = v.first() {
+                let r = first.lock();
+                let fixed = st.shard_fds().first().is_some_and(|&fd| r.is_registered(fd));
+                eprintln!(
+                    "peregrine: [io] rings={} sqpoll={} fixed_files={}",
+                    v.len(),
+                    if r.is_sqpoll() { "on" } else { "off" },
+                    if fixed { "registered" } else { "plain-fd" },
+                );
+            }
             v
         } else {
             Vec::new()
@@ -2691,6 +2708,16 @@ impl Model {
     /// Experts the prefetch lane has streamed ahead of time (off the critical path).
     pub fn ecache_prefetch_reads(&self) -> Option<u64> {
         self.ecache.as_ref().map(|c| c.lock().prefetch_reads)
+    }
+
+    /// O_DIRECT landing buffers checked out across the streaming rings right
+    /// now (`None` when experts are resident — no rings). Stuck at the pool
+    /// cap means reads are serializing on buffer availability.
+    pub fn io_slab_in_use(&self) -> Option<usize> {
+        if self.io_reactors.is_empty() {
+            return None;
+        }
+        Some(self.io_reactors.iter().map(|r| r.lock().slab_in_use()).sum())
     }
 
     /// Prefetch-lane reads the warm tier has attributed to `layer` (lets the

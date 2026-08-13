@@ -980,6 +980,13 @@ mod uring {
         /// Size the internal aligned-buffer pool used by [`Reactor::read_direct_many`].
         /// `buf_cap` should be the largest region streamed directly; `max_bufs`
         /// bounds total pool RAM. Call once before enabling the O_DIRECT path.
+        /// Slab buffers currently checked out of this ring's pool — the
+        /// O_DIRECT landing buffers in flight right now. A number stuck at
+        /// `max_bufs` means reads are serializing on buffer availability.
+        pub fn slab_in_use(&self) -> usize {
+            self.slab.in_use()
+        }
+
         pub fn configure_slab(&mut self, buf_cap: usize, max_bufs: usize) {
             self.slab = SlabPool::new(buf_cap, max_bufs);
         }
@@ -1606,6 +1613,9 @@ impl Reactor {
     }
     pub fn is_registered(&self, _fd: RawFd) -> bool {
         false
+    }
+    pub fn slab_in_use(&self) -> usize {
+        0
     }
     pub fn read_many(&mut self, _reqs: &mut [ReadReq]) -> std::io::Result<Vec<i64>> {
         Self::unsupported()
