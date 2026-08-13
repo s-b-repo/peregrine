@@ -191,9 +191,37 @@ impl GigaTokenizer {
         GigaTokenizer { inner: self.inner.fork(), pool: Vec::new() }
     }
 
+    /// A shared, immutable view of the vocabulary for decoding without this
+    /// tokenizer (or any lock a caller wraps it in). Streaming emits one
+    /// token at a time; going through [`Self::decode`] for that costs a lock
+    /// acquisition plus two Vec allocations per token per stream, all to
+    /// index an immutable table. The handle is one `Arc` clone; take it once
+    /// per stream and decode at token rate with no shared state.
+    pub fn decode_handle(&self) -> DecodeHandle {
+        DecodeHandle { vocab: std::sync::Arc::clone(&self.inner.vocab) }
+    }
+
     /// Vocabulary size (including added tokens).
     pub fn vocab_size(&self) -> usize {
         self.inner.vocab_size()
+    }
+}
+
+/// A clone-cheap (one `Arc`) read-only vocabulary view from
+/// [`GigaTokenizer::decode_handle`], for per-token decoding on streaming
+/// paths without locking the tokenizer.
+#[derive(Clone)]
+pub struct DecodeHandle {
+    vocab: std::sync::Arc<Vec<std::sync::Arc<[u8]>>>,
+}
+
+impl DecodeHandle {
+    /// The raw bytes of one token id, or `None` outside the vocabulary —
+    /// the same lenient contract as [`GigaTokenizer::decode`]'s skip (a
+    /// padded `lm_head` can sample past the vocab; a stale id must not kill
+    /// a stream).
+    pub fn token_bytes(&self, id: u32) -> Option<&[u8]> {
+        self.vocab.get(id as usize).map(|b| b.as_ref())
     }
 }
 
@@ -300,6 +328,18 @@ mod facade_tests {
         // Degenerate shapes.
         assert!(t.encode_batch(&[], 4).is_empty());
         assert_eq!(t.encode_batch_with(&["", "a"], 8, 0), vec![t.encode(""), t.encode("a")]);
+    }
+
+    #[test]
+    fn decode_handle_matches_decode() {
+        let mut t = gpt2();
+        let ids = t.encode("Hello world <|endoftext|> ünïcode ✓ tails");
+        let h = t.decode_handle();
+        let via_handle: Vec<u8> =
+            ids.iter().filter_map(|&i| h.token_bytes(i)).flatten().copied().collect();
+        assert_eq!(via_handle, t.decode(&ids), "handle bytes must equal decode bytes");
+        assert!(h.token_bytes(t.vocab_size() as u32).is_none(), "out-of-vocab is None");
+        assert!(h.token_bytes(u32::MAX).is_none());
     }
 
     #[test]

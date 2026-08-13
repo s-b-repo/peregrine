@@ -541,6 +541,10 @@ async fn chat_completions(
             // incremental decoder that holds an unfinished character until the
             // next token completes it (see `IncrementalDecoder`).
             let mut dec = tok::IncrementalDecoder::new();
+            // One lock acquisition per stream, then per-token decode is a
+            // lock-free table read — N streams at token rate must not contend
+            // on the encode mutex.
+            let vocab = tokenizer.decode_handle();
             let mut out_ids: Vec<u32> = Vec::new();
             // Tool markup arrives split across tokens, so the decoded text goes
             // through the filter before any of it becomes a delta: a client must
@@ -555,7 +559,7 @@ async fn chat_completions(
                 match msg {
                     EngineOut::Token(t) => {
                         out_ids.push(t);
-                        let decoded = dec.push(&tokenizer.decode_bytes(&[t]));
+                        let decoded = dec.push(vocab.token_bytes(t).unwrap_or(&[]));
                         if decoded.is_empty() {
                             continue; // token only extended an unfinished character
                         }
@@ -737,8 +741,9 @@ fn memo_response(
     // tool call comes back as a call and not as the markup that produced it.
     let mut filter = tools::OutputFilter::with_tools(active_tools(req));
     let mut emitted_calls = 0usize;
+    let vocab = tokenizer.decode_handle();
     for &t in out_ids {
-        let decoded = dec.push(&tokenizer.decode_bytes(&[t]));
+        let decoded = dec.push(vocab.token_bytes(t).unwrap_or(&[]));
         if decoded.is_empty() {
             continue;
         }
