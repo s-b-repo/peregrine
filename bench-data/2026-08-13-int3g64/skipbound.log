@@ -1,0 +1,4 @@
+peregrine-skipbound: computing bounds (one pass over every routed expert)
+peregrine-skipbound: 19200 experts bounded
+peregrine-skipbound: wrote /home/cortix/models/GLM-5.2/expert_bounds.json
+peregrine-skipbound: trace bench-data/2026-08-13-int3g64/routes.json: no usable frames

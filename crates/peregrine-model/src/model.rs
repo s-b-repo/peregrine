@@ -869,10 +869,12 @@ fn route_hist_depth() -> usize {
 /// `[0.0, 1.0]` (default 0.6 → 6000 bp); read once.
 ///
 /// The knob is spelled as a fraction because that is what it meant when only
-/// [`crate::PhaseTracker`] read it — and until 2026-08-08 `PhaseTracker` was the *only*
+/// `PhaseTracker` read it — and until 2026-08-08 that struct was the *only*
 /// reader, while having no production caller, so the documented default governed
 /// nothing. The live predictor used a hardcoded `6000`. This converts at the boundary
 /// so one env var drives both and the units stay honest on each side.
+/// (`PhaseTracker` itself was deleted 2026-08-14 on the `COLI_PREDICT_EVAL`
+/// scoreboard — see `workload.rs`'s module doc; the fraction spelling stays.)
 fn phase_threshold_bp() -> u32 {
     use std::sync::OnceLock;
     static BP: OnceLock<u32> = OnceLock::new();

@@ -17,7 +17,7 @@ concurrent CPU/GPU/SSD scheduler + `io_uring`.
 
 | Scope | ✅ Done | 🟡 Partial | ⬜ Not started | Total | Completion |
 |---|---:|---:|---:|---:|---:|
-| **Full roadmap** | 129 | 1 | 8 | 138 | **~93% strict · ~94% weighted** |
+| **Full roadmap** | 130 | 0 | 8 | 138 | **~94% strict · ~94% weighted** |
 | **Priority shortlist** | 17 | 0 | 3 | 20 | **85% strict · 85% weighted** |
 
 *Strict = Done ÷ Total. Weighted = (Done + ½·Partial) ÷ Total. "Fast matrix multiplication" is excluded.
@@ -66,7 +66,7 @@ production caller). The vendored tokenizer got its own measured pass
 (+19 % line / +15 % warm-parallel, ids byte-identical;
 [tokenizer.md](docs/tokenizer.md#2026-08-13-speed-pass)).
 
-**Nine roadmap line-items (1 partial + 8 not started).** The 2026-08-08 wave
+**Eight roadmap line-items (8 not started, all hardware-blocked or declined; the last partial — §3b `PhaseTracker` — closed 2026-08-14 on the scoreboard below).** The 2026-08-08 wave
 closed §2's CUDA-graph decode wiring and its GPU-side fused reduce — the last
 two engineering 🟡s — and took the `[R]` dead-code count **29 → 22** by wiring
 `moe_engine_installed`, `pick_lfru`/`pick_swap`, `speculative_sample`, and
@@ -156,9 +156,17 @@ of those intact. What replaces it, by the same test:
   with. **Closed as a measured negative at every useful setting.** With
   routing slack (this) and precision slack (int2) both measured absent, the
   workload-reduction menu narrows to formats that keep every expert but
-  shrink its bytes: int3-g64 remains the untested rung.
+  shrink its bytes. int3-g64 was the untested rung; it was measured 2026-08-14 and **fails** (see below).
 - **int2-g64 is not the answer** — measured this pass at `flip_rate = 1.000`.
-  See §13. `int3-g64` (12.7 % smaller than int4) is the untested rung.
+  See §13. `int3-g64` was the last untested rung, and it fails too (2026-08-14):
+  **`flip_rate = 0.514` (263/512)** against the int4 source on the committed prose
+  corpus — half the top-1 predictions move. The container is real (the candidate
+  arm's working set read 9.35 GB/token vs int4's 10.85, so the 13.4 % byte saving
+  was genuinely there) but the scheme is not licensed. With int2 at 1.000 and
+  min-share at 0.21–0.28, **every sub-int4 round-to-nearest rung is now a
+  measured negative** — what remains below 4 bits is vector quantization /
+  incoherence processing (AQLM, QuIP#), a research project, not a converter flag.
+  Artifact at `/srv/modelstripe/GLM-5.2-int3g64`; log `bench-data/2026-08-13-int3g64/`.
 - Speculative, named so it is not rediscovered: expert-delta or shared-basis
   coding is the only idea here with a ceiling below 2 bits/weight, but it breaks
   `QtInfo::detect`'s per-tensor self-description and there is no evidence
@@ -201,7 +209,7 @@ carried as a pending item. Details in §13.
   independently — vector quantization or incoherence processing, as AQLM and
   QuIP# do — which is a research project, not a converter flag. Recorded as a
   closed negative result rather than a pending one: the container exists, the
-  gate ran, the answer is in. `int3-g64` (3.5 bits effective, 12.7 % smaller than
+  gate ran, the answer is in. `int3-g64` (3.5 bits effective, measured 13.4 % smaller than
   int4) is the untested point on this ladder and the only one still worth a run.
 
   **The "blocked on the cable" claim this bullet used to make was wrong**, and
@@ -618,7 +626,7 @@ code that never runs cannot be wrong — it can only mislead.*
 - [x] ✅ **`peregrine-sched` is now the correctness oracle** (2026-08-06) — no crate depends on it and production MoE is `concurrent.rs::moe_forward_concurrent`, so a second implementation of the same computation was a second thing to keep correct with nothing checking it. `streamed_matches_the_production_concurrent_path` closes that: it builds a `testkit` container, runs the **production** path over it through a real `ForwardCtx`, and points this crate's `DiskQt`s at **the same container bytes** via `SafeTensors::region` — the same triples `concurrent.rs`'s private `tplan` builds from — so the two engines read one file rather than two. Both entry points take the router weights as arguments, so routing is identical by construction and only the expert path is under test. Tolerance, not bits: the lanes accumulate in different orders and `f32 +=` is not associative; bit-identity is asserted *within* each engine, never across them. Guarded against passing vacuously by requiring the reference output to be non-zero, and verified to bite (a 1.5× `routed_scale` on one side fails it). The crate's own `concurrent_matches_sequential` — which compares against the *resident* reference, not the concurrent path, and whose name said otherwise (`docs/testing-and-quality.md` flagged it) — is renamed `streamed_matches_the_resident_reference` `peregrine-sched/src/lib.rs`
 - [x] ✅ **MTP speculative decode — wired in both binaries** — `generate_speculative` was unreachable from either. The stdio server takes `--draft N` / `COLI_DRAFT`, and the batched HTTP engine speculates per sequence with all sequences' `1 + γ` rows in *one* forward, so B sequences share one routed-expert union — B separate speculative decodes would stream B unions off the disk that is already the bottleneck. Greedy requests only (argmax acceptance is sequence-identical; temperature > 0 is merely distribution-preserving), drafts capped by the remaining `max_new`, and speculated rows recorded into a scratch history so a rejected draft never warms experts for a token that never existed. **colibrì's "net loss" figure was taken at depth 2**, where 2.46 accepted is already 82% of that configuration's ceiling of 3 — which is why the default guidance is 4–6, and why the reason to wire it was never completeness
 
-- [ ] 🟡 **`PhaseTracker` (`workload.rs`) — a fifth, found 2026-08-08, and deliberately left unwired.** Nothing in the engine constructs one; the live phase signal is `PredictSource::PhaseAware`, which compares the newest two frames per prediction and holds no state. The cost was not zero while it sat there: `COLI_PHASE_THRESHOLD` was documented with a default of 0.6 and **`PhaseTracker` was its only reader**, so the knob the docs offered governed nothing, and the predictor that *should* have obeyed it used a hardcoded `6000` bp. That half is fixed — the threshold is now converted at the boundary and read by the predictor — so what remains unreachable is the struct, not the setting. **Kept rather than deleted because it is not a duplicate**: it holds an EWMA of frame-to-frame distance plus `since_change`, i.e. a *window* after a shift, and `PhaseAware` can express no such thing — it re-decides instantaneously at every layer. Whether a window beats the instantaneous check is precisely what `COLI_PREDICT_EVAL` exists to answer, and until it does, wiring this would be a guess with a control loop attached — the failure mode §3c's own note warns about, facing the other way. The reason is recorded at the definition `workload.rs`
+- [x] ✅ **`PhaseTracker` — deleted 2026-08-14 on the evidence it was kept to wait for.** It sat unwired because only `COLI_PREDICT_EVAL` could say whether its post-shift *window* beat `PhaseAware`'s instantaneous check, and the scoreboard had never been run. It ran (2026-08-14, real checkpoint, `GEN 64`, 4 725 layer transitions, width 16): router-lookahead **recall 92.5 % / precision 46.3 %**, PhaseAware 58.1 % / 29.3 %, prev-token baseline 38.9 % / 38.3 %. PhaseAware does beat the baseline windowless on recall, but the router look-ahead — the shipped default — dominates the whole statistical stack on *both* axes, so a window refinement to an arm 34 recall points behind it has no path to relevance. Struct, re-export and tests deleted; `COLI_PHASE_THRESHOLD` stays (the predictor reads it). This also resolves the open question the 2026-08-03 borrowed negatives put against §1's statistical predictor stack: answered, in the look-ahead's favor. Run archived at `bench-data/2026-08-13-predict-eval/` `workload.rs`
 
 ## 3c. Dead-code sweep (2026-08-07, extended 2026-08-08)
 

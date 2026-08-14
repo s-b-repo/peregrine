@@ -1,0 +1,18 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 39.4 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.4 + cache 2.1 -> peak 26.6 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: [workingset] one token routes 10.85 GB of experts against a 2.00 GB cache (18% of a pass) — no eviction order can hold a pass; prefetch-protect on
+[expertmap] indexed=19456 coalescing=19200 (98.7%) -> 39936 reads per full sweep vs 116736 unmerged
+[workingset] 10.85 GB per token; prefetch-protect on (budget cannot hold a pass)
+[ecache] hits=1325 misses=38033 disk_reads=38033 prefetch_reads=16555 hit_rate=3.4%
+[ecache] busiest layers by disk+prefetch reads: L57=528+226pf L4=527+275pf L5=527+267pf L39=527+221pf L62=527+223pf
+[prefetch] used=30 wasted=16516 unclassified=9 accuracy=0.2% (of 16546 classified) yield=0.2% (of 16555 issued) fadvise=0 verify_mismatch=0
+[prefetch] resident-unused: 4 slots, 0.08 GB of 2.15 GB budget (3.5%)
+[lookahead] issued=27834
+[predict-eval] scored 4725 layer transitions, width=16
+[predict-eval] router-lookahead recall=92.5% precision=46.3% silent=0/4725 p@r=[99% 96% 93% 88% 82% 73% 60% 45% 31% 20% 15% 11% 9% 7% 6% 5%]
+[predict-eval] predictor        recall=58.1% precision=29.3% silent=0/4725 p@r=[75% 64% 50% 40% 33% 27% 24% 23% 20% 20% 18% 18% 15% 15% 13% 11%]
+[predict-eval] prev-token       recall=38.9% precision=38.3% silent=0/4725 p@r=[67% 55% 45% 39% 33% 27% 22% 20% 39% 33% 27% 15% 19% 16% 17% 39%]

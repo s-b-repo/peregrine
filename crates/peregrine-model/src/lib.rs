@@ -54,7 +54,7 @@ pub use lane::{Bias, BubbleTuner, LaneBalancer, LaneTimings, LaneTimingsAccum, P
 pub use learn::{learn_mode, BanditScheduler, KnobArm, LearnMode, QAction, QScheduler, QState};
 pub use telemetry::{open_l3_miss_counter, PlanOptimizer, RuntimeTelemetry};
 pub use wmma_tune::{KernelShape, TileConfig, WmmaTuner};
-pub use workload::{classify_str, PhaseTracker, TokenClass};
+pub use workload::{classify_str, TokenClass};
 pub use predeval::{ArmReport, PredictEval};
 pub use predict::{phase_boost, Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 pub use rlm::{rlm_enabled, rlm_layers, rlm_margin, rlm_max_depth, RLMController};

@@ -533,8 +533,9 @@ pub struct OverlapStats {
     /// previous position also routed. This is the quantity a perfect one-step
     /// cache would hit, i.e. what "cross-token locality" should mean.
     pub mean_overlap: f64,
-    /// Mean `|A ∩ B| / |A ∪ B|` (Jaccard). Reported alongside because
-    /// `PhaseTracker` steers on Jaccard distance, so the two stay comparable.
+    /// Mean `|A ∩ B| / |A ∪ B|` (Jaccard). Reported alongside because the
+    /// engine's phase signal (`PredictSource::PhaseAware`) steers on Jaccard
+    /// distance, so the two stay comparable.
     pub mean_jaccard: f64,
     /// Mean routed-set size, so the reader can size the null below.
     pub mean_set_size: f64,

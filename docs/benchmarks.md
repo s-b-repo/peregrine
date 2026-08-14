@@ -657,3 +657,43 @@ line, **+8 %** whole, **+15 %** warm-parallel on the GLM vocab, ids
 byte-identical; the `COLI_TOK_MERGE_SIMD=avx2` arm is a wash (±1 %), so the
 scalar default stands with a local number behind it. Full table and method:
 [tokenizer.md → 2026-08-13 speed pass](tokenizer.md#2026-08-13-speed-pass).
+
+## Benchmark pass — 2026-08-14 (overnight chain, `scripts/overnight-2026-08-13.sh`)
+
+Four measurements, three verdicts, one still in flight:
+
+**int3-g64 quality gate: FAILS — `flip_rate = 0.513672` (263/512).** Conversion
+383.73 → 332.19 GB (67 shards, 3h12m onto the md0 stripe), then teacher forcing
+on the committed prose corpus, same rules as the min-share and int2 gates. The
+byte saving was real — the candidate arm's working set read 9.35 GB/token vs
+int4's 10.85 — but half the top-1 predictions moved. With int2 at 1.000 and
+min-share at 0.21–0.28, **every sub-int4 round-to-nearest rung is now a
+measured negative**; below 4 bits means vector quantization / incoherence
+processing, not a converter flag. Logs: `bench-data/2026-08-13-int3g64/`.
+
+**Predict-eval scoreboard (first ever run):** 4 725 layer transitions, width 16:
+
+| arm | recall | precision |
+|---|---:|---:|
+| router-lookahead | **92.5 %** | **46.3 %** |
+| PhaseAware predictor | 58.1 % | 29.3 % |
+| prev-token baseline | 38.9 % | 38.3 % |
+
+The router look-ahead dominates the statistical stack on both axes — this
+closed todo §3b (`PhaseTracker` deleted) and answers the 2026-08-03 open
+question against §1's statistical predictors. Log:
+`bench-data/2026-08-13-predict-eval/`.
+
+**Serve defaults A/B at B=16 (REPEATS=1, in flight):** the defaults-on arm read
+**0.07 tok/s** (512 tok / 7310.8 s, 16/16 streams). Not comparable to the
+2026-08-10 sweep's 0.085 row-for-row (different git, different knob set — that
+run had no prefix cache and KV budget 4096); the paired defaults-off arm is the
+comparison and was still running when this was written. Its number belongs
+beside this line when it lands: `bench-data/2026-08-13-defaults-ab/`.
+
+**Skipbound (runbook §8): half a result.** `dump-routes` wrote a 256-forward
+trace and `peregrine-skipbound` bounded 19 200 experts and wrote
+`expert_bounds.json` into the model dir — but the trace replay reported
+`no usable frames`, so the "how many reads would bounds skip" number did not
+come out. The bounds artifact is real; the trace-format mismatch between
+`dump-routes` output and skipbound's reader is an open (small) defect.
