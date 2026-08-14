@@ -1,0 +1,8 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 38.9 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.4 + cache 2.1 -> peak 26.6 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: [workingset] one token routes 10.85 GB of experts against a 2.00 GB cache (18% of a pass) — no eviction order can hold a pass; prefetch-protect on
+wrote 256 forwards of routing trace to bench-data/2026-08-13-int3g64/routes.json (256 tokens)
