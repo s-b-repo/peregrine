@@ -292,6 +292,51 @@ fn run() -> Result<(), Error> {
             eprintln!("wrote {n} forwards of routing trace to {out} ({} tokens)", corpus.len());
             Ok(())
         }
+        // `calib-capture <model-dir> <out.json> [corpus-len] [--text FILE]`: the
+        // ideas-#7 calibration pass — teacher-force the corpus with the capture
+        // hook installed and write the mean-|x|-per-channel sidecar that
+        // `peregrine-requantize --calib` reads. Composable with
+        // `COLI_PREDICT_EVAL=1` in the same process: the capture is passive, so
+        // one instrumented pass yields calibration stats and predictor recall
+        // together (the agreed shared disk slot).
+        Some("calib-capture") => {
+            let usage = || {
+                Error::Format(
+                    "usage: peregrine calib-capture <model-dir> <out.json> [corpus-len] [--text FILE]".into(),
+                )
+            };
+            let dir = args.get(2).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
+            let out = args.get(3).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
+            let len = args.get(4).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(2048);
+            let text = flag_value(&args, "--text");
+            let mut model = Model::load_streaming(Path::new(dir), true)?;
+            let corpus = match &text {
+                Some(path) => encode_text_corpus(dir, path, len, "calib-capture")?,
+                None => {
+                    // Louder sibling of dump-routes' warning, and rightly so: an
+                    // importance profile from uniform-random ids is noise that a
+                    // conversion would then bake into a container's rounding.
+                    eprintln!(
+                        "peregrine: calib-capture has no --text, so it is calibrating on \
+                         uniform-random token ids. Random ids produce hidden statistics no \
+                         real prompt would, so the sidecar will exist but its importance \
+                         profile is noise. Pass --text <file> before converting with it."
+                    );
+                    synth_corpus(model.cfg.vocab as usize, len)
+                }
+            };
+            model.enable_calib_capture(std::path::PathBuf::from(out));
+            let forced = model.teacher_forcing(&corpus)?;
+            match model.write_calib_sidecar()? {
+                Some(p) => eprintln!(
+                    "wrote calibration sidecar to {} ({} positions teacher-forced)",
+                    p.display(),
+                    forced.len()
+                ),
+                None => eprintln!("peregrine: capture was not enabled — nothing written"),
+            }
+            Ok(())
+        }
         // `route-stats <routes.json> [n_experts]`: read a trace written by
         // `dump-routes`/`galactic` and report what the router actually does —
         // consecutive-token expert overlap against the independence null, and
