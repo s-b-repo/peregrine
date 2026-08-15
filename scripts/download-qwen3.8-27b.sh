@@ -24,8 +24,16 @@ for i in $(seq -w 1 18); do
   files+=("model-000${i}-of-00018.safetensors")
 done
 
-printf '%s\n' "${files[@]/#/$BASE/}" > urls.txt
-echo "== [$(date '+%F %T')] starting: $(wc -l < urls.txt) files -> $DEST"
+# CRITICAL: HuggingFace 302-redirects LFS files (all shards + tokenizer.json)
+# to a CDN whose URL basename is a content hash — aria2c would otherwise name
+# them by that hash, not the real filename, and the result is unusable as a
+# model dir. A per-URL `out=` directive forces the real name regardless of the
+# redirect; a completed real-named file is skipped by -c on resume.
+: > urls.txt
+for f in "${files[@]}"; do
+  printf '%s\n  out=%s\n' "$BASE/$f" "$f" >> urls.txt
+done
+echo "== [$(date '+%F %T')] starting: ${#files[@]} files -> $DEST"
 ionice -c3 aria2c -c -j2 -x1 -s1 \
   --max-overall-download-limit=1300K \
   --auto-file-renaming=false \
