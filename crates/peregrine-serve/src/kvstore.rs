@@ -169,8 +169,16 @@ pub struct KvSessionStore {
     dtype: KvDtype,
     cfg: Cfg,
     entries: Arc<Mutex<Vec<IndexEntry>>>,
+    /// The write path's inputs, kept for the synchronous mode; the writer
+    /// thread owns a clone sharing the same `entries`.
+    ctx: WriterCtx,
+    /// `COLI_KV_STORE_SYNC=1`: serialize + fsync on the calling (engine) thread
+    /// — the pre-2026-08-15 behaviour. Exists as the A/B control arm for the
+    /// async writer and as an operator fallback; resolved once at open, never
+    /// through a process-global.
+    sync_writes: bool,
     /// Depth-1 channel to the writer thread; `None` if the spawn failed at open
-    /// (checkpoints disabled by advisory, loads unaffected).
+    /// (checkpoints disabled by advisory, loads unaffected) or in sync mode.
     writer_tx: Option<std::sync::mpsc::SyncSender<WriterMsg>>,
     writer_join: Option<std::thread::JoinHandle<()>>,
     /// Checkpoints accepted for write. The write itself is asynchronous, so a
@@ -194,7 +202,10 @@ enum WriterMsg {
 }
 
 /// Everything `write_entry` and the index bookkeeping need, snapshotted at
-/// open so the writer owns its inputs outright.
+/// open so the writer owns its inputs outright. `Clone` because the store keeps
+/// one copy for the synchronous path (`COLI_KV_STORE_SYNC`) and hands one to
+/// the writer thread — the `entries` Arc makes both views the same index.
+#[derive(Clone)]
 struct WriterCtx {
     dir: PathBuf,
     fingerprint: u64,
@@ -224,7 +235,8 @@ impl KvSessionStore {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(32);
-        match KvSessionStore::open(&dir, model, cap_mb.saturating_mul(1024 * 1024), trim, align) {
+        let sync = matches!(std::env::var("COLI_KV_STORE_SYNC").ok().as_deref(), Some("1") | Some("true"));
+        match KvSessionStore::open(&dir, model, cap_mb.saturating_mul(1024 * 1024), trim, align, sync) {
             Ok(s) => Some(s),
             Err(e) => {
                 note_advisory_err("kvstore open (disk KV disabled)", &e);
@@ -233,16 +245,26 @@ impl KvSessionStore {
         }
     }
 
-    fn open(dir: &Path, model: &Model, cap_bytes: u64, trim: usize, align: usize) -> Result<KvSessionStore, Error> {
+    fn open(dir: &Path, model: &Model, cap_bytes: u64, trim: usize, align: usize, sync: bool) -> Result<KvSessionStore, Error> {
         std::fs::create_dir_all(dir).ctx(|| format!("create {}", dir.display()))?;
+        let ctx = WriterCtx {
+            dir: dir.to_path_buf(),
+            fingerprint: container_fingerprint(model.checkpoint_dir())?,
+            dtype: peregrine_model::kv_dtype(),
+            cfg: model.cfg.clone(),
+            cap_bytes,
+            entries: Arc::new(Mutex::new(Vec::new())),
+        };
         let mut s = KvSessionStore {
             dir: dir.to_path_buf(),
             trim,
             align: align.max(1),
-            fingerprint: container_fingerprint(model.checkpoint_dir())?,
-            dtype: peregrine_model::kv_dtype(),
+            fingerprint: ctx.fingerprint,
+            dtype: ctx.dtype,
             cfg: model.cfg.clone(),
-            entries: Arc::new(Mutex::new(Vec::new())),
+            entries: Arc::clone(&ctx.entries),
+            ctx,
+            sync_writes: sync,
             writer_tx: None,
             writer_join: None,
             saved: 0,
@@ -251,23 +273,19 @@ impl KvSessionStore {
             dropped_busy: 0,
         };
         s.scan()?;
-        let ctx = WriterCtx {
-            dir: s.dir.clone(),
-            fingerprint: s.fingerprint,
-            dtype: s.dtype,
-            cfg: s.cfg.clone(),
-            cap_bytes,
-            entries: Arc::clone(&s.entries),
-        };
-        let (tx, rx) = std::sync::mpsc::sync_channel::<WriterMsg>(1);
-        match std::thread::Builder::new().name("peregrine-kvstore-writer".into()).spawn(move || writer_loop(ctx, rx)) {
-            Ok(j) => {
-                s.writer_tx = Some(tx);
-                s.writer_join = Some(j);
+        if !sync {
+            let ctx = s.ctx.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel::<WriterMsg>(1);
+            match std::thread::Builder::new().name("peregrine-kvstore-writer".into()).spawn(move || writer_loop(ctx, rx))
+            {
+                Ok(j) => {
+                    s.writer_tx = Some(tx);
+                    s.writer_join = Some(j);
+                }
+                // No writer means no new checkpoints; restores still work, and a
+                // store that cannot spawn a thread has bigger problems than this.
+                Err(e) => note_advisory_err("kvstore writer spawn (checkpoints disabled)", &e),
             }
-            // No writer means no new checkpoints; restores still work, and a
-            // store that cannot spawn a thread has bigger problems than this.
-            Err(e) => note_advisory_err("kvstore writer spawn (checkpoints disabled)", &e),
         }
         Ok(s)
     }
@@ -462,13 +480,26 @@ impl KvSessionStore {
         if n < KV_STORE_MIN_TOKENS {
             return;
         }
-        let Some(tx) = self.writer_tx.clone() else {
-            return; // spawn failed at open; the advisory already fired there
-        };
         let tokens = &tokens[..n];
         if self.entries.lock().iter().any(|e| e.tokens.len() >= n && e.tokens.starts_with(tokens)) {
             return;
         }
+        if self.sync_writes {
+            // The historical path, kept as the A/B control arm and operator
+            // fallback: everything on the calling thread, durable on return.
+            let export = kv.export_prefix(n);
+            match Self::write_entry(&self.ctx, tokens, &export) {
+                Ok(entry) => {
+                    self.saved += 1;
+                    index_committed(&self.ctx, entry, tokens);
+                }
+                Err(e) => note_advisory_err("kvstore save", &e),
+            }
+            return;
+        }
+        let Some(tx) = self.writer_tx.clone() else {
+            return; // spawn failed at open; the advisory already fired there
+        };
         let export = kv.export_prefix(n);
         match tx.try_send(WriterMsg::Write { tokens: tokens.to_vec(), export }) {
             Ok(()) => self.saved += 1,
@@ -665,14 +696,14 @@ mod tests {
         let mut live = SeqKv::new(&model.cfg);
         model.forward_prefill_seq(&prompt, &mut live, 0)?;
 
-        let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64)?;
+        let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64, false)?;
         store.save(&prompt, &live);
         store.flush(); // the write is asynchronous; the index fills on commit
         assert_eq!(store.entry_count(), 1, "one checkpoint written");
         assert_eq!(store.saved, 1);
 
         // The restart: a fresh store over the same directory.
-        let mut fresh = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64)?;
+        let mut fresh = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64, false)?;
         assert_eq!(fresh.entry_count(), 1, "the checkpoint is re-indexed after restart");
         let (mut restored, n) = fresh
             .load_longest(&prompt)
@@ -702,7 +733,7 @@ mod tests {
         let prompt = long_prompt();
         let mut live = SeqKv::new(&model.cfg);
         model.forward_prefill_seq(&prompt, &mut live, 0)?;
-        let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64)?;
+        let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64, false)?;
         store.save(&prompt, &live);
         store.flush();
 
@@ -713,7 +744,7 @@ mod tests {
         bytes[mid] ^= 0x40;
         std::fs::write(&path, &bytes)?;
 
-        let mut fresh = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64)?;
+        let mut fresh = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64, false)?;
         assert!(
             fresh.load_longest(&prompt).is_none(),
             "a corrupt checkpoint must be skipped so the request cold-prefills"
@@ -732,7 +763,7 @@ mod tests {
         let prompt = long_prompt();
         let mut live = SeqKv::new(&model.cfg);
         model.forward_prefill_seq(&prompt, &mut live, 0)?;
-        let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64)?;
+        let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64, false)?;
         store.save(&prompt, &live);
         store.flush();
 
@@ -743,7 +774,7 @@ mod tests {
         cfg_bytes.push(b' ');
         std::fs::write(mdir.join("config.json"), &cfg_bytes)?;
         let other = peregrine_model::Model::load(&mdir)?;
-        let fresh = KvSessionStore::open(&sdir, &other, 1 << 30, 32, 64)?;
+        let fresh = KvSessionStore::open(&sdir, &other, 1 << 30, 32, 64, false)?;
         assert_eq!(fresh.entry_count(), 0, "a foreign checkpoint must not be indexed");
         assert_eq!(fresh.best_match_len(&prompt), 0);
         std::fs::remove_dir_all(&mdir)?;
@@ -765,7 +796,7 @@ mod tests {
         model.forward_prefill_seq(&b, &mut kv_b, 0)?;
 
         // Cap below two entries: saving the second evicts the first (LRU).
-        let mut store = KvSessionStore::open(&sdir, &model, 1, 32, 64)?;
+        let mut store = KvSessionStore::open(&sdir, &model, 1, 32, 64, false)?;
         store.save(&a, &kv_a);
         store.flush();
         assert_eq!(store.entry_count(), 1);
@@ -781,6 +812,33 @@ mod tests {
         let before = store.saved;
         store.save(&b[..320], &kv_b.clone_prefix(320));
         assert_eq!(store.saved, before, "a covered prefix must dedup, not rewrite");
+        std::fs::remove_dir_all(&mdir)?;
+        std::fs::remove_dir_all(&sdir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sync_mode_commits_on_the_calling_thread_and_interoperates() -> Result<(), Error> {
+        // COLI_KV_STORE_SYNC: the historical write path, kept as the A/B
+        // control arm. Durable and indexed on return, no writer thread, and a
+        // checkpoint it writes is indistinguishable to an async-mode store.
+        let mdir = tiny_dir("syncmode")?;
+        let sdir = store_dir("syncmode")?;
+        let model = peregrine_model::Model::load(&mdir)?;
+        let prompt = long_prompt();
+        let mut live = SeqKv::new(&model.cfg);
+        model.forward_prefill_seq(&prompt, &mut live, 0)?;
+        let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64, true)?;
+        assert!(store.writer_join.is_none(), "sync mode must not spawn a writer");
+        store.save(&prompt, &live);
+        // Deliberately no flush: sync mode's contract is durable-on-return.
+        assert_eq!(store.entry_count(), 1);
+        assert_eq!(store.saved, 1);
+        let mut fresh = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64, false)?;
+        assert!(
+            fresh.load_longest(&prompt).is_some(),
+            "an async-mode store must read a sync-mode checkpoint (same format, same index rules)"
+        );
         std::fs::remove_dir_all(&mdir)?;
         std::fs::remove_dir_all(&sdir)?;
         Ok(())

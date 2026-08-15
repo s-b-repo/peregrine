@@ -870,7 +870,7 @@ fn ring_homes(group_sizes: &[usize], n_rings: usize) -> Vec<usize> {
     }
     let mut homes = Vec::with_capacity(n_rings);
     for (g, &n) in share.iter().enumerate() {
-        homes.extend(std::iter::repeat(g).take(n));
+        homes.extend(std::iter::repeat_n(g, n));
     }
     homes.resize(n_rings, homes.last().copied().unwrap_or(0));
     homes
