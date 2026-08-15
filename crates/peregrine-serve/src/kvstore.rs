@@ -22,16 +22,24 @@
 //!   is a skip, not a conversion — f16 rows restored into an f32 engine would
 //!   build a cache no cold prefill of that engine could produce.
 //!
-//! Writes are synchronous on the engine thread, temp + atomic rename like
-//! every other artifact this project persists: a 2k-token entry is ~350 MB ≈
-//! 0.3–2 s against a 16 s/token decode. A background writer over the
-//! refcounted prefix snapshot is the named follow-up if that ever shows.
+//! Writes are asynchronous as of 2026-08-15 — the follow-up the previous
+//! paragraph here named ("a background writer … if that ever shows") is now
+//! the implementation. The engine thread pays only the prefix copy
+//! (`SeqKv::export_prefix`, a memcpy that must borrow the live KV); the
+//! serialize + hash + fsync — the 0.3–2 s a 2k-token/~350 MB entry costs —
+//! happens on a dedicated writer thread behind a **depth-1 queue**. A writer
+//! still busy with the previous checkpoint costs the new one (`dropped_busy`),
+//! never a decode stall: a checkpoint is an optimization, and the one thing it
+//! must never do is hold up the batch it exists to speed up. Files still
+//! commit temp + atomic rename, so a crash mid-write leaves no torn entry.
 
+use parking_lot::Mutex;
 use peregrine_core::config::Cfg;
 use peregrine_core::{durable, note_advisory_err, Context, Error};
 use peregrine_model::{KvDtype, KvExport, KvLayerExport, Model, SeqKv};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const MAGIC: [u8; 4] = *b"PGKV";
 const VERSION: u32 = 1;
@@ -150,19 +158,50 @@ struct IndexEntry {
 
 /// The store: a directory of `.pgkv` checkpoints plus an in-memory token
 /// index, LRU-ordered (scan order = mtime at boot, touched entries move to the
-/// back, eviction pops the front).
+/// back, eviction pops the front). The index is shared with the writer thread
+/// — a checkpoint appears in it only once its file has committed — and every
+/// lock hold on it is index bookkeeping, never file I/O.
 pub struct KvSessionStore {
     dir: PathBuf,
-    cap_bytes: u64,
     trim: usize,
     align: usize,
     fingerprint: u64,
     dtype: KvDtype,
     cfg: Cfg,
-    entries: Vec<IndexEntry>,
+    entries: Arc<Mutex<Vec<IndexEntry>>>,
+    /// Depth-1 channel to the writer thread; `None` if the spawn failed at open
+    /// (checkpoints disabled by advisory, loads unaffected).
+    writer_tx: Option<std::sync::mpsc::SyncSender<WriterMsg>>,
+    writer_join: Option<std::thread::JoinHandle<()>>,
+    /// Checkpoints accepted for write. The write itself is asynchronous, so a
+    /// downstream failure is an advisory, not a decrement — this counts what
+    /// serving decided to persist.
     pub saved: u64,
     pub loaded: u64,
     pub tokens_restored: u64,
+    /// Checkpoints declined because the writer was still busy with the previous
+    /// one — each was an optimization forgone, never an error.
+    pub dropped_busy: u64,
+}
+
+/// Work for the writer thread.
+enum WriterMsg {
+    /// Serialize + fsync one checkpoint, then index it.
+    Write { tokens: Vec<i32>, export: KvExport },
+    /// Barrier: reply once every earlier write has committed or failed. Tests
+    /// and orderly shutdown use it; serving never does.
+    Sync(std::sync::mpsc::Sender<()>),
+}
+
+/// Everything `write_entry` and the index bookkeeping need, snapshotted at
+/// open so the writer owns its inputs outright.
+struct WriterCtx {
+    dir: PathBuf,
+    fingerprint: u64,
+    dtype: KvDtype,
+    cfg: Cfg,
+    cap_bytes: u64,
+    entries: Arc<Mutex<Vec<IndexEntry>>>,
 }
 
 impl KvSessionStore {
@@ -198,18 +237,38 @@ impl KvSessionStore {
         std::fs::create_dir_all(dir).ctx(|| format!("create {}", dir.display()))?;
         let mut s = KvSessionStore {
             dir: dir.to_path_buf(),
-            cap_bytes,
             trim,
             align: align.max(1),
             fingerprint: container_fingerprint(model.checkpoint_dir())?,
             dtype: peregrine_model::kv_dtype(),
             cfg: model.cfg.clone(),
-            entries: Vec::new(),
+            entries: Arc::new(Mutex::new(Vec::new())),
+            writer_tx: None,
+            writer_join: None,
             saved: 0,
             loaded: 0,
             tokens_restored: 0,
+            dropped_busy: 0,
         };
         s.scan()?;
+        let ctx = WriterCtx {
+            dir: s.dir.clone(),
+            fingerprint: s.fingerprint,
+            dtype: s.dtype,
+            cfg: s.cfg.clone(),
+            cap_bytes,
+            entries: Arc::clone(&s.entries),
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WriterMsg>(1);
+        match std::thread::Builder::new().name("peregrine-kvstore-writer".into()).spawn(move || writer_loop(ctx, rx)) {
+            Ok(j) => {
+                s.writer_tx = Some(tx);
+                s.writer_join = Some(j);
+            }
+            // No writer means no new checkpoints; restores still work, and a
+            // store that cannot spawn a thread has bigger problems than this.
+            Err(e) => note_advisory_err("kvstore writer spawn (checkpoints disabled)", &e),
+        }
         Ok(s)
     }
 
@@ -226,7 +285,7 @@ impl KvSessionStore {
         found.sort();
         for (_, path) in found {
             match self.read_header(&path) {
-                Ok(Some((tokens, bytes))) => self.entries.push(IndexEntry { path, tokens, bytes }),
+                Ok(Some((tokens, bytes))) => self.entries.lock().push(IndexEntry { path, tokens, bytes }),
                 Ok(None) => {} // another container's checkpoint; leave it be
                 Err(e) => note_advisory_err("kvstore index (file skipped)", &e),
             }
@@ -271,7 +330,7 @@ impl KvSessionStore {
     /// checkpoint can beat what memory already has.
     pub fn best_match_len(&self, prompt: &[i32]) -> usize {
         let cap = prompt.len().saturating_sub(1);
-        self.entries.iter().map(|e| common_prefix(&e.tokens, prompt).min(cap)).max().unwrap_or(0)
+        self.entries.lock().iter().map(|e| common_prefix(&e.tokens, prompt).min(cap)).max().unwrap_or(0)
     }
 
     /// Restore the longest stored prefix of `prompt`, capped (like the
@@ -280,21 +339,31 @@ impl KvSessionStore {
     /// request then cold-prefills, which is always correct.
     pub fn load_longest(&mut self, prompt: &[i32]) -> Option<(SeqKv, usize)> {
         let cap = prompt.len().checked_sub(1)?;
-        let (idx, n) = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (i, common_prefix(&e.tokens, prompt).min(cap)))
-            .max_by_key(|&(_, n)| n)?;
+        // Pick the candidate under the lock, read its file outside it: the writer
+        // thread indexes and evicts under the same lock, and a multi-hundred-MB
+        // file read must not hold it. The index can shift while the file is read,
+        // so the touch/remove below re-finds by path and shrugs if it's gone.
+        let (path, n) = {
+            let entries = self.entries.lock();
+            let (idx, n) = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i, common_prefix(&e.tokens, prompt).min(cap)))
+                .max_by_key(|&(_, n)| n)?;
+            (entries[idx].path.clone(), n)
+        };
         if n < self.align.max(2) {
             return None;
         }
-        match self.read_entry(idx, prompt, cap) {
+        match self.read_entry(&path, prompt, cap) {
             Ok(hit) => {
                 if hit.is_some() {
                     // LRU touch: survivors of eviction are the ones being used.
-                    let e = self.entries.remove(idx);
-                    self.entries.push(e);
+                    let mut entries = self.entries.lock();
+                    if let Some(idx) = entries.iter().position(|e| e.path == path) {
+                        let e = entries.remove(idx);
+                        entries.push(e);
+                    }
                     self.loaded += 1;
                     if let Some((_, n)) = hit {
                         self.tokens_restored += n as u64;
@@ -305,7 +374,10 @@ impl KvSessionStore {
             Err(e) => {
                 note_advisory_err("kvstore load (cold prefill instead)", &e);
                 // Whatever is wrong with the file will be wrong next time too.
-                self.entries.remove(idx);
+                let mut entries = self.entries.lock();
+                if let Some(idx) = entries.iter().position(|e| e.path == path) {
+                    entries.remove(idx);
+                }
                 None
             }
         }
@@ -314,12 +386,7 @@ impl KvSessionStore {
     /// Full read of one checkpoint: checksum the whole file, re-verify the
     /// prompt match against the *file's* tokens (the index is a cache of
     /// them), rebuild the KV, and narrow it to the matched prefix.
-    fn read_entry(&self, idx: usize, prompt: &[i32], cap: usize) -> Result<Option<(SeqKv, usize)>, Error> {
-        let entry = self
-            .entries
-            .get(idx)
-            .ok_or_else(|| Error::Format("kvstore index out of range".into()))?;
-        let path = &entry.path;
+    fn read_entry(&self, path: &Path, prompt: &[i32], cap: usize) -> Result<Option<(SeqKv, usize)>, Error> {
         let bytes = std::fs::read(path).ctx(|| format!("read {}", path.display()))?;
         if bytes.len() < 8 {
             return Err(Error::Format(format!("{}: truncated", path.display())));
@@ -385,60 +452,64 @@ impl KvSessionStore {
     /// Persist `tokens`' completed KV if it clears the floor and no
     /// equal-or-longer entry already covers it. Errors are advisories: a full
     /// disk must cost the checkpoint, never the request.
+    ///
+    /// Asynchronous: this pays only the prefix copy (`export_prefix` borrows the
+    /// live KV, so it cannot move off this thread) and hands the serialize +
+    /// hash + fsync to the writer. The entry appears in the index when its file
+    /// commits, not when this returns.
     pub fn save(&mut self, tokens: &[i32], kv: &SeqKv) {
         let n = save_len(tokens.len().min(kv.len()), self.trim, self.align);
         if n < KV_STORE_MIN_TOKENS {
             return;
         }
+        let Some(tx) = self.writer_tx.clone() else {
+            return; // spawn failed at open; the advisory already fired there
+        };
         let tokens = &tokens[..n];
-        if self.entries.iter().any(|e| e.tokens.len() >= n && e.tokens.starts_with(tokens)) {
+        if self.entries.lock().iter().any(|e| e.tokens.len() >= n && e.tokens.starts_with(tokens)) {
             return;
         }
-        match self.write_entry(tokens, kv) {
-            Ok(entry) => {
-                self.saved += 1;
-                // Entries this one strictly covers are redundant, same rule as
-                // the in-memory cache — drop their files with them.
-                let covered: Vec<usize> = self
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.tokens.len() < n && tokens.starts_with(&e.tokens))
-                    .map(|(i, _)| i)
-                    .collect();
-                for i in covered.into_iter().rev() {
-                    let old = self.entries.remove(i);
-                    if let Err(e) = std::fs::remove_file(&old.path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            note_advisory_err("kvstore remove covered entry", &e);
-                        }
-                    }
-                }
-                self.entries.push(entry);
-                self.evict_to_cap();
+        let export = kv.export_prefix(n);
+        match tx.try_send(WriterMsg::Write { tokens: tokens.to_vec(), export }) {
+            Ok(()) => self.saved += 1,
+            // Depth-1 queue: a writer still mid-checkpoint costs this one. The
+            // dedupe above means a dropped save of a still-growing session gets
+            // another chance at its next retirement.
+            Err(std::sync::mpsc::TrySendError::Full(_)) => self.dropped_busy += 1,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                note_advisory_err("kvstore save", &"writer thread exited");
             }
-            Err(e) => note_advisory_err("kvstore save", &e),
         }
     }
 
-    fn write_entry(&self, tokens: &[i32], kv: &SeqKv) -> Result<IndexEntry, Error> {
+    /// Block until every accepted checkpoint has committed or failed. Serving
+    /// never calls this — tests do, and so does anything that wants the index
+    /// to reflect all prior [`Self::save`] calls before reading it.
+    pub fn flush(&self) {
+        let Some(tx) = self.writer_tx.as_ref() else { return };
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if tx.send(WriterMsg::Sync(ack_tx)).is_ok() && ack_rx.recv().is_err() {
+            note_advisory_err("kvstore flush", &"writer exited before acking");
+        }
+    }
+
+    fn write_entry(ctx: &WriterCtx, tokens: &[i32], export: &KvExport) -> Result<IndexEntry, Error> {
         let n = tokens.len();
-        let export = kv.export_prefix(n);
         let mut name_hash = FNV_OFFSET;
         for &t in tokens {
             name_hash = fnv1a64(name_hash, &t.to_le_bytes());
         }
         let name = format!("{name_hash:016x}-{n}.pgkv");
-        let path = self.dir.join(name);
+        let path = ctx.dir.join(name);
         let tmp = durable::temp_sibling(&path)?;
         {
             let f = std::fs::File::create(&tmp).ctx(|| format!("create {}", tmp.display()))?;
             let mut w = HashingWriter { w: std::io::BufWriter::new(f), h: FNV_OFFSET };
             w.write_all(&MAGIC).ctx(|| "kvstore header".to_string())?;
             w.write_all(&VERSION.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
-            w.write_all(&self.fingerprint.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
-            w.write_all(&dtype_tag(self.dtype).to_le_bytes()).ctx(|| "kvstore header".to_string())?;
-            for dim in [self.cfg.n_layers as u32, self.cfg.kv_lora as u32, self.cfg.qk_rope as u32, n as u32] {
+            w.write_all(&ctx.fingerprint.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
+            w.write_all(&dtype_tag(ctx.dtype).to_le_bytes()).ctx(|| "kvstore header".to_string())?;
+            for dim in [ctx.cfg.n_layers as u32, ctx.cfg.kv_lora as u32, ctx.cfg.qk_rope as u32, n as u32] {
                 w.write_all(&dim.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
             }
             for &t in tokens {
@@ -466,28 +537,83 @@ impl KvSessionStore {
         Ok(IndexEntry { path, tokens: tokens.to_vec(), bytes })
     }
 
-    /// Drop least-recently-used checkpoints (index front) until the directory
-    /// fits `COLI_KV_STORE_MB`.
-    fn evict_to_cap(&mut self) {
-        let mut total: u64 = self.entries.iter().map(|e| e.bytes).sum();
-        while total > self.cap_bytes && self.entries.len() > 1 {
-            let victim = self.entries.remove(0);
-            total = total.saturating_sub(victim.bytes);
-            if let Err(e) = std::fs::remove_file(&victim.path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    note_advisory_err("kvstore evict", &e);
+    /// Bytes currently indexed on disk.
+    pub fn resident_bytes(&self) -> u64 {
+        self.entries.lock().iter().map(|e| e.bytes).sum()
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.lock().len()
+    }
+}
+
+impl Drop for KvSessionStore {
+    fn drop(&mut self) {
+        // Closing the channel is the writer's shutdown signal; the join bounds
+        // the wait to the one checkpoint possibly in flight. (A process killed
+        // harder than a drop still tears nothing — files commit temp + rename.)
+        self.writer_tx = None;
+        if let Some(j) = self.writer_join.take() {
+            if j.join().is_err() {
+                note_advisory_err("kvstore writer join", &"writer thread panicked");
+            }
+        }
+    }
+}
+
+/// The writer thread: serialize + fsync checkpoints off the engine thread, then
+/// index them. One job at a time, FIFO; the depth-1 channel in front of it is
+/// the whole backpressure story.
+fn writer_loop(ctx: WriterCtx, rx: std::sync::mpsc::Receiver<WriterMsg>) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            WriterMsg::Write { tokens, export } => match KvSessionStore::write_entry(&ctx, &tokens, &export) {
+                Ok(entry) => index_committed(&ctx, entry, &tokens),
+                Err(e) => note_advisory_err("kvstore save", &e),
+            },
+            WriterMsg::Sync(ack) => {
+                if ack.send(()).is_err() {
+                    note_advisory_err("kvstore flush ack", &"flush requester gone");
                 }
             }
         }
     }
+}
 
-    /// Bytes currently indexed on disk.
-    pub fn resident_bytes(&self) -> u64 {
-        self.entries.iter().map(|e| e.bytes).sum()
+/// Post-commit index bookkeeping, writer-side: replace any same-path row (a
+/// racing save of the identical prefix commits to the same filename), drop
+/// entries the new one strictly covers, append, and evict LRU-first to the cap
+/// — the same rules `save` applied when it was synchronous. Victim files are
+/// unlinked *outside* the lock: the engine thread probes this index on its hot
+/// path, and unlink latency is the disk's business, not the index's.
+fn index_committed(ctx: &WriterCtx, entry: IndexEntry, tokens: &[i32]) {
+    let n = tokens.len();
+    let mut victims: Vec<PathBuf> = Vec::new();
+    {
+        let mut entries = ctx.entries.lock();
+        entries.retain(|e| e.path != entry.path);
+        let mut i = 0;
+        while i < entries.len() {
+            if entries[i].tokens.len() < n && tokens.starts_with(&entries[i].tokens) {
+                victims.push(entries.remove(i).path);
+            } else {
+                i += 1;
+            }
+        }
+        entries.push(entry);
+        let mut total: u64 = entries.iter().map(|e| e.bytes).sum();
+        while total > ctx.cap_bytes && entries.len() > 1 {
+            let victim = entries.remove(0);
+            total = total.saturating_sub(victim.bytes);
+            victims.push(victim.path);
+        }
     }
-
-    pub fn entry_count(&self) -> usize {
-        self.entries.len()
+    for path in victims {
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                note_advisory_err("kvstore evict", &e);
+            }
+        }
     }
 }
 
@@ -541,6 +667,7 @@ mod tests {
 
         let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64)?;
         store.save(&prompt, &live);
+        store.flush(); // the write is asynchronous; the index fills on commit
         assert_eq!(store.entry_count(), 1, "one checkpoint written");
         assert_eq!(store.saved, 1);
 
@@ -577,9 +704,10 @@ mod tests {
         model.forward_prefill_seq(&prompt, &mut live, 0)?;
         let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64)?;
         store.save(&prompt, &live);
+        store.flush();
 
         // Flip one payload byte in the checkpoint on disk.
-        let path = store.entries[0].path.clone();
+        let path = store.entries.lock()[0].path.clone();
         let mut bytes = std::fs::read(&path)?;
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0x40;
@@ -606,6 +734,7 @@ mod tests {
         model.forward_prefill_seq(&prompt, &mut live, 0)?;
         let mut store = KvSessionStore::open(&sdir, &model, 1 << 30, 32, 64)?;
         store.save(&prompt, &live);
+        store.flush();
 
         // "Another container": same weights, but its config.json differs — the
         // fingerprint hashes config bytes, so this is a different identity, as
@@ -638,8 +767,10 @@ mod tests {
         // Cap below two entries: saving the second evicts the first (LRU).
         let mut store = KvSessionStore::open(&sdir, &model, 1, 32, 64)?;
         store.save(&a, &kv_a);
+        store.flush();
         assert_eq!(store.entry_count(), 1);
         store.save(&b, &kv_b);
+        store.flush();
         assert_eq!(store.entry_count(), 1, "the cap holds one entry, oldest evicted");
         // The survivor is the newer entry: its stored (trimmed+aligned) 320
         // tokens all match `b`, while `a` would diverge at position 10.
