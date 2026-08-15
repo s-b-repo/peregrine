@@ -151,6 +151,29 @@ pub fn rope_interleave(v: &mut [f32], pos: usize, c: &Cfg) {
     rope_interleave_with(v, pos, &RopeTable::from_cfg(c));
 }
 
+/// Rotate-half ("neox") RoPE over the first `2*pairs` lanes of `v`, in place —
+/// the pairing HF's `apply_rotary_pos_emb` uses and therefore the one Qwen3
+/// checkpoints are trained under. It differs from [`rope_interleave_with`] in
+/// *both* respects that matter: input pairs are split-half `(j, half+j)` rather
+/// than interleaved `(2j, 2j+1)`, and the output stays in place rather than
+/// being permuted. Applying GLM's form to a Qwen head would scramble every
+/// position while looking numerically plausible, which is why the pairing is
+/// pinned by `rope_neox_matches_the_hand_computed_vector` below.
+pub fn rope_neox_with(v: &mut [f32], pos: usize, table: &RopeTable) {
+    let half = table.inv.len();
+    // Same refusal as the interleaved form: never leave a rotation half-applied.
+    if half == 0 || v.len() < 2 * half {
+        return;
+    }
+    for (j, &inv) in table.inv.iter().enumerate() {
+        let ang = pos as f32 * inv;
+        let (cs, sn) = (ang.cos(), ang.sin());
+        let (a, b) = (v[j], v[half + j]);
+        v[j] = a * cs - b * sn;
+        v[half + j] = b * cs + a * sn;
+    }
+}
+
 /// [`rope_interleave`] against a precomputed [`RopeTable`] — the hot-path form.
 /// Rotating `2*pairs` lanes, this is bit-identical to the `powf`-per-call
 /// version (same frequencies, same order of operations).
@@ -261,6 +284,29 @@ mod tests {
         rope_interleave_with(&mut b, 13, &RopeTable::from_cfg(&c));
         assert_eq!(a, b, "cached frequencies must be bit-identical");
         Ok(())
+    }
+
+    #[test]
+    fn rope_neox_matches_the_hand_computed_vector() {
+        // head_dim 4 → pairs (0,2) and (1,3); theta 10000 → inv = [1, 0.01].
+        // pos=1, v=[1,2,3,4]:
+        //   j=0: a=1,b=3 → v0 = cos(1) - 3 sin(1),  v2 = 3 cos(1) + sin(1)
+        //   j=1: a=2,b=4 → v1 = 2 cos(.01) - 4 sin(.01), v3 = 4 cos(.01) + 2 sin(.01)
+        let t = RopeTable::new(4, 10000.0);
+        let mut v = [1.0f32, 2.0, 3.0, 4.0];
+        rope_neox_with(&mut v, 1, &t);
+        let want = [-1.984_110_7, 1.959_900_7, 2.462_377_9, 4.019_799_7];
+        for (got, want) in v.iter().zip(want) {
+            assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
+        }
+        // pos=0 is the identity — no permutation, unlike the interleaved form.
+        let mut v0 = [1.0f32, 2.0, 3.0, 4.0];
+        rope_neox_with(&mut v0, 0, &t);
+        assert_eq!(v0, [1.0, 2.0, 3.0, 4.0]);
+        // Lanes beyond the table's span are untouched (partial rotary).
+        let mut vp = [1.0f32, 2.0, 3.0, 4.0, 9.0, 9.0];
+        rope_neox_with(&mut vp, 1, &t);
+        assert_eq!(&vp[4..], &[9.0, 9.0], "partial rotary must not touch the pass-through lanes");
     }
 
     #[test]

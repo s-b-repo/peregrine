@@ -1380,6 +1380,131 @@ pub fn mla_attention_rows(
     Ok(w.o.apply_vec(&ctx, s_n))
 }
 
+// ---------------------------------------------------------------------------
+// GQA attention (Track C): the Qwen3-family full-attention layer. Used by
+// `Arch::DenseGqa` on every layer and by `Arch::HybridGdn` on its
+// full-attention layers (and, phase 2, by the Qwen MTP head's layer).
+// ---------------------------------------------------------------------------
+
+/// Grouped-query attention weights: plain projections, per-head q/k RMS norms,
+/// and — when `gated` — an output gate folded into `wq` (Qwen3.5's
+/// `attn_output_gate`: `wq` emits `[n_heads*head_dim*2]`, query in the first
+/// flat half, gate in the second; `sigmoid(gate)` multiplies the attention
+/// output *before* `o`). The gate lanes are raw projections — never normed,
+/// never roped. The flat-chunk layout is one of the two contract points the
+/// container parity gate pins (coordination file, Track C REV 2).
+pub struct GqaWeights<'a> {
+    pub wq: &'a QtWeight,
+    pub wk: &'a QtWeight,
+    pub wv: &'a QtWeight,
+    pub o: &'a QtWeight,
+    /// Per-head RMS norm applied to each q head over `head_dim`, before RoPE.
+    pub q_norm: &'a [f32],
+    /// Per-head RMS norm applied to each k head over `head_dim`, before RoPE.
+    pub k_norm: &'a [f32],
+    pub gated: bool,
+}
+
+/// GQA attention over `s_n` new positions starting at `pos_base`, against (and
+/// appending to) `cache`. Rows are processed in order, each attending its own
+/// causal prefix, so one prefill call and token-at-a-time decode produce
+/// bit-identical outputs (`gqa_prefill_matches_stepwise_decode`).
+///
+/// The cache holds K rows in the first slot and V rows in the second — the
+/// same width-parameterized [`LayerKv`] MLA uses for latents, which is what
+/// lets the prefix cache and the disk KV store carry GQA sequences unchanged.
+pub fn gqa_attention(
+    w: &GqaWeights,
+    x: &[f32],
+    s_n: usize,
+    pos_base: usize,
+    cache: &mut LayerKv,
+    c: &Cfg,
+) -> Result<Vec<f32>, Error> {
+    let nh = c.n_heads as usize;
+    let nkv = (c.n_kv_heads as usize).max(1);
+    let hd = c.head_dim as usize;
+    let group = nh / nkv;
+    let kdim = nkv * hd;
+    let table = crate::math::RopeTable::from_cfg(c); // span = qk_rope (partial under HybridGdn)
+
+    let mut qg = w.wq.apply_vec(x, s_n); // [s_n, nh*hd] or [s_n, 2*nh*hd] gated
+    let q_row_w = if w.gated { 2 * nh * hd } else { nh * hd };
+    let mut k_all = w.wk.apply_vec(x, s_n);
+    let v_all = w.wv.apply_vec(x, s_n);
+
+    let mut ctx_out = vec![0.0f32; s_n * nh * hd];
+    let mut kbuf: Vec<f32> = Vec::new();
+    let mut vbuf: Vec<f32> = Vec::new();
+    let mut scores: Vec<f32> = Vec::new();
+    for s in 0..s_n {
+        let pos = pos_base + s;
+        // Queries and keys: per-head RMS norm, then RoPE over the rotary span.
+        let q_row = &mut qg[s * q_row_w..s * q_row_w + nh * hd];
+        for h in 0..nh {
+            let qh = &mut q_row[h * hd..(h + 1) * hd];
+            crate::math::rmsnorm_inplace(qh, w.q_norm, c.eps);
+            crate::math::rope_neox_with(qh, pos, &table);
+        }
+        let k_row = &mut k_all[s * kdim..(s + 1) * kdim];
+        for h in 0..nkv {
+            let kh = &mut k_row[h * hd..(h + 1) * hd];
+            crate::math::rmsnorm_inplace(kh, w.k_norm, c.eps);
+            crate::math::rope_neox_with(kh, pos, &table);
+        }
+        cache.append(pos, k_row, &v_all[s * kdim..(s + 1) * kdim])?;
+        // Attend this row over its causal prefix (0..=pos). Spans are
+        // materialized per row — O(n²) over a long prefill, which is the simple
+        // correct form; chunked prefill bounds it, and the resident regime this
+        // arch targets is decode-dominated (s_n = 1, one materialization).
+        let tk = pos + 1;
+        let ks = cache.lc_span(tk);
+        let k_mat: &[f32] = match ks.as_contiguous_f32(tk, kdim) {
+            Some(m) => m,
+            None => {
+                kbuf.clear();
+                ks.extend_f32(tk, kdim, &mut kbuf);
+                &kbuf
+            }
+        };
+        let vs = cache.rc_span(tk);
+        let v_mat: &[f32] = match vs.as_contiguous_f32(tk, kdim) {
+            Some(m) => m,
+            None => {
+                vbuf.clear();
+                vs.extend_f32(tk, kdim, &mut vbuf);
+                &vbuf
+            }
+        };
+        let q_row = &qg[s * q_row_w..s * q_row_w + nh * hd];
+        for h in 0..nh {
+            let qh = &q_row[h * hd..(h + 1) * hd];
+            let kv_off = (h / group) * hd;
+            scores.clear();
+            scores.extend((0..tk).map(|t| {
+                let kt = &k_mat[t * kdim + kv_off..t * kdim + kv_off + hd];
+                qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * c.attn_scale
+            }));
+            crate::math::softmax(&mut scores);
+            let out = &mut ctx_out[s * nh * hd + h * hd..s * nh * hd + (h + 1) * hd];
+            for (t, &a) in scores.iter().enumerate() {
+                let vt = &v_mat[t * kdim + kv_off..t * kdim + kv_off + hd];
+                for (o, &vv) in out.iter_mut().zip(vt) {
+                    *o += a * vv;
+                }
+            }
+        }
+        if w.gated {
+            let gate = &qg[s * q_row_w + nh * hd..(s + 1) * q_row_w];
+            let out = &mut ctx_out[s * nh * hd..(s + 1) * nh * hd];
+            for (o, &g) in out.iter_mut().zip(gate) {
+                *o *= crate::math::sigmoidf(g);
+            }
+        }
+    }
+    Ok(w.o.apply_vec(&ctx_out, s_n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2226,6 +2351,154 @@ mod tests {
         let par = attend_absorb_batched(&w.view(), &q, &rows, &c, 2); // parallel (s_n >= 2)
         let ser = attend_absorb_batched(&w.view(), &q, &rows, &c, usize::MAX); // forced serial
         assert!(par.iter().zip(&ser).all(|(a, b)| a.to_bits() == b.to_bits()), "attend_absorb must be bit-identical parallel vs serial");
+        Ok(())
+    }
+
+    // --- GQA (Track C) ---
+
+    fn gqa_cfg() -> Result<Cfg, peregrine_core::Error> {
+        Cfg::from_json(&serde_json::json!({
+            "model_type": "qwen3", "vocab_size": 32, "hidden_size": 16,
+            "intermediate_size": 8, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 4,
+            "rope_theta": 10000.0, "rms_norm_eps": 1e-6, "eos_token_id": 0
+        }))
+    }
+
+    struct GqaW {
+        wq: QtWeight,
+        wk: QtWeight,
+        wv: QtWeight,
+        o: QtWeight,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+        gated: bool,
+    }
+    impl GqaW {
+        fn view(&self) -> GqaWeights<'_> {
+            GqaWeights {
+                wq: &self.wq,
+                wk: &self.wk,
+                wv: &self.wv,
+                o: &self.o,
+                q_norm: &self.q_norm,
+                k_norm: &self.k_norm,
+                gated: self.gated,
+            }
+        }
+    }
+
+    fn make_gqa_weights(c: &Cfg, seed: u64, gated: bool, zero_gate: bool) -> GqaW {
+        let mut r = Lcg(seed);
+        let (hidden, nh, nkv, hd) =
+            (c.hidden as usize, c.n_heads as usize, c.n_kv_heads as usize, c.head_dim as usize);
+        let w = |r: &mut Lcg, n: usize| (0..n).map(|_| r.f()).collect::<Vec<f32>>();
+        let q_half = w(&mut r, nh * hd * hidden);
+        let wq = if gated {
+            // Flat-chunk layout: query rows first, then the gate rows.
+            let mut full = q_half.clone();
+            let gate_rows =
+                if zero_gate { vec![0.0; nh * hd * hidden] } else { w(&mut r, nh * hd * hidden) };
+            full.extend_from_slice(&gate_rows);
+            quant_i4(&full, 2 * nh * hd, hidden)
+        } else {
+            quant_i4(&q_half, nh * hd, hidden)
+        };
+        GqaW {
+            wq,
+            wk: quant_i4(&w(&mut r, nkv * hd * hidden), nkv * hd, hidden),
+            wv: quant_i4(&w(&mut r, nkv * hd * hidden), nkv * hd, hidden),
+            o: quant_i4(&w(&mut r, hidden * nh * hd), hidden, nh * hd),
+            q_norm: (0..hd).map(|_| 0.5 + r.f() * 0.1).collect(),
+            k_norm: (0..hd).map(|_| 0.5 + r.f() * 0.1).collect(),
+            gated,
+        }
+    }
+
+    #[test]
+    fn gqa_prefill_matches_stepwise_decode() -> Result<(), peregrine_core::Error> {
+        // The strongest self-consistency check available without a reference
+        // implementation: one 5-position prefill call and five 1-position
+        // decode calls must produce bit-identical outputs and caches.
+        let c = gqa_cfg()?;
+        let w = make_gqa_weights(&c, 11, false, false);
+        let d = c.hidden as usize;
+        let mut r = Lcg(99);
+        let x: Vec<f32> = (0..5 * d).map(|_| r.f()).collect();
+
+        let mut cache_a = LayerKv::new(c.kv_row_a() as usize, c.kv_row_b() as usize);
+        let all = gqa_attention(&w.view(), &x, 5, 0, &mut cache_a, &c)?;
+
+        let mut cache_b = LayerKv::new(c.kv_row_a() as usize, c.kv_row_b() as usize);
+        let mut step = Vec::new();
+        for s in 0..5 {
+            step.extend(gqa_attention(&w.view(), &x[s * d..(s + 1) * d], 1, s, &mut cache_b, &c)?);
+        }
+        assert_eq!(all.len(), step.len());
+        assert!(
+            all.iter().zip(&step).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "prefill and stepwise decode must be bit-identical"
+        );
+        assert_eq!(cache_a.len(), cache_b.len());
+        Ok(())
+    }
+
+    #[test]
+    fn gqa_zero_gate_halves_the_output_exactly() -> Result<(), peregrine_core::Error> {
+        // attn_output_gate with all-zero gate rows multiplies the attention
+        // output by sigmoid(0) = 0.5 before the (linear) o projection, so the
+        // final output is exactly half the ungated one — halving is a power-of-2
+        // scale and commutes with every f32 rounding step.
+        let c = gqa_cfg()?;
+        let plain = make_gqa_weights(&c, 21, false, false);
+        let gated = GqaW { gated: true, ..make_gqa_weights(&c, 21, true, true) };
+        let d = c.hidden as usize;
+        let mut r = Lcg(7);
+        let x: Vec<f32> = (0..3 * d).map(|_| r.f()).collect();
+        let mut ca = LayerKv::new(c.kv_row_a() as usize, c.kv_row_b() as usize);
+        let mut cb = LayerKv::new(c.kv_row_a() as usize, c.kv_row_b() as usize);
+        let base = gqa_attention(&plain.view(), &x, 3, 0, &mut ca, &c)?;
+        let half = gqa_attention(&gated.view(), &x, 3, 0, &mut cb, &c)?;
+        assert!(
+            base.iter().zip(&half).all(|(b, h)| (b * 0.5).to_bits() == h.to_bits()),
+            "a zero gate must scale the output by exactly 0.5"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gqa_partial_rotary_only_touches_the_rotary_span() -> Result<(), peregrine_core::Error> {
+        // Under HybridGdn geometry (partial_rotary 0.5 here) the same weights
+        // must attend identically at position 0 regardless of the span (no
+        // rotation happens at pos 0), and differently at later positions.
+        let c_full = gqa_cfg()?;
+        let mut j = serde_json::json!({
+            "model_type": "qwen3_5",
+            "vocab_size": 32, "hidden_size": 16, "intermediate_size": 8,
+            "num_hidden_layers": 2, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 4,
+            "layer_types": ["full_attention", "full_attention"],
+            "linear_num_key_heads": 1, "linear_num_value_heads": 1,
+            "linear_key_head_dim": 4, "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 4, "partial_rotary_factor": 0.5,
+            "rope_theta": 10000.0, "rms_norm_eps": 1e-6, "eos_token_id": 0
+        });
+        // validate_hybrid skips linear checks when no layer is linear
+        j["attn_output_gate"] = serde_json::json!(false);
+        let c_part = Cfg::from_json(&j)?;
+        assert_eq!(c_part.qk_rope, 2, "half of head_dim 4");
+        let w = make_gqa_weights(&c_full, 31, false, false);
+        let d = c_full.hidden as usize;
+        let mut r = Lcg(3);
+        let x: Vec<f32> = (0..2 * d).map(|_| r.f()).collect();
+        let mut ca = LayerKv::new(c_full.kv_row_a() as usize, c_full.kv_row_b() as usize);
+        let mut cb = LayerKv::new(c_part.kv_row_a() as usize, c_part.kv_row_b() as usize);
+        let full = gqa_attention(&w.view(), &x, 2, 0, &mut ca, &c_full)?;
+        let part = gqa_attention(&w.view(), &x, 2, 0, &mut cb, &c_part)?;
+        let row0_same = full[..d].iter().zip(&part[..d]).all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(row0_same, "position 0 rotates nothing, so the spans cannot differ there");
+        let row1_differs = full[d..].iter().zip(&part[d..]).any(|(a, b)| a.to_bits() != b.to_bits());
+        assert!(row1_differs, "position 1 must feel the span difference");
         Ok(())
     }
 }
