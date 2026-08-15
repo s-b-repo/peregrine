@@ -47,6 +47,63 @@ pub struct TensorInfo {
 }
 
 /// Index over all `*.safetensors` shards in a model directory.
+/// Device-ordinal mapping for a set of shard paths (Track A Seam 1) — pure so
+/// the policy is unit-testable without env mutation or multiple real devices.
+///
+/// `devs[i]` is `st_dev` of `paths[i]`. `overrides` is `COLI_IO_DEVICE_MAP`:
+/// comma-separated `path-prefix=ordinal` rules, longest matching prefix wins,
+/// malformed entries ignored. Overridden paths keep their given ordinals
+/// **verbatim** (a test dictates grouping, so renumbering would defeat it);
+/// unmatched paths get dense first-seen `st_dev` ordinals numbered after the
+/// highest override. Without overrides: dense first-seen order from 0. The
+/// second return is `max ordinal + 1` — the sizing bound, which may exceed the
+/// number of *used* ordinals under a sparse override.
+fn device_map(paths: &[PathBuf], devs: &[u64], overrides: Option<&str>) -> (Vec<u8>, usize) {
+    let rules: Vec<(&str, u8)> = match overrides {
+        None => Vec::new(),
+        Some(s) => s
+            .split(',')
+            .filter_map(|e| {
+                let (p, o) = e.split_once('=')?;
+                let p = p.trim();
+                let o = o.trim().parse::<u8>().ok()?;
+                if p.is_empty() {
+                    None
+                } else {
+                    Some((p, o))
+                }
+            })
+            .collect(),
+    };
+    let base = rules.iter().map(|&(_, o)| o as usize + 1).max().unwrap_or(0);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for (p, &d) in paths.iter().zip(devs) {
+        let p_str = p.to_string_lossy();
+        let hit = rules
+            .iter()
+            .filter(|(pre, _)| p_str.starts_with(pre))
+            .max_by_key(|(pre, _)| pre.len())
+            .map(|&(_, o)| o);
+        let ord = match hit {
+            Some(o) => o,
+            None => {
+                let idx = match seen.iter().position(|&x| x == d) {
+                    Some(i) => i,
+                    None => {
+                        seen.push(d);
+                        seen.len() - 1
+                    }
+                };
+                (base + idx).min(u8::MAX as usize) as u8
+            }
+        };
+        out.push(ord);
+    }
+    let n = out.iter().map(|&o| o as usize + 1).max().unwrap_or(1);
+    (out, n)
+}
+
 pub struct SafeTensors {
     tensors: Vec<TensorInfo>,
     index: HashMap<String, usize>,
@@ -56,6 +113,11 @@ pub struct SafeTensors {
     /// rejects the open or aligned reads); callers then use the buffered fd.
     direct_files: Vec<Option<File>>,
     paths: Vec<PathBuf>,
+    /// `devices[i]` = device ordinal of `files[i]`/`paths[i]` (see
+    /// [`Self::device_of`]); computed once at open by [`device_map`].
+    devices: Vec<u8>,
+    /// `max ordinal + 1` — see [`Self::n_devices`].
+    n_devices: usize,
     /// The io_uring lane every read goes through (interior mutability keeps the
     /// read methods `&self`). Serialized: one positioned read at a time.
     reactor: Mutex<Reactor>,
@@ -196,13 +258,19 @@ impl SafeTensors {
         let mut index: HashMap<String, usize> = HashMap::new();
         let mut files: Vec<File> = Vec::with_capacity(shard_paths.len());
         let mut direct_files: Vec<Option<File>> = Vec::with_capacity(shard_paths.len());
+        let mut shard_devs: Vec<u64> = Vec::with_capacity(shard_paths.len());
 
         for (file_idx, path) in shard_paths.iter().enumerate() {
             let f = File::open(path).ctx(|| path.display().to_string())?;
             // O_DIRECT twin for bulk expert streaming; kept only if a probe aligned
             // read succeeds. Any failure → buffered fallback (never fatal).
             let direct = open_direct(path);
-            let fsz = f.metadata().ctx(|| path.display().to_string())?.len();
+            let meta = f.metadata().ctx(|| path.display().to_string())?;
+            // Which physical device this shard lives on (st_dev of the opened
+            // fd), for the io lane's device-aware scheduling. Taken from the
+            // same `metadata` call the size check already needed.
+            shard_devs.push(std::os::unix::fs::MetadataExt::dev(&meta));
+            let fsz = meta.len();
             let read = |reactor: &mut Reactor, off: u64, buf: &mut [u8]| -> Result<(), Error> {
                 reactor.read_exact(f.as_raw_fd(), off, buf).ctx(|| format!("{}: io_uring read @ {off}", path.display()))
             };
@@ -335,7 +403,29 @@ impl SafeTensors {
             files.push(f);
             direct_files.push(direct);
         }
-        Ok(SafeTensors { tensors, index, files, direct_files, paths: shard_paths, reactor: Mutex::new(reactor) })
+        // Device ordinals for the io lane's device-aware scheduling (Track A).
+        // The env override is read here, once per open — per-call, not through
+        // a OnceLock latch, so a test can exercise the mapping and the flip
+        // costs one getenv per model load.
+        let map_env = match std::env::var("COLI_IO_DEVICE_MAP") {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(e) => {
+                peregrine_io::note_advisory_err("COLI_IO_DEVICE_MAP read", &e);
+                None
+            }
+        };
+        let (devices, n_devices) = device_map(&shard_paths, &shard_devs, map_env.as_deref());
+        Ok(SafeTensors {
+            tensors,
+            index,
+            files,
+            direct_files,
+            paths: shard_paths,
+            devices,
+            n_devices,
+            reactor: Mutex::new(reactor),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -349,6 +439,49 @@ impl SafeTensors {
     }
     pub fn paths(&self) -> &[PathBuf] {
         &self.paths
+    }
+
+    /// Device ordinal of shard `file_idx` — an opaque group key for io-lane
+    /// scheduling (Track A): reads against the same ordinal contend on the
+    /// same physical device. Derived once at open from the opened fd's
+    /// `st_dev`, or dictated by `COLI_IO_DEVICE_MAP` (comma-separated
+    /// `path-prefix=ordinal`, longest prefix wins) so a test can group shards
+    /// without owning multiple real devices. Stable for the process lifetime.
+    ///
+    /// Ordinals are **not guaranteed dense** under an override — treat the
+    /// value as a key, size per-device structures from [`Self::n_devices`],
+    /// and never take a populated `0..n` range as given. Out of range → `0`,
+    /// so the accessor is infallible (a wrong index degrades scheduling, never
+    /// correctness — the bytes still come from whatever fd the region names).
+    pub fn device_of(&self, file_idx: usize) -> u8 {
+        self.devices.get(file_idx).copied().unwrap_or(0)
+    }
+
+    /// `max ordinal + 1` — the sizing bound for per-device structures. Slots
+    /// below the bound may be unused when `COLI_IO_DEVICE_MAP` dictates sparse
+    /// ordinals.
+    pub fn n_devices(&self) -> usize {
+        self.n_devices
+    }
+
+    /// The fd → device table for io-lane consumers whose plans carry
+    /// `RawFd`-bearing regions rather than file indices (Track A Seam 2).
+    /// Covers **every** open fd: the buffered shard files *and* their
+    /// O_DIRECT twins — [`Self::region`] and [`Self::region_direct`] hand out
+    /// either one, so a table built from the buffered fds alone would miss
+    /// every direct-path read. A twin shares its shard's ordinal.
+    pub fn fd_devices(&self) -> Vec<(RawFd, u8)> {
+        self.files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.as_raw_fd(), self.device_of(i)))
+            .chain(
+                self.direct_files
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| f.as_ref().map(|f| (f.as_raw_fd(), self.device_of(i)))),
+            )
+            .collect()
     }
 
     pub fn find(&self, name: &str) -> Option<&TensorInfo> {
@@ -702,6 +835,66 @@ mod tests {
             }
         }
         d
+    }
+
+    #[test]
+    fn device_map_is_dense_first_seen_without_overrides() {
+        let paths: Vec<PathBuf> =
+            ["/a/s1.st", "/a/s2.st", "/b/s3.st", "/a/s4.st"].iter().map(PathBuf::from).collect();
+        // Two distinct st_devs, interleaved: dense ordinals in first-seen order.
+        let (ords, n) = device_map(&paths, &[7, 7, 9, 7], None);
+        assert_eq!(ords, vec![0, 0, 1, 0]);
+        assert_eq!(n, 2);
+        // One device → one ordinal, n_devices 1.
+        let (ords, n) = device_map(&paths, &[5, 5, 5, 5], None);
+        assert_eq!(ords, vec![0, 0, 0, 0]);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn device_map_overrides_keep_verbatim_ordinals_and_longest_prefix_wins() {
+        let paths: Vec<PathBuf> = ["/srv/stripe/s1.st", "/srv/stripe/deep/s2.st", "/mnt/600p/s3.st", "/elsewhere/s4.st"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        // All four on ONE real device — the override dictates grouping anyway,
+        // which is its whole purpose (tests without multiple devices).
+        let map = "/srv/stripe=3,/srv/stripe/deep=1,/mnt/600p=0";
+        let (ords, n) = device_map(&paths, &[7, 7, 7, 7], Some(map));
+        // Longest prefix wins for the deep path; verbatim ordinals elsewhere;
+        // the unmatched path numbers after the highest override (3 + 1 = 4).
+        assert_eq!(ords, vec![3, 1, 0, 4]);
+        assert_eq!(n, 5, "sizing bound is max ordinal + 1, holes included");
+        // Malformed entries are ignored, not fatal, and don't disturb the rest.
+        let (ords, _) = device_map(&paths, &[7, 7, 7, 7], Some("garbage,=5,/mnt/600p=oops,/srv/stripe=2"));
+        assert_eq!(ords[0], 2, "the surviving rule still applies");
+        assert_eq!(ords[2], 3, "unparseable rule leaves its path to st_dev numbering");
+    }
+
+    #[test]
+    fn device_api_reports_one_device_for_a_tmpdir_fixture() -> Result<(), Error> {
+        // A single-dir fixture lives on one filesystem, so the whole API
+        // surface is exercisable without owning two devices: one ordinal,
+        // n_devices 1, out-of-range → 0, and the fd table covers every open fd.
+        let dir = tmpdir("devids");
+        write_safetensors(
+            &dir,
+            &[Blob { name: "a", dtype: "F32", shape: vec![2], bytes: f32_bytes(&[1.0, 2.0]) }],
+        )?;
+        let st = SafeTensors::open(&dir)?;
+        assert_eq!(st.n_devices(), 1);
+        assert_eq!(st.device_of(0), 0);
+        assert_eq!(st.device_of(999), 0, "out-of-range is infallible, not a panic");
+        let fds = st.fd_devices();
+        let buffered = st.paths().len();
+        assert!(fds.len() >= buffered, "every buffered shard fd is in the table");
+        assert!(fds.iter().all(|&(_, d)| d == 0), "one filesystem → one ordinal everywhere");
+        // The buffered region fd must resolve through the table — the property
+        // Seam 2's fd→device lookup depends on.
+        let (fd, _, _) = st.region("a").ok_or_else(|| Error::Format("region".into()))?;
+        assert!(fds.iter().any(|&(f, _)| f == fd), "region()'s fd is resolvable to a device");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
