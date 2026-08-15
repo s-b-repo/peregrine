@@ -15,7 +15,7 @@
 // is its own crate root, so the attribute has to be repeated per target.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use peregrine_tools::requant::{plan_sizes, requantize, DownPolicy, HeatTier, Plan, Target};
+use peregrine_tools::requant::{load_calib, plan_sizes, requantize, DownPolicy, HeatTier, Plan, Target};
 use std::path::Path;
 
 fn usage() -> i32 {
@@ -39,6 +39,12 @@ fn usage() -> i32 {
          \x20 --keep-last-layers N pass the last N expert layer indices through\n\
          \x20                      untouched (the MTP head row counts as one) — the\n\
          \x20                      hybrid hedge for the layers closest to the logits\n\
+         \x20 --calib <sidecar>    importance-weighted rounding from a calibration\n\
+         \x20                      sidecar (mean |x| per hidden channel per layer,\n\
+         \x20                      from a teacher-forcing capture pass). int3-g64\n\
+         \x20                      only; applies to gate/up (input width = hidden),\n\
+         \x20                      down and dense layers stay data-free. Same bytes\n\
+         \x20                      on disk — only the rounding objective changes\n\
          \x20 --tier-hot-frac <f>  heat-tiered precision: keep this fraction of each\n\
          \x20                      layer's experts (by routing heat from the source's\n\
          \x20                      route_stats.json) at --tier-hot, rest at --target\n\
@@ -107,6 +113,19 @@ fn main() -> std::process::ExitCode {
                         eprintln!("peregrine-requantize: --keep-last-layers needs an integer");
                         return std::process::ExitCode::from(2);
                     }
+                }
+            }
+            "--calib" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => match load_calib(Path::new(p)) {
+                        Ok(c) => plan.calib = Some(c),
+                        Err(e) => {
+                            eprintln!("peregrine-requantize: {e}");
+                            return std::process::ExitCode::from(2);
+                        }
+                    },
+                    None => return std::process::ExitCode::from(usage() as u8),
                 }
             }
             "--tier-hot-frac" => {
@@ -206,6 +225,9 @@ fn main() -> std::process::ExitCode {
     if plan.keep_last_layers > 0 {
         extras.push_str(&format!(" | keep-last-layers {}", plan.keep_last_layers));
     }
+    if let Some(c) = &plan.calib {
+        extras.push_str(&format!(" | calib {:016x}", c.fp));
+    }
     eprintln!(
         "peregrine-requantize: {} -> {} | target {} | include '{}'{extras}",
         indir.display(),
@@ -215,8 +237,15 @@ fn main() -> std::process::ExitCode {
     );
     match requantize(indir, outdir, &plan) {
         Ok(rep) => {
+            // The calibrated count is part of the report so an inert sidecar
+            // (nothing matched its widths) is visible, not silent.
+            let calibrated = if plan.calib.is_some() {
+                format!(", {} calibrated", rep.tensors_calibrated)
+            } else {
+                String::new()
+            };
             eprintln!(
-                "peregrine-requantize: {} tensors ({} requantized) -> {} shards | {:.2} GB -> {:.2} GB ({:.1}% of source)",
+                "peregrine-requantize: {} tensors ({} requantized{calibrated}) -> {} shards | {:.2} GB -> {:.2} GB ({:.1}% of source)",
                 rep.tensors_total,
                 rep.tensors_requantized,
                 rep.shards,
