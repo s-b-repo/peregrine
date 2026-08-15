@@ -139,6 +139,25 @@ mistakes "documented" for "measured":
   checkpoint files contain the session's token ids in the clear — point the
   knob at storage with the same privacy expectations as the server log.
 
+### Pending measurement: `COLI_PREFETCH_STALE_DROP` (2026-08-15, same rule)
+
+- **`COLI_PREFETCH_STALE_DROP=1`** (default 0, off; window via
+  `COLI_PREFETCH_STALE_SLACK`, default 1 layer-step) — drop a queued
+  speculative warm *before its disk read* once the forward sweep has moved
+  past the layer window it was emitted for. The 2026-08-13 defaults run is
+  the motivating measurement: at B=16 the rings sit at 93 % duty, the
+  unbounded prefetch queue backlogs, and **40 352 of 41 159 speculative reads
+  (98.6 %) were classified wasted — ~12.6 % of all disk reads** on a run whose
+  wall clock is its disk time (`[lane] io 71 %`, moe wall ≈ io time). A late
+  speculation is a demand read's bandwidth spent on a token that already
+  happened. The gate is advisory-lane-only (it can drop a read, never add
+  one, so output is untouched by construction), and the `[prefetch]` line now
+  reports `stale_dropped=` so the A/B can see both the reads not spent and
+  whatever survives as `used`. At B=1, where the disk has real idle windows
+  and the look-ahead measurably wins, a timely queue means the gate should be
+  a near-no-op — that prediction is part of what the A/B checks. Bulk warms
+  (`tiers.json` seed, expert replicas) are exempt by construction.
+
 ### Unavailable here: `COLI_IO_RINGS=8`
 
 Streaming buffers scale with ring count — 11.5 GB at 4 rings, **21.1 GB at 8** — and

@@ -172,6 +172,12 @@ pub struct Model {
     /// [`prefetch_worker`] for what the separate ring does and does not buy.
     /// `Some` alongside `ecache`.
     prefetch: Option<PrefetchPool>,
+    /// Layer-step clock + staleness policy shared with the prefetch workers, so a
+    /// speculative warm whose layer window has passed is dropped before it costs a
+    /// disk read (`COLI_PREFETCH_STALE_DROP`; see [`SweepClock`]). Always present —
+    /// ticking it is two instructions, and gating its existence on the knob would
+    /// put an `Option` probe in every layer of every forward.
+    sweep: Arc<SweepClock>,
     /// Optional GPU VRAM expert tier (the 3rd lane). Built only when `COLI_GPU`
     /// is set and the `cuda` backend is available; `None` otherwise.
     gpu: Option<GpuTier>,
@@ -835,10 +841,75 @@ fn max_expert_region_bytes(st: &SafeTensors) -> usize {
     max + 2 * peregrine_io::ALIGN
 }
 
+/// The layer-step clock the forward loops advance and the prefetch workers read.
+///
+/// Exists because a speculative warm is only worth its disk read *inside the layer
+/// boundary it was emitted for*. The 2026-08-13 defaults run measured the failure
+/// mode this closes: at B=16 the rings run at 93 % duty, the unbounded prefetch
+/// queue backlogs by minutes, and by the time the lane services an item the demand
+/// path has long since streamed — and the cache long since evicted — that expert.
+/// 40 352 of 41 159 speculative reads (98.6 %) were classified wasted, ~12.6 % of
+/// all disk reads on an engine whose wall clock *is* its disk time. A late
+/// speculation is not a cheap miss; it is a demand read's bandwidth spent on a
+/// guess about a token that already happened.
+///
+/// `step` advances once per layer the forward sweep executes (decode, batched
+/// decode, and external-KV prefill — the paths whose demand reads churn the cache).
+/// A `Warm` batch is stamped with `step` at emit; the worker drops items once
+/// `step` has moved more than `slack` past their stamp, *before* paying the read.
+/// `slack` is in layer-steps: an item emitted during step `s` targets the layer
+/// executing at `s + 1`, so the default slack of 1 keeps exactly the window the
+/// emitter designed for. `slack == u64::MAX` disables the gate — the historical
+/// behaviour, and the default until the A/B says otherwise
+/// (`COLI_PREFETCH_STALE_DROP=1`, slack via `COLI_PREFETCH_STALE_SLACK`).
+///
+/// Read from env at model build, not through a process-global `OnceLock`: the
+/// route-min-share measurement was voided by exactly that latch (both A/B arms in
+/// one process saw the first arm's value), and this knob exists to be A/B'd.
+struct SweepClock {
+    /// Layer-step ordinal, monotonically increasing across the model's lifetime.
+    step: std::sync::atomic::AtomicU64,
+    /// Layer-steps past its stamp a warm item stays serviceable; `u64::MAX` = gate off.
+    slack: std::sync::atomic::AtomicU64,
+}
+
+impl SweepClock {
+    fn from_env() -> SweepClock {
+        let on = matches!(std::env::var("COLI_PREFETCH_STALE_DROP").as_deref(), Ok("1") | Ok("true"));
+        let slack = if on { env_usize("COLI_PREFETCH_STALE_SLACK", 1) as u64 } else { u64::MAX };
+        SweepClock {
+            step: std::sync::atomic::AtomicU64::new(0),
+            slack: std::sync::atomic::AtomicU64::new(slack),
+        }
+    }
+
+    /// The current layer-step, for stamping a `Warm` batch at emit time.
+    fn now(&self) -> u64 {
+        self.step.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Advance one layer-step. Called by the forward loops as each layer executes.
+    fn tick(&self) {
+        self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a warm item stamped at `stamp` is past its service window at `now`.
+///
+/// Pure, so the boundary cases are testable without a model or a lane thread. A
+/// `u64::MAX` stamp (the bulk warms: `tiers.json` seed, expert replicas — deliberate
+/// transfers, not layer-boundary speculation) saturates to a zero age and is never
+/// stale; likewise `slack == u64::MAX` (gate off) admits any age.
+fn warm_item_is_stale(now: u64, stamp: u64, slack: u64) -> bool {
+    now.saturating_sub(stamp) > slack
+}
+
 /// Messages to the background prefetch lane.
 enum PrefetchMsg {
     /// Warm these experts into the shared cache (skipping ones already resident).
-    Warm(Vec<crate::concurrent::PrefetchItem>),
+    /// The `u64` is the [`SweepClock`] stamp at emit; `u64::MAX` marks a deliberate
+    /// (non-speculative) warm the stale gate must never drop.
+    Warm(Vec<crate::concurrent::PrefetchItem>, u64),
     /// Page-cache-hint these low-confidence experts via `fadvise(WILLNEED)` — no
     /// streaming, no cache insert (multi-path tier 2).
     Hint(Vec<crate::concurrent::HintItem>),
@@ -916,7 +987,13 @@ fn prefetch_lanes() -> usize {
 /// Spawn `lanes` prefetch workers sharing `cache`, each on its own ring. Read
 /// `COLI_PREFETCH_VERIFY` fresh here (not a process-global) so it can be toggled at
 /// load time: when set, each worker re-reads and byte-compares its speculative loads.
-fn spawn_prefetch_pool(cache: &Arc<Mutex<WarmCache>>, st: &SafeTensors, direct: bool, lanes: usize) -> Result<PrefetchPool, Error> {
+fn spawn_prefetch_pool(
+    cache: &Arc<Mutex<WarmCache>>,
+    st: &SafeTensors,
+    direct: bool,
+    lanes: usize,
+    sweep: &Arc<SweepClock>,
+) -> Result<PrefetchPool, Error> {
     let lanes = lanes.max(1);
     let verify = matches!(std::env::var("COLI_PREFETCH_VERIFY").as_deref(), Ok("1") | Ok("true"));
     let mut handles = Vec::with_capacity(lanes);
@@ -926,12 +1003,13 @@ fn spawn_prefetch_pool(cache: &Arc<Mutex<WarmCache>>, st: &SafeTensors, direct: 
             reactor.configure_slab(max_expert_region_bytes(st), 2);
         }
         let cache = Arc::clone(cache);
+        let sweep = Arc::clone(sweep);
         let (tx, rx) = crossbeam_channel::unbounded::<PrefetchMsg>();
         let join = std::thread::Builder::new()
             .name(format!("peregrine-prefetch-{i}"))
             .spawn(move || {
                 numa_pin_worker(i); // opt-in NUMA affinity (COLI_NUMA_PIN=1)
-                prefetch_worker(reactor, cache, rx, direct, verify)
+                prefetch_worker(reactor, cache, rx, direct, verify, sweep)
             })
             .map_err(|e| Error::Format(format!("spawn prefetch thread: {e}")))?;
         handles.push(PrefetchHandle { tx, join: Some(join) });
@@ -1582,6 +1660,9 @@ struct PrefetchCtx<'a> {
     /// Under O_DIRECT the page cache is bypassed, so tier-2 hints are pointless and
     /// suppressed.
     direct: bool,
+    /// Stamps each `Warm` batch with the layer-step it was emitted in, so the lane
+    /// can drop it unread once its window has passed ([`SweepClock`]).
+    sweep: &'a SweepClock,
 }
 
 impl PrefetchCtx<'_> {
@@ -1643,7 +1724,7 @@ impl PrefetchCtx<'_> {
                 rank += 1;
             }
         }
-        if !warms.is_empty() && self.prefetch.tx.send(PrefetchMsg::Warm(warms)).is_err() {
+        if !warms.is_empty() && self.prefetch.tx.send(PrefetchMsg::Warm(warms, self.sweep.now())).is_err() {
             peregrine_io::note_advisory_err("prefetch warm dispatch", &"prefetch lane is down");
         }
         if !hints.is_empty() && self.prefetch.tx.send(PrefetchMsg::Hint(hints)).is_err() {
@@ -1672,6 +1753,9 @@ struct LookaheadCtx<'a> {
     /// Same load-time expert map [`PrefetchCtx`] carries; `None` falls back to
     /// re-deriving plans per request, which is what this path did before.
     expert_index: Option<&'a crate::concurrent::ExpertIndex>,
+    /// Stamps each `Warm` batch with the layer-step it was emitted in, so the lane
+    /// can drop it unread once its window has passed ([`SweepClock`]).
+    sweep: &'a SweepClock,
 }
 
 impl LookaheadCtx<'_> {
@@ -1716,7 +1800,7 @@ impl LookaheadCtx<'_> {
             return;
         }
         LOOKAHEAD_ISSUED.fetch_add(warms.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        if self.prefetch.tx.send(PrefetchMsg::Warm(warms)).is_err() {
+        if self.prefetch.tx.send(PrefetchMsg::Warm(warms, self.sweep.now())).is_err() {
             peregrine_io::note_advisory_err("lookahead dispatch", &"prefetch lane is down");
         }
     }
@@ -1932,6 +2016,7 @@ fn prefetch_worker(
     rx: crossbeam_channel::Receiver<PrefetchMsg>,
     direct: bool,
     verify: bool,
+    sweep: Arc<SweepClock>,
 ) {
     loop {
         // `recv`'s only error is `Disconnected` — the model dropped its sender,
@@ -1941,8 +2026,17 @@ fn prefetch_worker(
             Err(crossbeam_channel::RecvError) => break,
         };
         match msg {
-            PrefetchMsg::Warm(items) => {
+            PrefetchMsg::Warm(items, stamp) => {
                 for item in items {
+                    // Checked per item, not per batch: a batch can take long enough
+                    // to service that it goes stale midway, and the whole point is
+                    // to stop *before* the read. Two relaxed loads — cheaper than
+                    // the cache probe below.
+                    let slack = sweep.slack.load(std::sync::atomic::Ordering::Relaxed);
+                    if warm_item_is_stale(sweep.now(), stamp, slack) {
+                        cache.lock().note_prefetch_stale_dropped(1);
+                        continue;
+                    }
                     let key = item.key();
                     if cache.lock().contains(key) {
                         continue; // already warm — don't re-read
@@ -2447,10 +2541,11 @@ impl Model {
         // Prefetch lane: a background worker warming the next token's predicted
         // experts into the shared cache via its own ring. Spawned only when the
         // cache exists (streaming mode). `route_hist` is the predictor's state.
+        let sweep = Arc::new(SweepClock::from_env());
         let (route_hist, prefetch) = match &ecache {
             Some(cache) => (
                 Some(Mutex::new(RouteHistory::new(cfg.n_layers as usize, route_hist_depth()))),
-                Some(spawn_prefetch_pool(cache, &st, direct, prefetch_lanes())?),
+                Some(spawn_prefetch_pool(cache, &st, direct, prefetch_lanes(), &sweep)?),
             ),
             None => (None, None),
         };
@@ -2549,6 +2644,7 @@ impl Model {
             perf_llc_last: 0,
             perf_llc_ewma: 0.0,
             prefetch,
+            sweep,
             gpu,
             mtp,
             // `heat` is `Some` exactly when a GPU tier exists, which is also
@@ -2701,7 +2797,7 @@ impl Model {
                 Err(e) => peregrine_io::note_advisory_err("tier-seed prefetch resolve", &e),
             }
         }
-        if !items.is_empty() && pool.lane(0).tx.send(PrefetchMsg::Warm(items)).is_err() {
+        if !items.is_empty() && pool.lane(0).tx.send(PrefetchMsg::Warm(items, u64::MAX)).is_err() {
             peregrine_io::note_advisory_err("prefetch warm dispatch", &"prefetch lane is down");
         }
     }
@@ -2764,6 +2860,7 @@ impl Model {
                 warm_paths: policy.warm_paths,
                 hint_paths: policy.hint_paths,
                 direct: self.direct,
+                sweep: self.sweep.as_ref(),
             }),
             _ => None,
         }
@@ -2785,6 +2882,7 @@ impl Model {
                 st: &self.st,
                 cfg: &self.cfg,
                 expert_index: self.expert_index.as_ref(),
+                sweep: self.sweep.as_ref(),
             }),
             _ => None,
         }
@@ -2943,6 +3041,12 @@ impl Model {
         self.ecache.as_ref().map(|c| c.lock().verify_mismatch)
     }
 
+    /// Speculative warm items the lane discarded unread because their layer window
+    /// had passed (`COLI_PREFETCH_STALE_DROP`). Each is a disk read not spent.
+    pub fn ecache_prefetch_stale_dropped(&self) -> Option<u64> {
+        self.ecache.as_ref().map(|c| c.lock().prefetch_stale_dropped)
+    }
+
     /// The warm cache's achieved compression ratio (uncompressed ÷ admitted).
     /// `None` without a cache or when `COLI_CACHE_COMPRESS` is off. Around 1.2x
     /// is the expected figure for packed int4 experts; near 1.0 means the decode
@@ -3052,6 +3156,7 @@ impl Model {
             warm_paths: policy.warm_paths,
             hint_paths: policy.hint_paths,
             direct: self.direct,
+            sweep: self.sweep.as_ref(),
         };
         for layer in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
             ctx.emit_layer(layer);
@@ -3116,7 +3221,7 @@ impl Model {
                 }
             }
         }
-        if !items.is_empty() && pool.lane(0).tx.send(PrefetchMsg::Warm(items)).is_err() {
+        if !items.is_empty() && pool.lane(0).tx.send(PrefetchMsg::Warm(items, u64::MAX)).is_err() {
             peregrine_io::note_advisory_err("prefetch warm dispatch", &"prefetch lane is down");
         }
     }
@@ -3959,8 +4064,9 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, expert_index, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, ..
+                cfg, layers, kv, st, expert_index, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, ..
             } = self;
+            let sweep: &SweepClock = sweep;
             let ctx = ForwardCtx {
                 st,
                 absorb: *absorb,
@@ -4001,6 +4107,7 @@ impl Model {
                     warm_paths: policy.warm_paths,
                     hint_paths: policy.hint_paths,
                     direct: *direct,
+                    sweep,
                 }),
                 _ => None,
             };
@@ -4039,6 +4146,7 @@ impl Model {
                         st,
                         cfg,
                         expert_index: None,
+                        sweep,
                     })
                 }
                 _ => None,
@@ -4050,6 +4158,7 @@ impl Model {
             let eval = (s_n == 1).then_some(predict_eval.as_ref()).flatten();
             let layers: &[LayerW] = layers;
             for (li, l) in layers.iter().enumerate() {
+                sweep.tick();
                 forward_layer(l, li, &mut kv[li], &ctx, &mut x, s_n, pos_base)?;
                 if let Some(pfc) = &pfc {
                     pfc.emit_layer(li);
@@ -4348,6 +4457,11 @@ impl Model {
         }
         let ctx = self.forward_ctx();
         for (li, l) in self.layers.iter().enumerate() {
+            // Advancing the sweep clock here matters even though this path emits no
+            // speculation: a prefill's demand reads churn the cache exactly like a
+            // decode step's, so a warm item queued just before a long prefill is
+            // stale by the end of it — and should read as such.
+            self.sweep.tick();
             forward_layer(l, li, &mut seq.layers[li], &ctx, &mut x, s_n, pos_base)?;
         }
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
@@ -4611,6 +4725,7 @@ impl Model {
         let la = (la_width > 0).then(|| self.lookahead_ctx()).flatten();
         let layers: &[LayerW] = &self.layers;
         for (li, l) in layers.iter().enumerate() {
+            self.sweep.tick();
             let mut caches: Vec<&mut LayerKv> = seqs.iter_mut().map(|sk| &mut sk.layers[li]).collect();
             forward_layer_batched(l, li, &mut caches, RowLayout { pos_of, owner }, &ctx, &mut x)?;
             if let Some(la) = &la {
@@ -5594,6 +5709,84 @@ mod tests {
         assert!(hints > 0, "hint tier must issue fadvise hints (got {hints})");
         assert_eq!(streamed, 0, "warm_paths=0 must stream nothing into the cache");
         assert_eq!(disk, 0, "hints are off the critical path");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stale_predicate_draws_the_window_where_the_emitter_designed_it() {
+        // An item emitted during step s targets the layer executing at s + 1, so at
+        // slack=1 it is fresh through that layer and dead the step after.
+        assert!(!warm_item_is_stale(10, 10, 1), "same-step service is fresh");
+        assert!(!warm_item_is_stale(11, 10, 1), "the target layer's own step is fresh");
+        assert!(warm_item_is_stale(12, 10, 1), "one step past the target layer is stale");
+        // The two sentinel values disarm the gate from either side: a MAX stamp
+        // (deliberate bulk warms) and a MAX slack (gate off) are never stale.
+        assert!(!warm_item_is_stale(u64::MAX, u64::MAX, 0), "bulk warms never go stale");
+        assert!(!warm_item_is_stale(u64::MAX, 0, u64::MAX), "gate off admits any age");
+        // Unset env means gate off — the historical behaviour is the default until
+        // the A/B licenses a flip.
+        assert_eq!(
+            SweepClock::from_env().slack.load(std::sync::atomic::Ordering::Relaxed),
+            u64::MAX,
+            "stale-drop must be opt-in"
+        );
+    }
+
+    #[test]
+    fn a_stale_warm_batch_is_dropped_before_it_costs_a_disk_read() -> Result<(), peregrine_core::Error> {
+        let dir = tmp_model_dir("stale_drop")?;
+        let m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        // Arm the gate and age the clock *before* anything is enqueued, so the
+        // drop decision is already fixed when the lane dequeues — no race with the
+        // worker thread, unlike advancing the clock after a send.
+        m.sweep.slack.store(1, std::sync::atomic::Ordering::Relaxed);
+        m.sweep.step.store(10, std::sync::atomic::Ordering::Relaxed);
+        let first_sparse = m.cfg.first_dense as usize;
+        let pool = m.prefetch.as_ref().ok_or_else(|| Error::Format("no prefetch pool".into()))?;
+        // Stamped at step 0, ten steps ago: the layer window this item was emitted
+        // for is long gone, which is exactly the 98.6%-wasted shape of the
+        // 2026-08-13 B=16 run.
+        let item = crate::concurrent::prefetch_item(m.expert_index.as_ref(), &m.st, &m.cfg, first_sparse, 0)?;
+        if pool.lane(0).tx.send(PrefetchMsg::Warm(vec![item], 0)).is_err() {
+            return Err(Error::Format("prefetch lane is down".into()));
+        }
+        m.prefetch_barrier();
+        let streamed = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        let dropped = m.ecache_prefetch_stale_dropped().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert_eq!(streamed, 0, "a stale item must be dropped before the read, not after");
+        assert_eq!(dropped, 1, "the drop must be counted, or the [prefetch] line can't show the win");
+        // The same item stamped at the current step is inside its window and
+        // streams normally — the gate kills lateness, not speculation.
+        let item = crate::concurrent::prefetch_item(m.expert_index.as_ref(), &m.st, &m.cfg, first_sparse, 0)?;
+        if pool.lane(0).tx.send(PrefetchMsg::Warm(vec![item], 10)).is_err() {
+            return Err(Error::Format("prefetch lane is down".into()));
+        }
+        m.prefetch_barrier();
+        let streamed = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert_eq!(streamed, 1, "a fresh item must stream exactly as before the gate existed");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gate_left_at_default_services_arbitrarily_late_warms() -> Result<(), peregrine_core::Error> {
+        // The load-time default (COLI_PREFETCH_STALE_DROP unset) is slack=MAX: an
+        // ancient stamp still streams, pinning "off = the historical behaviour".
+        let dir = tmp_model_dir("stale_gate_off")?;
+        let m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        m.sweep.step.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
+        let first_sparse = m.cfg.first_dense as usize;
+        let pool = m.prefetch.as_ref().ok_or_else(|| Error::Format("no prefetch pool".into()))?;
+        let item = crate::concurrent::prefetch_item(m.expert_index.as_ref(), &m.st, &m.cfg, first_sparse, 0)?;
+        if pool.lane(0).tx.send(PrefetchMsg::Warm(vec![item], 0)).is_err() {
+            return Err(Error::Format("prefetch lane is down".into()));
+        }
+        m.prefetch_barrier();
+        let streamed = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        let dropped = m.ecache_prefetch_stale_dropped().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert_eq!(streamed, 1, "gate off: even a million-step-old warm still streams");
+        assert_eq!(dropped, 0, "gate off must count nothing");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

@@ -64,7 +64,17 @@ sessions (`serve/src/kvstore.rs`): completed prefixes ≥256 tokens checkpoint
 to disk (fingerprint + checksum + full-token compare; ~176 KiB/token) and a
 restarted server restores them instead of re-streaming ~10.85 GB/token of
 prefill; the in-memory prefix cache's disk extension, promoted back on first
-hit.
+hit. Added later the same day, same off-by-default rule: (5)
+**`COLI_PREFETCH_STALE_DROP`** — the prefetch worker drops a queued
+speculative warm *before* its disk read once the sweep has moved
+`COLI_PREFETCH_STALE_SLACK` (default 1) layer-steps past its emit stamp.
+Motivated by the 08-13 defaults counters: at B=16 the unbounded prefetch
+queue backlogs behind 93 %-duty rings and 98.6 % of speculative reads
+(40 352/41 159, ~12.6 % of *all* disk reads) were serviced too late to be
+anything but waste. Advisory-lane-only, so output is untouched by
+construction; `[prefetch]` now prints `stale_dropped=`; A/B queued behind
+the overnight chain (`scripts/prefetch-stale-ab.sh`, results →
+`bench-data/2026-08-15-stale-drop/`).
 
 **2026-08-13 evening wave (two sessions, coordinated).** Beyond the min-share
 gate (measured negative at every τ — see §6's replacement item) and the VRAM

@@ -1541,10 +1541,13 @@ fn run_tuned(
         // Whether that biases the tuner is a real question and not answered here.
         let unclassified = pf.saturating_sub(used + wasted);
         let yield_pct = if pf > 0 { 100.0 * used as f64 / pf as f64 } else { 0.0 };
+        // `stale_dropped` is *not* part of `issued`: those items never reached a
+        // read, so they are disk bandwidth the gate returned to the demand lane.
+        let sd = model.ecache_prefetch_stale_dropped().unwrap_or(0);
         eprintln!(
             "[prefetch] used={used} wasted={wasted} unclassified={unclassified} \
              accuracy={acc:.1}% (of {} classified) yield={yield_pct:.1}% (of {pf} issued) \
-             fadvise={fadv} verify_mismatch={vm}",
+             fadvise={fadv} verify_mismatch={vm} stale_dropped={sd}",
             used + wasted
         );
         // How much of the cache speculation is *holding* — the unclassified slabs

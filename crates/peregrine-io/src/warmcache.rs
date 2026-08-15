@@ -321,6 +321,12 @@ pub struct WarmCache {
     pub prefetch_used: u64,
     /// prefetched slabs evicted before ever being hit (the prefetch was wasted).
     pub prefetch_wasted: u64,
+    /// speculative warm items the prefetch lane discarded *before* reading, because
+    /// the layer window they were emitted for had already passed by the time the
+    /// lane dequeued them (the stale-drop gate, `COLI_PREFETCH_STALE_DROP`). Each
+    /// one is a disk read that would almost certainly have joined `prefetch_wasted`,
+    /// not spent.
+    pub prefetch_stale_dropped: u64,
     /// low-confidence experts the prefetch lane merely *hinted* to the page cache
     /// via `fadvise(WILLNEED)` (multi-path tier 2), rather than fully streaming.
     pub fadvise_hints: u64,
@@ -405,6 +411,7 @@ impl WarmCache {
             prefetch_reads_by_layer: Vec::new(),
             prefetch_used: 0,
             prefetch_wasted: 0,
+            prefetch_stale_dropped: 0,
             fadvise_hints: 0,
             verify_mismatch: 0,
             bloom_skips: 0,
@@ -726,6 +733,12 @@ impl WarmCache {
         self.verify_mismatch += 1;
     }
 
+    /// Record `n` speculative warm items discarded unread because their layer
+    /// window had already passed (see [`Self::prefetch_stale_dropped`]).
+    pub fn note_prefetch_stale_dropped(&mut self, n: u64) {
+        self.prefetch_stale_dropped += n;
+    }
+
     /// Drop all resident slabs and zero the counters. Used by tests to force a
     /// cold cache so the prefetch lane's contribution is observable in isolation.
     pub fn clear(&mut self) {
@@ -741,6 +754,7 @@ impl WarmCache {
         self.prefetch_reads_by_layer.clear();
         self.prefetch_used = 0;
         self.prefetch_wasted = 0;
+        self.prefetch_stale_dropped = 0;
         self.fadvise_hints = 0;
         self.verify_mismatch = 0;
         self.bloom_skips = 0;
@@ -1322,6 +1336,16 @@ mod tests {
         assert!(c.get((0, 1)).is_some()); // second hit must not double-count
         assert_eq!(c.prefetch_used, 1);
         assert_eq!(c.prefetch_wasted, 0);
+    }
+
+    #[test]
+    fn stale_drop_counter_accumulates_and_clears_with_the_rest() {
+        let mut c = WarmCache::new(80);
+        c.note_prefetch_stale_dropped(3);
+        c.note_prefetch_stale_dropped(2);
+        assert_eq!(c.prefetch_stale_dropped, 5);
+        c.clear();
+        assert_eq!(c.prefetch_stale_dropped, 0, "clear() must reset it like every other counter");
     }
 
     #[test]
