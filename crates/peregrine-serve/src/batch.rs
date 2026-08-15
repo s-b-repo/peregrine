@@ -55,10 +55,7 @@ const PREFILL_CHUNK: usize = 64;
 /// see [`prefill_chunk`], whose math is what this default buys. `0` restores
 /// the historical fixed [`PREFILL_CHUNK`] exactly.
 fn prefill_chunk_div() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_PREFILL_CHUNK_DIV").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(4)
-    })
+    std::env::var("COLI_PREFILL_CHUNK_DIV").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(4)
 }
 
 /// How many prompt tokens to prefill in one step, given how many are already cached.
@@ -94,14 +91,11 @@ fn prefill_chunk(pos: usize, div: usize) -> usize {
 /// the historical behaviour: every request prefills its whole prompt from
 /// scratch.
 fn prefix_cache_budget() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_PREFIX_CACHE_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(2048)
-            .saturating_mul(1024 * 1024)
-    })
+    std::env::var("COLI_PREFIX_CACHE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(2048)
+        .saturating_mul(1024 * 1024)
 }
 
 /// Prompts shorter than this are not worth caching: the snapshot copy would cost
@@ -451,10 +445,63 @@ impl EngineHandle {
 }
 
 /// State shared between the engine thread and its [`EngineHandle`], bundled
-/// so `run_tuned` stays within the argument count its own comment defends.
+/// so `run` stays within the argument count its own comment defends.
 struct EngineShared {
     telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Every engine-loop knob, resolved from the environment **once at spawn** and
+/// threaded through — never a process-wide `OnceLock`. Two reasons, both
+/// already paid for in this repo: an `OnceLock` latch voided the
+/// route-min-share A/B (both arms in one process read the first arm's value —
+/// `todo.md` §6), and the `spawn_fused`/`spawn_tuned`/`spawn_spec` ladder below
+/// existed purely so tests could dodge the latch knob-by-knob. Tests now
+/// override fields on this struct instead; the parser functions keep their
+/// documentation and defaults and are called exactly once, from [`Self::from_env`].
+#[derive(Clone, Copy)]
+struct EngineKnobs {
+    /// `COLI_FUSE_PREFILL` — see [`fuse_prefill`].
+    fuse_prefill: bool,
+    /// `COLI_PREFILL_CHUNK_DIV` — see [`prefill_chunk_div`].
+    prefill_chunk_div: usize,
+    /// `COLI_PREFIX_CACHE_MB` in bytes — see [`prefix_cache_budget`].
+    prefix_cache_budget: usize,
+    /// `COLI_BATCH_SLA_MS` — see [`batch_sla_ms`].
+    batch_sla_ms: Option<u64>,
+    /// `COLI_DRAFT` — see [`draft_depth`].
+    draft_depth: usize,
+    /// `COLI_DRAFT_SAMPLED` — see [`draft_sampled`].
+    draft_sampled: bool,
+    /// `COLI_SPEC_CONF` — see [`spec_conf`].
+    spec_conf: f32,
+    /// `COLI_MAX_BATCH_ROWS` — see [`max_batch_rows`].
+    max_batch_rows: usize,
+    /// `COLI_QUEUE_DEPTH` — see [`queue_depth_cap`].
+    queue_depth_cap: usize,
+    /// `COLI_ADAPTIVE_WINDOW` — see [`adaptive_window_ratio`].
+    adaptive_window_ratio: u64,
+    /// `COLI_KV_BUDGET_MB` in bytes — see [`kv_budget_bytes`].
+    kv_budget_bytes: usize,
+}
+
+impl EngineKnobs {
+    /// The one place the engine reads its environment.
+    fn from_env() -> EngineKnobs {
+        EngineKnobs {
+            fuse_prefill: fuse_prefill(),
+            prefill_chunk_div: prefill_chunk_div(),
+            prefix_cache_budget: prefix_cache_budget(),
+            batch_sla_ms: batch_sla_ms(),
+            draft_depth: draft_depth(),
+            draft_sampled: draft_sampled(),
+            spec_conf: spec_conf(),
+            max_batch_rows: max_batch_rows(),
+            queue_depth_cap: queue_depth_cap(),
+            adaptive_window_ratio: adaptive_window_ratio(),
+            kv_budget_bytes: kv_budget_bytes(),
+        }
+    }
 }
 
 /// Spawn the engine on a dedicated OS thread that owns `model`, batching up to
@@ -462,6 +509,17 @@ struct EngineShared {
 /// handle (the thread exits once every [`EngineHandle`] is dropped and all active
 /// sequences finish).
 pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle<()>), Error> {
+    spawn_with_knobs(model, max_batch, EngineKnobs::from_env())
+}
+
+/// [`spawn`] with the knobs supplied by the caller — production hands it
+/// [`EngineKnobs::from_env`]; tests hand it a struct with the fields under test
+/// overridden, so no test ever mutates the process environment.
+fn spawn_with_knobs(
+    model: Model,
+    max_batch: usize,
+    knobs: EngineKnobs,
+) -> Result<(EngineHandle, JoinHandle<()>), Error> {
     let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
     let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
@@ -470,28 +528,22 @@ pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle
     let shared = EngineShared { telemetry: telemetry.clone(), queued: queued.clone() };
     let join = std::thread::Builder::new()
         .name("peregrine-batch".to_string())
-        .spawn(move || run(model, rx_normal, rx_high, cap, fuse_prefill(), shared))
+        .spawn(move || run(model, rx_normal, rx_high, cap, knobs, shared))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high, telemetry, queued, queue_cap: queue_depth_cap() }, join))
+    Ok((EngineHandle { tx_normal, tx_high, telemetry, queued, queue_cap: knobs.queue_depth_cap }, join))
 }
 
-/// [`spawn`] with the prefill/decode fusion forced on or off.
-///
-/// Exists because `COLI_FUSE_PREFILL` resolves through a process-wide
-/// `OnceLock`, and a test that mutated the environment would race every other
-/// test in the binary — the same reason `iotune.rs` gives for not gating a
-/// feature on one.
+/// [`spawn`] with the prefill/decode fusion forced on or off (test knob override).
 #[cfg(test)]
 fn spawn_fused(model: Model, max_batch: usize, fuse: bool) -> Result<(EngineHandle, JoinHandle<()>), Error> {
     spawn_tuned(model, max_batch, fuse, None)
 }
 
-/// Override for the speculation knobs, `None` meaning "read the environment".
-/// Production passes the default (all `None`); tests force values so they never
-/// race each other on the process-wide `OnceLock`s the environment resolves
-/// through. Bundled rather than passed as two parameters because `run_tuned`
-/// already sits at clippy's argument limit, and because the two are one
-/// decision: sampled speculation without a depth is not a configuration.
+/// Override for the speculation knobs, `None` meaning "the environment's value".
+/// Kept as the test ladder's argument shape; it folds into [`EngineKnobs`] in
+/// [`spawn_spec`]. Bundled rather than passed as parameters because the two are
+/// one decision: sampled speculation without a depth is not a configuration.
+#[cfg(test)]
 #[derive(Clone, Copy, Default)]
 struct SpecOverride {
     /// `COLI_DRAFT`.
@@ -502,11 +554,7 @@ struct SpecOverride {
     conf: Option<f32>,
 }
 
-/// [`spawn`] with the fusion and the speculation knobs forced.
-///
-/// These resolve through process-wide `OnceLock`s, and a test that mutated the
-/// environment would race every other test in the binary — the same reason
-/// `iotune.rs` gives for not gating a feature on one.
+/// [`spawn`] with the fusion and the speculation depth forced (test knob override).
 #[cfg(test)]
 fn spawn_tuned(
     model: Model,
@@ -525,27 +573,26 @@ fn spawn_spec(
     fuse: bool,
     spec: SpecOverride,
 ) -> Result<(EngineHandle, JoinHandle<()>), Error> {
-    let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
-    let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
-    let cap = max_batch.max(1);
-    let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
-    let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let shared = EngineShared { telemetry: telemetry.clone(), queued: queued.clone() };
-    let join = std::thread::Builder::new()
-        .name("peregrine-batch-test".to_string())
-        .spawn(move || run_tuned(model, rx_normal, rx_high, cap, fuse, spec, shared))
-        .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high, telemetry, queued, queue_cap: queue_depth_cap() }, join))
+    let mut knobs = EngineKnobs::from_env();
+    knobs.fuse_prefill = fuse;
+    if let Some(d) = spec.depth {
+        knobs.draft_depth = d;
+    }
+    if let Some(s) = spec.sampled {
+        knobs.draft_sampled = s;
+    }
+    if let Some(c) = spec.conf {
+        knobs.spec_conf = c;
+    }
+    spawn_with_knobs(model, max_batch, knobs)
 }
 
 /// Latency SLA target for adaptive batching, in milliseconds. When set
-/// (`COLI_BATCH_SLA_MS=<n>` or via [`spawn_with_sla`] callers), the engine
+/// (`COLI_BATCH_SLA_MS=<n>`, or an [`EngineKnobs`] override in tests), the engine
 /// shrinks the working batch cap on p95-latency overrun and grows it back when
 /// slack appears. Unset → static `max_batch` (the historical default).
 fn batch_sla_ms() -> Option<u64> {
-    use std::sync::OnceLock;
-    static V: OnceLock<Option<u64>> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("COLI_BATCH_SLA_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0))
+    std::env::var("COLI_BATCH_SLA_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0)
 }
 
 /// Speculative draft depth for the batched engine (`COLI_DRAFT`). `0`/unset is
@@ -555,8 +602,7 @@ fn batch_sla_ms() -> Option<u64> {
 /// model class came from a depth-2 fork where 2.46 accepted was already 82% of
 /// that configuration's ceiling of 3.
 fn draft_depth() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("COLI_DRAFT").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0))
+    std::env::var("COLI_DRAFT").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
 }
 
 /// Confidence floor for the MTP draft (`COLI_SPEC_CONF`, clamped to `[0, 1)`).
@@ -574,15 +620,12 @@ fn draft_depth() -> usize {
 /// documents output drift; peregrine's invariant forbids that trade).
 /// ds4 ships 0.6 (Metal) / 0.7 (CUDA) as defaults — 0.65 is the A/B arm.
 fn spec_conf() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_SPEC_CONF")
-            .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 0.999_999))
-            .unwrap_or(0.0)
-    })
+    std::env::var("COLI_SPEC_CONF")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(0.0, 0.999_999))
+        .unwrap_or(0.0)
 }
 
 /// Extend speculation to temperature > 0 requests via rejection sampling
@@ -601,8 +644,7 @@ fn spec_conf() -> f32 {
 /// head is a good proposal distribution at temperature is a modelling question,
 /// and a bad one costs acceptance rate rather than correctness.
 fn draft_sampled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("COLI_DRAFT_SAMPLED").ok().as_deref(), Some("1") | Some("true")))
+    matches!(std::env::var("COLI_DRAFT_SAMPLED").ok().as_deref(), Some("1") | Some("true"))
 }
 
 /// How deep this sequence may speculate.
@@ -644,8 +686,7 @@ fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize, 
 /// (`COLI_UNION_STATS`); the serve-path A/B recipe is in
 /// `docs/validation-runbook.md`.
 fn fuse_prefill() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !matches!(std::env::var("COLI_FUSE_PREFILL").ok().as_deref(), Some("0") | Some("false")))
+    !matches!(std::env::var("COLI_FUSE_PREFILL").ok().as_deref(), Some("0") | Some("false"))
 }
 
 /// Ceiling on rows in one fused forward (`COLI_MAX_BATCH_ROWS`); `0`/unset =
@@ -657,10 +698,7 @@ fn fuse_prefill() -> bool {
 /// bounds next-tick draft depth so the decode block itself fits. Purely a
 /// scheduling bound — which rows run when — never which tokens come out.
 fn max_batch_rows() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_MAX_BATCH_ROWS").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
-    })
+    std::env::var("COLI_MAX_BATCH_ROWS").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
 }
 
 /// Admission-queue depth cap (`COLI_QUEUE_DEPTH`); `0`/unset = unbounded, the
@@ -669,10 +707,7 @@ fn max_batch_rows() -> usize {
 /// overload becomes visible backpressure rather than unbounded memory and a
 /// client timeout long after the fact.
 fn queue_depth_cap() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_QUEUE_DEPTH").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
-    })
+    std::env::var("COLI_QUEUE_DEPTH").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
 }
 
 /// Number of decode ticks per prefill tick when the adaptive window is on.
@@ -681,15 +716,11 @@ fn queue_depth_cap() -> usize {
 /// trading admission latency for decode throughput when the workload is decode-
 /// heavy. Purely a scheduling knob — correctness-neutral.
 fn adaptive_window_ratio() -> u64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<u64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_ADAPTIVE_WINDOW")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(1)
-    })
+    std::env::var("COLI_ADAPTIVE_WINDOW")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
 }
 
 /// Resident KV budget in bytes (`COLI_KV_BUDGET_MB`); 0 = off, the historical
@@ -704,15 +735,11 @@ fn adaptive_window_ratio() -> u64 {
 /// every downstream KV optimization is worth exactly zero extra batch slots
 /// until this exists.
 fn kv_budget_bytes() -> usize {
-    use std::sync::OnceLock;
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_KV_BUDGET_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .map(|mb| mb.saturating_mul(1 << 20))
-            .unwrap_or(0)
-    })
+    std::env::var("COLI_KV_BUDGET_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1 << 20))
+        .unwrap_or(0)
 }
 
 /// Whether the engine may admit another sequence given the KV already resident.
@@ -841,28 +868,15 @@ struct SeqState {
 /// sequences one batched step at a time until each hits a stop id, its token
 /// budget, or a dropped client.
 fn run(
-    model: Model,
-    rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
-    rx_high: mpsc::UnboundedReceiver<EngineRequest>,
-    max_batch: usize,
-    fuse: bool,
-    shared: EngineShared,
-) {
-    run_tuned(model, rx_normal, rx_high, max_batch, fuse, SpecOverride::default(), shared)
-}
-
-/// [`run`] with the speculation knobs overridable, for tests. Each `None` reads
-/// the corresponding environment variable.
-fn run_tuned(
     mut model: Model,
     mut rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
     mut rx_high: mpsc::UnboundedReceiver<EngineRequest>,
     max_batch: usize,
-    fuse: bool,
-    spec: SpecOverride,
+    knobs: EngineKnobs,
     shared: EngineShared,
 ) {
     let EngineShared { telemetry, queued } = shared;
+    let fuse = knobs.fuse_prefill;
     let vocab = model.cfg.vocab as usize;
     let stop_ids = model.cfg.stop_ids.clone();
     let mut active: Vec<SeqState> = Vec::new();
@@ -875,21 +889,25 @@ fn run_tuned(
     // Adaptive-batching state. `working_cap` is the current admission ceiling
     // (starts at `max_batch`, shrinks under SLA overrun, grows on slack). EWMA
     // over per-forward wall time drives the adjustment.
-    let sla_ms = batch_sla_ms();
-    // Resolved once: prefill chunking is a latency/work trade, not a per-tick decision.
-    let chunk_div = prefill_chunk_div();
-    let depth = spec.depth.unwrap_or_else(draft_depth);
-    let sampled_spec = spec.sampled.unwrap_or_else(draft_sampled);
-    let conf_floor = spec.conf.unwrap_or_else(spec_conf);
+    let sla_ms = knobs.batch_sla_ms;
+    // Prefill chunking is a latency/work trade, not a per-tick decision.
+    let chunk_div = knobs.prefill_chunk_div;
+    let depth = knobs.draft_depth;
+    let sampled_spec = knobs.draft_sampled;
+    let conf_floor = knobs.spec_conf;
     let has_mtp = model.has_mtp();
     let mut prefix = PrefixStore::new(
-        prefix_cache_budget(),
+        knobs.prefix_cache_budget,
         crate::kvstore::KvSessionStore::from_env(&model, PREFIX_CACHE_MIN_TOKENS),
     );
-    // Resolved once: the KV byte ceiling admission respects alongside the count.
-    let kv_budget = kv_budget_bytes();
-    // Resolved once: the fused-forward row ceiling (0 = uncapped).
-    let max_rows = max_batch_rows();
+    // The KV byte ceiling admission respects alongside the count.
+    let kv_budget = knobs.kv_budget_bytes;
+    // The fused-forward row ceiling (0 = uncapped).
+    let max_rows = knobs.max_batch_rows;
+    // Decode ticks per prefill tick (COLI_ADAPTIVE_WINDOW). Hoisted with the
+    // rest: it used to be re-read every tick through its process-wide latch,
+    // which made it look per-tick-tunable when it never was.
+    let win = knobs.adaptive_window_ratio;
     let mut working_cap = max_batch;
     let mut ewma_decode_us: u64 = 0;
     // Small current-thread runtime just for the priority-aware blocking recv.
@@ -968,7 +986,6 @@ fn run_tuned(
         // Nth engine tick so decode gets more consecutive time before yielding.
         // If no decodes are active yet, always run prefill (else the engine stalls
         // waiting for a prefill that never fires).
-        let win = adaptive_window_ratio();
         let do_prefill = win == 1 || active.is_empty() || steps.is_multiple_of(win as usize);
         // Fusion needs something to fuse *with*: a live decode batch and a
         // pending prefill. Otherwise there is only one forward to run anyway, so
@@ -1387,13 +1404,18 @@ fn run_tuned(
     }
     // Disk-persisted sessions, silent unless COLI_KV_STORE_DIR enabled them.
     if let Some(d) = &prefix.disk {
+        // The write path is asynchronous (kvstore.rs); draining it first makes
+        // entries/resident reflect every accepted checkpoint, and dropped_busy
+        // says how many the depth-1 writer queue declined.
+        d.flush();
         eprintln!(
-            "[kvstore] saved={} loaded={} tokens_restored={} entries={} resident={:.1} MiB",
+            "[kvstore] saved={} loaded={} tokens_restored={} entries={} resident={:.1} MiB dropped_busy={}",
             d.saved,
             d.loaded,
             d.tokens_restored,
             d.entry_count(),
-            d.resident_bytes() as f64 / (1024.0 * 1024.0)
+            d.resident_bytes() as f64 / (1024.0 * 1024.0),
+            d.dropped_busy
         );
     }
     // Speculation accounting, silent when speculation never ran. The accept

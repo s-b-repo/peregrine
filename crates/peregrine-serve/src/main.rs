@@ -350,12 +350,22 @@ fn priority_from_header(v: Option<&str>) -> Priority {
 }
 
 /// Resolve + validate common generation params against the server caps.
-fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>, usize, f32, f32), ApiError> {
+async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>, usize, f32, f32), ApiError> {
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
     let prompt = build_prompt(&req.messages, active_tools(req));
-    let ids = tk(state.inner.tokenizer.encode(&prompt))?;
+    // Encode is CPU-bound and serialized behind the process-wide encode mutex
+    // (`tok.rs`: `encode` is `&mut`, so every request takes the same lock). Run it
+    // on the blocking pool: a burst of B arrivals then parks blocking-pool threads
+    // waiting on that mutex, not the runtime workers the SSE pump tasks and every
+    // other endpoint are scheduled on. parking_lot does not yield to tokio, so
+    // before this change B-1 of a burst's handlers each pinned a worker thread
+    // doing nothing.
+    let tokenizer = state.inner.tokenizer.clone();
+    let ids = tk(tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
+        .await
+        .map_err(|e| ApiError::internal(format!("encode task: {e}")))?)?;
     if ids.len() > state.inner.args.max_prompt_tokens {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -530,7 +540,7 @@ async fn chat_completions(
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
     check_auth(&state, &headers)?;
-    let (ids, max_new, temperature, top_p) = resolve_params(&state, &req)?;
+    let (ids, max_new, temperature, top_p) = resolve_params(&state, &req).await?;
     let model_id = state.inner.args.model_id.clone();
     let priority = priority_from_header(headers.get("x-peregrine-priority").and_then(header_utf8));
     let class = classify_request(&req.messages);
@@ -556,8 +566,23 @@ async fn chat_completions(
             // Stored as token ids, so the transport framing is rebuilt fresh: this
             // request's own completion id and timestamp, and whichever wire format it
             // asked for. A streaming request can be served from an entry a
-            // non-streaming one created.
-            return memo_response(&req, &tokenizer, &out_ids, &completion_id, &model_id, created, prompt_tokens);
+            // non-streaming one created. The replay decodes and re-chunks the whole
+            // completion — CPU time proportional to its length — so it runs on the
+            // blocking pool like every other decode.
+            let stream = req.stream;
+            let tool_defs = active_tools(&req).to_vec();
+            let replay_tok = tokenizer.clone();
+            let frame = ReplayFrame {
+                completion_id: completion_id.clone(),
+                model_id: model_id.clone(),
+                created,
+                prompt_tokens,
+            };
+            return tokio::task::spawn_blocking(move || {
+                memo_response(stream, &tool_defs, &replay_tok, &out_ids, &frame)
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("memo replay task: {e}")))?;
         }
     }
 
@@ -679,7 +704,13 @@ async fn chat_completions(
         if let Some(key) = memo_key {
             state.inner.memo.lock().insert(key, out_ids.clone());
         }
-        let (text, calls) = split_output(&tk(tokenizer.decode(&out_ids))?, active_tools(&req));
+        // Decode goes through the same global tokenizer mutex as encode, so it
+        // belongs on the blocking pool for the same reason (see `resolve_params`).
+        let n_out = out_ids.len();
+        let decoded = tokio::task::spawn_blocking(move || tokenizer.decode(&out_ids))
+            .await
+            .map_err(|e| ApiError::internal(format!("decode task: {e}")))?;
+        let (text, calls) = split_output(&tk(decoded)?, active_tools(&req));
         Ok(Json(json_completion(
             &text,
             &calls,
@@ -687,7 +718,7 @@ async fn chat_completions(
             &model_id,
             created,
             prompt_tokens,
-            out_ids.len(),
+            n_out,
         ))
         .into_response())
     }
@@ -749,24 +780,33 @@ fn json_completion(
 /// The SSE path re-chunks through the same [`tok::IncrementalDecoder`] as a live
 /// stream, so a multi-byte character is split across deltas identically. It is sent
 /// as one ready-made stream with no engine behind it.
-fn memo_response(
-    req: &ChatRequest,
-    tokenizer: &Arc<TokenBackend>,
-    out_ids: &[u32],
-    completion_id: &str,
-    model_id: &str,
+/// The framing a memo replay rebuilds — always *this* request's identifiers and
+/// timestamp, never the original's (see [`memo_response`]).
+struct ReplayFrame {
+    completion_id: String,
+    model_id: String,
     created: u64,
     prompt_tokens: usize,
+}
+
+fn memo_response(
+    stream: bool,
+    tool_defs: &[tools::ToolDef],
+    tokenizer: &TokenBackend,
+    out_ids: &[u32],
+    frame: &ReplayFrame,
 ) -> Result<Response, ApiError> {
-    if !req.stream {
-        let (text, calls) = split_output(&tk(tokenizer.decode(out_ids))?, active_tools(req));
+    let (completion_id, model_id) = (frame.completion_id.as_str(), frame.model_id.as_str());
+    let created = frame.created;
+    if !stream {
+        let (text, calls) = split_output(&tk(tokenizer.decode(out_ids))?, tool_defs);
         return Ok(Json(json_completion(
             &text,
             &calls,
             completion_id,
             model_id,
             created,
-            prompt_tokens,
+            frame.prompt_tokens,
             out_ids.len(),
         ))
         .into_response());
@@ -776,7 +816,7 @@ fn memo_response(
     let mut dec = tok::IncrementalDecoder::new();
     // The replay runs through the same filter as a live stream, so a memoized
     // tool call comes back as a call and not as the markup that produced it.
-    let mut filter = tools::OutputFilter::with_tools(active_tools(req));
+    let mut filter = tools::OutputFilter::with_tools(tool_defs);
     let mut emitted_calls = 0usize;
     let vocab = tokenizer.decode_handle();
     for &t in out_ids {
