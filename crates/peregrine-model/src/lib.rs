@@ -15,6 +15,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod attention;
+pub mod gdn;
 pub mod concurrent;
 pub mod dsa;
 pub mod gpu;

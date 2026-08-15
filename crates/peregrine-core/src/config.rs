@@ -9,9 +9,52 @@ use crate::{Context, Error};
 use serde_json::Value;
 use std::path::Path;
 
+/// Which transformer architecture a checkpoint declares. The engine was built
+/// for GLM-5.2's MLA + routed experts; `DenseGqa` (added 2026-08-15, Track C,
+/// for Qwen3.8) is a plain dense stack with grouped-query attention — no
+/// latents, no routers, every layer's MLP on the dense path the engine already
+/// computes for GLM's `first_k_dense_replace` layers. Detection is by
+/// `model_type`, never by guessing from field presence alone, so an unknown
+/// checkpoint fails loudly instead of loading as the wrong math.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arch {
+    /// GLM-5.2 shape: MLA attention (kv_lora latents), MoE with routed experts.
+    GlmMla,
+    /// Qwen3-family dense shape: GQA attention with per-head q/k RMS norm and
+    /// full-head-dim rotate-half RoPE, SwiGLU MLP every layer.
+    DenseGqa,
+    /// Qwen3.5/3.8 hybrid: `layer_types` interleaves output-gated GQA
+    /// full-attention layers (partial rotate-half RoPE) with gated-DeltaNet
+    /// linear-attention layers carrying a per-stream recurrent state instead
+    /// of KV. Dense SwiGLU MLP every layer, like [`Arch::DenseGqa`].
+    HybridGdn,
+}
+
 /// Parsed `config.json`. Mirrors `Cfg` in `c/glm.c`.
 #[derive(Clone, Debug)]
 pub struct Cfg {
+    pub arch: Arch,
+    /// GQA: number of key/value heads (`num_key_value_heads`); equals `n_heads`
+    /// under MLA (where every head shares the latent anyway — unused there).
+    pub n_kv_heads: i64,
+    /// GQA: per-head dimension (`head_dim`, defaulting to hidden/n_heads).
+    /// 0 under MLA, whose head geometry is qk_nope/qk_rope/v_head.
+    pub head_dim: i64,
+    /// HybridGdn: which layers run full attention (`layer_types`); `true` =
+    /// full attention, `false` = gated-DeltaNet linear attention. Empty for
+    /// the other architectures (every layer is whatever the arch says).
+    pub full_attn: Vec<bool>,
+    /// HybridGdn: whether q_proj emits `[n_heads*head_dim*2]` — query in the
+    /// first flat half, a sigmoid output gate in the second
+    /// (`attn_output_gate`). The gate multiplies the attention output before
+    /// o_proj.
+    pub attn_gate: bool,
+    /// Gated-DeltaNet geometry (`linear_*` in config.json); zero elsewhere.
+    pub lin_k_heads: i64,
+    pub lin_v_heads: i64,
+    pub lin_k_dim: i64,
+    pub lin_v_dim: i64,
+    pub lin_conv_k: i64,
     pub hidden: i64,
     pub n_layers: i64,
     pub n_heads: i64,
@@ -71,6 +114,26 @@ impl Cfg {
 
     /// Parse a config from an already-decoded JSON value (used by tests).
     pub fn from_json(root: &Value) -> Result<Cfg, Error> {
+        // Architecture dispatch, on the checkpoint's own declaration. Absent
+        // `model_type` keeps the historical GLM path (laptop-converted GLM
+        // containers predate this field being read), but a *declared* type this
+        // engine does not implement is a loud error, not a GLM-shaped guess.
+        match root.get("model_type").and_then(|v| v.as_str()) {
+            // Hybrid families first: "qwen3_5"/"qwen3_next" (and the VL wrapper,
+            // whose text stack lives under `text_config`) — checked before the
+            // "qwen3" prefix would swallow them into the pure-dense path.
+            Some(t) if t.starts_with("qwen3_5") || t.starts_with("qwen3_next") => {
+                return Cfg::from_json_hybrid(root.get("text_config").unwrap_or(root))
+            }
+            Some(t) if t.starts_with("qwen3") => return Cfg::from_json_gqa(root),
+            Some(t) if t.starts_with("glm") || t.starts_with("deepseek") => {}
+            None => {}
+            Some(other) => {
+                return Err(Error::Format(format!(
+                    "config: model_type \"{other}\" is not supported (glm/deepseek MLA-MoE, qwen3 dense-GQA, or qwen3_5 hybrid)"
+                )))
+            }
+        }
         let n_layers = gi(root, "num_hidden_layers");
 
         // stop tokens: eos_token_id is a scalar or an array. Every listed id is
@@ -144,6 +207,16 @@ impl Cfg {
         };
 
         let mut c = Cfg {
+            arch: Arch::GlmMla,
+            n_kv_heads: gi(root, "num_attention_heads"),
+            head_dim: 0,
+            full_attn: Vec::new(),
+            attn_gate: false,
+            lin_k_heads: 0,
+            lin_v_heads: 0,
+            lin_k_dim: 0,
+            lin_v_dim: 0,
+            lin_conv_k: 0,
             hidden: gi(root, "hidden_size"),
             n_layers,
             n_heads: gi(root, "num_attention_heads"),
@@ -180,6 +253,246 @@ impl Cfg {
         }
         c.validate()?;
         Ok(c)
+    }
+
+    /// Parse a Qwen3-family dense-GQA config. The MoE/MLA fields are filled
+    /// with the degenerate values that keep every existing invariant true —
+    /// `first_dense = n_layers` means no layer ever takes the sparse path, so
+    /// `n_experts = topk = 1` are never consulted by routing — rather than
+    /// with zeros that would trip bounds checks or divide-by-zero downstream.
+    fn from_json_gqa(root: &Value) -> Result<Cfg, Error> {
+        let n_layers = gi(root, "num_hidden_layers");
+        let hidden = gi(root, "hidden_size");
+        let n_heads = gi(root, "num_attention_heads");
+        let n_kv_heads = match gi(root, "num_key_value_heads") {
+            0 => n_heads, // MHA spelling: absent field means every head has its own KV
+            n => n,
+        };
+        let head_dim = match gi(root, "head_dim") {
+            0 if n_heads > 0 => hidden / n_heads,
+            hd => hd,
+        };
+        let mut stop_ids = Vec::new();
+        match root.get("eos_token_id") {
+            Some(Value::Number(n)) => match n.as_i64() {
+                Some(id) => stop_ids.push(id as i32),
+                None => return Err(Error::Format(format!("config: eos_token_id={n} is not an integer"))),
+            },
+            Some(Value::Array(a)) => {
+                for v in a.iter() {
+                    match v.as_i64() {
+                        Some(id) => stop_ids.push(id as i32),
+                        None => return Err(Error::Format(format!("config: eos_token_id entry {v} is not an integer"))),
+                    }
+                }
+            }
+            _ => {}
+        }
+        let theta_json = root
+            .get("rope_parameters")
+            .and_then(|rp| rp.get("rope_theta"))
+            .or_else(|| root.get("rope_theta"));
+        let theta = match theta_json.and_then(|v| v.as_f64()) {
+            Some(f) if f.is_finite() && f > 0.0 => f as f32,
+            // GQA rotates every head lane; an unparseable theta would scramble
+            // every position, so there is no safe default here at all.
+            _ => return Err(Error::Format("config: qwen3 checkpoint without a positive rope_theta".into())),
+        };
+        let dense_inter = gi(root, "intermediate_size");
+        let c = Cfg {
+            arch: Arch::DenseGqa,
+            n_kv_heads,
+            head_dim,
+            full_attn: Vec::new(),
+            attn_gate: false,
+            lin_k_heads: 0,
+            lin_v_heads: 0,
+            lin_k_dim: 0,
+            lin_v_dim: 0,
+            lin_conv_k: 0,
+            hidden,
+            n_layers,
+            n_heads,
+            // Degenerate MoE: no layer is sparse (first_dense = n_layers), so
+            // these exist only to satisfy shared bounds checks.
+            n_experts: 1,
+            topk: 1,
+            moe_inter: dense_inter,
+            dense_inter,
+            first_dense: n_layers,
+            q_lora: 0,
+            kv_lora: 0,
+            qk_nope: 0,
+            // The full head is rotated, so head_dim doubles as the RoPE span —
+            // which keeps `RopeTable::from_cfg` and `attn_scale` correct without
+            // a parallel set of derived fields.
+            qk_rope: head_dim,
+            v_head: head_dim,
+            n_shared: 0,
+            vocab: gi(root, "vocab_size"),
+            n_group: 1,
+            topk_group: 1,
+            norm_topk: false,
+            eps: gf(root, "rms_norm_eps", 1e-6),
+            routed_scale: 1.0,
+            theta,
+            stop_ids,
+            index_topk: 0,
+            index_nh: 0,
+            index_hd: 0,
+            idx_type: vec![false; n_layers.max(0) as usize],
+            qk_head: head_dim,
+            attn_scale: 1.0 / (head_dim.max(1) as f32).sqrt(),
+        };
+        c.validate_gqa()?;
+        Ok(c)
+    }
+
+    /// Parse a Qwen3.5/3.8-family hybrid config (`root` is already the text
+    /// sub-config when the checkpoint is the VL wrapper). Everything the
+    /// dense-GQA parse establishes holds; on top of it: the per-layer
+    /// full/linear schedule, the attention output gate, partial rotary, and
+    /// the gated-DeltaNet geometry.
+    fn from_json_hybrid(root: &Value) -> Result<Cfg, Error> {
+        let mut c = Cfg::from_json_gqa(root)?;
+        c.arch = Arch::HybridGdn;
+        let n_layers = c.n_layers.max(0) as usize;
+        // The explicit list wins; `full_attention_interval = k` (every k-th
+        // layer, 1-indexed: layers k-1, 2k-1, …) is the fallback spelling.
+        c.full_attn = match root.get("layer_types").and_then(|v| v.as_array()) {
+            Some(types) => {
+                if types.len() != n_layers {
+                    return Err(Error::Format(format!(
+                        "config: layer_types lists {} layers but num_hidden_layers={n_layers}",
+                        types.len()
+                    )));
+                }
+                let mut out = Vec::with_capacity(n_layers);
+                for (i, t) in types.iter().enumerate() {
+                    match t.as_str() {
+                        Some("full_attention") => out.push(true),
+                        Some("linear_attention") => out.push(false),
+                        other => {
+                            return Err(Error::Format(format!(
+                                "config: layer_types[{i}] = {other:?} (expected full_attention | linear_attention)"
+                            )))
+                        }
+                    }
+                }
+                out
+            }
+            None => {
+                let k = gi(root, "full_attention_interval").max(1) as usize;
+                (0..n_layers).map(|i| (i + 1) % k == 0).collect()
+            }
+        };
+        c.attn_gate = root.get("attn_output_gate").and_then(|v| v.as_bool()).unwrap_or(false);
+        c.lin_k_heads = gi(root, "linear_num_key_heads");
+        c.lin_v_heads = gi(root, "linear_num_value_heads");
+        c.lin_k_dim = gi(root, "linear_key_head_dim");
+        c.lin_v_dim = gi(root, "linear_value_head_dim");
+        c.lin_conv_k = gi(root, "linear_conv_kernel_dim");
+        // Partial rotary narrows the RoPE span (qk_rope doubles as that span —
+        // see from_json_gqa); the score scale stays 1/sqrt(head_dim).
+        let pr = root
+            .get("partial_rotary_factor")
+            .or_else(|| root.get("rope_parameters").and_then(|rp| rp.get("partial_rotary_factor")))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        if !(pr > 0.0 && pr <= 1.0) {
+            return Err(Error::Format(format!("config: partial_rotary_factor={pr} is outside (0,1]")));
+        }
+        c.qk_rope = ((c.head_dim as f64 * pr) as i64) & !1; // even, per the RoPE pair rule
+        if c.qk_rope < 2 {
+            return Err(Error::Format(format!(
+                "config: partial rotary span {} is too small to rotate a pair",
+                c.qk_rope
+            )));
+        }
+        c.validate_hybrid()?;
+        Ok(c)
+    }
+
+    /// The linear-attention geometry checks on top of [`Self::validate_gqa`]
+    /// (which already ran inside [`Self::from_json_gqa`]).
+    fn validate_hybrid(&self) -> Result<(), Error> {
+        let ck = |name: &str, v: i64, lo: i64, hi: i64| -> Result<(), Error> {
+            if v < lo || v > hi {
+                Err(Error::Format(format!("config: {name}={v} is outside [{lo},{hi}]")))
+            } else {
+                Ok(())
+            }
+        };
+        // A hybrid with no linear layers is just dense GQA misdeclared; with no
+        // full layers it still works, so only the geometry is bounds-checked.
+        if self.full_attn.iter().any(|f| !f) {
+            ck("linear_num_key_heads", self.lin_k_heads, 1, 1024)?;
+            ck("linear_num_value_heads", self.lin_v_heads, 1, 4096)?;
+            ck("linear_key_head_dim", self.lin_k_dim, 1, 1 << 16)?;
+            ck("linear_value_head_dim", self.lin_v_dim, 1, 1 << 16)?;
+            ck("linear_conv_kernel_dim", self.lin_conv_k, 1, 64)?;
+            if self.lin_v_heads % self.lin_k_heads != 0 {
+                return Err(Error::Format(format!(
+                    "config: linear_num_value_heads={} is not a multiple of linear_num_key_heads={}",
+                    self.lin_v_heads, self.lin_k_heads
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Bounds checks for the dense-GQA shape — the same hostile-config choke
+    /// point [`Self::validate`] is for MLA, over the fields GQA actually reads.
+    fn validate_gqa(&self) -> Result<(), Error> {
+        let ck = |name: &str, v: i64, lo: i64, hi: i64| -> Result<(), Error> {
+            if v < lo || v > hi {
+                Err(Error::Format(format!("config: {name}={v} is outside [{lo},{hi}]")))
+            } else {
+                Ok(())
+            }
+        };
+        ck("hidden_size", self.hidden, 1, 1 << 20)?;
+        ck("num_hidden_layers", self.n_layers, 1, 128)?;
+        ck("num_attention_heads", self.n_heads, 1, 1024)?;
+        ck("num_key_value_heads", self.n_kv_heads, 1, self.n_heads)?;
+        ck("head_dim", self.head_dim, 2, 1 << 16)?;
+        ck("intermediate_size", self.dense_inter, 1, 1 << 24)?;
+        ck("vocab_size", self.vocab, 1, 1 << 24)?;
+        // Grouped queries share KV heads in whole groups; a ragged ratio would
+        // leave some queries with no defined KV head.
+        if self.n_heads % self.n_kv_heads != 0 {
+            return Err(Error::Format(format!(
+                "config: num_attention_heads={} is not a multiple of num_key_value_heads={}",
+                self.n_heads, self.n_kv_heads
+            )));
+        }
+        if self.head_dim % 2 != 0 {
+            return Err(Error::Format(format!(
+                "config: head_dim={} must be even (RoPE rotates lane pairs)",
+                self.head_dim
+            )));
+        }
+        Ok(())
+    }
+
+    /// Width of one cached row in the KV cache's first slot: the MLA compressed
+    /// latent, or all GQA key heads for one position. [`LayerKv`] is
+    /// width-parameterized, which is what lets both architectures share every
+    /// cache mechanism (prefix cache, disk sessions, truncate/clone) unchanged.
+    pub fn kv_row_a(&self) -> i64 {
+        match self.arch {
+            Arch::GlmMla => self.kv_lora,
+            Arch::DenseGqa | Arch::HybridGdn => self.n_kv_heads * self.head_dim,
+        }
+    }
+
+    /// Width of one cached row in the second slot: MLA's rope keys, or all GQA
+    /// value heads for one position.
+    pub fn kv_row_b(&self) -> i64 {
+        match self.arch {
+            Arch::GlmMla => self.qk_rope,
+            Arch::DenseGqa | Arch::HybridGdn => self.n_kv_heads * self.head_dim,
+        }
     }
 
     /// The `CKR` bounds checks from `load_cfg` — a single choke point that
@@ -378,6 +691,147 @@ mod tests {
         let mut j = tiny_json();
         j["rope_parameters"] = serde_json::json!({ "rope_type": "default" });
         assert!(Cfg::from_json(&j).is_err(), "a roped model must not silently default theta");
+    }
+
+    /// The Track-C tiny Qwen-shaped config (kept in sync with
+    /// `peregrine_model::testkit::tiny_qwen_cfg_json` — C2's importer fixture
+    /// matches these dims).
+    fn tiny_qwen_json() -> Value {
+        serde_json::json!({
+            "model_type": "qwen3",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6,
+            "eos_token_id": 0
+        })
+    }
+
+    #[test]
+    fn qwen3_config_parses_as_dense_gqa() -> Result<(), Error> {
+        let c = Cfg::from_json(&tiny_qwen_json())?;
+        assert_eq!(c.arch, Arch::DenseGqa);
+        assert_eq!((c.n_heads, c.n_kv_heads, c.head_dim), (4, 2, 4));
+        // Degenerate MoE invariants: no sparse layer can ever engage.
+        assert_eq!(c.first_dense, c.n_layers, "every layer must take the dense path");
+        assert_eq!((c.n_experts, c.topk), (1, 1));
+        // head_dim doubles as the RoPE span and the score scale basis.
+        assert_eq!(c.qk_rope, 4);
+        assert_eq!(c.qk_head, 4);
+        assert!((c.attn_scale - 0.5).abs() < 1e-9); // 1/sqrt(4)
+        // KV rows: all K heads in slot a, all V heads in slot b.
+        assert_eq!((c.kv_row_a(), c.kv_row_b()), (8, 8));
+        Ok(())
+    }
+
+    #[test]
+    fn qwen3_defaults_head_dim_and_kv_heads_when_absent() -> Result<(), Error> {
+        let mut j = tiny_qwen_json();
+        if let Some(o) = j.as_object_mut() {
+            o.remove("head_dim");
+            o.remove("num_key_value_heads");
+        }
+        let c = Cfg::from_json(&j)?;
+        assert_eq!(c.head_dim, 4, "head_dim defaults to hidden/n_heads");
+        assert_eq!(c.n_kv_heads, 4, "absent num_key_value_heads means MHA");
+        Ok(())
+    }
+
+    #[test]
+    fn declared_unknown_model_type_is_a_loud_error() {
+        let mut j = tiny_json();
+        j["model_type"] = serde_json::json!("llama");
+        assert!(Cfg::from_json(&j).is_err(), "an unimplemented declared arch must not load as GLM");
+        // ...while GLM-family declarations and the historical absent field both load.
+        let mut j2 = tiny_json();
+        j2["model_type"] = serde_json::json!("glm_moe");
+        assert!(Cfg::from_json(&j2).is_ok());
+        assert_eq!(Cfg::from_json(&tiny_json()).map(|c| c.arch).ok(), Some(Arch::GlmMla));
+    }
+
+    #[test]
+    fn gqa_rejects_ragged_head_grouping_and_theta_less_configs() {
+        let mut j = tiny_qwen_json();
+        j["num_key_value_heads"] = serde_json::json!(3); // 4 % 3 != 0
+        assert!(Cfg::from_json(&j).is_err());
+        let mut j2 = tiny_qwen_json();
+        if let Some(o) = j2.as_object_mut() {
+            o.remove("rope_theta");
+        }
+        assert!(Cfg::from_json(&j2).is_err(), "GQA rotates every lane; theta cannot default");
+    }
+
+    /// The Track-C tiny hybrid config: 3 layers (linear, linear, full), the
+    /// qwen3_5 shape at toy dims. Kept in sync with
+    /// `peregrine_model::testkit::tiny_hybrid_cfg_json` and C2's importer fixture.
+    fn tiny_hybrid_json() -> Value {
+        serde_json::json!({
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 8,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "full_attention_interval": 3,
+                "layer_types": ["linear_attention", "linear_attention", "full_attention"],
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 4,
+                "linear_value_head_dim": 4,
+                "linear_conv_kernel_dim": 4,
+                "attn_output_gate": true,
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": {"rope_theta": 10000000.0, "partial_rotary_factor": 0.25},
+                "rms_norm_eps": 1e-6,
+                "eos_token_id": 0
+            }
+        })
+    }
+
+    #[test]
+    fn qwen3_5_config_parses_as_hybrid() -> Result<(), Error> {
+        let c = Cfg::from_json(&tiny_hybrid_json())?;
+        assert_eq!(c.arch, Arch::HybridGdn);
+        assert_eq!(c.full_attn, vec![false, false, true]);
+        assert!(c.attn_gate);
+        assert_eq!((c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim, c.lin_conv_k), (2, 4, 4, 4, 4));
+        // Partial rotary: span = head_dim * 0.25 = 2 lanes; scale on full head_dim.
+        assert_eq!(c.qk_rope, 2);
+        assert!((c.attn_scale - 1.0 / (8f32).sqrt()).abs() < 1e-9);
+        assert_eq!(c.theta, 10_000_000.0);
+        // KV rows cover only full-attention layers' geometry.
+        assert_eq!((c.kv_row_a(), c.kv_row_b()), (16, 16));
+        assert_eq!(c.first_dense, c.n_layers, "hybrid MLPs all take the dense path");
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_layer_types_must_match_layer_count() {
+        let mut j = tiny_hybrid_json();
+        j["text_config"]["layer_types"] = serde_json::json!(["linear_attention", "full_attention"]);
+        assert!(Cfg::from_json(&j).is_err(), "a 2-entry schedule for 3 layers must not load");
+    }
+
+    #[test]
+    fn hybrid_interval_fallback_matches_the_shipped_schedule() -> Result<(), Error> {
+        // Drop the explicit list; full_attention_interval=3 must reproduce it
+        // (1-indexed every-3rd: layers 2, 5, … → here just layer index 2).
+        let mut j = tiny_hybrid_json();
+        if let Some(o) = j["text_config"].as_object_mut() {
+            o.remove("layer_types");
+        }
+        let c = Cfg::from_json(&j)?;
+        assert_eq!(c.full_attn, vec![false, false, true]);
+        Ok(())
     }
 
     #[test]

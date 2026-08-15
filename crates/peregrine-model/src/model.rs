@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use peregrine_core::{Cfg, Context, Error, SafeTensors};
+use peregrine_core::{Arch, Cfg, Context, Error, SafeTensors};
+use crate::gdn::GdnState;
 use peregrine_io::{Reactor, WarmCache};
 
 use crate::attention::{
@@ -29,13 +30,7 @@ use crate::weight::QtWeight;
 struct LayerW {
     in_ln: Vec<f32>,
     post_ln: Vec<f32>,
-    q_a: QtWeight,
-    q_a_ln: Vec<f32>,
-    q_b: QtWeight,
-    kv_a: QtWeight,
-    kv_a_ln: Vec<f32>,
-    kv_b: QtWeight,
-    o: QtWeight,
+    attn: LayerAttn,
     sparse: bool,
     dense: Option<Mlp>,          // dense layers (i < first_dense)
     router: Vec<f32>,            // [E, hidden] (sparse only)
@@ -47,16 +42,91 @@ struct LayerW {
     indexer: Option<IndexerWeights>,
 }
 
+/// Per-layer attention weights, one variant per architecture family. GLM's
+/// MLA is the historical shape; `Gqa` serves `Arch::DenseGqa` layers and the
+/// hybrid's full-attention layers; `Gdn` is the hybrid's gated-DeltaNet
+/// linear-attention layer (Track C).
+enum LayerAttn {
+    Mla {
+        q_a: QtWeight,
+        q_a_ln: Vec<f32>,
+        q_b: QtWeight,
+        kv_a: QtWeight,
+        kv_a_ln: Vec<f32>,
+        kv_b: QtWeight,
+        o: QtWeight,
+    },
+    Gqa {
+        wq: QtWeight,
+        wk: QtWeight,
+        wv: QtWeight,
+        o: QtWeight,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+    },
+    Gdn {
+        in_qkv: QtWeight,
+        in_z: QtWeight,
+        in_a: QtWeight,
+        in_b: QtWeight,
+        conv: Vec<f32>,
+        a_log: Vec<f32>,
+        dt_bias: Vec<f32>,
+        norm: Vec<f32>,
+        out: QtWeight,
+    },
+}
+
 impl LayerW {
-    fn attn(&self) -> AttnWeights<'_> {
-        AttnWeights {
-            q_a: &self.q_a,
-            q_a_ln: &self.q_a_ln,
-            q_b: &self.q_b,
-            kv_a: &self.kv_a,
-            kv_a_ln: &self.kv_a_ln,
-            kv_b: &self.kv_b,
-            o: &self.o,
+    /// The MLA weight view. Callers on MLA-only paths (the GLM forward, MTP,
+    /// absorb) reach attention through this; a non-MLA layer here is a wiring
+    /// bug reported as an error, never a panic.
+    fn attn(&self) -> Result<AttnWeights<'_>, Error> {
+        match &self.attn {
+            LayerAttn::Mla { q_a, q_a_ln, q_b, kv_a, kv_a_ln, kv_b, o } => Ok(AttnWeights {
+                q_a,
+                q_a_ln,
+                q_b,
+                kv_a,
+                kv_a_ln,
+                kv_b,
+                o,
+            }),
+            _ => Err(Error::Format("MLA attention path reached on a non-MLA layer".into())),
+        }
+    }
+
+    fn gqa(&self, gated: bool) -> Result<crate::attention::GqaWeights<'_>, Error> {
+        match &self.attn {
+            LayerAttn::Gqa { wq, wk, wv, o, q_norm, k_norm } => Ok(crate::attention::GqaWeights {
+                wq,
+                wk,
+                wv,
+                o,
+                q_norm,
+                k_norm,
+                gated,
+            }),
+            _ => Err(Error::Format("GQA attention path reached on a non-GQA layer".into())),
+        }
+    }
+
+    fn gdn(&self) -> Result<crate::gdn::GdnWeights<'_>, Error> {
+        match &self.attn {
+            LayerAttn::Gdn { in_qkv, in_z, in_a, in_b, conv, a_log, dt_bias, norm, out } => {
+                Ok(crate::gdn::GdnWeights {
+                    in_qkv,
+                    in_z,
+                    in_a,
+                    in_b,
+                    conv,
+                    a_log,
+                    dt_bias,
+                    norm,
+                    out,
+                })
+            }
+            _ => Err(Error::Format("GDN attention path reached on a non-GDN layer".into())),
         }
     }
 }
@@ -98,6 +168,10 @@ pub struct Model {
     final_norm: Vec<f32>,
     lm_head: QtWeight,
     kv: Vec<LayerKv>,
+    /// Per-layer gated-DeltaNet recurrent state for the engine's own sequence
+    /// (`Arch::HybridGdn` linear layers; `None` slots elsewhere). The linear
+    /// layers' analogue of `kv` — constant-size, reset with it.
+    gdn: Vec<Option<GdnState>>,
     /// When set, routed experts are streamed from `st` per layer on demand
     /// instead of held resident — required to run models that exceed RAM
     /// (e.g. the 744B GLM-5.2). `LayerW::experts` is empty in this mode.
@@ -358,7 +432,7 @@ impl SeqKv {
     /// [`Self::new`] at an explicit element type, so a test can exercise the
     /// narrow path without a process-wide environment variable.
     pub fn with_dtype(cfg: &Cfg, dt: KvDtype) -> SeqKv {
-        let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let (kvl, qkr) = (cfg.kv_row_a() as usize, cfg.kv_row_b() as usize);
         SeqKv { layers: (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, dt)).collect() }
     }
 
@@ -465,7 +539,7 @@ impl SeqKv {
     /// goes through the same order-checked [`LayerKv::append`] path prefill
     /// uses, so an import can never construct a cache prefill could not.
     pub fn import(cfg: &Cfg, dt: KvDtype, ex: &KvExport) -> Result<SeqKv, Error> {
-        let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let (kvl, qkr) = (cfg.kv_row_a() as usize, cfg.kv_row_b() as usize);
         if ex.layers.len() != cfg.n_layers as usize {
             return Err(Error::Format(format!(
                 "KV import: {} layers in the export, model has {}",
@@ -2185,13 +2259,74 @@ fn load_f32(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
 /// Load one transformer layer (`model.layers.{i}.*`). In streaming mode the
 /// routed experts are left on disk (presence-checked only); otherwise resident.
 /// Reused for both the main stack and the MTP head layer.
+/// The per-layer tensor prefix for this architecture — GLM/DeepSeek and dense
+/// Qwen3 checkpoints put the stack at `model.layers.*`; the Qwen3.5 hybrid's
+/// text stack lives under `model.language_model.layers.*` (the VL wrapper's
+/// naming, kept verbatim per the Track C contract).
+fn layer_prefix(cfg: &Cfg, i: usize) -> String {
+    match cfg.arch {
+        Arch::GlmMla | Arch::DenseGqa => format!("model.layers.{i}."),
+        Arch::HybridGdn => format!("model.language_model.layers.{i}."),
+    }
+}
+
 fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Result<LayerW, Error> {
     let d = cfg.hidden as usize;
     let h = cfg.n_heads as usize;
     let (qkh, vh) = (cfg.qk_head as usize, cfg.v_head as usize);
-    let (ql, kvl, qkr, qkn) = (cfg.q_lora as usize, cfg.kv_lora as usize, cfg.qk_rope as usize, cfg.qk_nope as usize);
-    let p = |s: &str| format!("model.layers.{i}.{s}");
+    let (ql, kvl, qkn) = (cfg.q_lora as usize, cfg.kv_lora as usize, cfg.qk_nope as usize);
+    let qkr = cfg.qk_rope as usize;
+    let pre = layer_prefix(cfg, i);
+    let p = |s: &str| format!("{pre}{s}");
     let sparse = i >= cfg.first_dense as usize;
+
+    let attn = match cfg.arch {
+        Arch::GlmMla => LayerAttn::Mla {
+            q_a: QtWeight::load(st, &p("self_attn.q_a_proj.weight"), ql, d)?,
+            q_a_ln: load_f32(st, &p("self_attn.q_a_layernorm.weight"), ql)?,
+            q_b: QtWeight::load(st, &p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
+            kv_a: QtWeight::load(st, &p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d)?,
+            kv_a_ln: load_f32(st, &p("self_attn.kv_a_layernorm.weight"), kvl)?,
+            kv_b: QtWeight::load(st, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
+            o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, h * vh)?,
+        },
+        Arch::DenseGqa | Arch::HybridGdn
+            if cfg.arch == Arch::DenseGqa || cfg.full_attn.get(i).copied().unwrap_or(false) =>
+        {
+            let (nh, nkv, hd) = (cfg.n_heads as usize, cfg.n_kv_heads as usize, cfg.head_dim as usize);
+            // attn_output_gate widens q_proj to [2*nh*hd, d]: query rows then
+            // gate rows, the flat-chunk layout (Track C contract, gate-pinned).
+            let q_rows = if cfg.attn_gate { 2 * nh * hd } else { nh * hd };
+            LayerAttn::Gqa {
+                wq: QtWeight::load(st, &p("self_attn.q_proj.weight"), q_rows, d)?,
+                wk: QtWeight::load(st, &p("self_attn.k_proj.weight"), nkv * hd, d)?,
+                wv: QtWeight::load(st, &p("self_attn.v_proj.weight"), nkv * hd, d)?,
+                o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, nh * hd)?,
+                q_norm: load_f32(st, &p("self_attn.q_norm.weight"), hd)?,
+                k_norm: load_f32(st, &p("self_attn.k_norm.weight"), hd)?,
+            }
+        }
+        Arch::DenseGqa | Arch::HybridGdn => {
+            let (kh, vh_l, kd, vd) = (
+                cfg.lin_k_heads as usize,
+                cfg.lin_v_heads as usize,
+                cfg.lin_k_dim as usize,
+                cfg.lin_v_dim as usize,
+            );
+            let conv_dim = 2 * kh * kd + vh_l * vd;
+            LayerAttn::Gdn {
+                in_qkv: QtWeight::load(st, &p("linear_attn.in_proj_qkv.weight"), conv_dim, d)?,
+                in_z: QtWeight::load(st, &p("linear_attn.in_proj_z.weight"), vh_l * vd, d)?,
+                in_a: QtWeight::load(st, &p("linear_attn.in_proj_a.weight"), vh_l, d)?,
+                in_b: QtWeight::load(st, &p("linear_attn.in_proj_b.weight"), vh_l, d)?,
+                conv: load_f32(st, &p("linear_attn.conv1d.weight"), conv_dim * cfg.lin_conv_k as usize)?,
+                a_log: load_f32(st, &p("linear_attn.A_log"), vh_l)?,
+                dt_bias: load_f32(st, &p("linear_attn.dt_bias"), vh_l)?,
+                norm: load_f32(st, &p("linear_attn.norm.weight"), vd)?,
+                out: QtWeight::load(st, &p("linear_attn.out_proj.weight"), d, vh_l * vd)?,
+            }
+        }
+    };
 
     let (mut dense, mut router, mut router_bias, mut shared, mut experts) =
         (None, Vec::new(), Vec::new(), None, Vec::new());
@@ -2212,7 +2347,7 @@ fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Re
             down: QtWeight::load(st, &p("mlp.shared_experts.down_proj.weight"), d, si)?,
         });
         for e in 0..e_n {
-            let pe = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
+            let pe = |s: &str| format!("{pre}mlp.experts.{e}.{s}");
             if stream_experts {
                 // don't hold experts resident; verify presence so a malformed
                 // checkpoint fails at load, not mid-decode.
@@ -2235,13 +2370,7 @@ fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Re
     Ok(LayerW {
         in_ln: load_f32(st, &p("input_layernorm.weight"), d)?,
         post_ln: load_f32(st, &p("post_attention_layernorm.weight"), d)?,
-        q_a: QtWeight::load(st, &p("self_attn.q_a_proj.weight"), ql, d)?,
-        q_a_ln: load_f32(st, &p("self_attn.q_a_layernorm.weight"), ql)?,
-        q_b: QtWeight::load(st, &p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
-        kv_a: QtWeight::load(st, &p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d)?,
-        kv_a_ln: load_f32(st, &p("self_attn.kv_a_layernorm.weight"), kvl)?,
-        kv_b: QtWeight::load(st, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
-        o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, h * vh)?,
+        attn,
         sparse,
         dense,
         router,
@@ -2276,15 +2405,25 @@ fn rmsnorm_rows(x: &[f32], w: &[f32], s_n: usize, d: usize, eps: f32) -> Vec<f32
 /// Forward one transformer layer in place: `x += attn(norm(x)); x += ffn(norm(x))`.
 /// Shared by the main stack and the MTP head; the sparse-MoE streaming/GPU lanes
 /// apply exactly as in the main loop. Compute state travels in [`ForwardCtx`].
+/// One layer's mutable sequence state: the KV cache every architecture except
+/// GDN appends to, and the GDN recurrent state when the calling path can
+/// supply one (`None` on external-KV / replay / MTP paths, which is what makes
+/// a GDN layer there a clean error instead of silent corruption).
+struct LayerState<'a> {
+    kv: &'a mut LayerKv,
+    gdn: Option<&'a mut GdnState>,
+}
+
 fn forward_layer(
     l: &LayerW,
     li: usize,
-    kv: &mut LayerKv,
+    state: LayerState<'_>,
     ctx: &ForwardCtx,
     x: &mut [f32],
     s_n: usize,
     pos_base: usize,
 ) -> Result<(), Error> {
+    let LayerState { kv, gdn } = state;
     let cfg = ctx.cfg;
     let d = cfg.hidden as usize;
     let eps = cfg.eps;
@@ -2302,10 +2441,23 @@ fn forward_layer(
     // with an indexer and `COLI_DSA=1` takes the dense-sparse path even when
     // `COLI_MLA_ABSORB` is also set — stated here rather than left to
     // whichever branch happened to come first.
-    let attn = match (ctx.dsa.then_some(()).and(l.indexer.as_ref()), ctx.absorb) {
-        (Some(ix), _) => mla_attention_dsa_indexed(&l.attn(), ix, &nrm, s_n, pos_base, kv, cfg)?,
-        (None, true) => mla_attention_absorb(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?,
-        (None, false) => mla_attention(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?,
+    let attn = match &l.attn {
+        LayerAttn::Gqa { .. } => crate::attention::gqa_attention(&l.gqa(cfg.attn_gate)?, &nrm, s_n, pos_base, kv, cfg)?,
+        LayerAttn::Gdn { .. } => {
+            // A GDN layer's context lives in a recurrent state, not the KV
+            // cache. Paths that cannot supply one (external-KV serving, RLM
+            // replay, the GLM MTP head) get a clean refusal — Track C phase 2
+            // gives serving its own per-sequence state.
+            let st_g = gdn.ok_or_else(|| {
+                Error::Format(format!("layer {li}: gated-DeltaNet needs a recurrent state on this path (hybrid serving is Track C phase 2)"))
+            })?;
+            crate::gdn::gdn_forward(&l.gdn()?, &nrm, s_n, st_g, cfg)?
+        }
+        LayerAttn::Mla { .. } => match (ctx.dsa.then_some(()).and(l.indexer.as_ref()), ctx.absorb) {
+            (Some(ix), _) => mla_attention_dsa_indexed(&l.attn()?, ix, &nrm, s_n, pos_base, kv, cfg)?,
+            (None, true) => mla_attention_absorb(&l.attn()?, &nrm, s_n, pos_base, kv, cfg)?,
+            (None, false) => mla_attention(&l.attn()?, &nrm, s_n, pos_base, kv, cfg)?,
+        },
     };
     for z in 0..s_n * d {
         x[z] += attn[z];
@@ -2349,7 +2501,33 @@ fn forward_layer_batched(
     let eps = cfg.eps;
     let s_n = rows_at.len();
     let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
-    let attn = mla_attention_rows(&l.attn(), &nrm, rows_at, caches, cfg, ctx.absorb)?;
+    let attn = match &l.attn {
+        LayerAttn::Mla { .. } => mla_attention_rows(&l.attn()?, &nrm, rows_at, caches, cfg, ctx.absorb)?,
+        LayerAttn::Gqa { .. } => {
+            // Batched GQA decode: each row attends its own cache, so the batch
+            // form is the single form per row (the MoE-free analogue of what
+            // mla_attention_rows does; rows share nothing but weights).
+            let w = l.gqa(cfg.attn_gate)?;
+            let mut out = vec![0.0f32; s_n * d];
+            for s in 0..s_n {
+                let row = crate::attention::gqa_attention(
+                    &w,
+                    &nrm[s * d..(s + 1) * d],
+                    1,
+                    rows_at.pos_of[s],
+                    caches[rows_at.owner[s]],
+                    cfg,
+                )?;
+                out[s * d..(s + 1) * d].copy_from_slice(&row);
+            }
+            out
+        }
+        LayerAttn::Gdn { .. } => {
+            return Err(Error::Format(
+                "batched decode over gated-DeltaNet layers needs per-sequence recurrent state (Track C phase 2)".into(),
+            ))
+        }
+    };
     for z in 0..s_n * d {
         x[z] += attn[z];
     }
@@ -2519,12 +2697,16 @@ impl Model {
         };
 
         let d = cfg.hidden as usize;
-        let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let (kvl, qkr) = (cfg.kv_row_a() as usize, cfg.kv_row_b() as usize);
         let vocab = cfg.vocab as usize;
 
-        let embed = QtWeight::load(&st, "model.embed_tokens.weight", vocab, d)?;
+        let (embed_name, norm_name) = match cfg.arch {
+            Arch::GlmMla | Arch::DenseGqa => ("model.embed_tokens.weight", "model.norm.weight"),
+            Arch::HybridGdn => ("model.language_model.embed_tokens.weight", "model.language_model.norm.weight"),
+        };
+        let embed = QtWeight::load(&st, embed_name, vocab, d)?;
         let lm_head = QtWeight::load(&st, "lm_head.weight", vocab, d)?;
-        let final_norm = load_f32(&st, "model.norm.weight", d)?;
+        let final_norm = load_f32(&st, norm_name, d)?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
         for i in 0..cfg.n_layers as usize {
@@ -2532,6 +2714,12 @@ impl Model {
         }
 
         let kv = (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, kv_dtype())).collect();
+        let gdn: Vec<Option<GdnState>> = (0..cfg.n_layers as usize)
+            .map(|i| {
+                (cfg.arch == Arch::HybridGdn && !cfg.full_attn.get(i).copied().unwrap_or(true))
+                    .then(|| GdnState::new(&cfg))
+            })
+            .collect();
         // The concurrent MoE lane needs its own ring, set up once, so a layer's
         // experts stream while the CPU pool computes. Only in streaming mode.
         // `new_streaming` honours the `COLI_SQPOLL` opt-in; other Reactors in
@@ -2772,6 +2960,7 @@ impl Model {
             perf_llc_ewma: 0.0,
             prefetch,
             sweep,
+            gdn,
             gpu,
             mtp,
             // `heat` is `Some` exactly when a GPU tier exists, which is also
@@ -2934,9 +3123,12 @@ impl Model {
     /// predictor's history (a new sequence has no useful routing history); the
     /// warm cache itself persists (a warm expert is warm regardless of sequence).
     pub fn reset(&mut self) {
-        let (kvl, qkr) = (self.cfg.kv_lora as usize, self.cfg.qk_rope as usize);
+        let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
         for k in &mut self.kv {
             *k = LayerKv::with_dtype(kvl, qkr, kv_dtype());
+        }
+        for g in self.gdn.iter_mut().flatten() {
+            g.reset();
         }
         if let Some(h) = &self.route_hist {
             h.lock().clear();
@@ -4235,7 +4427,7 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, ..
+                cfg, layers, kv, gdn, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, ..
             } = self;
             let sweep: &SweepClock = sweep;
             let ctx = ForwardCtx {
@@ -4335,7 +4527,7 @@ impl Model {
             let layers: &[LayerW] = layers;
             for (li, l) in layers.iter().enumerate() {
                 sweep.tick();
-                forward_layer(l, li, &mut kv[li], &ctx, &mut x, s_n, pos_base)?;
+                forward_layer(l, li, LayerState { kv: &mut kv[li], gdn: gdn[li].as_mut() }, &ctx, &mut x, s_n, pos_base)?;
                 if let Some(pfc) = &pfc {
                     pfc.emit_layer(li);
                 }
@@ -4536,7 +4728,7 @@ impl Model {
         let lg = {
             let ctx = self.forward_ctx();
             for (i, l) in self.layers[start..].iter().enumerate() {
-                forward_layer(l, start + i, &mut kv_local[i], &ctx, h, s_n, pos_base)?;
+                forward_layer(l, start + i, LayerState { kv: &mut kv_local[i], gdn: None }, &ctx, h, s_n, pos_base)?;
             }
             // Drop `kv_local` here is unnecessary — it owns no shared `&self`
             // borrow; the constraint is just `ctx` going out of scope.
@@ -4644,7 +4836,7 @@ impl Model {
             // decode step's, so a warm item queued just before a long prefill is
             // stale by the end of it — and should read as such.
             self.sweep.tick();
-            forward_layer(l, li, &mut seq.layers[li], &ctx, &mut x, s_n, pos_base)?;
+            forward_layer(l, li, LayerState { kv: &mut seq.layers[li], gdn: None }, &ctx, &mut x, s_n, pos_base)?;
         }
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
         Ok(self.lm_head.apply_vec(&xf, s_n))
@@ -5124,7 +5316,7 @@ impl Model {
         let eps = self.cfg.eps;
         let vocab = self.cfg.vocab as usize;
         let n_layers = self.cfg.n_layers as usize;
-        let (kvl, qkr) = (self.cfg.kv_lora as usize, self.cfg.qk_rope as usize);
+        let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
 
         let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, stream_experts, cfg, absorb, dsa, .. } =
             self;
@@ -5176,7 +5368,7 @@ impl Model {
             cat.extend_from_slice(&hn);
             let mut hx = mtp.eh_proj.apply_vec(&cat, 1);
             // one MTP transformer layer at relative position g (fresh local KV)
-            forward_layer(&mtp.layer, n_layers, &mut kv, &ctx, &mut hx, 1, g)?;
+            forward_layer(&mtp.layer, n_layers, LayerState { kv: &mut kv, gdn: None }, &ctx, &mut hx, 1, g)?;
             let row = rmsnorm_rows(&hx, &mtp.mtp_norm, 1, d, eps);
             let logit = lm_head.apply_vec(&row, 1);
             // The confidence gate (ds4's DSpark idea): a step whose top token
@@ -5389,6 +5581,60 @@ mod tests {
         }
         build_tiny_model(&d)?;
         Ok(d)
+    }
+
+    /// End-to-end check shared by the two Track C architectures: load from a
+    /// tiny fixture, prove one prefill call and token-at-a-time decode produce
+    /// bit-identical last-position logits (through reset), and run a short
+    /// greedy generate. The strongest whole-stack self-consistency available
+    /// before the real-container parity gate.
+    fn prefill_step_identity_and_generate(dir: &PathBuf) -> Result<(), peregrine_core::Error> {
+        let mut m = Model::load(dir)?;
+        let toks = [1, 5, 9, 2, 7];
+        let vocab = m.cfg.vocab as usize;
+        let all = m.forward_step(&toks, 0)?;
+        let last_all = &all[(toks.len() - 1) * vocab..];
+        m.reset();
+        let mut last = Vec::new();
+        for (i, &t) in toks.iter().enumerate() {
+            last = m.forward_step(&[t], i)?;
+        }
+        assert!(
+            last_all.iter().zip(&last).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "prefill and stepwise decode must be bit-identical through the whole stack"
+        );
+        m.reset();
+        let mut s = Sampler::new(0.0, 0.95, 1);
+        let out = m.generate(&toks, 4, &mut s)?;
+        assert_eq!(out.len(), 4, "greedy generate must emit the requested tokens");
+        Ok(())
+    }
+
+    #[test]
+    fn dense_gqa_model_loads_decodes_and_is_step_consistent() -> Result<(), peregrine_core::Error> {
+        let d = std::env::temp_dir().join(format!("peregrine_qwen_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_qwen_model(&d, 42)?;
+        prefill_step_identity_and_generate(&d)?;
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_model_loads_decodes_and_is_step_consistent() -> Result<(), peregrine_core::Error> {
+        // Exercises every hybrid mechanism through the full stack: two GDN
+        // layers (conv ring + recurrent state), one output-gated GQA layer
+        // with partial rotary, the language_model tensor prefix, and reset.
+        let d = std::env::temp_dir().join(format!("peregrine_hybrid_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_hybrid_model(&d, 43)?;
+        prefill_step_identity_and_generate(&d)?;
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
     }
 
     /// `accept_run_sampled` must emit the request's own distribution.
