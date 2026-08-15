@@ -112,6 +112,13 @@ pub struct Model {
     /// Removes the per-request re-derivation of both an expert's on-disk
     /// location and its quantized format.
     expert_index: Option<crate::concurrent::ExpertIndex>,
+    /// fd → device-ordinal table for device-pure io claims
+    /// (`COLI_IO_DEVICE_SCHED`, read once here at build — not OnceLock-latched,
+    /// for the same A/B-aliasing reason as `SweepClock`). `Some` only when
+    /// experts stream through >1 ring AND the shards actually span >1 device;
+    /// everywhere else `None` keeps the concurrent lane's historical blind
+    /// cursor, which is behavior-identical on a single device.
+    fd_device_table: Option<std::collections::HashMap<std::os::unix::io::RawFd, u8>>,
     /// Bytes one token's routing touches (0 when experts are resident). The
     /// threshold that decides whether capacity or policy binds this deployment.
     expert_per_token_bytes: u64,
@@ -2615,6 +2622,27 @@ impl Model {
                 if prefetch_protect { "on" } else { "off" },
             );
         }
+        // Device-pure io claims (`COLI_IO_DEVICE_SCHED=1`): built only when the
+        // claim grouping can differ from the blind cursor — streaming, >1 ring,
+        // and shards genuinely on >1 device. The env read happens here at build
+        // so two A/B arms in one process can never alias through a latch.
+        let fd_device_table = if stream_experts
+            && io_reactors.len() > 1
+            && std::env::var("COLI_IO_DEVICE_SCHED").is_ok_and(|v| v.trim() == "1")
+        {
+            let table: std::collections::HashMap<std::os::unix::io::RawFd, u8> =
+                st.fd_devices().into_iter().collect();
+            let devices = table.values().collect::<std::collections::BTreeSet<_>>().len();
+            (devices > 1).then(|| {
+                eprintln!(
+                    "peregrine: [io] device-pure claims on ({devices} devices, {} shard fds)",
+                    table.len()
+                );
+                table
+            })
+        } else {
+            None
+        };
         let mut model = Model {
             route_hist_epoch: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -2630,6 +2658,7 @@ impl Model {
             direct,
             st,
             expert_index,
+            fd_device_table,
             expert_per_token_bytes,
             prefetch_protect,
             io_reactors,
@@ -4064,7 +4093,7 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, expert_index, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, ..
+                cfg, layers, kv, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, ..
             } = self;
             let sweep: &SweepClock = sweep;
             let ctx = ForwardCtx {
@@ -4088,6 +4117,7 @@ impl Model {
                 layout_schedule: layout_schedule.as_deref(),
                 affinity: Some(aff.as_ref()),
                 expert_index: expert_index.as_ref(),
+                fd_devices: fd_device_table.as_ref(),
             };
             // Layer look-ahead: a shared prefetch view over the same field borrows, so
             // each layer's next-token prefetch is emitted the moment that layer
@@ -4437,6 +4467,7 @@ impl Model {
             layout_schedule: self.layout_schedule.as_deref(),
             affinity: None,
             expert_index: self.expert_index.as_ref(),
+            fd_devices: self.fd_device_table.as_ref(),
         }
     }
 
@@ -4701,6 +4732,7 @@ impl Model {
             layout_schedule: self.layout_schedule.as_deref(),
             affinity: Some(aff.as_ref()),
             expert_index: self.expert_index.as_ref(),
+            fd_devices: self.fd_device_table.as_ref(),
         };
         // Router look-ahead, on the same decode-only rule as `forward_hidden`. B == 1
         // *is* a decode step — the serving engine reaching this path with one live
@@ -4967,6 +4999,7 @@ impl Model {
             layout_schedule: None, // drafts benefit less from disk-order tuning
             affinity: None,
             expert_index: None,
+            fd_devices: None, // drafts keep the blind claim cursor, like the rest of their tuning
         };
         let mut kv = LayerKv::new(kvl, qkr);
         let mut h = hlast.to_vec(); // pre-final-norm hidden
