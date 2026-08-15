@@ -122,20 +122,23 @@ pub fn i3_value(lo_byte: u8, hi_byte: u8, k: usize) -> i32 {
 /// rounding mode. `f32::round()` disagrees on exact .5 values, which showed up
 /// as 3 differing bytes in 480 when this was diffed against colibrì's encoder.
 /// Byte-identity is the whole point of supporting this format.
+/// Takes the weight *row* and the group's own 24-byte destination slice —
+/// slicing at the caller keeps this at five arguments and makes an
+/// out-of-bounds group unrepresentable rather than merely unlikely.
 #[inline]
-fn i3_encode_group(w: &[f32], row: usize, i: usize, lo_i: usize, hi_i: usize, s: f32, base: usize, q: &mut [u8]) {
+fn i3_encode_group(row_w: &[f32], lo_i: usize, hi_i: usize, s: f32, group_q: &mut [u8]) {
     for k in lo_i..hi_i {
-        let v = (w[row * i + k] / s).round_ties_even().clamp(-4.0, 3.0) as i32;
+        let v = (row_w[k] / s).round_ties_even().clamp(-4.0, 3.0) as i32;
         let u = (v + 4) as u8;
-        q[base + ((k - lo_i) >> 2)] |= (u & 0x03) << (2 * ((k - lo_i) & 3));
-        q[base + I3_LOW_BYTES + ((k - lo_i) >> 3)] |= ((u >> 2) & 0x01) << ((k - lo_i) & 7);
+        group_q[(k - lo_i) >> 2] |= (u & 0x03) << (2 * ((k - lo_i) & 3));
+        group_q[I3_LOW_BYTES + ((k - lo_i) >> 3)] |= ((u >> 2) & 0x01) << ((k - lo_i) & 7);
     }
     // A partial final group pads with biased 4, i.e. value 0: low bits
     // already zero, high bit set. (Writing the low plane instead would
     // encode -3 and quietly corrupt the tail of every ragged row.)
     for k in hi_i..lo_i + I3_GROUP {
         let kk = k - lo_i;
-        q[base + I3_LOW_BYTES + (kk >> 3)] |= 1 << (kk & 7);
+        group_q[I3_LOW_BYTES + (kk >> 3)] |= 1 << (kk & 7);
     }
 }
 
@@ -157,7 +160,7 @@ pub fn quant_i3_g64(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<f32>) {
             let s = (amax / 3.0).max(1e-8);
             scale[row * ng + g] = s;
             let base = (row * ng + g) * I3_GROUP_BYTES;
-            i3_encode_group(w, row, i, lo_i, hi_i, s, base, &mut q);
+            i3_encode_group(&w[row * i..(row + 1) * i], lo_i, hi_i, s, &mut q[base..base + I3_GROUP_BYTES]);
         }
     }
     (q, scale)
@@ -228,7 +231,7 @@ pub fn quant_i3_g64_weighted(w: &[f32], o: usize, i: usize, cw: &[f32]) -> (Vec<
             };
             scale[row * ng + g] = best;
             let base = (row * ng + g) * I3_GROUP_BYTES;
-            i3_encode_group(w, row, i, lo_i, hi_i, best, base, &mut q);
+            i3_encode_group(&w[row * i..(row + 1) * i], lo_i, hi_i, best, &mut q[base..base + I3_GROUP_BYTES]);
         }
     }
     (q, scale)
