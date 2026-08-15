@@ -596,7 +596,15 @@ impl Drop for KvSessionStore {
 /// index them. One job at a time, FIFO; the depth-1 channel in front of it is
 /// the whole backpressure story.
 fn writer_loop(ctx: WriterCtx, rx: std::sync::mpsc::Receiver<WriterMsg>) {
-    while let Ok(msg) = rx.recv() {
+    loop {
+        // `recv`'s only error is `Disconnected` — the store dropped its sender,
+        // which is this thread's normal shutdown signal (same shape as
+        // `prefetch_worker` in peregrine-model, and spelled out so the strict
+        // audit can see the error path is handled, not swallowed).
+        let msg = match rx.recv() {
+            Ok(msg) => msg,
+            Err(std::sync::mpsc::RecvError) => break,
+        };
         match msg {
             WriterMsg::Write { tokens, export } => match KvSessionStore::write_entry(&ctx, &tokens, &export) {
                 Ok(entry) => index_committed(&ctx, entry, &tokens),
