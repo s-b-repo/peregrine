@@ -185,6 +185,9 @@ fn run() -> Result<(), Error> {
             }
             // heat + history + co-activation seed for the next session
             model.save_route_stats(dirp)?;
+            // topic-routing profiles alongside, so a COLI_TOPIC_ROUTING boot
+            // starts warm (no-op when topic routing was off this run)
+            model.save_topic_profiles_here()?;
             eprintln!(
                 "galactic pass complete ({len}-token corpus): automaton.json, macrostates.json, \
                  routes.json, schedule.json, route_stats.json written to {dir}"

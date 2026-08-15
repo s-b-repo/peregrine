@@ -243,6 +243,11 @@ pub struct Model {
     /// selects per-class prefetch-breadth overrides. Defaults to `Prose`
     /// (== base policy unless the operator set per-class envs).
     workload_class: Mutex<crate::workload::TokenClass>,
+    /// Topic-based smart routing (`COLI_TOPIC_ROUTING=1`): per-`TokenClass`
+    /// expert-usage profiles that bias warm-cache eviction toward the experts
+    /// the *active* topic reuses. `None` disables — protection then uses the
+    /// global-heat tiebreak exactly as before. Read at build, not OnceLock.
+    topic_profiles: Option<crate::topic::TopicProfiles>,
     /// CPU-lane worker count the governors may adjust at runtime, clamped to
     /// `[2, workers]`. Read once per forward when building `ForwardCtx`; the
     /// thermal / power / bandwidth governors write it between forwards.
@@ -1979,16 +1984,19 @@ fn router_ranks_for_batch(l: &LayerW, cfg: &Cfg, x: &[f32], s_n: usize, per_row:
 /// token's set there, which is precisely the `prev-token` baseline. Predicting before
 /// scoring, or scoring after the next layer runs, would quietly change what both
 /// numbers mean.
-fn score_and_stash(
-    eval: &Mutex<crate::predeval::PredictEval>,
-    rh: &Mutex<RouteHistory>,
-    predictor: &PredictSource,
-    layers: &[LayerW],
-    cfg: &Cfg,
-    li: usize,
-    x: &[f32],
-    deep: &mut [Vec<i32>],
-) {
+/// The forward-invariant borrows [`score_and_stash`] needs, bundled so the
+/// per-layer call stays under clippy's argument limit (the per-layer inputs
+/// `li`/`x`/`deep` travel separately). Built once before the layer loop.
+struct ScoreCtx<'a> {
+    eval: &'a Mutex<crate::predeval::PredictEval>,
+    rh: &'a Mutex<RouteHistory>,
+    predictor: &'a PredictSource,
+    layers: &'a [LayerW],
+    cfg: &'a Cfg,
+}
+
+fn score_and_stash(sc: &ScoreCtx, li: usize, x: &[f32], deep: &mut [Vec<i32>]) {
+    let ScoreCtx { eval, rh, predictor, layers, cfg } = sc;
     let width = eval.lock().width();
     let next = li + 1;
     let predict_next = next < layers.len() && layers[next].sparse && next >= cfg.first_dense as usize;
@@ -2716,6 +2724,23 @@ impl Model {
         } else {
             None
         };
+        // Topic-based smart routing (`COLI_TOPIC_ROUTING=1`): per-class expert
+        // profiles for cache-residency bias. Env read here at build (not
+        // OnceLock), and only when experts stream — a resident model has no
+        // eviction to steer. Seeds from a `topic_profiles.json` sidecar if the
+        // checkpoint carries one and its shape matches, so a boot starts warm.
+        let topic_profiles = if stream_experts
+            && std::env::var("COLI_TOPIC_ROUTING").is_ok_and(|v| v.trim() == "1")
+        {
+            let tag = config_tag(&cfg);
+            let seeded = read_optional_artifact(dir, "topic_profiles.json")
+                .and_then(|v| crate::topic::TopicProfiles::from_json(&v, &tag, cfg.n_layers as usize, cfg.n_experts as usize));
+            Some(seeded.unwrap_or_else(|| {
+                crate::topic::TopicProfiles::new(cfg.n_layers as usize, cfg.n_experts as usize)
+            }))
+        } else {
+            None
+        };
         let mut model = Model {
             route_hist_epoch: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -2767,6 +2792,7 @@ impl Model {
             ),
             last_iowq: Mutex::new(None),
             workload_class: Mutex::new(crate::workload::TokenClass::Prose),
+            topic_profiles,
             effective_workers: std::sync::atomic::AtomicUsize::new(workers),
             governor: Mutex::new(GovernorState::new(workers)),
             entropy_ewma: Mutex::new(0.5),
@@ -3002,6 +3028,27 @@ impl Model {
         }
     }
 
+    /// Fold this decode step's routing into the active topic's profile
+    /// (`COLI_TOPIC_ROUTING`). Once per forward, off the batched-matmul path, so
+    /// the atomics are uncontended; a no-op unless topic routing is on and a
+    /// route history exists. Learning is unconditional on `prefetch_protect` —
+    /// the profile is worth building even when the evictor is not consuming it,
+    /// so a later request (or a persisted sidecar) can.
+    fn accumulate_topic(&self) {
+        let (Some(profiles), Some(hist)) = (&self.topic_profiles, &self.route_hist) else {
+            return;
+        };
+        let class = *self.workload_class.lock();
+        let first_dense = self.cfg.first_dense as usize;
+        let n_layers = self.cfg.n_layers as usize;
+        let hist = hist.lock();
+        for layer in first_dense..n_layers {
+            if let Some(set) = hist.latest(layer) {
+                profiles.note(class, layer, set);
+            }
+        }
+    }
+
     /// Protect the experts predicted from `hist` (a single stream's routing) in the
     /// shared cache. Shared by the single-stream path and per-sequence batched prefetch.
     fn protect_from(&self, hist: &Mutex<RouteHistory>) {
@@ -3012,6 +3059,15 @@ impl Model {
         let n_experts = self.cfg.n_experts as usize;
         let first_dense = self.cfg.first_dense as usize;
         let n_layers = self.cfg.n_layers as usize;
+        // Topic-based smart routing: when the active topic's profile is warm, its
+        // per-class routing frequency is the eviction tiebreak instead of the
+        // global heat — so a coding request keeps coding-hot experts resident
+        // through an interleaved prose request. Falls back to global heat while
+        // the class is still cold, so it is never worse than the pre-topic
+        // behaviour. Still correctness-neutral: only the low-bits tiebreak of a
+        // protection priority changes, never the predicted set or any read.
+        let topic = self.topic_profiles.as_ref().map(|p| (p, *self.workload_class.lock()));
+        let topic = topic.filter(|(p, class)| p.is_warm(*class));
         // Build the whole protection set under the *history* lock only, then
         // apply it in one short cache-lock hold. Previously both locks were held
         // across all 78 layers × K predictions; the cache lock is contended by
@@ -3022,8 +3078,11 @@ impl Model {
             let mut v = Vec::new();
             for layer in first_dense..n_layers {
                 for (e, score) in self.predictor.predict_layer(layer, &hist) {
-                    let h = heat.as_ref().and_then(|c| c.get(layer * n_experts + e as usize).copied()).unwrap_or(0);
-                    v.push(((layer as u32, e), pack_prio(score, h)));
+                    let tie = match &topic {
+                        Some((p, class)) => p.heat_for(*class, layer, e as usize),
+                        None => heat.as_ref().and_then(|c| c.get(layer * n_experts + e as usize).copied()).unwrap_or(0),
+                    };
+                    v.push(((layer as u32, e), pack_prio(score, tie)));
                 }
             }
             v
@@ -3851,6 +3910,16 @@ impl Model {
         self.save_route_stats(&dir)
     }
 
+    /// Persist the topic-routing profiles to `<checkpoint_dir>/topic_profiles.json`
+    /// so the next boot with `COLI_TOPIC_ROUTING=1` starts warm on this
+    /// workload mix. Best-effort and a no-op when topic routing is off — a
+    /// shutdown path can call it unconditionally.
+    pub fn save_topic_profiles_here(&self) -> Result<(), Error> {
+        let Some(profiles) = &self.topic_profiles else { return Ok(()) };
+        let path = self.checkpoint_dir.join("topic_profiles.json");
+        crate::topic::save_profiles(profiles, &config_tag(&self.cfg), &path)
+    }
+
     /// Serialize the current routing history and heat snapshot to
     /// `<dir>/route_stats.json`. Overwrites any existing file. Best-effort — a
     /// missing history or non-writable dir returns `Ok(())` without an error, so
@@ -4283,7 +4352,8 @@ impl Model {
                     // prediction stashed for `li` one layer ago — while `latest(li+1)`
                     // is still the *previous token's* set there, which is exactly the
                     // baseline arm.
-                    score_and_stash(eval, rh, predictor, layers, cfg, li, &x, &mut deep);
+                    let sc = ScoreCtx { eval, rh, predictor, layers, cfg };
+                    score_and_stash(&sc, li, &x, &mut deep);
                 }
             }
         }
@@ -4292,6 +4362,10 @@ impl Model {
         if !lookahead {
             self.enqueue_prefetch();
         }
+        // Topic-based smart routing: fold this step's routing into the active
+        // topic's profile before protection consumes it. Independent of the
+        // protect flag — the profile is learned even when unused.
+        self.accumulate_topic();
         // Predictive eviction: protect the experts we expect to reuse next.
         if self.prefetch_protect {
             self.update_cache_protection();

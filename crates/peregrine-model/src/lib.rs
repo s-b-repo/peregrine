@@ -33,6 +33,7 @@ pub mod router;
 pub mod sample;
 pub mod telemetry;
 pub mod testkit;
+pub mod topic;
 pub mod weight;
 pub mod wmma_tune;
 pub mod workload;
