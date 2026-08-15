@@ -70,6 +70,50 @@ impl Bounds {
             "experts": rows,
         })
     }
+
+    /// The inverse of [`Self::to_json`], so a sidecar the tool already wrote
+    /// can be measured against a trace **without re-reading the container** —
+    /// `compute_bounds` is a pass over every routed expert (~hundreds of GB),
+    /// which is a steep toll for an analysis whose other input is a JSON trace.
+    /// Rows with missing or non-numeric fields are refused, not skipped: a
+    /// silently thinner sidecar would make every absent expert read as
+    /// "unbounded" and quietly shrink the denominator of the one fraction this
+    /// tool exists to report.
+    pub fn from_json(v: &serde_json::Value) -> Result<Bounds, Error> {
+        let version = v.get("version").and_then(|n| n.as_u64());
+        if version != Some(1) {
+            return Err(Error::Format(format!("bounds sidecar: unsupported version {version:?}")));
+        }
+        let rows = v
+            .get("experts")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| Error::Format("bounds sidecar: no `experts` array".into()))?;
+        let mut b = Bounds::default();
+        for (i, row) in rows.iter().enumerate() {
+            let (Some(l), Some(e), Some(c)) = (
+                row.get("layer").and_then(|x| x.as_u64()),
+                row.get("expert").and_then(|x| x.as_u64()),
+                row.get("c").and_then(|x| x.as_f64()),
+            ) else {
+                return Err(Error::Format(format!("bounds sidecar: malformed row {i}: {row}")));
+            };
+            b.c.insert((l as usize, e as usize), c);
+        }
+        if b.c.is_empty() {
+            return Err(Error::Format("bounds sidecar: zero experts — measuring against it would report every position unbounded".into()));
+        }
+        Ok(b)
+    }
+}
+
+/// Read a bounds sidecar (the file `peregrine-skipbound` writes by default as
+/// `<model-dir>/expert_bounds.json`).
+pub fn load_bounds(path: &std::path::Path) -> Result<Bounds, Error> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| Error::Format(format!("read bounds {}: {e}", path.display())))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::Format(format!("parse bounds {}: {e}", path.display())))?;
+    Bounds::from_json(&v)
 }
 
 /// Frobenius norm of one quantized weight, read row by row.
@@ -357,6 +401,26 @@ mod tests {
             b.c.insert((l, e), c);
         }
         b
+    }
+
+    #[test]
+    fn a_sidecar_round_trips_and_malformed_rows_are_refused_not_skipped() -> Result<(), Error> {
+        // from_json is what lets a trace analysis skip the container pass, so
+        // it must reproduce exactly what to_json wrote…
+        let b = bounds_of(&[(0, 0, 1.5), (0, 3, 0.25), (7, 200, 1e-6)]);
+        let back = Bounds::from_json(&b.to_json())?;
+        assert_eq!(back.c, b.c, "sidecar round-trip must be exact");
+        // …and refuse rather than thin out: a dropped row would read as
+        // "unbounded" downstream and shrink the measured denominator silently.
+        let mut v = b.to_json();
+        if let Some(rows) = v.get_mut("experts").and_then(|e| e.as_array_mut()) {
+            rows.push(serde_json::json!({ "layer": 1, "expert": "not-a-number", "c": 0.5 }));
+        }
+        assert!(Bounds::from_json(&v).is_err(), "a malformed row must fail the load");
+        // Version and emptiness are hard errors too.
+        assert!(Bounds::from_json(&serde_json::json!({"version": 2, "experts": []})).is_err());
+        assert!(Bounds::from_json(&serde_json::json!({"version": 1, "experts": []})).is_err());
+        Ok(())
     }
 
     #[test]
