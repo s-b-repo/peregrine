@@ -1375,6 +1375,37 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_sidecar_feeds_the_converter_end_to_end() -> Result<(), Error> {
+        // The full #7 pipeline on the tiny model: capture → sidecar →
+        // load_calib → calibrated conversion. The MTP row comes back empty
+        // from capture (it never drafts), so only the two real expert layers
+        // calibrate: 2 layers × 4 experts × gate+up = 16 tensors.
+        let (dir, out) = fixture_dirs("calib_e2e")?;
+        peregrine_model::testkit::build_tiny_model(&dir)?;
+        let sidecar = dir.join("calib_channels.json");
+        {
+            let mut m = peregrine_model::Model::load(&dir)?;
+            m.enable_calib_capture(sidecar.clone());
+            m.teacher_forcing(&[1, 5, 9, 2, 7, 3])?;
+            m.write_calib_sidecar()?;
+        }
+        let cal = load_calib(&sidecar)?;
+        assert_eq!(cal.layers.len(), 4, "3 layers + the MTP row");
+        assert!(cal.layers[0].is_empty() && cal.layers[3].is_empty());
+        assert_eq!(cal.layers[1].len(), 16);
+
+        let plan = Plan { target: Target::Int3G64, calib: Some(cal), ..Plan::default() };
+        let predicted = plan_sizes(&dir, &plan)?;
+        let rep = requantize(&dir, &out, &plan)?;
+        assert_eq!(rep.tensors_calibrated, 16, "layers 1–2 calibrate; dense and MTP fall back");
+        assert_eq!(predicted.tensors_calibrated, rep.tensors_calibrated, "forecast matches the run");
+        peregrine_core::config::Cfg::load(&out)?;
+        std::fs::remove_dir_all(&dir)?;
+        std::fs::remove_dir_all(&out)?;
+        Ok(())
+    }
+
+    #[test]
     fn load_calib_accepts_the_sidecar_shape_and_refuses_mis_sized_layers() -> Result<(), Error> {
         let dir = std::env::temp_dir().join(format!("peregrine_rq_calibjson_{}", std::process::id()));
         if let Err(e) = std::fs::remove_dir_all(&dir) {

@@ -59,6 +59,13 @@ pub struct ForwardCtx<'a> {
     /// speculative-draft forwards (so drafts don't pollute the main-stream
     /// prediction) and when prefetch is off.
     pub route_log: Option<&'a Mutex<RouteHistory>>,
+    /// Calibration capture (`COLI_CALIB_CAPTURE`, ideas #7): each sparse
+    /// layer's MoE-input rows fold into per-channel `Σ|x|` right before the
+    /// router runs. `None` in serving (the env is only set on capture runs)
+    /// and on draft forwards — drafts replay positions the main stream
+    /// already accumulated, so counting them would double-weight whatever the
+    /// drafter happened to explore.
+    pub calib: Option<&'a Mutex<crate::model::CalibAccum>>,
     /// Per-**row** routing history for batched decode: `route_log_multi[r]` receives
     /// row `r`'s own routed set, so each concurrent stream predicts and prefetches
     /// from its *own* routing rather than the weak cross-sequence union. `None` on the
@@ -2261,6 +2268,7 @@ mod tests {
             stream_experts: true,
             ecache: None,
             route_log: None,
+            calib: None,
             route_log_multi: None,
             direct: false,
             heat: None,

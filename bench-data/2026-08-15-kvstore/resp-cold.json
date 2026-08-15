@@ -1,0 +1,21 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "This is a beautiful and evocative",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1786782689,
+  "id": "chatcmpl-1786782689937142121",
+  "model": "glm-5.2",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 8,
+    "prompt_tokens": 894,
+    "total_tokens": 902
+  }
+}

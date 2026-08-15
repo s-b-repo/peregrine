@@ -353,6 +353,12 @@ pub struct Model {
     /// artifacts (route stats, layout hints, kernel tuning) can be re-persisted
     /// without threading the path through the caller each time.
     checkpoint_dir: std::path::PathBuf,
+    /// Calibration capture (`COLI_CALIB_CAPTURE=<out.json>`, ideas #7): the
+    /// output path and the running per-layer channel sums. `None` in serving —
+    /// the env is read once at load (no OnceLock; `enable_calib_capture` is
+    /// the test/tool seam), and a `None` here costs one branch per sparse
+    /// layer per forward.
+    calib: Option<(std::path::PathBuf, Mutex<CalibAccum>)>,
     /// Optional expert-order hint per layer, loaded from `<dir>/schedule.json`
     /// (emitted by `peregrine-layout-reorg`). When present, the concurrent
     /// scheduler sorts each layer's streamed-expert plan by this order so the
@@ -2414,6 +2420,76 @@ struct LayerState<'a> {
     gdn: Option<&'a mut GdnState>,
 }
 
+/// Accumulator for the calibration capture pass (`COLI_CALIB_CAPTURE`, ideas
+/// #7): per expert-bearing layer, `Σ|x|` per hidden channel over every
+/// main-stream row that reached the MoE branch, plus that layer's row count.
+/// Pooled per layer on purpose — every expert in a layer sees the same
+/// pre-gating hidden distribution, which is what makes ~16 routed
+/// samples/expert/layer of per-expert statistics unnecessary.
+///
+/// Rows are `n_layers + 1` in the `HeatTable` convention. The MTP row exists
+/// but never accumulates: capture runs draft nothing, and draft forwards
+/// deliberately carry `calib: None`. Its sidecar row is therefore empty and
+/// the converter falls back to data-free rounding for the MTP experts —
+/// combine `--calib` with `--keep-last-layers` when they should be protected
+/// instead.
+pub struct CalibAccum {
+    sums: Vec<Vec<f64>>,
+    rows: Vec<u64>,
+    hidden: usize,
+}
+
+impl CalibAccum {
+    fn new(n_layers: usize, hidden: usize) -> CalibAccum {
+        CalibAccum { sums: vec![Vec::new(); n_layers + 1], rows: vec![0; n_layers + 1], hidden }
+    }
+
+    /// Fold `s_n` rows of a layer's MoE input into the running per-channel
+    /// `Σ|x|`. The row width is trusted to be `hidden` — the caller passes the
+    /// same `nrm2` it hands the router.
+    fn accumulate(&mut self, li: usize, x: &[f32], s_n: usize) {
+        let d = self.hidden;
+        let (Some(sum), Some(rows)) = (self.sums.get_mut(li), self.rows.get_mut(li)) else {
+            return;
+        };
+        if sum.is_empty() {
+            sum.resize(d, 0.0);
+        }
+        for r in 0..s_n {
+            let Some(row) = x.get(r * d..(r + 1) * d) else { break };
+            for (acc, &v) in sum.iter_mut().zip(row) {
+                *acc += f64::from(v.abs());
+            }
+        }
+        *rows += s_n as u64;
+    }
+
+    /// The sidecar value: mean `|x|` per channel per layer, empty rows for
+    /// layers that never accumulated (dense layers, the MTP row).
+    fn to_sidecar_json(&self) -> serde_json::Value {
+        let layers: Vec<serde_json::Value> = self
+            .sums
+            .iter()
+            .zip(&self.rows)
+            .map(|(sum, &n)| {
+                if sum.is_empty() || n == 0 {
+                    serde_json::json!([])
+                } else {
+                    let means: Vec<f64> = sum.iter().map(|s| s / n as f64).collect();
+                    serde_json::json!(means)
+                }
+            })
+            .collect();
+        serde_json::json!({
+            "version": 1,
+            "stat": "mean_abs",
+            "hidden": self.hidden,
+            "positions": self.rows.iter().copied().max().unwrap_or(0),
+            "layers": layers,
+        })
+    }
+}
+
 fn forward_layer(
     l: &LayerW,
     li: usize,
@@ -2464,6 +2540,11 @@ fn forward_layer(
     }
     let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
     let ffn: Vec<f32> = if l.sparse {
+        // Calibration capture sees exactly what the router is about to see —
+        // the one place "the MoE input's channel magnitudes" is unambiguous.
+        if let Some(cal) = ctx.calib {
+            cal.lock().accumulate(li, &nrm2, s_n);
+        }
         if ctx.stream_experts {
             moe_forward_dispatch(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
         } else {
@@ -2533,6 +2614,11 @@ fn forward_layer_batched(
     }
     let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
     let ffn: Vec<f32> = if l.sparse {
+        // Same capture point as `forward_layer` — the batched rows are main
+        // stream too (draft rows never reach here with `calib` set).
+        if let Some(cal) = ctx.calib {
+            cal.lock().accumulate(li, &nrm2, s_n);
+        }
         if ctx.stream_experts {
             moe_forward_dispatch(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
         } else {
@@ -2991,9 +3077,20 @@ impl Model {
             learned_prefetch: std::sync::atomic::AtomicUsize::new(0),
             last_forward_at: Mutex::new(None),
             checkpoint_dir: dir.to_path_buf(),
+            calib: None,
             layout_schedule: load_layout_schedule(dir),
             rlm: crate::rlm::RLMController::new(),
         };
+        // Calibration capture (ideas #7): read per load, not through a
+        // OnceLock latch — the seam `enable_calib_capture` is what tests and
+        // the calib-capture subcommand use, this env spelling is for co-runs
+        // (e.g. alongside COLI_PREDICT_EVAL in one instrumented pass).
+        match std::env::var("COLI_CALIB_CAPTURE") {
+            Ok(p) if !p.trim().is_empty() => model.enable_calib_capture(std::path::PathBuf::from(p.trim())),
+            Ok(_) => {}
+            Err(std::env::VarError::NotPresent) => {}
+            Err(e) => peregrine_io::note_advisory_err("COLI_CALIB_CAPTURE read", &e),
+        }
         // Upgrade the predictor to the offline transition automaton if a matching
         // `automaton.json` sits next to the checkpoint (else stay on momentum),
         // then blend in the macro-state table if one is present.
@@ -3698,6 +3795,34 @@ impl Model {
 
     pub fn checkpoint_dir(&self) -> &std::path::Path {
         &self.checkpoint_dir
+    }
+
+    /// Install the calibration accumulator (ideas #7), directing the sidecar
+    /// to `out`. The explicit seam behind `COLI_CALIB_CAPTURE`, so tests and
+    /// the `calib-capture` subcommand never touch process env (the same
+    /// rationale as `load_streaming_ecache`). Subsequent main-stream forwards
+    /// fold every sparse layer's MoE input into per-channel `Σ|x|`; call
+    /// [`Self::write_calib_sidecar`] to persist the means.
+    pub fn enable_calib_capture(&mut self, out: std::path::PathBuf) {
+        let (n_layers, hidden) = (self.cfg.n_layers as usize, self.cfg.hidden as usize);
+        self.calib = Some((out, Mutex::new(CalibAccum::new(n_layers, hidden))));
+    }
+
+    /// Write the captured calibration means as the sidecar `--calib` reads
+    /// (`{"version":1,"stat":"mean_abs",...}`), atomically. Deliberately an
+    /// explicit call rather than a `Drop` hook: a crashed or interrupted
+    /// capture writes nothing, instead of persisting a partial mean that
+    /// would silently calibrate every later conversion. `Ok(None)` when
+    /// capture was never enabled.
+    pub fn write_calib_sidecar(&self) -> Result<Option<std::path::PathBuf>, Error> {
+        let Some((out, acc)) = &self.calib else {
+            return Ok(None);
+        };
+        let v = acc.lock().to_sidecar_json();
+        let bytes =
+            serde_json::to_vec_pretty(&v).map_err(|e| Error::Format(format!("calibration sidecar: {e}")))?;
+        peregrine_core::durable::write_atomic(out, &bytes)?;
+        Ok(Some(out.clone()))
     }
 
     /// Snapshot this forward's per-lane wall time into the bubble tuner and the
@@ -4427,7 +4552,7 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, gdn, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, ..
+                cfg, layers, kv, gdn, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, calib, ..
             } = self;
             let sweep: &SweepClock = sweep;
             let ctx = ForwardCtx {
@@ -4441,6 +4566,7 @@ impl Model {
                 stream_experts: *stream_experts,
                 ecache: ecache.as_deref(),
                 route_log: route_hist.as_ref(),
+                calib: calib.as_ref().map(|(_, a)| a),
                 route_log_multi: None,
                 direct: *direct,
                 heat: heat.as_ref(),
@@ -4799,6 +4925,7 @@ impl Model {
             stream_experts: self.stream_experts,
             ecache: self.ecache.as_deref(),
             route_log: None,
+            calib: self.calib.as_ref().map(|(_, a)| a),
             route_log_multi: None,
             direct: self.direct,
             heat: self.heat.as_ref(),
@@ -5065,6 +5192,7 @@ impl Model {
             stream_experts: self.stream_experts,
             ecache: self.ecache.as_deref(),
             route_log: None,
+            calib: self.calib.as_ref().map(|(_, a)| a),
             route_log_multi: histories,
             direct: self.direct,
             heat: self.heat.as_ref(),
@@ -5332,6 +5460,7 @@ impl Model {
             stream_experts: *stream_experts,
             ecache: ecache.as_deref(),
             route_log: None, // drafts must not overwrite the main-stream prediction
+            calib: None, // drafts replay accumulated positions — counting them double-weights
             route_log_multi: None,
             direct: *direct,
             heat: None, // speculative drafts must not skew residency heat
@@ -6654,6 +6783,47 @@ mod tests {
                 from_live.iter().zip(&from_restored).all(|(x, y)| x.to_bits() == y.to_bits()),
                 "a forward from the restored cache must be bit-identical ({dt:?})"
             );
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn calib_capture_accumulates_moe_inputs_and_writes_the_sidecar() -> Result<(), peregrine_core::Error> {
+        // The ideas-#7 capture hook end to end at model level: teacher-force a
+        // corpus with capture enabled, and the sidecar must hold mean-|x|
+        // vectors exactly where experts live — dense layer 0 empty, layers 1–2
+        // populated at hidden width, the MTP row empty (capture never drafts).
+        let dir = tmp_model_dir("calibcap")?;
+        let mut m = Model::load(&dir)?;
+        assert!(m.write_calib_sidecar()?.is_none(), "no capture enabled → nothing to write");
+
+        let out = dir.join("calib_channels.json");
+        m.enable_calib_capture(out.clone());
+        let toks = [1i32, 5, 9, 2, 7, 3, 11, 4];
+        m.teacher_forcing(&toks)?;
+        let p = m
+            .write_calib_sidecar()?
+            .ok_or_else(|| peregrine_core::Error::Format("sidecar expected".into()))?;
+        assert_eq!(p, out);
+
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&out)?)
+            .map_err(|e| peregrine_core::Error::Format(format!("sidecar parse: {e}")))?;
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["stat"], "mean_abs");
+        assert_eq!(v["hidden"], 16);
+        assert_eq!(v["positions"], toks.len());
+        let layers = v["layers"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        assert_eq!(layers.len(), 4, "3 layers + the MTP row");
+        assert!(layers[0].as_array().is_some_and(Vec::is_empty), "dense layer 0 has no MoE input");
+        assert!(layers[3].as_array().is_some_and(Vec::is_empty), "the MTP row never accumulates");
+        for l in [1, 2] {
+            let row = layers[l].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            assert_eq!(row.len(), 16, "layer {l} at hidden width");
+            let vals: Vec<f64> = row.iter().filter_map(|x| x.as_f64()).collect();
+            assert_eq!(vals.len(), 16);
+            assert!(vals.iter().all(|x| x.is_finite() && *x >= 0.0), "means are |x| averages");
+            assert!(vals.iter().any(|x| *x > 0.0), "a real forward leaves nonzero magnitude");
         }
         std::fs::remove_dir_all(&dir)?;
         Ok(())

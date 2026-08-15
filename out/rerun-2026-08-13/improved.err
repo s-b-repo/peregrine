@@ -1,0 +1,12 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 39.3 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.2 + cache 4.3 -> peak 28.6 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: O_DIRECT streaming enabled
+peregrine: [workingset] one token routes 10.85 GB of experts against a 4.00 GB cache (37% of a pass) — no eviction order can hold a pass; prefetch-protect on
+peregrine bench: loaded 78 layers, vocab 154880, mtp=yes, draft=γ=0, in 12.2s
+    [ecache] disk_reads this batch: 1797
+    [ecache] disk_reads this batch: 3763
+    [ecache] disk_reads this batch: 7354

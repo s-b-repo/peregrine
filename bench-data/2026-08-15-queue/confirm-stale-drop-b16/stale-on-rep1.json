@@ -1,0 +1,1 @@
+{"label": "stale-on-rep1", "concurrency": 16, "max_tokens": 32, "streams_ok": 16, "errors": [], "tokens_total": 512, "wall_s": 6042.934, "tokens_per_s": 0.085, "ttft_median_s": null, "per_stream_tokens": [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32]}

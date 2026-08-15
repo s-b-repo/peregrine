@@ -1,0 +1,10 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 43.4 GB | resident 10.9 + KV 0.7 + stream 6.6 + slack 1.4 + cache 34.7 -> peak 54.4 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: [ecache] requested 26.4 GB, granted 25.3 GB — capped to fit the streaming buffers and safety margin inside 33.0 GB available
+peregrine: [workingset] one token routes 10.85 GB of experts against a 23.57 GB cache (217% of a pass) — recency alone can hold a pass; prefetch-protect off
+[tokenizer] gigatoken BPE active, vocab=154856
+peregrine-serve listening on http://127.0.0.1:8131

@@ -453,6 +453,7 @@ mod tests {
             stream_experts: true,
             ecache: None,
             route_log: None,
+            calib: None,
             route_log_multi: None,
             direct: false,
             heat: None,

@@ -1,0 +1,15 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=available (CUDA backend linked (c/backend_cuda.cu), 1 device(s) visible)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 39.1 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.2 + cache 4.3 -> peak 28.6 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: O_DIRECT streaming enabled
+[CUDA] device 0: NVIDIA GeForce RTX 3060, 12.5 GB VRAM, sm_86
+peregrine: CUDA contexts initialized: 1 (device 0)
+peregrine: GPU tier holds 60 experts in VRAM (cold)
+peregrine: [workingset] one token routes 10.85 GB of experts against a 4.00 GB cache (37% of a pass) — no eviction order can hold a pass; prefetch-protect on
+peregrine bench: loaded 78 layers, vocab 154880, mtp=yes, draft=γ=0, in 38.2s
+    [ecache] disk_reads this batch: 1794
+    [ecache] disk_reads this batch: 4100
+    [ecache] disk_reads this batch: 8255

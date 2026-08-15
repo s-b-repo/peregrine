@@ -1,0 +1,4 @@
+== [2026-08-15 17:11:27] waiting on the overnight chain
+== [2026-08-15 17:11:27] waiting on the stale-drop A/B
+== [2026-08-15 17:11:27] box is free; 2 enabled job(s)
+== [2026-08-15 17:11:27] running bench-data/2026-08-15-queue/jobs/10-confirm-stale-drop.sh
