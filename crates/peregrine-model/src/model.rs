@@ -1236,7 +1236,8 @@ fn router_lookahead_batch() -> bool {
 
 /// The arms the predictor scoreboard compares, in the order the forward loop stashes
 /// them. See [`predict_eval_init`].
-const PREDICT_EVAL_ARMS: [&str; 3] = ["router-lookahead", "predictor", "prev-token"];
+const PREDICT_EVAL_ARMS: [&str; 4] =
+    ["router-lookahead", "router-lookahead-2", "predictor", "prev-token"];
 
 /// Build the predictor scoreboard when `COLI_PREDICT_EVAL=1`
 /// (`COLI_PREDICT_EVAL_N` candidates per arm, default: the model's top-k, so recall
@@ -1245,6 +1246,14 @@ const PREDICT_EVAL_ARMS: [&str; 3] = ["router-lookahead", "predictor", "prev-tok
 /// Three arms, chosen so the comparison is the one that matters:
 ///
 /// - **`router-lookahead`** — layer `L+1`'s router applied to layer `L`'s output.
+/// - **`router-lookahead-2`** — layer `L+1`'s router applied to layer `L-1`'s
+///   output: the same prediction issued one full layer-sweep earlier. At 93% io
+///   duty a Δ=1 warm often cannot finish before its layer executes (the late
+///   fraction of the measured 98.6% prefetch waste), so lead time — not recall —
+///   is what Δ=2 buys; this arm prices the recall it costs (residual-stream
+///   drift across the skipped layer). The first sparse layer of each step has no
+///   two-back producer and scores an empty prediction there — a fixed, small
+///   understatement shared by every step, not noise.
 /// - **`predictor`** — whatever [`PredictSource`] is configured: momentum, the
 ///   transition automaton, macro-states. A statistic over the router's past answers.
 /// - **`prev-token`** — the previous token's routed set at that layer, verbatim. The
@@ -1978,6 +1987,7 @@ fn score_and_stash(
     cfg: &Cfg,
     li: usize,
     x: &[f32],
+    deep: &mut [Vec<i32>],
 ) {
     let width = eval.lock().width();
     let next = li + 1;
@@ -2011,11 +2021,26 @@ fn score_and_stash(
         (actual, prev, statistical)
     };
     let lookahead = if predict_next { router_ranks_for(&layers[next], cfg, x, width) } else { Vec::new() };
+    // The Δ=2 leg: `deep[next]` holds layer `next`'s router ranked against the
+    // hidden as it stood one layer earlier — stashed by the previous call. Take
+    // it (empty on the first sparse layer of the step, scored as such), then
+    // rank two-ahead against the current hidden for the call after this one.
+    // `deep` is per-forward-step state owned by the layer loop, so a stale
+    // prediction can never leak across tokens.
+    let lookahead2 = if predict_next {
+        std::mem::take(&mut deep[next])
+    } else {
+        Vec::new()
+    };
+    let two = li + 2;
+    if two < layers.len() && layers[two].sparse && two >= cfg.first_dense as usize {
+        deep[two] = router_ranks_for(&layers[two], cfg, x, width);
+    }
     let mut ev = eval.lock();
     ev.score(li, &actual);
     if predict_next {
         // Arm order must match `PREDICT_EVAL_ARMS`.
-        ev.stash(next, vec![lookahead, statistical, prev]);
+        ev.stash(next, vec![lookahead, lookahead2, statistical, prev]);
     }
 }
 
@@ -4234,6 +4259,10 @@ impl Model {
             // recall against it would not be the number any of these predictors is
             // trying to hit.
             let eval = (s_n == 1).then_some(predict_eval.as_ref()).flatten();
+            // Per-step carry for the Δ=2 eval arm: `deep[t]` is layer `t`'s
+            // predicted set ranked two layers early. Fresh each forward step.
+            let mut deep: Vec<Vec<i32>> =
+                if eval.is_some() { vec![Vec::new(); layers.len()] } else { Vec::new() };
             let layers: &[LayerW] = layers;
             for (li, l) in layers.iter().enumerate() {
                 sweep.tick();
@@ -4254,7 +4283,7 @@ impl Model {
                     // prediction stashed for `li` one layer ago — while `latest(li+1)`
                     // is still the *previous token's* set there, which is exactly the
                     // baseline arm.
-                    score_and_stash(eval, rh, predictor, layers, cfg, li, &x);
+                    score_and_stash(eval, rh, predictor, layers, cfg, li, &x, &mut deep);
                 }
             }
         }
