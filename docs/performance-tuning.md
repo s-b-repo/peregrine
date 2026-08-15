@@ -108,6 +108,37 @@ forward verifies γ+1 rows and its routed union grows faster than acceptance rep
 Output is sequence-identical at temperature 0, as documented; it is simply slower.
 The advice may still hold where experts are **resident** rather than streamed.
 
+### Pending measurement: the 2026-08-15 ds4-port wave
+
+Four knobs ported from antirez's ds4/DwarfStar engine landed 2026-08-15, every
+one **off by default** until its A/B (running in `scripts/overnight-2026-08-15.sh`,
+results → `bench-data/2026-08-15-*/`) licenses a change. Listed here so nobody
+mistakes "documented" for "measured":
+
+- **Asymmetric expert requantization** — `peregrine-requantize --down keep
+  --keep-last-layers 6 --target int3-g64`: gate/up to int3-g64, `down_proj`
+  byte-identical, last 6 expert layers (incl. the MTP row) untouched. The one
+  untested point on the sub-int4 ladder after todo.md §13 closed every uniform
+  rung (uniform int3-g64: flip_rate 0.514). Predicted 383.73 → 355.25 GB
+  (−7.4 % container bytes); gate before trusting.
+- **`COLI_SPEC_CONF`** (default 0, off) — stop an MTP draft early when the
+  head's top-token probability drops under the floor. Depth-only: `accept_run`
+  is untouched, so greedy output is bit-identical by construction (test:
+  `the_confidence_floor_never_changes_a_greedy_stream`). Rationale: every
+  drafted token is a verify row streaming expert bytes; the `COLI_DRAFT=4`
+  rejection above is exactly the cost this floor prunes. ds4 ships 0.6–0.7.
+- **`COLI_ECACHE_GB=auto`** (+ `COLI_ECACHE_AUTO_FRAC`, default 0.80) — ds4's
+  budget rule: a fraction of post-load `MemAvailable`, still capped by the
+  transient reserve + 1 GiB safety. Numeric spellings unchanged.
+- **`COLI_KV_STORE_DIR`** (+ `COLI_KV_STORE_MB` cap, default 16384;
+  `COLI_KV_STORE_TRIM`, default 32) — disk-persisted KV sessions: completed
+  prefixes ≥ 256 tokens checkpoint to disk and a restarted server restores
+  them instead of re-prefilling (~176 KiB stored per token vs ~10.85 GB of
+  expert reads re-streamed). Fingerprint + checksum + full-token compare gate
+  every load; a bad file means a cold prefill, never a wrong token. Note the
+  checkpoint files contain the session's token ids in the clear — point the
+  knob at storage with the same privacy expectations as the server log.
+
 ### Unavailable here: `COLI_IO_RINGS=8`
 
 Streaming buffers scale with ring count — 11.5 GB at 4 rings, **21.1 GB at 8** — and

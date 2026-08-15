@@ -148,12 +148,10 @@ impl PrefixCache {
         self.budget > 0
     }
 
-    /// Longest cached prefix of `prompt`, as a seeded cache and its length.
-    ///
-    /// Never returns the whole prompt: prefill must still run for at least one
-    /// position, since that forward is what produces the logits the first token
-    /// is sampled from.
-    fn lookup(&mut self, prompt: &[i32]) -> Option<(SeqKv, usize)> {
+    /// Index and match length of the best entry for `prompt`, touching no
+    /// counters — shared by [`Self::lookup`] and [`PrefixStore`]'s probe of
+    /// whether the disk index can do better before it reads a checkpoint.
+    fn best_match(&self, prompt: &[i32]) -> Option<(usize, usize)> {
         if !self.enabled() || prompt.len() < 2 {
             return None;
         }
@@ -165,7 +163,16 @@ impl PrefixCache {
                 best = Some((i, n));
             }
         }
-        let (i, n) = best?;
+        best
+    }
+
+    /// Longest cached prefix of `prompt`, as a seeded cache and its length.
+    ///
+    /// Never returns the whole prompt: prefill must still run for at least one
+    /// position, since that forward is what produces the logits the first token
+    /// is sampled from.
+    fn lookup(&mut self, prompt: &[i32]) -> Option<(SeqKv, usize)> {
+        let (i, n) = self.best_match(prompt)?;
         self.clock += 1;
         let clock = self.clock;
         let e = self.entries.get_mut(i)?;
@@ -217,6 +224,55 @@ impl PrefixCache {
             };
             self.used -= self.entries.swap_remove(victim).bytes;
         }
+    }
+}
+
+/// The in-memory prefix cache plus its optional disk extension
+/// (`COLI_KV_STORE_DIR`, see [`crate::kvstore`]). One type, one `&mut`
+/// parameter, everywhere the engine used to pass the cache — wrapping instead
+/// of widening signatures, since `finish_prefill_chunk` already sits at the
+/// strict audit's argument limit.
+struct PrefixStore {
+    mem: PrefixCache,
+    disk: Option<crate::kvstore::KvSessionStore>,
+}
+
+impl PrefixStore {
+    fn new(mem_budget: usize, disk: Option<crate::kvstore::KvSessionStore>) -> PrefixStore {
+        PrefixStore { mem: PrefixCache::new(mem_budget), disk }
+    }
+
+    /// Memory first. The disk is consulted only when its index says it can
+    /// beat memory's best match — a pure token compare, no file I/O — which is
+    /// the after-restart case and the conversation-continued-across-restart
+    /// case. A disk hit is promoted into memory, so each checkpoint is read at
+    /// most once per process and every later request takes the cheap path.
+    fn lookup(&mut self, prompt: &[i32]) -> Option<(SeqKv, usize)> {
+        let mem_n = self.mem.best_match(prompt).map_or(0, |(_, n)| n);
+        if let Some(disk) = &mut self.disk {
+            if disk.best_match_len(prompt) > mem_n {
+                if let Some((kv, n)) = disk.load_longest(prompt) {
+                    if n > mem_n {
+                        self.mem.insert(&prompt[..n], &kv);
+                        return Some((kv, n));
+                    }
+                }
+            }
+        }
+        self.mem.lookup(prompt)
+    }
+
+    /// Every insert is offered to the disk first (its own floor, trim, and
+    /// dedup decide whether anything is written), then cached in memory.
+    /// Because qualifying entries reach the disk at insert time, memory
+    /// eviction never loses anything the disk wanted and shutdown needs no
+    /// separate persist pass — the ds4 trigger list (long prefill, eviction,
+    /// shutdown) collapses to this one hook.
+    fn insert(&mut self, prompt: &[i32], kv: &SeqKv) {
+        if let Some(disk) = &mut self.disk {
+            disk.save(prompt, kv);
+        }
+        self.mem.insert(prompt, kv);
     }
 }
 
@@ -317,9 +373,15 @@ pub struct EngineTelemetry {
     /// wasted expert reads. Both zero when speculation is off.
     pub spec_proposed: u64,
     pub spec_accepted: u64,
+    /// Drafts the `COLI_SPEC_CONF` floor cut short of their requested depth,
+    /// cumulative. Zero when the floor is off (the default).
+    pub spec_conf_stops: u64,
     /// RLM recursive refinement `(passes_emitted, tokens_recursed)`,
     /// cumulative — `(0, 0)` unless `COLI_RLM=1`.
     pub rlm: (u64, u64),
+    /// Disk-persisted KV sessions `(saved, loaded, tokens_restored)`,
+    /// cumulative — `None` unless `COLI_KV_STORE_DIR` is set.
+    pub kvstore: Option<(u64, u64, u64)>,
     /// O_DIRECT slab buffers currently checked out across the streaming rings
     /// (`None` when experts are resident). Stuck at the pool cap = reads are
     /// serializing on buffer availability.
@@ -436,6 +498,8 @@ struct SpecOverride {
     depth: Option<usize>,
     /// `COLI_DRAFT_SAMPLED`.
     sampled: Option<bool>,
+    /// `COLI_SPEC_CONF`.
+    conf: Option<f32>,
 }
 
 /// [`spawn`] with the fusion and the speculation knobs forced.
@@ -450,7 +514,7 @@ fn spawn_tuned(
     fuse: bool,
     depth: Option<usize>,
 ) -> Result<(EngineHandle, JoinHandle<()>), Error> {
-    spawn_spec(model, max_batch, fuse, SpecOverride { depth, sampled: None })
+    spawn_spec(model, max_batch, fuse, SpecOverride { depth, sampled: None, conf: None })
 }
 
 /// [`spawn_tuned`] with the sampled-speculation knob forced too.
@@ -493,6 +557,32 @@ fn batch_sla_ms() -> Option<u64> {
 fn draft_depth() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("COLI_DRAFT").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0))
+}
+
+/// Confidence floor for the MTP draft (`COLI_SPEC_CONF`, clamped to `[0, 1)`).
+/// `0`/unset drafts the full `COLI_DRAFT` depth — the historical behavior and
+/// the default until an A/B licenses otherwise.
+///
+/// The ds4/DSpark observation this ports: draft yield is bimodal — predictable
+/// continuations accept nearly everything, uncertain ones reject nearly
+/// everything — and the MTP head's own top-token probability separates the two
+/// before any verify row is spent. Every drafted token becomes a verify row in
+/// the batched forward, and a rejected row is a row of wasted expert reads, so
+/// stopping a low-confidence draft attacks bytes/accepted-token directly.
+/// Depth-only by design: `accept_run`'s greedy identity is untouched, so this
+/// knob can never change emitted tokens (ds4's version gates acceptance too and
+/// documents output drift; peregrine's invariant forbids that trade).
+/// ds4 ships 0.6 (Metal) / 0.7 (CUDA) as defaults — 0.65 is the A/B arm.
+fn spec_conf() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_SPEC_CONF")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 0.999_999))
+            .unwrap_or(0.0)
+    })
 }
 
 /// Extend speculation to temperature > 0 requests via rejection sampling
@@ -781,6 +871,7 @@ fn run_tuned(
     // MTP acceptance accounting (see `EngineTelemetry::spec_proposed`).
     let mut spec_proposed: u64 = 0;
     let mut spec_accepted: u64 = 0;
+    let mut spec_conf_stops: u64 = 0;
     // Adaptive-batching state. `working_cap` is the current admission ceiling
     // (starts at `max_batch`, shrinks under SLA overrun, grows on slack). EWMA
     // over per-forward wall time drives the adjustment.
@@ -789,8 +880,12 @@ fn run_tuned(
     let chunk_div = prefill_chunk_div();
     let depth = spec.depth.unwrap_or_else(draft_depth);
     let sampled_spec = spec.sampled.unwrap_or_else(draft_sampled);
+    let conf_floor = spec.conf.unwrap_or_else(spec_conf);
     let has_mtp = model.has_mtp();
-    let mut prefix = PrefixCache::new(prefix_cache_budget());
+    let mut prefix = PrefixStore::new(
+        prefix_cache_budget(),
+        crate::kvstore::KvSessionStore::from_env(&model, PREFIX_CACHE_MIN_TOKENS),
+    );
     // Resolved once: the KV byte ceiling admission respects alongside the count.
     let kv_budget = kv_budget_bytes();
     // Resolved once: the fused-forward row ceiling (0 = uncapped).
@@ -1215,15 +1310,23 @@ fn run_tuned(
                 // handing it a sampled draft would break `accept_run`'s
                 // sequence-identity with greedy decoding.
                 let drafted = if s.sampler.temp > 0.0 {
-                    model.mtp_draft_sampled(s.next_tok, g, &s.hlast, &mut s.sampler).map(|(d, q)| {
+                    model.mtp_draft_sampled(s.next_tok, g, &s.hlast, conf_floor, &mut s.sampler).map(|(d, q)| {
                         s.draft_q = q;
                         d
                     })
                 } else {
-                    model.mtp_draft(s.next_tok, g, &s.hlast)
+                    model.mtp_draft(s.next_tok, g, &s.hlast, conf_floor)
                 };
                 match drafted {
-                    Ok(d) => s.draft = d,
+                    Ok(d) => {
+                        // A draft shorter than requested under an active floor
+                        // is the gate firing — the number that says whether
+                        // 0.65 is pruning wasted verify rows or starving depth.
+                        if conf_floor > 0.0 && d.len() < g {
+                            spec_conf_stops += 1;
+                        }
+                        s.draft = d;
+                    }
                     // A partial `draft_q` from a failed draft must not survive:
                     // the next verify would score this tick's rows against it.
                     Err(e) => {
@@ -1265,26 +1368,39 @@ fn run_tuned(
             prefetch_reads: model.ecache_prefetch_reads().unwrap_or(0),
             spec_proposed,
             spec_accepted,
+            spec_conf_stops,
             rlm: model.rlm_stats(),
+            kvstore: prefix.disk.as_ref().map(|d| (d.saved, d.loaded, d.tokens_restored)),
             io_slab_in_use: model.io_slab_in_use(),
         };
     }
     // Shutdown: report what the prefix cache absorbed. Silent when it is off, so
     // a default run's output is unchanged.
-    if prefix.enabled() {
+    if prefix.mem.enabled() {
         eprintln!(
             "[prefix-cache] hits={} tokens_reused={} entries={} resident={:.1} MiB",
-            prefix.hits,
-            prefix.tokens_saved,
-            prefix.entries.len(),
-            prefix.used as f64 / (1024.0 * 1024.0)
+            prefix.mem.hits,
+            prefix.mem.tokens_saved,
+            prefix.mem.entries.len(),
+            prefix.mem.used as f64 / (1024.0 * 1024.0)
+        );
+    }
+    // Disk-persisted sessions, silent unless COLI_KV_STORE_DIR enabled them.
+    if let Some(d) = &prefix.disk {
+        eprintln!(
+            "[kvstore] saved={} loaded={} tokens_restored={} entries={} resident={:.1} MiB",
+            d.saved,
+            d.loaded,
+            d.tokens_restored,
+            d.entry_count(),
+            d.resident_bytes() as f64 / (1024.0 * 1024.0)
         );
     }
     // Speculation accounting, silent when speculation never ran. The accept
     // rate is what says whether COLI_DRAFT's depth pays for its verify rows.
     if spec_proposed > 0 {
         eprintln!(
-            "[spec] proposed={spec_proposed} accepted={spec_accepted} accept_rate={:.1}%",
+            "[spec] proposed={spec_proposed} accepted={spec_accepted} conf_stops={spec_conf_stops} accept_rate={:.1}%",
             spec_accepted as f64 / spec_proposed as f64 * 100.0
         );
     }
@@ -1520,7 +1636,7 @@ fn admit_pending(
     model: &Model,
     pending: &mut VecDeque<Prefilling>,
     req: EngineRequest,
-    prefix: &mut PrefixCache,
+    prefix: &mut PrefixStore,
     queued: &std::sync::atomic::AtomicUsize,
 ) {
     // The request has left the channel: it no longer counts against
@@ -1572,7 +1688,7 @@ fn prefill_step(
     vocab: usize,
     stop_ids: &[i32],
     chunk_div: usize,
-    prefix: &mut PrefixCache,
+    prefix: &mut PrefixStore,
 ) {
     let Some(mut p) = pending.pop_front() else {
         return;
@@ -1664,7 +1780,7 @@ fn finish_prefill_chunk(
     pending: &mut VecDeque<Prefilling>,
     active: &mut Vec<SeqState>,
     out_cfg: OutputCfg,
-    prefix: &mut PrefixCache,
+    prefix: &mut PrefixStore,
 ) {
     let OutputCfg { vocab, stop_ids } = out_cfg;
     let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist, seq_id } = p;
@@ -1910,7 +2026,7 @@ mod tests {
         let dir = tiny_dir("seqid")?;
         let model = Model::load(&dir)?;
         let mut pending: VecDeque<Prefilling> = VecDeque::new();
-        let mut prefix = PrefixCache::new(0);
+        let mut prefix = PrefixStore::new(0, None);
         let mut keepalive = Vec::new();
         for _ in 0..3 {
             let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
@@ -2384,7 +2500,7 @@ mod tests {
             Ok(toks)
         };
 
-        let on = SpecOverride { depth: Some(4), sampled: Some(true) };
+        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None };
         let got = run_engine(on)?;
         assert!(!got.is_empty(), "sampled speculation generated nothing");
         assert!(got.len() <= n, "served {} tokens for max_new {n}", got.len());
@@ -2398,7 +2514,7 @@ mod tests {
         // And the knob is a knob: with it off, the same request takes the
         // historical one-row path, whose stream differs precisely because the
         // RNG is consumed differently.
-        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false) })?;
+        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None })?;
         assert!(!off.is_empty(), "the unspeculated path generated nothing");
         assert_ne!(
             off, got,
@@ -2406,6 +2522,53 @@ mod tests {
              identical streams mean no draft was ever taken and the test proves nothing"
         );
 
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The confidence floor's one hard promise: whatever `COLI_SPEC_CONF` is
+    /// set to, a greedy request serves exactly the tokens it would serve with
+    /// the floor off. The floor decides how *deep* a draft goes; `accept_run`
+    /// alone decides what is emitted, so any divergence here means the gate
+    /// leaked past depth into acceptance.
+    #[test]
+    fn the_confidence_floor_never_changes_a_greedy_stream() -> Result<(), Error> {
+        let dir = tiny_dir("spec_conf_engine")?;
+        let prompt = vec![1i32, 5, 9, 2];
+        let n = 8usize;
+
+        let run_engine = |spec: SpecOverride| -> Result<Vec<u32>, Error> {
+            let (handle, join) = spawn_spec(Model::load(&dir)?, 4, false, spec)?;
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: prompt.clone(),
+                max_new: n,
+                sampler: Sampler::new(0.0, 0.9, 1), // greedy: sequence-identity is the contract
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            drop(handle);
+            let mut toks = Vec::new();
+            let mut rx = rx;
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Error(e) => return Err(Error::Format(e)),
+                }
+            }
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok(toks)
+        };
+
+        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0) })?;
+        assert!(!base.is_empty(), "the baseline generated nothing");
+        for floor in [0.65f32, 0.999] {
+            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor) })?;
+            assert_eq!(gated, base, "a {floor} confidence floor changed a greedy stream");
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

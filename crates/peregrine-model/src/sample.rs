@@ -31,6 +31,38 @@ pub fn argmax(lo: &[f32]) -> usize {
     b
 }
 
+/// Probability the argmax token would receive under `softmax(lo)` — the draft
+/// confidence the speculative gate (`COLI_SPEC_CONF`) compares against its
+/// floor. Stable by construction: shifting by the max makes the top term
+/// `exp(0)`, so the result is `1 / Σ exp(l − max)` and nothing overflows.
+///
+/// NaN logits are skipped, matching [`argmax`]'s stance. An empty, all-NaN or
+/// `+inf`-contaminated row reports `0.0` — under any floor that reads as "no
+/// confidence" and stops the draft, which is the safe side: a numerical fault
+/// costs draft depth, never a wrong token (acceptance is separate).
+pub fn top_prob(lo: &[f32]) -> f32 {
+    let mut mx = f32::NEG_INFINITY;
+    for &v in lo {
+        if !v.is_nan() && v > mx {
+            mx = v;
+        }
+    }
+    if !mx.is_finite() {
+        return 0.0;
+    }
+    let mut denom = 0f64;
+    for &v in lo {
+        if !v.is_nan() {
+            denom += f64::from(v - mx).exp();
+        }
+    }
+    if denom > 0.0 {
+        (1.0 / denom) as f32
+    } else {
+        0.0
+    }
+}
+
 /// Greedy argmax over a batch of `out.len()` logit rows `logits[n, vocab]`, one
 /// token per row into `out`. The all-greedy fast path for batched decode
 /// (`temp <= 0`) — skips per-sequence `Sampler` dispatch. Sampled decode keeps a
@@ -250,6 +282,33 @@ mod tests {
     fn greedy_is_argmax() {
         let mut s = Sampler::new(0.0, 0.9, 1);
         assert_eq!(s.pick(&[0.1, 0.9, 0.3, 0.2], -1), 1);
+    }
+
+    #[test]
+    fn top_prob_is_uniform_share_on_flat_logits_and_one_on_a_spike() {
+        // Flat logits: every token holds exactly 1/n of the mass.
+        let flat = [0.5f32; 8];
+        assert!((top_prob(&flat) - 1.0 / 8.0).abs() < 1e-6);
+        // A dominant logit takes essentially all of it.
+        let spike = [0.0f32, 30.0, 0.0, 0.0];
+        assert!(top_prob(&spike) > 0.999);
+        // Sharpening the same shape can only raise the top share — the
+        // monotonicity a confidence floor relies on.
+        let soft = [0.0f32, 2.0, 0.0, 0.0];
+        assert!(top_prob(&spike) > top_prob(&soft));
+        assert!(top_prob(&soft) > top_prob(&flat));
+    }
+
+    #[test]
+    fn top_prob_reports_zero_confidence_on_degenerate_rows() {
+        // Empty, all-NaN, and +inf-contaminated rows must all read as "no
+        // confidence" so a floor stops the draft instead of trusting a fault.
+        assert_eq!(top_prob(&[]), 0.0);
+        assert_eq!(top_prob(&[f32::NAN, f32::NAN]), 0.0);
+        assert_eq!(top_prob(&[1.0, f32::INFINITY]), 0.0);
+        // A NaN alongside real logits is skipped, not fatal.
+        let with_nan = [0.0f32, f32::NAN, 30.0];
+        assert!(top_prob(&with_nan) > 0.999);
     }
 
     #[test]

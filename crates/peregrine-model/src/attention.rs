@@ -509,7 +509,7 @@ impl LayerKv {
     /// sequence with its cache must fail that one request, not abort the
     /// process (the release profile sets `panic = "abort"`, so a panic here
     /// would take every concurrent sequence down with it).
-    fn append(&mut self, pos: usize, lc_row: &[f32], rc_row: &[f32]) -> Result<(), Error> {
+    pub(crate) fn append(&mut self, pos: usize, lc_row: &[f32], rc_row: &[f32]) -> Result<(), Error> {
         if pos != self.len {
             return Err(Error::Format(format!(
                 "KV cache append out of order: position {pos} into a cache of length {}",
@@ -666,6 +666,23 @@ impl LayerKv {
     /// this rather than `len`.
     pub fn index_len(&self) -> usize {
         self.ix_span(self.len).rows(self.ix_width)
+    }
+
+    /// Width of one DSA indexer key row (`0` = no indexer keys yet). Needed by
+    /// `SeqKv::export_prefix` to slice the `ix` stream it reads via
+    /// [`Self::ix_span`].
+    pub(crate) fn ix_width(&self) -> usize {
+        self.ix_width
+    }
+
+    /// Row widths of the two latent streams — `SeqKv::export_prefix` slices its
+    /// flat `f32` output with these.
+    pub(crate) fn kv_lora_width(&self) -> usize {
+        self.kv_lora
+    }
+
+    pub(crate) fn qk_rope_width(&self) -> usize {
+        self.qk_rope
     }
 
     /// Cache one position's indexer key. Appended in the same order as the

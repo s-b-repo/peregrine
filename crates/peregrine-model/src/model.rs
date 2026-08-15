@@ -403,6 +403,106 @@ impl SeqKv {
     pub fn clone_prefix(&self, n: usize) -> SeqKv {
         SeqKv { layers: self.layers.iter().map(|k| k.clone_prefix(n)).collect() }
     }
+
+    /// The first `n` positions of every layer as plain `f32` vectors — the
+    /// disk-persistence seam (`COLI_KV_STORE_DIR`). Reads go through the same
+    /// [`KvSpan`](crate::attention::KvSpan)s attention itself uses, so the
+    /// export sees exactly the values a forward would.
+    ///
+    /// Round-trip exactness: an `f16` cache exports through the widening
+    /// `f16 → f32` (exact), and [`Self::import`] re-narrows values that were
+    /// `f16` back to the identical bits — so export/import is lossless for
+    /// both dtypes *when the importing cache uses the same dtype*, which the
+    /// disk store enforces via its header.
+    pub fn export_prefix(&self, n: usize) -> KvExport {
+        let n = n.min(self.len());
+        let layers = self
+            .layers
+            .iter()
+            .map(|k| {
+                // The indexer stream is exported only when it is row-aligned
+                // with the latents from position 0. Mid-sequence DSA enablement
+                // leaves `ix` shorter than `len` with its rows belonging to
+                // *later* positions; exporting those as rows 0..ix_rows would
+                // rebuild a silently misaligned cache. Dropping `ix` is safe —
+                // it degrades DSA selection for the restored prefix, never
+                // correctness of the latents.
+                let ixw = if k.index_len() == k.len() { k.ix_width() } else { 0 };
+                let mut lc = Vec::new();
+                let mut rc = Vec::new();
+                let mut ix = Vec::new();
+                k.lc_span(n).extend_f32(n, k.kv_lora_width(), &mut lc);
+                k.rc_span(n).extend_f32(n, k.qk_rope_width(), &mut rc);
+                if ixw > 0 {
+                    k.ix_span(n).extend_f32(n, ixw, &mut ix);
+                }
+                KvLayerExport { lc, rc, ix, ix_width: ixw }
+            })
+            .collect();
+        KvExport { n, layers }
+    }
+
+    /// Rebuild a cache from an export — the inverse of [`Self::export_prefix`].
+    /// Widths are validated against `cfg` before any row lands, and every row
+    /// goes through the same order-checked [`LayerKv::append`] path prefill
+    /// uses, so an import can never construct a cache prefill could not.
+    pub fn import(cfg: &Cfg, dt: KvDtype, ex: &KvExport) -> Result<SeqKv, Error> {
+        let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
+        if ex.layers.len() != cfg.n_layers as usize {
+            return Err(Error::Format(format!(
+                "KV import: {} layers in the export, model has {}",
+                ex.layers.len(),
+                cfg.n_layers
+            )));
+        }
+        let mut kv = SeqKv::with_dtype(cfg, dt);
+        for (k, le) in kv.layers.iter_mut().zip(&ex.layers) {
+            if le.lc.len() != ex.n * kvl || le.rc.len() != ex.n * qkr {
+                return Err(Error::Format(format!(
+                    "KV import: layer stream lengths ({}, {}) do not match {} rows of ({kvl}, {qkr})",
+                    le.lc.len(),
+                    le.rc.len(),
+                    ex.n
+                )));
+            }
+            if le.ix_width > 0 && le.ix.len() != ex.n * le.ix_width {
+                return Err(Error::Format(format!(
+                    "KV import: indexer stream is {} elements, expected {} rows of {}",
+                    le.ix.len(),
+                    ex.n,
+                    le.ix_width
+                )));
+            }
+            for r in 0..ex.n {
+                k.append(r, &le.lc[r * kvl..(r + 1) * kvl], &le.rc[r * qkr..(r + 1) * qkr])?;
+            }
+            if le.ix_width > 0 {
+                for row in le.ix.chunks_exact(le.ix_width) {
+                    k.append_index_key(row);
+                }
+            }
+        }
+        Ok(kv)
+    }
+}
+
+/// One layer's exported KV streams (see [`SeqKv::export_prefix`]): flat
+/// row-major `f32`, `n` rows each of the layer's own widths.
+pub struct KvLayerExport {
+    pub lc: Vec<f32>,
+    pub rc: Vec<f32>,
+    /// DSA indexer keys; empty (with `ix_width == 0`) when the layer has none
+    /// or they were not aligned enough to export.
+    pub ix: Vec<f32>,
+    pub ix_width: usize,
+}
+
+/// A `SeqKv` prefix as plain vectors — the unit the serve-side disk store
+/// (`COLI_KV_STORE_DIR`) serializes and restores.
+pub struct KvExport {
+    /// Positions exported.
+    pub n: usize,
+    pub layers: Vec<KvLayerExport>,
 }
 
 /// Memory this process may actually use, in bytes (0 if unreadable): the smaller of
@@ -570,22 +670,70 @@ fn read_cgroup_file(path: &str) -> Option<String> {
     }
 }
 
-/// Warm-cache byte budget from the environment: `COLI_ECACHE_GB` (GiB float) if
-/// set, else 10% of `MemAvailable` capped at 2 GiB. `0` (or an unparseable value)
+/// How `COLI_ECACHE_GB` was spelled: an explicit byte budget, or the ds4-style
+/// `auto` fraction of `MemAvailable`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EcacheSpec {
+    /// Explicit GiB (`0` = disabled) — the historical spelling, byte-for-byte.
+    Fixed(usize),
+    /// `auto`: this fraction of `MemAvailable` at resolution time.
+    AutoFrac(f64),
+}
+
+/// Pure parse of the `COLI_ECACHE_GB` spelling (`frac` is
+/// `COLI_ECACHE_AUTO_FRAC`, consulted only for `auto`). `None` = unparseable;
+/// the caller notes the advisory and disables the cache, the historical
+/// behavior for garbage input.
+///
+/// The default fraction is ds4/DwarfStar's budget rule — 80% of the backend's
+/// recommended working set — which lands here as 80% of post-load
+/// `MemAvailable`: read after the resident weights are mapped, so they are
+/// already netted out, exactly the subtraction ds4 does explicitly. Clamped to
+/// (0, 0.95]: a fraction of 1.0 would hand the cache every byte the box has
+/// left, and `cap_ecache_budget`'s reserve-and-safety cut still applies on top.
+fn parse_ecache_spec(v: &str, frac: Option<&str>) -> Option<EcacheSpec> {
+    const GIB: f64 = (1u64 << 30) as f64;
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        let f = frac
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .map(|f| f.min(0.95))
+            .unwrap_or(0.80);
+        return Some(EcacheSpec::AutoFrac(f));
+    }
+    t.parse::<f64>().ok().map(|g| EcacheSpec::Fixed((g.max(0.0) * GIB) as usize))
+}
+
+/// Warm-cache byte budget from the environment: `COLI_ECACHE_GB` (GiB float,
+/// or `auto` for a `COLI_ECACHE_AUTO_FRAC` share of `MemAvailable`) if set,
+/// else 10% of `MemAvailable` capped at 2 GiB. `0` (or an unparseable value)
 /// disables the cache. Kept independent of the streaming-vs-resident RAM
 /// heuristic so the two knobs don't interfere.
 fn ecache_budget_bytes() -> usize {
     const GIB: f64 = (1u64 << 30) as f64;
     match std::env::var("COLI_ECACHE_GB") {
         Ok(v) => {
-            let g: f64 = match v.trim().parse() {
-                Ok(g) => g,
+            let frac_env = match std::env::var("COLI_ECACHE_AUTO_FRAC") {
+                Ok(f) => Some(f),
+                Err(std::env::VarError::NotPresent) => None,
                 Err(e) => {
-                    peregrine_io::note_advisory_err("COLI_ECACHE_GB parse (cache disabled)", &e);
-                    0.0
+                    peregrine_io::note_advisory_err("COLI_ECACHE_AUTO_FRAC read", &e);
+                    None
                 }
             };
-            return (g.max(0.0) * GIB) as usize;
+            return match parse_ecache_spec(&v, frac_env.as_deref()) {
+                Some(EcacheSpec::Fixed(b)) => b,
+                Some(EcacheSpec::AutoFrac(f)) => (f * mem_available_bytes() as f64) as usize,
+                None => {
+                    let e = std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("expected GiB or 'auto', got {v:?}"),
+                    );
+                    peregrine_io::note_advisory_err("COLI_ECACHE_GB parse (cache disabled)", &e);
+                    0
+                }
+            };
         }
         Err(std::env::VarError::NotPresent) => {}
         Err(e) => peregrine_io::note_advisory_err("COLI_ECACHE_GB read", &e),
@@ -4615,8 +4763,13 @@ impl Model {
     /// That matters — the batching thread holds `&Model` while several
     /// sequences draft, and a `&mut` here would have serialised them behind the
     /// one borrow.
-    pub fn mtp_draft(&self, next_tok: i32, g_draft: usize, hlast: &[f32]) -> Result<Vec<i32>, Error> {
-        self.mtp_draft_with(next_tok, g_draft, hlast, |lo| crate::sample::argmax(lo) as i32)
+    /// `conf_floor > 0` stops the draft early when the MTP head's top-token
+    /// probability drops under it (`0.0` = draft the full depth, the historical
+    /// behavior). Depth-only: acceptance is the caller's `accept_run`, so the
+    /// floor can never change an emitted token — it trades draft depth for
+    /// fewer rejected verify rows, each of which streams expert bytes.
+    pub fn mtp_draft(&self, next_tok: i32, g_draft: usize, hlast: &[f32], conf_floor: f32) -> Result<Vec<i32>, Error> {
+        self.mtp_draft_with(next_tok, g_draft, hlast, conf_floor, |lo| crate::sample::argmax(lo) as i32)
     }
 
     /// Draft `g_draft` tokens **sampled from `sampler`'s own distribution**,
@@ -4641,10 +4794,11 @@ impl Model {
         next_tok: i32,
         g_draft: usize,
         hlast: &[f32],
+        conf_floor: f32,
         sampler: &mut Sampler,
     ) -> Result<(Vec<i32>, Vec<Vec<f32>>), Error> {
         let mut qs: Vec<Vec<f32>> = Vec::with_capacity(g_draft);
-        let drafts = self.mtp_draft_with(next_tok, g_draft, hlast, |lo| {
+        let drafts = self.mtp_draft_with(next_tok, g_draft, hlast, conf_floor, |lo| {
             let (t, q) = sampler.pick_with_distribution(lo);
             qs.push(q);
             t as i32
@@ -4665,6 +4819,7 @@ impl Model {
         next_tok: i32,
         g_draft: usize,
         hlast: &[f32],
+        conf_floor: f32,
         mut pick: impl FnMut(&[f32]) -> i32,
     ) -> Result<Vec<i32>, Error> {
         let d = self.cfg.hidden as usize;
@@ -4725,6 +4880,15 @@ impl Model {
             forward_layer(&mtp.layer, n_layers, &mut kv, &ctx, &mut hx, 1, g)?;
             let row = rmsnorm_rows(&hx, &mtp.mtp_norm, 1, d, eps);
             let logit = lm_head.apply_vec(&row, 1);
+            // The confidence gate (ds4's DSpark idea): a step whose top token
+            // holds less than `conf_floor` of the distribution ends the draft
+            // *before* `pick` — the low-confidence token itself is excluded,
+            // since it would be the likeliest wasted verify row. Breaking
+            // before `pick` also keeps the sampled path's `drafts`/`qs`
+            // aligned by construction.
+            if conf_floor > 0.0 && crate::sample::top_prob(&logit) < conf_floor {
+                break;
+            }
             let t2 = pick(&logit);
             draft.push(t2);
             tok = t2;
@@ -4767,7 +4931,10 @@ impl Model {
             let budget = n_new - out.len();
             // draft at most budget-1 (we always emit `next` this round)
             let g_want = g_draft.min(budget.saturating_sub(1));
-            let draft = if g_want > 0 { self.mtp_draft(next, g_want, &hlast)? } else { Vec::new() };
+            // No confidence floor here: the serve engine resolves
+            // `COLI_SPEC_CONF`; this single-sequence path keeps the historical
+            // fixed depth so its output-identity contract stays trivially true.
+            let draft = if g_want > 0 { self.mtp_draft(next, g_want, &hlast, 0.0)? } else { Vec::new() };
             let g = draft.len();
 
             // verify [next, draft...] in one forward
@@ -5739,6 +5906,29 @@ mod tests {
     }
 
     #[test]
+    fn ecache_spec_parses_numbers_auto_and_rejects_garbage() {
+        const GIB: usize = 1 << 30;
+        // The historical numeric spelling is untouched, fractions included.
+        assert_eq!(parse_ecache_spec("8", None), Some(EcacheSpec::Fixed(8 * GIB)));
+        assert_eq!(parse_ecache_spec("0.5", None), Some(EcacheSpec::Fixed(GIB / 2)));
+        assert_eq!(parse_ecache_spec("0", None), Some(EcacheSpec::Fixed(0)));
+        assert_eq!(parse_ecache_spec("-2", None), Some(EcacheSpec::Fixed(0)), "negative clamps to disabled");
+        // `auto` takes ds4's 0.80 unless COLI_ECACHE_AUTO_FRAC narrows it.
+        assert_eq!(parse_ecache_spec("auto", None), Some(EcacheSpec::AutoFrac(0.80)));
+        assert_eq!(parse_ecache_spec(" AUTO ", None), Some(EcacheSpec::AutoFrac(0.80)), "case/space insensitive");
+        assert_eq!(parse_ecache_spec("auto", Some("0.5")), Some(EcacheSpec::AutoFrac(0.5)));
+        // The fraction clamps to 0.95 — 1.0 would hand the cache every free
+        // byte — and nonsense fractions fall back to the default rather than 0.
+        assert_eq!(parse_ecache_spec("auto", Some("1.4")), Some(EcacheSpec::AutoFrac(0.95)));
+        assert_eq!(parse_ecache_spec("auto", Some("0")), Some(EcacheSpec::AutoFrac(0.80)));
+        assert_eq!(parse_ecache_spec("auto", Some("nan")), Some(EcacheSpec::AutoFrac(0.80)));
+        assert_eq!(parse_ecache_spec("auto", Some("gibberish")), Some(EcacheSpec::AutoFrac(0.80)));
+        // Garbage spellings surface as None so the caller can disable-with-advisory.
+        assert_eq!(parse_ecache_spec("lots", None), None);
+        assert_eq!(parse_ecache_spec("", None), None);
+    }
+
+    #[test]
     fn rmsnorm_rows_parallel_matches_serial() {
         // rmsnorm_rows runs rows on the compute pool when the row is wide enough
         // (d >= 256); use d=512 so the parallel path engages, and assert it stays
@@ -5772,6 +5962,67 @@ mod tests {
         let external = m.forward_prefill_seq(&toks, &mut seq, 0)?;
         assert_eq!(internal, external, "external-KV prefill must equal internal forward_step");
         assert_eq!(seq.len(), toks.len());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn kv_export_import_round_trips_bit_identically() -> Result<(), peregrine_core::Error> {
+        // The disk-persistence seam's whole contract: a cache rebuilt from an
+        // export must be indistinguishable from the live one — the values it
+        // exports again are equal, and (the decisive check) a forward continued
+        // from it produces bit-identical logits. Both dtypes, since f16 narrows
+        // on append and must re-narrow to the same bits.
+        let dir = tmp_model_dir("kvexport")?;
+        let m = Model::load(&dir)?;
+        let toks = [1i32, 5, 9, 2, 7, 3];
+        for dt in [KvDtype::F32, KvDtype::F16] {
+            let mut live = SeqKv::with_dtype(&m.cfg, dt);
+            m.forward_prefill_seq(&toks, &mut live, 0)?;
+            let ex = live.export_prefix(live.len());
+            assert_eq!(ex.n, toks.len());
+            let restored = SeqKv::import(&m.cfg, dt, &ex)?;
+            assert_eq!(restored.len(), live.len());
+
+            let again = restored.export_prefix(restored.len());
+            for (a, b) in ex.layers.iter().zip(&again.layers) {
+                assert!(a.lc.iter().zip(&b.lc).all(|(x, y)| x.to_bits() == y.to_bits()), "lc drifted ({dt:?})");
+                assert!(a.rc.iter().zip(&b.rc).all(|(x, y)| x.to_bits() == y.to_bits()), "rc drifted ({dt:?})");
+                assert_eq!(a.lc.len(), b.lc.len());
+                assert_eq!(a.rc.len(), b.rc.len());
+            }
+
+            let (mut a, mut b) = (live, restored);
+            let pos = toks.len();
+            let mut one: [&mut SeqKv; 1] = [&mut a];
+            let from_live = m.forward_rows_batched(&[7], &[0], &mut one, &[pos], None)?;
+            let mut one: [&mut SeqKv; 1] = [&mut b];
+            let from_restored = m.forward_rows_batched(&[7], &[0], &mut one, &[pos], None)?;
+            assert!(
+                from_live.iter().zip(&from_restored).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "a forward from the restored cache must be bit-identical ({dt:?})"
+            );
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn kv_import_refuses_mismatched_shapes() -> Result<(), peregrine_core::Error> {
+        let dir = tmp_model_dir("kvimportbad")?;
+        let m = Model::load(&dir)?;
+        let mut live = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&[1, 5, 9, 2], &mut live, 0)?;
+        let mut ex = live.export_prefix(live.len());
+        // Truncated stream → refused, not silently misaligned.
+        if let Some(l0) = ex.layers.first_mut() {
+            l0.lc.pop();
+        }
+        assert!(SeqKv::import(&m.cfg, KvDtype::F32, &ex).is_err(), "a short lc stream must be refused");
+        // Wrong layer count → refused.
+        let mut ex = live.export_prefix(live.len());
+        ex.layers.pop();
+        assert!(SeqKv::import(&m.cfg, KvDtype::F32, &ex).is_err(), "a missing layer must be refused");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -6078,9 +6329,16 @@ mod tests {
         // And it is what the drafter accepts: `mtp_draft` takes `&self`, so
         // several sequences can draft from one `&Model` without serialising.
         if m.has_mtp() {
-            let draft = m.mtp_draft(tok, 2, &hidden)?;
+            let draft = m.mtp_draft(tok, 2, &hidden, 0.0)?;
             assert_eq!(draft.len(), 2, "the head drafts to the requested depth");
             assert!(draft.iter().all(|&t| t >= 0 && (t as usize) < vocab), "drafts must be real token ids");
+            // An impossible floor stops the draft at depth 0; the tokens a
+            // permissive floor keeps are a prefix of the unfloored draft —
+            // the gate may only shorten, never redirect.
+            let none = m.mtp_draft(tok, 2, &hidden, 1.1)?;
+            assert!(none.is_empty(), "a floor above 1.0 must draft nothing");
+            let floored = m.mtp_draft(tok, 2, &hidden, 1e-9)?;
+            assert_eq!(floored, draft, "an always-passing floor must not change the draft");
         }
         std::fs::remove_dir_all(&dir)?;
         Ok(())

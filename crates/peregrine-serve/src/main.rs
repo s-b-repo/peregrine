@@ -16,6 +16,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod batch;
+mod kvstore;
 mod memo;
 mod tok;
 mod tools;
@@ -479,6 +480,8 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
         "spec": {
             "proposed": t.spec_proposed,
             "accepted": t.spec_accepted,
+            // Drafts the COLI_SPEC_CONF floor cut short (0 with the floor off).
+            "conf_stops": t.spec_conf_stops,
             "accept_rate": if t.spec_proposed > 0 {
                 t.spec_accepted as f64 / t.spec_proposed as f64
             } else { 0.0 },
@@ -486,6 +489,10 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
         // RLM recursive refinement (COLI_RLM): passes emitted and tokens that
         // triggered at least one.
         "rlm": { "passes": t.rlm.0, "tokens_recursed": t.rlm.1 },
+        // Disk-persisted KV sessions (COLI_KV_STORE_DIR); null when off.
+        "kvstore": t.kvstore.map(|(s, l, r)| serde_json::json!({
+            "saved": s, "loaded": l, "tokens_restored": r,
+        })),
         // O_DIRECT slab buffers in flight (null when experts are resident);
         // pinned at the pool cap = reads serializing on buffer availability.
         "io_slab_in_use": t.io_slab_in_use,

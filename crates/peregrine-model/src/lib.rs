@@ -47,7 +47,8 @@ pub use math::{
 };
 pub use mlp::{moe_forward, Mlp, MoeCfg};
 pub use model::{
-    accept_run, accept_run_sampled, lookahead_issued, save_automaton, save_macrostates, Model, SeqKv, Verified,
+    accept_run, accept_run_sampled, kv_dtype, lookahead_issued, save_automaton, save_macrostates, KvExport,
+    KvLayerExport, Model, SeqKv, Verified,
 };
 pub use iotune::{IoTuner, IowqCap};
 pub use lane::{Bias, BubbleTuner, LaneBalancer, LaneTimings, LaneTimingsAccum, Placement};

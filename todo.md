@@ -45,6 +45,27 @@ open question against §1's entire statistical predictor stack.*
 
 ## 📌 What is actually left (2026-08-08; defrag + min-share closed 2026-08-13)
 
+**2026-08-15 wave (the ds4 port — verdicts pending overnight).** Four
+techniques from [antirez's ds4/DwarfStar](https://github.com/antirez/ds4)
+(same problem shape: GLM-5.2 experts streamed on consumer hardware) landed as
+code; every knob is off by default and `scripts/overnight-2026-08-15.sh` is
+measuring them — numbers land in `bench-data/2026-08-15-*/` and get copied
+here and into docs/benchmarks.md when the chain finishes. (1) **Asymmetric
+expert requantization** (`--down keep --keep-last-layers 6`, §13's pending
+bullet — the only untested evidence-backed point left on the sub-int4
+ladder). (2) **`COLI_SPEC_CONF`** — confidence-gated MTP draft depth;
+depth-only, `accept_run` untouched, greedy output pinned bit-identical by an
+engine test. The §6/`performance-tuning.md` `COLI_DRAFT=4` rejection (each
+rejected verify row streams its own expert bytes) is precisely the waste it
+prunes, so the 08-13 rejection gets a second look with the floor at 0.65.
+(3) **`COLI_ECACHE_GB=auto`** — ds4's 80 %-of-available budget rule over the
+existing reserve/safety caps. (4) **`COLI_KV_STORE_DIR`** — disk-persisted KV
+sessions (`serve/src/kvstore.rs`): completed prefixes ≥256 tokens checkpoint
+to disk (fingerprint + checksum + full-token compare; ~176 KiB/token) and a
+restarted server restores them instead of re-streaming ~10.85 GB/token of
+prefill; the in-memory prefix cache's disk extension, promoted back on first
+hit.
+
 **2026-08-13 evening wave (two sessions, coordinated).** Beyond the min-share
 gate (measured negative at every τ — see §6's replacement item) and the VRAM
 defrag probe (96.7 % of free VRAM in one block after worst-case churn — §2
@@ -167,6 +188,22 @@ of those intact. What replaces it, by the same test:
   measured negative** — what remains below 4 bits is vector quantization /
   incoherence processing (AQLM, QuIP#), a research project, not a converter flag.
   Artifact at `/srv/modelstripe/GLM-5.2-int3g64`; log `bench-data/2026-08-13-int3g64/`.
+- 🟡 **Pending (overnight 2026-08-15): the asymmetric/hybrid point, which the
+  closure above deliberately does not cover.** Every closed rung was *uniform* —
+  same scheme for gate/up/down across every layer. ds4/DwarfStar ships 2-bit
+  GLM-5.2/DeepSeek containers that hold up under agent workloads using an
+  **asymmetric** recipe: gate/up harder than down (down feeds the residual
+  stream directly; gate/up error launders through the SwiGLU first), plus the
+  last expert layers kept at full precision. `peregrine-requantize` grew
+  `--down keep` and `--keep-last-layers N` (2026-08-15) and the chain
+  (`scripts/overnight-2026-08-15.sh`) is converting
+  `/srv/modelstripe/GLM-5.2-i3g64-asym` (355.25 GB predicted, −7.4 %): gate/up
+  int3-g64, down byte-identical int4, last 6 expert layer indices (MTP row
+  included) untouched. Gate + container A/B run unattended; verdict lands in
+  `bench-data/2026-08-15-i3g64-asym/`. If it fails at `--keep-last-layers 12`
+  too, this closes beside its siblings and the converter flags stay (they cost
+  nothing and serve future formats). One cheap idle-priority run to test the
+  only remaining evidence-backed point on the ladder — not a reopening of RTN.
 - Speculative, named so it is not rediscovered: expert-delta or shared-basis
   coding is the only idea here with a ceiling below 2 bits/weight, but it breaks
   `QtInfo::detect`'s per-tensor self-description and there is no evidence

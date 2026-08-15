@@ -1166,7 +1166,10 @@ fn run_bench(batch_args: &[String]) -> Result<(), Error> {
                 let mut drafts: Vec<Vec<i32>> = Vec::with_capacity(b);
                 for s in 0..b {
                     let hs = &hlast[s * d..(s + 1) * d];
-                    let draft = model.mtp_draft(toks[s], draft, hs)?;
+                    // No confidence floor on the bench path: `COLI_SPEC_CONF`
+                    // is a serve-engine knob, and the bench measures the fixed
+                    // depth it is told to.
+                    let draft = model.mtp_draft(toks[s], draft, hs, 0.0)?;
                     drafts.push(draft);
                 }
                 // verify `[next, draft...]` for every sequence in ONE forward —
