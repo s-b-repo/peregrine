@@ -1418,6 +1418,14 @@ fn run(
             d.dropped_busy
         );
     }
+    // Topic-routing profiles learn in-process; without this a long-running
+    // server relearns its workload mix every boot — the sidecar's other writer
+    // is the stdio engine's route-stats path, which this server never takes.
+    // Unconditional by design: the call is a documented no-op when
+    // COLI_TOPIC_ROUTING is off.
+    if let Err(e) = model.save_topic_profiles_here() {
+        peregrine_core::note_advisory_err("topic profiles persist", &e);
+    }
     // Speculation accounting, silent when speculation never ran. The accept
     // rate is what says whether COLI_DRAFT's depth pays for its verify rows.
     if spec_proposed > 0 {
