@@ -112,6 +112,33 @@ pub fn i3_value(lo_byte: u8, hi_byte: u8, k: usize) -> i32 {
     (low | (high << 2)) - 4
 }
 
+/// Encode one 64-value group at scale `s` into the int3-g64 planes — the one
+/// copy of the bit-packing, shared by [`quant_i3_g64`] and
+/// [`quant_i3_g64_weighted`] so a chosen scale always encodes identically
+/// whichever objective chose it.
+///
+/// Ties to even, not away from zero: the reference encoder uses `np.rint`,
+/// whose own comment in that file reads "np.rint = lrintf" — C's default
+/// rounding mode. `f32::round()` disagrees on exact .5 values, which showed up
+/// as 3 differing bytes in 480 when this was diffed against colibrì's encoder.
+/// Byte-identity is the whole point of supporting this format.
+#[inline]
+fn i3_encode_group(w: &[f32], row: usize, i: usize, lo_i: usize, hi_i: usize, s: f32, base: usize, q: &mut [u8]) {
+    for k in lo_i..hi_i {
+        let v = (w[row * i + k] / s).round_ties_even().clamp(-4.0, 3.0) as i32;
+        let u = (v + 4) as u8;
+        q[base + ((k - lo_i) >> 2)] |= (u & 0x03) << (2 * ((k - lo_i) & 3));
+        q[base + I3_LOW_BYTES + ((k - lo_i) >> 3)] |= ((u >> 2) & 0x01) << ((k - lo_i) & 7);
+    }
+    // A partial final group pads with biased 4, i.e. value 0: low bits
+    // already zero, high bit set. (Writing the low plane instead would
+    // encode -3 and quietly corrupt the tail of every ragged row.)
+    for k in hi_i..lo_i + I3_GROUP {
+        let kk = k - lo_i;
+        q[base + I3_LOW_BYTES + (kk >> 3)] |= 1 << (kk & 7);
+    }
+}
+
 /// Quantize `[o, i]` to int3 with one scale per 64-value group — colibrì's
 /// fmt 5, byte-for-byte. Positive extreme is exact (`amax / 3`); the `-4` level
 /// exists but only rounding reaches it.
@@ -130,27 +157,78 @@ pub fn quant_i3_g64(w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<f32>) {
             let s = (amax / 3.0).max(1e-8);
             scale[row * ng + g] = s;
             let base = (row * ng + g) * I3_GROUP_BYTES;
+            i3_encode_group(w, row, i, lo_i, hi_i, s, base, &mut q);
+        }
+    }
+    (q, scale)
+}
+
+/// [`quant_i3_g64`] with an importance-weighted rounding objective — the
+/// imatrix/AWQ observation applied to this format (ideas #7, 2026-08-15).
+///
+/// **The on-disk format is bit-for-bit the same**: same planes, same scale
+/// cardinality, decoded by the same kernels — only *which* scale each group
+/// gets (and therefore how its values round) changes. `cw[k]` is the
+/// importance of input channel `k`, in practice the mean `|x|` per hidden
+/// channel from a calibration pass, pooled per layer. Per group the scale is
+/// chosen to minimize `Σ cw[k]·(dequant(q_k) − w_k)²` over a candidate grid of
+/// `amax/d, d ∈ 2.4..=4.4` — larger `d` trades clipped extremes for finer
+/// resolution where the mass is, which is exactly the trade a salient channel
+/// should arbitrate and plain `amax/3` never can.
+///
+/// Guarantees the caller can lean on:
+/// - **Never worse than RTN by construction**: plain `amax/3` is evaluated
+///   first and replaced only on strictly smaller weighted error, so ties and
+///   degenerate grids keep the data-free answer.
+/// - **Deterministic**: the reconstruction mirrors the runtime dequant
+///   arithmetic (`f32` value × scale), errors accumulate in `f64`, and an
+///   all-zero or absent weight group falls back to the plain scale rather
+///   than letting "any scale is optimal" pick by float noise.
+/// - Channels past `cw.len()` weigh `1.0`, so a short vector degrades toward
+///   plain rather than skewing the tail.
+pub fn quant_i3_g64_weighted(w: &[f32], o: usize, i: usize, cw: &[f32]) -> (Vec<u8>, Vec<f32>) {
+    let ng = i.div_ceil(I3_GROUP);
+    let mut q = vec![0u8; o * ng * I3_GROUP_BYTES];
+    let mut scale = vec![0f32; o * ng];
+    for row in 0..o {
+        for g in 0..ng {
+            let lo_i = g * I3_GROUP;
+            let hi_i = ((g + 1) * I3_GROUP).min(i);
+            let mut amax = 0f32;
+            let mut wsum = 0f64;
             for k in lo_i..hi_i {
-                // Padding past `i` stays at the biased zero (4), matching the
-                // reference converter, so a partial final group decodes to 0.
-                // Ties to even, not away from zero: the reference encoder uses
-                // `np.rint`, whose own comment in that file reads "np.rint =
-                // lrintf" — C's default rounding mode. `f32::round()` disagrees
-                // on exact .5 values, which showed up as 3 differing bytes in 480
-                // when this was diffed against colibrì's encoder. Byte-identity
-                // is the whole point of supporting this format.
-                let v = (w[row * i + k] / s).round_ties_even().clamp(-4.0, 3.0) as i32;
-                let u = (v + 4) as u8;
-                q[base + ((k - lo_i) >> 2)] |= (u & 0x03) << (2 * ((k - lo_i) & 3));
-                q[base + I3_LOW_BYTES + ((k - lo_i) >> 3)] |= ((u >> 2) & 0x01) << ((k - lo_i) & 7);
+                amax = amax.max(w[row * i + k].abs());
+                wsum += f64::from(cw.get(k).copied().unwrap_or(1.0));
             }
-            // A partial final group pads with biased 4, i.e. value 0: low bits
-            // already zero, high bit set. (Writing the low plane instead would
-            // encode -3 and quietly corrupt the tail of every ragged row.)
-            for k in hi_i..(g + 1) * I3_GROUP {
-                let kk = k - lo_i;
-                q[base + I3_LOW_BYTES + (kk >> 3)] |= 1 << (kk & 7);
-            }
+            let s0 = (amax / 3.0).max(1e-8);
+            let werr = |s: f32| -> f64 {
+                let mut e = 0f64;
+                for k in lo_i..hi_i {
+                    let x = w[row * i + k];
+                    let v = (x / s).round_ties_even().clamp(-4.0, 3.0);
+                    let d = f64::from(v * s - x);
+                    e += f64::from(cw.get(k).copied().unwrap_or(1.0)) * d * d;
+                }
+                e
+            };
+            let best = if wsum > 0.0 && amax > 0.0 {
+                let mut best_s = s0;
+                let mut best_e = werr(s0);
+                for t in 0..=20 {
+                    let s = (amax / (2.4 + 0.1 * t as f32)).max(1e-8);
+                    let e = werr(s);
+                    if e < best_e {
+                        best_e = e;
+                        best_s = s;
+                    }
+                }
+                best_s
+            } else {
+                s0
+            };
+            scale[row * ng + g] = best;
+            let base = (row * ng + g) * I3_GROUP_BYTES;
+            i3_encode_group(w, row, i, lo_i, hi_i, best, base, &mut q);
         }
     }
     (q, scale)
@@ -577,6 +655,82 @@ mod tests {
         for (k, (a, b)) in sc.iter().zip(SCALES.iter()).enumerate() {
             assert_eq!(a.to_bits(), *b, "scale {k} must be bit-identical");
         }
+    }
+
+    /// Decode one int3-g64 value for the weighted tests — the same arithmetic
+    /// the runtime uses (`i3_value` × the group scale, in f32).
+    fn i3_decode(q: &[u8], sc: &[f32], i: usize, row: usize, k: usize) -> f32 {
+        let ng = i.div_ceil(I3_GROUP);
+        let g = k / I3_GROUP;
+        let base = (row * ng + g) * I3_GROUP_BYTES;
+        let kk = k - g * I3_GROUP;
+        let lo = q[base + (kk >> 2)];
+        let hi = q[base + I3_LOW_BYTES + (kk >> 3)];
+        i3_value(lo, hi, kk) as f32 * sc[row * ng + g]
+    }
+
+    fn i3_weighted_err(q: &[u8], sc: &[f32], w: &[f32], cw: &[f32], o: usize, i: usize) -> f64 {
+        let mut e = 0f64;
+        for row in 0..o {
+            for k in 0..i {
+                let d = f64::from(i3_decode(q, sc, i, row, k) - w[row * i + k]);
+                e += f64::from(cw[k]) * d * d;
+            }
+        }
+        e
+    }
+
+    #[test]
+    fn weighted_i3_never_does_worse_than_plain_and_beats_it_where_weights_skew() {
+        // The search's two contracts. (1) Plain amax/3 is a candidate evaluated
+        // first, so on ANY input the weighted encoder's weighted error is <=
+        // the plain encoder's. (2) The search is not inert: with one salient
+        // channel dominating the objective, a different scale must win — this
+        // is the entire mechanism by which calibration buys back flip rate.
+        let (o, i) = (4usize, 128usize);
+        let w: Vec<f32> =
+            (0..o * i).map(|k| (((k * 2654435761usize) % 1000) as f32 - 500.0) / 250.0).collect();
+        // A salient-channel profile: a few channels carry almost all importance.
+        let cw: Vec<f32> = (0..i).map(|k| if k % 17 == 0 { 100.0 } else { 0.1 }).collect();
+
+        let (pq, psc) = quant_i3_g64(&w, o, i);
+        let (wq, wsc) = quant_i3_g64_weighted(&w, o, i, &cw);
+        assert_eq!(wq.len(), pq.len(), "same payload bytes — the format must not change");
+        assert_eq!(wsc.len(), psc.len(), "same scale cardinality");
+
+        let plain_e = i3_weighted_err(&pq, &psc, &w, &cw, o, i);
+        let weighted_e = i3_weighted_err(&wq, &wsc, &w, &cw, o, i);
+        assert!(
+            weighted_e <= plain_e,
+            "weighted rounding must never lose on its own objective: {weighted_e} vs {plain_e}"
+        );
+        assert!(
+            weighted_e < plain_e * 0.999,
+            "with skewed importance the search must actually move: {weighted_e} vs {plain_e}"
+        );
+        assert_ne!(wq, pq, "a moved scale must show up in the payload bytes");
+    }
+
+    #[test]
+    fn weighted_i3_with_degenerate_weights_is_byte_identical_to_plain() {
+        // All-zero importance says "no evidence"; picking a scale by float
+        // noise there would make the container depend on the search grid.
+        // Uniform weights are NOT required to reproduce plain (MSE-optimal !=
+        // amax/3) — zero weights are, because they mean fall back.
+        let (o, i) = (2usize, 100usize); // ragged final group
+        let w: Vec<f32> =
+            (0..o * i).map(|k| (((k * 7 + 3) % 41) as f32 - 20.0) / 10.0).collect();
+        let (pq, psc) = quant_i3_g64(&w, o, i);
+        let (wq, wsc) = quant_i3_g64_weighted(&w, o, i, &vec![0.0; i]);
+        assert_eq!(wq, pq, "zero importance must reproduce the data-free bytes");
+        assert!(wsc.iter().zip(&psc).all(|(a, b)| a.to_bits() == b.to_bits()), "and the scales");
+        // A short (even empty) weight vector defaults missing channels to 1.0
+        // and still satisfies the never-worse contract.
+        let (wq2, wsc2) = quant_i3_g64_weighted(&w, o, i, &[]);
+        let ones = vec![1.0f32; i];
+        let e_short = i3_weighted_err(&wq2, &wsc2, &w, &ones, o, i);
+        let e_plain = i3_weighted_err(&pq, &psc, &w, &ones, o, i);
+        assert!(e_short <= e_plain, "uniform-by-default must not lose to plain: {e_short} vs {e_plain}");
     }
 
     #[test]
