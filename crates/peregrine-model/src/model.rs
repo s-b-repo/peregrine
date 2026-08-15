@@ -641,18 +641,66 @@ fn host_mem_available_bytes() -> u64 {
     0
 }
 
+/// The `0::<path>` line of a `/proc/self/cgroup` dump — the process's own v2
+/// cgroup, relative to the hierarchy root. Pure so the parse is testable.
+fn self_cgroup_v2_rel(contents: &str) -> Option<&str> {
+    contents.lines().find_map(|l| l.strip_prefix("0::")).map(str::trim)
+}
+
+/// Every directory from the process's cgroup up to the hierarchy root, leaf
+/// first. The kernel enforces the *tightest* limit on this path, and a
+/// transient `systemd-run --scope -p MemoryMax=` puts its limit several levels
+/// below the root — the 2026-08-15 stage-5 arm OOM'd exactly there: auto
+/// ecache read the root's `max`, sized 26 GB inside a 34G scope that already
+/// held the weights, and the kernel ended the arm at boot. Pure for the test.
+fn cgroup_walk_dirs(rel: &str) -> Vec<std::path::PathBuf> {
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let mut dir = root.join(rel.trim_start_matches('/'));
+    let mut dirs = Vec::new();
+    loop {
+        dirs.push(dir.clone());
+        if dir == root || !dir.pop() {
+            break;
+        }
+    }
+    dirs
+}
+
 /// Bytes left inside this process's cgroup memory controller, `None` when there is no
 /// limit or no controller. Tries v2's unified hierarchy first, then v1.
 ///
-/// Reads the cgroup *root* paths rather than resolving `/proc/self/cgroup`, because in
-/// the case that matters — a containerized process — the container's cgroup is
-/// mounted as its root, so these are its own limits.
+/// v2 is probed twice, and the tighter answer wins: once walking
+/// `/proc/self/cgroup` up to the root (the transient-scope case above), and
+/// once at the cgroup *root* paths — because in a containerized process the
+/// container's cgroup is mounted as its root and `/proc/self/cgroup` may name
+/// a path its mount namespace does not expose.
 fn cgroup_available_bytes() -> Option<u64> {
-    let v2 = (read_cgroup_file("/sys/fs/cgroup/memory.max"), read_cgroup_file("/sys/fs/cgroup/memory.current"));
-    if let (Some(max), Some(cur)) = v2 {
-        if let Some(v) = crate::ram::cgroup_v2_available(&max, &cur) {
-            return Some(v);
+    let mut best: Option<u64> = None;
+    let mut consider = |max: Option<String>, cur: Option<String>| {
+        if let (Some(max), Some(cur)) = (max, cur) {
+            if let Some(v) = crate::ram::cgroup_v2_available(&max, &cur) {
+                best = Some(best.map_or(v, |b| b.min(v)));
+            }
         }
+    };
+    if let Some(rel) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .as_deref()
+        .and_then(self_cgroup_v2_rel)
+    {
+        for dir in cgroup_walk_dirs(rel) {
+            consider(
+                read_cgroup_file(&dir.join("memory.max").to_string_lossy()),
+                read_cgroup_file(&dir.join("memory.current").to_string_lossy()),
+            );
+        }
+    }
+    consider(
+        read_cgroup_file("/sys/fs/cgroup/memory.max"),
+        read_cgroup_file("/sys/fs/cgroup/memory.current"),
+    );
+    if best.is_some() {
+        return best;
     }
     let limit = read_cgroup_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")?;
     // An unreadable usage file means "unknown", which the parser reads as zero
@@ -6129,6 +6177,35 @@ mod tests {
     fn stream_transient_reserve_scales_with_lanes() {
         assert_eq!(stream_transient_reserve(4, 8, 1000), (4 * experts_per_batch() + 8) * 1000);
         assert_eq!(stream_transient_reserve(0, 0, 1000), 0); // no lanes → no reserve
+    }
+
+    #[test]
+    fn self_cgroup_rel_takes_the_v2_line_and_ignores_v1_noise() {
+        // A hybrid dump: v1 controllers above, the v2 line among them.
+        let dump = "12:pids:/user.slice\n1:name=systemd:/init.scope\n0::/user.slice/user-1000.slice/run-abc.scope\n";
+        assert_eq!(
+            self_cgroup_v2_rel(dump),
+            Some("/user.slice/user-1000.slice/run-abc.scope")
+        );
+        assert_eq!(self_cgroup_v2_rel("12:pids:/x\n"), None, "no v2 line, no walk");
+    }
+
+    #[test]
+    fn cgroup_walk_visits_leaf_to_root_so_the_tightest_limit_wins() {
+        // The stage-5 OOM shape: the MemoryMax lives on the transient scope,
+        // not the root — every level must be visited or the limit is missed.
+        let dirs = cgroup_walk_dirs("/user.slice/run-abc.scope");
+        let s: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        assert_eq!(
+            s,
+            vec![
+                "/sys/fs/cgroup/user.slice/run-abc.scope",
+                "/sys/fs/cgroup/user.slice",
+                "/sys/fs/cgroup",
+            ]
+        );
+        // Root-relative spelling degenerates to the root probe alone.
+        assert_eq!(cgroup_walk_dirs("/"), vec![std::path::PathBuf::from("/sys/fs/cgroup")]);
     }
 
     #[test]
