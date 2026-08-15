@@ -10,6 +10,7 @@
 // is its own crate root, so the attribute has to be repeated per target.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod import;
 pub mod prune;
 pub mod requant;
 pub mod reshard;

@@ -19,6 +19,10 @@ name = "peregrine-requantize"
 path = "src/requant_main.rs"
 
 [[bin]]
+name = "peregrine-import-hf"
+path = "src/import_main.rs"
+
+[[bin]]
 name = "peregrine-reshard"
 path = "src/reshard_main.rs"
 
