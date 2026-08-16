@@ -380,6 +380,13 @@ pub struct Model {
 /// split cache from a contiguous one.
 pub struct SeqKv {
     layers: Vec<LayerKv>,
+    /// Per-layer gated-DeltaNet recurrent state (`Arch::HybridGdn` linear
+    /// layers; `None` slots everywhere else). A linear layer's whole context
+    /// lives here rather than in `layers` — constant-size, order-dependent,
+    /// and (unlike KV rows) not sliceable by position, which is why a sequence
+    /// carrying any of these is excluded from prefix caching and disk sessions
+    /// until the snapshot trade is measured (Track C phase 2a).
+    gdn: Vec<Option<GdnState>>,
 }
 
 /// `COLI_KV_DTYPE`: the element type every KV cache in this process is built
@@ -439,7 +446,23 @@ impl SeqKv {
     /// narrow path without a process-wide environment variable.
     pub fn with_dtype(cfg: &Cfg, dt: KvDtype) -> SeqKv {
         let (kvl, qkr) = (cfg.kv_row_a() as usize, cfg.kv_row_b() as usize);
-        SeqKv { layers: (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, dt)).collect() }
+        SeqKv {
+            layers: (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, dt)).collect(),
+            gdn: (0..cfg.n_layers as usize)
+                .map(|i| {
+                    (cfg.arch == peregrine_core::Arch::HybridGdn
+                        && !cfg.full_attn.get(i).copied().unwrap_or(true))
+                    .then(|| GdnState::new(cfg))
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether any layer's context is a recurrent state rather than KV rows.
+    /// The prefix cache and the disk KV store consult this: a point state has
+    /// no per-position slices to share or checkpoint.
+    pub fn has_recurrent_state(&self) -> bool {
+        self.gdn.iter().any(Option::is_some)
     }
 
     /// Positions cached so far (the sequence length); all layers share it.
@@ -499,7 +522,29 @@ impl SeqKv {
     /// seed any prompt it is a prefix of, and the result is the same as having
     /// prefilled those tokens directly.
     pub fn clone_prefix(&self, n: usize) -> SeqKv {
-        SeqKv { layers: self.layers.iter().map(|k| k.clone_prefix(n)).collect() }
+        // A GDN state is only meaningful at exactly its own length — there is
+        // no "state at position n" to slice out. Callers gate on
+        // [`Self::has_recurrent_state`]; if one slips through at the wrong
+        // length, a fresh state (plus an advisory) is strictly safer than a
+        // silently wrong one, because the clone then decodes as if the prefix
+        // had never been seen by the linear layers — visible garbage, not a
+        // plausible-looking near-miss.
+        let gdn = self
+            .gdn
+            .iter()
+            .map(|g| match g {
+                Some(st) if st.len == n => Some(st.clone()),
+                Some(st) => {
+                    peregrine_io::note_advisory_err(
+                        "SeqKv::clone_prefix on recurrent state",
+                        &format!("state at {} cloned at {n}; reset instead", st.len),
+                    );
+                    Some(GdnState::new_like(st))
+                }
+                None => None,
+            })
+            .collect();
+        SeqKv { layers: self.layers.iter().map(|k| k.clone_prefix(n)).collect(), gdn }
     }
 
     /// The first `n` positions of every layer as plain `f32` vectors — the
@@ -2573,6 +2618,7 @@ fn forward_layer_batched(
     l: &LayerW,
     li: usize,
     caches: &mut [&mut LayerKv],
+    gstates: &mut [Option<&mut GdnState>],
     rows_at: RowLayout,
     ctx: &ForwardCtx,
     x: &mut [f32],
@@ -2604,9 +2650,27 @@ fn forward_layer_batched(
             out
         }
         LayerAttn::Gdn { .. } => {
-            return Err(Error::Format(
-                "batched decode over gated-DeltaNet layers needs per-sequence recurrent state (Track C phase 2)".into(),
-            ))
+            // Row s advances its owner's recurrent state by one token. Rows of
+            // one owner arrive in ascending position order (decode is one row
+            // per sequence; a fused prefill chunk is consecutive positions of
+            // one sequence), and this loop runs them in row order — the same
+            // sequential contract `gdn_one_call_matches_stepwise` pins.
+            let w = l.gdn()?;
+            let mut out = vec![0.0f32; s_n * d];
+            for s in 0..s_n {
+                let owner = rows_at.owner[s];
+                let st = gstates
+                    .get_mut(owner)
+                    .and_then(|g| g.as_deref_mut())
+                    .ok_or_else(|| {
+                        Error::Format(format!(
+                            "layer {li}: row {s}'s sequence {owner} has no recurrent state (cache built for another architecture?)"
+                        ))
+                    })?;
+                let row = crate::gdn::gdn_forward(&w, &nrm[s * d..(s + 1) * d], 1, st, cfg)?;
+                out[s * d..(s + 1) * d].copy_from_slice(&row);
+            }
+            out
         }
     };
     for z in 0..s_n * d {
@@ -4231,6 +4295,15 @@ impl Model {
     /// so the next boot with `COLI_TOPIC_ROUTING=1` starts warm on this
     /// workload mix. Best-effort and a no-op when topic routing is off — a
     /// shutdown path can call it unconditionally.
+    /// Whether this model's sequences can be prefix-cached and disk-
+    /// checkpointed. False for `Arch::HybridGdn`: a GDN layer's context is a
+    /// point state, and a prefix hit would need a state snapshot taken exactly
+    /// at the boundary (~151 MB per entry at 27B dims) — a trade to measure,
+    /// not assume (Track C phase 2a).
+    pub fn prefix_cachable(&self) -> bool {
+        self.cfg.arch != Arch::HybridGdn
+    }
+
     pub fn save_topic_profiles_here(&self) -> Result<(), Error> {
         let Some(profiles) = &self.topic_profiles else { return Ok(()) };
         let path = self.checkpoint_dir.join("topic_profiles.json");
@@ -4963,7 +5036,7 @@ impl Model {
             // decode step's, so a warm item queued just before a long prefill is
             // stale by the end of it — and should read as such.
             self.sweep.tick();
-            forward_layer(l, li, LayerState { kv: &mut seq.layers[li], gdn: None }, &ctx, &mut x, s_n, pos_base)?;
+            forward_layer(l, li, LayerState { kv: &mut seq.layers[li], gdn: seq.gdn[li].as_mut() }, &ctx, &mut x, s_n, pos_base)?;
         }
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
         Ok(self.lm_head.apply_vec(&xf, s_n))
@@ -5229,8 +5302,16 @@ impl Model {
         let layers: &[LayerW] = &self.layers;
         for (li, l) in layers.iter().enumerate() {
             self.sweep.tick();
-            let mut caches: Vec<&mut LayerKv> = seqs.iter_mut().map(|sk| &mut sk.layers[li]).collect();
-            forward_layer_batched(l, li, &mut caches, RowLayout { pos_of, owner }, &ctx, &mut x)?;
+            // Disjoint split per sequence: the KV cache and the GDN state are
+            // separate fields, so one pass hands the batched layer both.
+            let (mut caches, mut gstates): (Vec<&mut LayerKv>, Vec<Option<&mut GdnState>>) = seqs
+                .iter_mut()
+                .map(|sk| {
+                    let SeqKv { layers, gdn } = &mut **sk;
+                    (&mut layers[li], gdn[li].as_mut())
+                })
+                .unzip();
+            forward_layer_batched(l, li, &mut caches, &mut gstates, RowLayout { pos_of, owner }, &ctx, &mut x)?;
             if let Some(la) = &la {
                 la.emit(layers, li + 1, &x, la_width);
             }
@@ -5747,6 +5828,72 @@ mod tests {
         }
         crate::testkit::build_tiny_qwen_model(&d, 42)?;
         prefill_step_identity_and_generate(&d)?;
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_external_kv_and_batched_decode_match_the_internal_path() -> Result<(), peregrine_core::Error> {
+        // Phase 2a's contract in one test: (a) prefill through the external-KV
+        // path (what serving uses) is bit-identical to the engine's internal
+        // path — proving the GDN state threads through SeqKv correctly; (b) a
+        // 2-sequence batched decode is bit-identical to each sequence decoded
+        // solo — proving per-owner state isolation in the batched layer.
+        let d = std::env::temp_dir().join(format!("peregrine_hybrid_serve_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_hybrid_model(&d, 44)?;
+        let mut m = Model::load(&d)?;
+        let vocab = m.cfg.vocab as usize;
+        let prompts: [&[i32]; 2] = [&[1, 5, 9, 2, 7], &[4, 4, 8, 3]];
+
+        // (a) internal vs external prefill, prompt 0.
+        let internal = m.forward_step(prompts[0], 0)?;
+        let last_internal = &internal[(prompts[0].len() - 1) * vocab..];
+        let mut seq0 = SeqKv::new(&m.cfg);
+        let external = m.forward_prefill_seq(prompts[0], &mut seq0, 0)?;
+        let last_external = &external[(prompts[0].len() - 1) * vocab..];
+        assert!(
+            last_internal.iter().zip(last_external).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "external-KV prefill must match the internal path bit for bit"
+        );
+
+        // (b) batched decode vs solo continuation, both sequences, 3 steps.
+        // Solo: continue each sequence with single-token external prefills.
+        let mut solo_logits = vec![Vec::new(), Vec::new()];
+        let mut solo_seqs = Vec::new();
+        for (i, p) in prompts.iter().enumerate() {
+            let mut sk = SeqKv::new(&m.cfg);
+            m.forward_prefill_seq(p, &mut sk, 0)?;
+            let mut next = 11i32 + i as i32; // arbitrary in-vocab continuations
+            for step in 0..3 {
+                let lg = m.forward_prefill_seq(&[next], &mut sk, p.len() + step)?;
+                solo_logits[i] = lg;
+                next += 1;
+            }
+            solo_seqs.push(sk);
+        }
+        // Batched: same continuations through forward_step_batched.
+        let mut b0 = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(prompts[0], &mut b0, 0)?;
+        let mut b1 = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(prompts[1], &mut b1, 0)?;
+        let mut batched_last = Vec::new();
+        for step in 0..3 {
+            let toks = [11 + step as i32, 12 + step as i32];
+            let pos = [prompts[0].len() + step, prompts[1].len() + step];
+            let mut seqs: Vec<&mut SeqKv> = vec![&mut b0, &mut b1];
+            batched_last = m.forward_step_batched(&toks, &mut seqs, &pos, None)?;
+        }
+        for i in 0..2 {
+            let got = &batched_last[i * vocab..(i + 1) * vocab];
+            assert!(
+                got.iter().zip(&solo_logits[i]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "batched decode must match sequence {i}'s solo continuation bit for bit"
+            );
+        }
+        assert!(b0.has_recurrent_state(), "hybrid sequences must carry recurrent state");
         std::fs::remove_dir_all(&d)?;
         Ok(())
     }

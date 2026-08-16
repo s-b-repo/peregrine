@@ -896,9 +896,18 @@ fn run(
     let sampled_spec = knobs.draft_sampled;
     let conf_floor = knobs.spec_conf;
     let has_mtp = model.has_mtp();
+    // A GDN sequence's context is a point state, not per-position rows: a
+    // prefix hit or a disk checkpoint would need a state snapshot taken exactly
+    // at the boundary. Until that trade is measured, hybrid models skip both
+    // (Track C phase 2a) — budget 0 is the prefix cache's documented off state.
+    let cacheable = model.prefix_cachable();
     let mut prefix = PrefixStore::new(
-        knobs.prefix_cache_budget,
-        crate::kvstore::KvSessionStore::from_env(&model, PREFIX_CACHE_MIN_TOKENS),
+        if cacheable { knobs.prefix_cache_budget } else { 0 },
+        if cacheable {
+            crate::kvstore::KvSessionStore::from_env(&model, PREFIX_CACHE_MIN_TOKENS)
+        } else {
+            None
+        },
     );
     // The KV byte ceiling admission respects alongside the count.
     let kv_budget = knobs.kv_budget_bytes;
@@ -2117,6 +2126,62 @@ mod tests {
         assert_eq!(active.iter().position(|s| s.seq_id == ids[2]), Some(1), "it slid to index 1");
         assert_eq!(active[1].seq_id, ids[2], "…and kept its lane across the retire");
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_engine_batches_and_matches_reference() -> Result<(), Error> {
+        // The Track C phase-2a end-to-end: the batch engine serves a hybrid
+        // (GDN + gated-GQA) model, three concurrent greedy requests each
+        // matching the standalone decode — with the prefix cache and disk KV
+        // sessions auto-disabled for the recurrent architecture.
+        let d = std::env::temp_dir().join(format!("peregrine_batch_hybrid_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        peregrine_model::testkit::build_tiny_hybrid_model(&d, 45)?;
+        let prompt = vec![3i32, 7, 1, 4];
+        let n = 6usize;
+        let want = {
+            let m = Model::load(&d)?;
+            assert!(!m.prefix_cachable(), "hybrid must opt out of prefix caching in 2a");
+            ref_decode(&m, &prompt, n)?
+        };
+        assert!(!want.is_empty(), "reference must produce tokens");
+
+        let (handle, join) = spawn(Model::load(&d)?, 8)?;
+        let mut rxs = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: prompt.clone(),
+                max_new: n,
+                sampler: Sampler::new(0.0, 0.9, 1),
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            rxs.push(rx);
+        }
+        let mut outs = Vec::new();
+        for mut rx in rxs {
+            let mut toks = Vec::new();
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Error(e) => return Err(Error::Format(e)),
+                }
+            }
+            outs.push(toks);
+        }
+        drop(handle);
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+        for (i, o) in outs.iter().enumerate() {
+            assert_eq!(o, &want, "hybrid batched request {i} must match the reference decode");
+        }
+        std::fs::remove_dir_all(&d)?;
         Ok(())
     }
 
