@@ -59,6 +59,7 @@ pub struct GdnWeights<'a> {
 /// pre-activation rows) and the delta-rule memory `S`. This replaces the KV
 /// cache for linear layers — constant size however long the context runs,
 /// which is most of why the hybrid can hold 262k tokens on consumer hardware.
+#[derive(Clone)]
 pub struct GdnState {
     /// `[k-1, conv_dim]` ring of past pre-activation projections, oldest first
     /// once full. `filled` counts real rows during warmup (zero-padding).
@@ -85,6 +86,13 @@ impl GdnState {
     /// Bytes this state holds — the linear layers' answer to `LayerKv::bytes`.
     pub fn bytes(&self) -> usize {
         (self.ring.len() + self.s.len()) * 4
+    }
+
+    /// A fresh (empty-context) state with `like`'s geometry — the safe
+    /// fallback when a caller needs a state slot but cannot legally clone one
+    /// mid-sequence (see `SeqKv::clone_prefix`).
+    pub fn new_like(like: &GdnState) -> GdnState {
+        GdnState { ring: vec![0.0; like.ring.len()], filled: 0, s: vec![0.0; like.s.len()], len: 0 }
     }
 
     /// Reset to the empty-context state (a new sequence on the same stream).
