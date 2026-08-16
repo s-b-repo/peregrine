@@ -443,6 +443,7 @@ fn run() -> Result<(), Error> {
                 );
                 Ok((out, t))
             };
+            let mut ref_topk: Option<Vec<Vec<i32>>> = None;
             let (a, b, cand_label) = match (&cand, &ref_json) {
                 (Some(cand), None) => {
                     let (a, used) = run(src, &toks)?;
@@ -455,12 +456,16 @@ fn run() -> Result<(), Error> {
                 }
                 (None, Some(path)) => {
                     let reference = load_reference_dump(Path::new(path))?;
+                    let topk = reference.topk.clone();
                     if text.is_some() {
                         // The dump carries its own ids; a --text alongside it
                         // would silently be ignored, which reads like it was used.
                         return Err(Error::Format(
                             "flip-rate: --reference-json carries its own token ids; drop --text".into(),
                         ));
+                    }
+                    if !topk.is_empty() {
+                        ref_topk = Some(topk);
                     }
                     let (a, _) = run(src, &reference.tokens)?;
                     (a, reference.argmax, path.clone())
@@ -475,6 +480,15 @@ fn run() -> Result<(), Error> {
             println!("flip_rate   {rate:.6}");
             println!("source      {src}");
             println!("candidate   {cand_label}");
+            // Top-k containment, only when a reference dump carried top-k rows:
+            // of the positions where argmax flipped, how many landed inside the
+            // reference's own top-k (near-ties) vs outside it (real departures).
+            if let Some(topk) = ref_topk.filter(|t| t.len() == a.len()) {
+                let flips: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+                let near = flips.iter().filter(|&&i| topk[i].contains(&a[i])).count();
+                let k = topk.first().map_or(0, Vec::len);
+                println!("flips_in_reference_top{k}   {near} of {} flips", flips.len());
+            }
             // Top-1 agreement only, and on one text. It is a floor on quality,
             // not a summary of it: a container can hold top-1 and still shift
             // the distribution underneath, which this cannot see.
@@ -609,6 +623,10 @@ fn run() -> Result<(), Error> {
 struct ReferenceDump {
     tokens: Vec<i32>,
     argmax: Vec<i32>,
+    /// Reference top-k ids per position, when the dump carries them: the
+    /// gray-zone tiebreaker (a candidate argmax inside the reference top-k is
+    /// a near-tie moved by quantization noise, not a wrong answer).
+    topk: Vec<Vec<i32>>,
 }
 
 fn load_reference_dump(path: &Path) -> Result<ReferenceDump, Error> {
@@ -627,7 +645,24 @@ fn load_reference_dump(path: &Path) -> Result<ReferenceDump, Error> {
             })
             .collect()
     };
-    let d = ReferenceDump { tokens: ids("tokens")?, argmax: ids("argmax")? };
+    let topk = match v.get("topk").and_then(|t| t.as_array()) {
+        None => Vec::new(),
+        Some(rows) => rows
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .ok_or_else(|| Error::Format(format!("{}: topk row is not an array", path.display())))?
+                    .iter()
+                    .map(|x| {
+                        x.as_i64().map(|n| n as i32).ok_or_else(|| {
+                            Error::Format(format!("{}: non-integer entry in topk", path.display()))
+                        })
+                    })
+                    .collect()
+            })
+            .collect::<Result<Vec<Vec<i32>>, Error>>()?,
+    };
+    let d = ReferenceDump { tokens: ids("tokens")?, argmax: ids("argmax")?, topk };
     if d.tokens.len() != d.argmax.len() || d.tokens.is_empty() {
         return Err(Error::Format(format!(
             "{}: tokens ({}) and argmax ({}) must be equal-length and non-empty",

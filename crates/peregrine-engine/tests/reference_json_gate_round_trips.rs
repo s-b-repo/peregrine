@@ -50,10 +50,31 @@ fn self_agreement_reads_zero_and_planted_flips_read_exactly() -> Result<(), pere
     let mut wrong = self_dump(&dir, &tokens)?;
     wrong[1] = (wrong[1] + 1) % 32;
     wrong[5] = (wrong[5] + 1) % 32;
-    std::fs::write(&dump, serde_json::json!({ "tokens": tokens, "argmax": wrong }).to_string())?;
+    // Give the dump top-k rows arranged so exactly one of the two planted
+    // flips is a "near-tie" (the container's answer sits in the reference
+    // top-k) and the other is a real departure — the containment line must
+    // split them 1 of 2.
+    let honest = self_dump(&dir, &tokens)?;
+    let topk: Vec<Vec<i32>> = (0..tokens.len())
+        .map(|i| {
+            if i == 1 {
+                vec![wrong[1], honest[1]] // flip position, container's answer IS in top-k
+            } else {
+                vec![wrong.get(i).copied().unwrap_or(0), -1] // position 5's honest answer is NOT
+            }
+        })
+        .collect();
+    std::fs::write(
+        &dump,
+        serde_json::json!({ "tokens": tokens, "argmax": wrong, "topk": topk }).to_string(),
+    )?;
     let out = bin().args(["flip-rate", dir.to_str().unwrap_or("."), "--reference-json"]).arg(&dump).output()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("flips       2"), "exactly the planted flips must be counted; got:\n{stdout}");
+    assert!(
+        stdout.contains("flips_in_reference_top2   1 of 2 flips"),
+        "the near-tie split must read 1 of 2; got:\n{stdout}"
+    );
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }

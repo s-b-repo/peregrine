@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--offload", required=True, help="disk offload dir (use the stripe)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-ram-gb", type=float, default=30.0, help="RAM the weights may occupy (leave headroom)")
+    ap.add_argument("--topk", type=int, default=8, help="also dump the reference top-k ids per position (gray-zone tiebreaker)")
     args = ap.parse_args()
 
     try:
@@ -81,12 +82,16 @@ def main():
         input_ids = torch.tensor([ids], dtype=torch.long)
         logits = model(input_ids=input_ids).logits[0]  # [N, vocab]
         argmax = logits.argmax(dim=-1).tolist()
+        topk = logits.topk(max(1, args.topk), dim=-1).indices.tolist()
 
     out = {
         "tokens": [int(t) for t in ids],
         # Same indexing as peregrine's teacher_forcing: argmax[i] is the
         # model's next-token prediction AT position i.
         "argmax": [int(a) for a in argmax],
+        # The gray-zone tiebreaker: a candidate argmax inside the reference
+        # top-k is a near-tie moved by quantization noise, not a wrong answer.
+        "topk": [[int(t) for t in row] for row in topk],
         "meta": {
             "model": args.model,
             "text": args.text,
