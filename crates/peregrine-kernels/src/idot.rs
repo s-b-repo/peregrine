@@ -215,9 +215,22 @@ pub mod x86 {
         let m4 = _mm_set1_epi8(0x0F);
         let b8 = _mm256_set1_epi8(8);
         let ones = _mm256_set1_epi16(1);
-        let mut acc = _mm256_setzero_si256();
+        // Two independent accumulators over two 32-element blocks per iteration.
+        // The `maddubs → madd → add` chain is several cycles deep and a single
+        // accumulator serializes every iteration on it; two chains interleave so
+        // one block's unpack overlaps the other's arithmetic. Bit-identical by
+        // the module's own argument — integer addition is associative, so the
+        // split and the final fold reassociate a sum with no rounding in it
+        // (`i4_simd_matches_scalar` pins it against the scalar reference).
+        //
+        // Written out rather than factored into a closure on purpose: a closure
+        // declared inside a `#[target_feature]` fn does NOT inherit the feature,
+        // so its intrinsics stop inlining and the "tidier" version measured 3.5x
+        // SLOWER (4.8 vs 16.9 GB/s at n=5120, `examples/idotbench.rs`).
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
         let mut i = 0usize;
-        while i + 32 <= n {
+        while i + 64 <= n {
             let by = _mm_loadu_si128(w4.as_ptr().add(i >> 1) as *const __m128i); // 16B = 32 nibbles
             let lo = _mm_and_si128(by, m4);
             let hi = _mm_and_si128(_mm_srli_epi16::<4>(by), m4);
@@ -226,10 +239,34 @@ pub mod x86 {
             let wv = _mm256_sub_epi8(_mm256_set_m128i(n1, n0), b8); // → [-8,7]
             let xv = _mm256_loadu_si256(x.as_ptr().add(i) as *const __m256i);
             let p = _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(xv, wv));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, ones));
+            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(p, ones));
+
+            let j = i + 32;
+            let by_b = _mm_loadu_si128(w4.as_ptr().add(j >> 1) as *const __m128i);
+            let lo_b = _mm_and_si128(by_b, m4);
+            let hi_b = _mm_and_si128(_mm_srli_epi16::<4>(by_b), m4);
+            let n0_b = _mm_unpacklo_epi8(lo_b, hi_b);
+            let n1_b = _mm_unpackhi_epi8(lo_b, hi_b);
+            let wv_b = _mm256_sub_epi8(_mm256_set_m128i(n1_b, n0_b), b8);
+            let xv_b = _mm256_loadu_si256(x.as_ptr().add(j) as *const __m256i);
+            let p_b = _mm256_maddubs_epi16(_mm256_sign_epi8(wv_b, wv_b), _mm256_sign_epi8(xv_b, wv_b));
+            acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(p_b, ones));
+            i += 64;
+        }
+        // Odd trailing 32-element block (n not a multiple of 64).
+        while i + 32 <= n {
+            let by = _mm_loadu_si128(w4.as_ptr().add(i >> 1) as *const __m128i);
+            let lo = _mm_and_si128(by, m4);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(by), m4);
+            let n0 = _mm_unpacklo_epi8(lo, hi);
+            let n1 = _mm_unpackhi_epi8(lo, hi);
+            let wv = _mm256_sub_epi8(_mm256_set_m128i(n1, n0), b8);
+            let xv = _mm256_loadu_si256(x.as_ptr().add(i) as *const __m256i);
+            let p = _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(xv, wv));
+            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(p, ones));
             i += 32;
         }
-        let mut sum = hsum256(acc);
+        let mut sum = hsum256(_mm256_add_epi32(acc0, acc1));
         if i < n {
             // `i` is a multiple of 32 (even), so element `i` is the low nibble of
             // byte `i/2` — slicing both w4 (by byte) and x (by element) stays aligned.
