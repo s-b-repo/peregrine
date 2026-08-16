@@ -122,8 +122,10 @@ its own status so nobody mistakes "documented" for "measured":
   than uniform's 0.514, nowhere near licensable. The data-free RTN ladder is
   now closed at every measured point, uniform or asymmetric (todo.md §13).
   The open question moved to **calibrated rounding**: `--calib` +
-  `peregrine calib-capture` (ideas #7) are code-complete and share a future
-  overnight with the `--keep-last-layers 12` contingency.
+  `peregrine calib-capture` (ideas #7) are code-complete — but the two-rung
+  measurement night was SHELVED 2026-08-16 by product decision (Qwen
+  resident serving took priority; partial GPU offload is that track's
+  VRAM-fit route). The tools remain the instrument of record if revisited.
 - **`COLI_SPEC_CONF`** (default 0, off) — stop an MTP draft early when the
   head's top-token probability drops under the floor. Depth-only: `accept_run`
   is untouched, so greedy output is bit-identical by construction (test:

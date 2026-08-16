@@ -215,10 +215,14 @@ of those intact. What replaces it, by the same test:
   (`quant_i3_g64_weighted` + `peregrine-requantize --calib` +
   `peregrine calib-capture`; per-layer mean-|x| channel stats pooled the AWQ
   way, plain amax/3 always a search candidate so it can never lose to RTN on
-  its own objective). It shares a future overnight slot with the
-  `--keep-last-layers 12` contingency: one night, two rungs, one flip gate
-  each. If both fail, sub-int4 on this model needs vector quantization /
-  incoherence processing — a research project, recorded above.
+  its own objective). The planned two-rung
+  overnight (keep-last-12 + calibrated) was SHELVED 2026-08-16 by product
+  decision — GLM byte-reduction lost priority to the Qwen resident-serving
+  track, and partial GPU offload is the VRAM-fit route there. The calibrated
+  tooling stays in the tree as the instrument of record
+  (`--calib`, `calib-capture`, jobs-available/200-two-rung-int3.sh is the
+  how-to) if sub-int4 is ever revisited; if both rungs were to fail, vector
+  quantization / incoherence processing remains the only road below 4 bits.
 - Speculative, named so it is not rediscovered: expert-delta or shared-basis
   coding is the only idea here with a ceiling below 2 bits/weight, but it breaks
   `QtInfo::detect`'s per-tensor self-description and there is no evidence
