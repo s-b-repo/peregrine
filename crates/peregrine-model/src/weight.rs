@@ -134,6 +134,40 @@ impl QtWeight {
         bytemuck::cast_slice::<u8, i8>(&self.q[..])
     }
 
+    /// `(bytes per weight row, scales per weight row)` — the row pitch an output-row
+    /// window slices on. `None` for the formats whose `apply` arm is a bespoke
+    /// scalar loop rather than one of the batched `matmul_*` kernels; those keep
+    /// the whole-matrix path (they are the rare compression rungs, never the
+    /// formats a served model actually runs).
+    fn row_pitch(&self) -> Option<(usize, usize)> {
+        match self.fmt {
+            QuantFmt::Int8 => Some((self.i, 1)),
+            QuantFmt::Int4 => Some((self.i.div_ceil(2), 1)),
+            QuantFmt::Int4Grouped => Some((self.i.div_ceil(2), self.i.div_ceil(self.gs))),
+            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 => None,
+        }
+    }
+
+    /// [`Self::apply`] restricted to output rows `rows`, for a **single** activation
+    /// row. `y` receives exactly `rows.len()` floats.
+    ///
+    /// Weights are `[O, I]` row-major, so an output-row range is a contiguous slice
+    /// of both the packed bytes and the scales — the window is a borrow, never a
+    /// copy, and each row's dot is the same one the full-matrix path computes.
+    fn apply_window(&self, rows: std::ops::Range<usize>, x: &[f32], act: ActScratch<'_>, y: &mut [f32]) {
+        let Some((rb, sp)) = self.row_pitch() else { return };
+        let shape = MatShape::new(1, self.i, rows.end - rows.start);
+        let q = &self.q[rows.start * rb..rows.end * rb];
+        let sc = &self.scale[rows.start * sp..rows.end * sp];
+        match self.fmt {
+            QuantFmt::Int8 => matmul_i8_from_f32(y, x, bytemuck::cast_slice::<u8, i8>(q), sc, shape, act),
+            QuantFmt::Int4 => matmul_i4_from_f32(y, x, q, sc, shape, act),
+            QuantFmt::Int4Grouped => matmul_i4g_from_f32(y, x, q, sc, shape, self.gs, act),
+            // `row_pitch` returned None for these, so they never reach here.
+            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 => {}
+        }
+    }
+
     /// `y[s_n, O] = apply(self, x[s_n, I])`. Caller provides int8 activation
     /// scratch `xq[s_n*I]`, per-row scale scratch `sx[s_n]`, and output `y`.
     pub fn apply(&self, x: &[f32], s_n: usize, xq: &mut [i8], sx: &mut [f32], y: &mut [f32]) {
@@ -212,6 +246,32 @@ impl QtWeight {
     /// oversubscription. This parallelizes every projection, lm_head, and expert.
     pub fn apply_vec(&self, x: &[f32], s_n: usize) -> Vec<f32> {
         let mut y = vec![0f32; s_n * self.o];
+        // DECODE (`s_n == 1`) splits the OUTPUT rows, not the batch rows.
+        //
+        // The batch split below is `par_chunks_mut(.., n = s_n, ..)`, which goes
+        // serial whenever `s_n < PAR_MATMUL_MIN` — and decode's `s_n` is 1, so
+        // every matmul of every layer ran on ONE worker while the other 11 sat
+        // idle (measured: 190% CPU of a possible 1200% on the resident Qwen
+        // serve). A resident dense model spends essentially all of its time
+        // here, so that is most of its decode cost. Output rows are independent
+        // and `[O, I]` row-major, so splitting them is both bit-identical and a
+        // contiguous slice; `y` is `[1, O]`, so each chunk is contiguous too.
+        //
+        // Above the same `i·o` work gate as the batch path: a matmul too small
+        // to pay for pool dispatch stays serial either way.
+        if s_n == 1 && self.i * self.o >= 1 << 20 && self.row_pitch().is_some() {
+            peregrine_par::par_chunks_mut(&mut y, 1, self.o, peregrine_par::PAR_MATMUL_MIN, |o0, o1, y_chunk| {
+                // Per-worker activation scratch. The quantization of `x` is
+                // repeated per chunk rather than hoisted: it is O(I) against the
+                // chunk's O(I·(o1-o0)) of matmul (≈0.1% at Qwen's shapes), and
+                // keeping it inside means the window path shares one code path
+                // with `apply` instead of needing a pre-quantized variant.
+                let mut xq = vec![0i8; self.i];
+                let mut sx = vec![0f32; 1];
+                self.apply_window(o0..o1, x, ActScratch { xq: &mut xq, sx: &mut sx }, y_chunk);
+            });
+            return y;
+        }
         // Only parallelize when the per-row matmul work (`i·o` MACs) is large enough
         // that the pool dispatch pays off; tiny matrices (e.g. the test model) stay
         // serial regardless of batch, avoiding overhead-dominated slowdowns. Real
@@ -407,7 +467,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::QtWeight;
-    use peregrine_kernels::matmul_f32;
+    use peregrine_kernels::{matmul_f32, ActScratch};
 
     struct Lcg(u64);
     impl Lcg {
@@ -623,6 +683,58 @@ mod tests {
                 par.iter().zip(&ser).all(|(a, b)| a.to_bits() == b.to_bits()),
                 "apply_vec parallel must match serial for {:?}",
                 w.fmt
+            );
+        }
+    }
+
+    #[test]
+    fn decode_splits_output_rows_and_stays_bit_identical() {
+        // The decode case: ONE activation row. The batch split cannot engage
+        // here (s_n = 1 < PAR_MATMUL_MIN), which is exactly why the output-row
+        // window exists — before it, every decode matmul ran single-threaded.
+        // Same 1024×1024 shape so `i·o ≥ 1<<20` puts us on the new path, and the
+        // result must still be bit-identical to one whole serial `apply`.
+        let (o, i, s_n) = (1024usize, 1024usize, 1usize);
+        let mut rng = Lcg(0xBEEF);
+        let wf: Vec<f32> = (0..o * i).map(|_| rng.f()).collect();
+        let xf: Vec<f32> = (0..s_n * i).map(|_| rng.f()).collect();
+        for w in [quant_i8(&wf, o, i), quant_i4(&wf, o, i), quant_i4_grouped(&wf, o, i, 16)] {
+            assert!(w.row_pitch().is_some(), "{:?} should take the window path", w.fmt);
+            let win = w.apply_vec(&xf, s_n);
+            let mut xq = vec![0i8; s_n * i];
+            let mut sx = vec![0f32; s_n];
+            let mut ser = vec![0f32; s_n * o];
+            w.apply(&xf, s_n, &mut xq, &mut sx, &mut ser);
+            assert!(
+                win.iter().zip(&ser).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "output-row window must match serial for {:?}",
+                w.fmt
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_is_the_matching_slice_of_the_whole_matmul() {
+        // Directly pin the window's contract: rows [o0,o1) of the full result,
+        // computed from a borrowed slice of the weights, equal the same rows of
+        // the whole-matrix answer. This is what makes splitting them sound.
+        let (o, i) = (1024usize, 1024usize);
+        let mut rng = Lcg(0x5151);
+        let wf: Vec<f32> = (0..o * i).map(|_| rng.f()).collect();
+        let xf: Vec<f32> = (0..i).map(|_| rng.f()).collect();
+        let w = quant_i4(&wf, o, i);
+        let mut xq = vec![0i8; i];
+        let mut sx = vec![0f32; 1];
+        let mut full = vec![0f32; o];
+        w.apply(&xf, 1, &mut xq, &mut sx, &mut full);
+        for (o0, o1) in [(0usize, 1usize), (0, 333), (333, 700), (700, o), (o - 1, o)] {
+            let mut part = vec![0f32; o1 - o0];
+            let mut xq2 = vec![0i8; i];
+            let mut sx2 = vec![0f32; 1];
+            w.apply_window(o0..o1, &xf, ActScratch { xq: &mut xq2, sx: &mut sx2 }, &mut part);
+            assert!(
+                part.iter().zip(&full[o0..o1]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "window [{o0},{o1}) must equal that slice of the full matmul"
             );
         }
     }
