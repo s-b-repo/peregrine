@@ -3506,6 +3506,15 @@ impl Model {
         self.mtp.is_some()
     }
 
+    /// Which chat-prompt markup this checkpoint expects. GLM ships no chat
+    /// template and uses `[gMASK]<sop><|role|>` markup; the Qwen-family arches
+    /// (DenseGqa / HybridGdn) use ChatML (`<|im_start|>role\n…<|im_end|>`). The
+    /// serving layer selects its prompt builder from this so a Qwen model is not
+    /// fed GLM control tokens (which tokenize to garbage and degenerate output).
+    pub fn uses_chatml_prompt(&self) -> bool {
+        !matches!(self.cfg.arch, Arch::GlmMla)
+    }
+
     /// `(hits, misses, disk_reads)` from the warm tier, or `None` when not
     /// streaming with a cache. For introspection/tests — the cache never affects
     /// output, only how many expert reads actually hit the disk.
