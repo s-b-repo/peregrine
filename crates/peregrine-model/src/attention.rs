@@ -1388,11 +1388,15 @@ pub fn mla_attention_rows(
 
 /// Grouped-query attention weights: plain projections, per-head q/k RMS norms,
 /// and — when `gated` — an output gate folded into `wq` (Qwen3.5's
-/// `attn_output_gate`: `wq` emits `[n_heads*head_dim*2]`, query in the first
-/// flat half, gate in the second; `sigmoid(gate)` multiplies the attention
-/// output *before* `o`). The gate lanes are raw projections — never normed,
-/// never roped. The flat-chunk layout is one of the two contract points the
-/// container parity gate pins (coordination file, Track C REV 2).
+/// `attn_output_gate`: `wq` emits `[n_heads*head_dim*2]` laid out
+/// **per-head interleaved** — each head owns a `2*head_dim` block, query lanes
+/// first, gate lanes second. HF views the row as `[.., n_heads, 2*head_dim]`
+/// and chunks the LAST dim; verbatim-verified against
+/// `modeling_qwen3_next.py` 2026-08-16 after the flat-halves reading of this
+/// same line scrambled every full-attention layer of the real checkpoint —
+/// the exact failure Track C contract point (a) was flagged for).
+/// `sigmoid(gate)` multiplies the attention output *before* `o`; gate lanes
+/// are raw projections — never normed, never roped.
 pub struct GqaWeights<'a> {
     pub wq: &'a QtWeight,
     pub wk: &'a QtWeight,
@@ -1428,8 +1432,25 @@ pub fn gqa_attention(
     let kdim = nkv * hd;
     let table = crate::math::RopeTable::from_cfg(c); // span = qk_rope (partial under HybridGdn)
 
-    let mut qg = w.wq.apply_vec(x, s_n); // [s_n, nh*hd] or [s_n, 2*nh*hd] gated
-    let q_row_w = if w.gated { 2 * nh * hd } else { nh * hd };
+    let qg = w.wq.apply_vec(x, s_n); // [s_n, nh*hd] or [s_n, 2*nh*hd] gated
+    // De-interleave the gated projection up front: head h's block is
+    // [query hd | gate hd] at offset h*2*hd (see GqaWeights). Everything
+    // downstream then works on plain [s_n, nh*hd] buffers for both modes.
+    let (mut qg, gate_all): (Vec<f32>, Option<Vec<f32>>) = if w.gated {
+        let mut q = vec![0.0f32; s_n * nh * hd];
+        let mut g = vec![0.0f32; s_n * nh * hd];
+        for s in 0..s_n {
+            for h in 0..nh {
+                let blk = &qg[s * 2 * nh * hd + h * 2 * hd..s * 2 * nh * hd + (h + 1) * 2 * hd];
+                q[s * nh * hd + h * hd..s * nh * hd + (h + 1) * hd].copy_from_slice(&blk[..hd]);
+                g[s * nh * hd + h * hd..s * nh * hd + (h + 1) * hd].copy_from_slice(&blk[hd..]);
+            }
+        }
+        (q, Some(g))
+    } else {
+        (qg, None)
+    };
+    let q_row_w = nh * hd;
     let mut k_all = w.wk.apply_vec(x, s_n);
     let v_all = w.wv.apply_vec(x, s_n);
 
@@ -1494,8 +1515,8 @@ pub fn gqa_attention(
                 }
             }
         }
-        if w.gated {
-            let gate = &qg[s * q_row_w + nh * hd..(s + 1) * q_row_w];
+        if let Some(gate_all) = &gate_all {
+            let gate = &gate_all[s * nh * hd..(s + 1) * nh * hd];
             let out = &mut ctx_out[s * nh * hd..(s + 1) * nh * hd];
             for (o, &g) in out.iter_mut().zip(gate) {
                 *o *= crate::math::sigmoidf(g);
@@ -2395,11 +2416,15 @@ mod tests {
         let w = |r: &mut Lcg, n: usize| (0..n).map(|_| r.f()).collect::<Vec<f32>>();
         let q_half = w(&mut r, nh * hd * hidden);
         let wq = if gated {
-            // Flat-chunk layout: query rows first, then the gate rows.
-            let mut full = q_half.clone();
+            // Per-head interleaved layout (the verbatim-verified HF one): each
+            // head contributes hd query rows then hd gate rows.
             let gate_rows =
                 if zero_gate { vec![0.0; nh * hd * hidden] } else { w(&mut r, nh * hd * hidden) };
-            full.extend_from_slice(&gate_rows);
+            let mut full = Vec::with_capacity(2 * nh * hd * hidden);
+            for h in 0..nh {
+                full.extend_from_slice(&q_half[h * hd * hidden..(h + 1) * hd * hidden]);
+                full.extend_from_slice(&gate_rows[h * hd * hidden..(h + 1) * hd * hidden]);
+            }
             quant_i4(&full, 2 * nh * hd, hidden)
         } else {
             quant_i4(&q_half, nh * hd, hidden)
