@@ -386,7 +386,23 @@ fn run() -> Result<(), Error> {
                 )
             };
             let src = args.get(2).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
-            let cand = args.get(3).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
+            // `--reference-json` replaces the candidate container: the reference
+            // arm was computed elsewhere (the HF bf16 offload runner,
+            // scripts/qwen-parity-reference.py) and dumped as
+            // {"tokens": [...], "argmax": [...]}. Token ids come FROM the dump,
+            // so tokenization is out of the equation entirely — the number is
+            // pure model-forward agreement.
+            let ref_json = flag_value(&args, "--reference-json");
+            let cand = match (args.get(3).filter(|s| !s.starts_with("--")), &ref_json) {
+                (Some(c), None) => Some(c.clone()),
+                (None, Some(_)) => None,
+                (Some(_), Some(_)) => {
+                    return Err(Error::Format(
+                        "flip-rate: give a candidate dir OR --reference-json, not both".into(),
+                    ))
+                }
+                (None, None) => return Err(usage()),
+            };
             let text = flag_value(&args, "--text");
             let n_tokens: usize = flag_value(&args, "--tokens")
                 .and_then(|v| v.parse().ok())
@@ -427,11 +443,29 @@ fn run() -> Result<(), Error> {
                 );
                 Ok((out, t))
             };
-            let (a, used) = run(src, &toks)?;
-            let b = if cand_env.is_empty() {
-                run(cand, &used)?.0
-            } else {
-                run_candidate_arm(cand, &used, &cand_env)?
+            let (a, b, cand_label) = match (&cand, &ref_json) {
+                (Some(cand), None) => {
+                    let (a, used) = run(src, &toks)?;
+                    let b = if cand_env.is_empty() {
+                        run(cand, &used)?.0
+                    } else {
+                        run_candidate_arm(cand, &used, &cand_env)?
+                    };
+                    (a, b, cand.clone())
+                }
+                (None, Some(path)) => {
+                    let reference = load_reference_dump(Path::new(path))?;
+                    if text.is_some() {
+                        // The dump carries its own ids; a --text alongside it
+                        // would silently be ignored, which reads like it was used.
+                        return Err(Error::Format(
+                            "flip-rate: --reference-json carries its own token ids; drop --text".into(),
+                        ));
+                    }
+                    let (a, _) = run(src, &reference.tokens)?;
+                    (a, reference.argmax, path.clone())
+                }
+                _ => return Err(usage()),
             };
 
             let rate = Model::prediction_flip_rate(&a, &b)
@@ -440,7 +474,7 @@ fn run() -> Result<(), Error> {
             println!("flips       {}", a.iter().zip(&b).filter(|(x, y)| x != y).count());
             println!("flip_rate   {rate:.6}");
             println!("source      {src}");
-            println!("candidate   {cand}");
+            println!("candidate   {cand_label}");
             // Top-1 agreement only, and on one text. It is a floor on quality,
             // not a summary of it: a container can hold top-1 and still shift
             // the distribution underneath, which this cannot see.
@@ -568,6 +602,43 @@ fn run() -> Result<(), Error> {
 /// `--name value` lookup over the raw argv. Deliberately not a flag parser:
 /// this binary's subcommands are positional and the two flags `flip-rate` takes
 /// do not justify pulling one in.
+/// A reference argmax dump: `{"tokens": [...], "argmax": [...]}` — what
+/// `scripts/qwen-parity-reference.py` writes and `flip-rate --reference-json`
+/// consumes. Lengths must match: prediction `argmax[i]` belongs to position `i`
+/// under teacher forcing, same indexing as [`Model::teacher_forcing`].
+struct ReferenceDump {
+    tokens: Vec<i32>,
+    argmax: Vec<i32>,
+}
+
+fn load_reference_dump(path: &Path) -> Result<ReferenceDump, Error> {
+    let bytes = std::fs::read(path).map_err(|e| Error::Format(format!("read {}: {e}", path.display())))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| Error::Format(format!("{}: {e}", path.display())))?;
+    let ids = |key: &str| -> Result<Vec<i32>, Error> {
+        v.get(key)
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| Error::Format(format!("{}: missing \"{key}\" array", path.display())))?
+            .iter()
+            .map(|x| {
+                x.as_i64().map(|n| n as i32).ok_or_else(|| {
+                    Error::Format(format!("{}: non-integer entry in \"{key}\"", path.display()))
+                })
+            })
+            .collect()
+    };
+    let d = ReferenceDump { tokens: ids("tokens")?, argmax: ids("argmax")? };
+    if d.tokens.len() != d.argmax.len() || d.tokens.is_empty() {
+        return Err(Error::Format(format!(
+            "{}: tokens ({}) and argmax ({}) must be equal-length and non-empty",
+            path.display(),
+            d.tokens.len(),
+            d.argmax.len()
+        )));
+    }
+    Ok(d)
+}
+
 fn flag_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
