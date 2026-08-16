@@ -55,6 +55,17 @@ pub struct GdnWeights<'a> {
     pub out: &'a QtWeight,
 }
 
+/// A saved [`GdnState`] context — see [`GdnState::snapshot`]. Opaque by
+/// design: the only valid operations are restoring it into the state it came
+/// from and dropping it.
+#[derive(Clone)]
+pub struct GdnSnapshot {
+    ring: Vec<f32>,
+    filled: usize,
+    s: Vec<f32>,
+    len: usize,
+}
+
 /// Per-stream recurrent state for one GDN layer: the conv ring (last `k-1`
 /// pre-activation rows) and the delta-rule memory `S`. This replaces the KV
 /// cache for linear layers — constant size however long the context runs,
@@ -93,6 +104,39 @@ impl GdnState {
     /// mid-sequence (see `SeqKv::clone_prefix`).
     pub fn new_like(like: &GdnState) -> GdnState {
         GdnState { ring: vec![0.0; like.ring.len()], filled: 0, s: vec![0.0; like.s.len()], len: 0 }
+    }
+
+    /// A point-in-time copy of the whole recurrent context. Speculative decode
+    /// needs it because a GDN state cannot rewind: KV rows for rejected draft
+    /// tokens can be truncated away, but the delta-rule memory has already
+    /// folded them in. The protocol (consumed by the spec-decode verify loop):
+    /// snapshot before the verify forward; on FULL acceptance drop the snapshot
+    /// (the state is exactly right — with spec-conf's ~80% accept rates this is
+    /// the common, zero-cost case); on partial acceptance restore and re-advance
+    /// the accepted rows. ~3.1 MB per layer at 27B dims — one snapshot per
+    /// sequence per verify step, never one per draft position.
+    pub fn snapshot(&self) -> GdnSnapshot {
+        GdnSnapshot { ring: self.ring.clone(), filled: self.filled, s: self.s.clone(), len: self.len }
+    }
+
+    /// Restore a snapshot taken from this layer's own stream. Geometry is
+    /// checked — restoring across layers or models is a wiring bug reported as
+    /// an error, never a silent state corruption.
+    pub fn restore(&mut self, snap: &GdnSnapshot) -> Result<(), Error> {
+        if snap.ring.len() != self.ring.len() || snap.s.len() != self.s.len() {
+            return Err(Error::Format(format!(
+                "gdn restore: snapshot geometry (ring {}, S {}) does not match the state (ring {}, S {})",
+                snap.ring.len(),
+                snap.s.len(),
+                self.ring.len(),
+                self.s.len()
+            )));
+        }
+        self.ring.copy_from_slice(&snap.ring);
+        self.filled = snap.filled;
+        self.s.copy_from_slice(&snap.s);
+        self.len = snap.len;
+        Ok(())
     }
 
     /// Reset to the empty-context state (a new sequence on the same stream).
@@ -416,6 +460,40 @@ mod tests {
         );
         assert_eq!(st_a.len, st_b.len);
         assert!(st_a.s.iter().zip(&st_b.s).all(|(a, b)| a.to_bits() == b.to_bits()), "states must match too");
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_restore_rewinds_a_diverged_state_bit_exactly() -> Result<(), peregrine_core::Error> {
+        // The spec-decode contract: advance, snapshot, advance further down a
+        // draft that gets rejected, restore — the state and all subsequent
+        // outputs must be bit-identical to never having taken the draft.
+        let c = tiny_gdn_cfg()?;
+        let w = make_weights(&c, 13);
+        let d = c.hidden as usize;
+        let mut r = Lcg(29);
+        let x: Vec<f32> = (0..8 * d).map(|_| r.f()).collect();
+
+        let mut st = GdnState::new(&c);
+        gdn_forward(&w.view(), &x[..3 * d], 3, &mut st, &c)?; // committed context
+        let snap = st.snapshot();
+        gdn_forward(&w.view(), &x[3 * d..7 * d], 4, &mut st, &c)?; // rejected draft
+        st.restore(&snap)?;
+        let after_restore = gdn_forward(&w.view(), &x[7 * d..8 * d], 1, &mut st, &c)?;
+
+        let mut clean = GdnState::new(&c);
+        gdn_forward(&w.view(), &x[..3 * d], 3, &mut clean, &c)?;
+        let clean_out = gdn_forward(&w.view(), &x[7 * d..8 * d], 1, &mut clean, &c)?;
+        assert!(
+            after_restore.iter().zip(&clean_out).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "a restored state must continue bit-identically to one that never drafted"
+        );
+        assert_eq!(st.len, clean.len);
+        // Cross-geometry restore is refused, not absorbed.
+        let other = tiny_gdn_cfg()?;
+        let mut wrong = GdnState::new(&other);
+        wrong.s.push(0.0); // perturb geometry
+        assert!(wrong.restore(&snap).is_err(), "geometry mismatch must refuse");
         Ok(())
     }
 
