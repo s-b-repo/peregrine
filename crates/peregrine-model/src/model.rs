@@ -480,11 +480,42 @@ impl SeqKv {
         self.layers.first().is_none_or(|k| k.is_empty())
     }
 
-    /// Rewind every layer to `new_len` (speculative-decode reject cleanup).
+    /// Rewind every KV layer to `new_len` (speculative-decode reject cleanup).
+    ///
+    /// **KV rows only.** A recurrent (GDN) layer's context cannot rewind by
+    /// truncation — rejected tokens are already folded into its memory. The
+    /// spec-decode contract for hybrid sequences is [`Self::gdn_snapshot`]
+    /// before the verify forward, [`Self::gdn_restore`] on partial acceptance,
+    /// and this truncate for the KV half — in that order.
     pub fn truncate(&mut self, new_len: usize) {
         for k in &mut self.layers {
             k.truncate(new_len);
         }
+    }
+
+    /// Snapshot every recurrent layer's context, `None` when no layer is
+    /// recurrent (KV-only architectures: [`Self::truncate`] alone suffices,
+    /// and the caller skips the ~151 MB copy entirely). One snapshot per
+    /// verify step, dropped on full acceptance — the common case.
+    pub fn gdn_snapshot(&self) -> Option<Vec<(usize, crate::gdn::GdnSnapshot)>> {
+        let snaps: Vec<(usize, crate::gdn::GdnSnapshot)> =
+            self.gdn.iter().enumerate().filter_map(|(i, g)| g.as_ref().map(|g| (i, g.snapshot()))).collect();
+        (!snaps.is_empty()).then_some(snaps)
+    }
+
+    /// Restore a [`Self::gdn_snapshot`] taken from this sequence. Layer indices
+    /// and geometry are checked; a mismatch is a wiring bug reported as an
+    /// error before any state is touched on that layer.
+    pub fn gdn_restore(&mut self, snaps: &[(usize, crate::gdn::GdnSnapshot)]) -> Result<(), Error> {
+        for (li, snap) in snaps {
+            let st = self
+                .gdn
+                .get_mut(*li)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| Error::Format(format!("gdn restore: layer {li} carries no recurrent state")))?;
+            st.restore(snap)?;
+        }
+        Ok(())
     }
 
     /// Logical bytes across every layer: what this sequence would cost holding
