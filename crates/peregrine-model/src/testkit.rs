@@ -191,6 +191,26 @@ pub fn tiny_hybrid_cfg_json() -> serde_json::Value {
     })
 }
 
+/// A dense-GQA config at caller-chosen width — the fixture for tests whose
+/// *numerics* must be representative rather than merely structural. The 16-wide
+/// [`tiny_qwen_cfg_json`] exercises every code path but sits inside a single
+/// WMMA tile, where edge handling and short accumulations make GPU/CPU
+/// agreement look worse than it is at real widths.
+pub fn sized_qwen_cfg_json(hidden: i64, inter: i64, n_heads: i64, n_kv_heads: i64, head_dim: i64) -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "qwen3", "vocab_size": 32, "hidden_size": hidden,
+        "intermediate_size": inter, "num_hidden_layers": 2,
+        "num_attention_heads": n_heads, "num_key_value_heads": n_kv_heads,
+        "head_dim": head_dim,
+        "rope_theta": 10000.0, "rms_norm_eps": 1e-6, "eos_token_id": 0
+    })
+}
+
+/// [`sized_qwen_cfg_json`] written to disk as a loadable model.
+pub fn build_sized_qwen_model(dir: &Path, seed: u64, cfg_json: serde_json::Value) -> Result<(), Error> {
+    build_tiny_gqa_family(dir, seed, cfg_json)
+}
+
 /// Write a tiny random dense-GQA (classic Qwen3) model into `dir`.
 pub fn build_tiny_qwen_model(dir: &Path, seed: u64) -> Result<(), Error> {
     build_tiny_gqa_family(dir, seed, tiny_qwen_cfg_json())

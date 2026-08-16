@@ -448,6 +448,7 @@ mod tests {
             dsa: false,
             reactors: &reactors,
             gpu: None,
+            gpu_dense: None,
             workers: 1,
             cfg: &cfg,
             stream_experts: true,

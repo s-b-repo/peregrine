@@ -14,9 +14,9 @@
 //! empty stub otherwise, so the scheduler/`Model` stay feature-agnostic.
 
 #[cfg(feature = "cuda")]
-pub use real::GpuTier;
+pub use real::{GpuDenseTier, GpuTier};
 #[cfg(not(feature = "cuda"))]
-pub use stub::GpuTier;
+pub use stub::{GpuDenseTier, GpuTier};
 
 /// Choose which `(layer, expert)` pairs to hold VRAM-resident, given how many
 /// experts fit in `budget`. Spreads residency **round-robin across all sparse
@@ -1307,6 +1307,107 @@ mod real {
     /// set (`COLI_GPU_F32_FRAC`, int4 tiers only), `reheat` promotes that fraction
     /// of the hottest residents to f32 per [`super::plan_precision_fitted`], tracking each
     /// expert's current format in `precision` and re-uploading on a change.
+    /// VRAM-resident **dense** MLPs, keyed by layer — the GPU tier for models
+    /// with no routed experts (Track D). Where [`GpuTier`] holds a *selection*
+    /// of a MoE's experts and re-selects as heat moves, this holds whole layers
+    /// and never moves them: a dense layer is either resident for the run or it
+    /// is not.
+    ///
+    /// **Layer-bounded and VRAM-probed rather than all-or-nothing.** Residency
+    /// stops at whatever the card actually has free when the model loads —
+    /// 6 layers next to another process's 10 GB, all 64 on an idle card, some
+    /// number in between on a smaller GPU — and the layers that did not fit
+    /// compute on the CPU exactly as before. That is what makes partial offload
+    /// a working configuration instead of a failure mode.
+    ///
+    /// **Deterministic by construction.** Layer `L` computes on the same device
+    /// for the whole run, so output does not depend on timing. `todo.md`'s
+    /// closed "CPU/GPU split GEMM" negative was about splitting *one GEMM's
+    /// rows* across devices, which made low-order bits a function of the
+    /// scheduler; layer-granular placement is not that and is not covered by
+    /// that closure.
+    pub struct GpuDenseTier {
+        device: i32,
+        mlps: HashMap<usize, GpuExpert>,
+        bytes: usize,
+        /// Layers examined but not uploaded because the budget ran out — the
+        /// number that says whether more VRAM would buy anything.
+        skipped: usize,
+    }
+
+    impl GpuDenseTier {
+        /// An empty tier on `device`. Uploading is [`Self::try_add`], one layer
+        /// at a time, so the caller keeps the load order and the failure policy.
+        pub fn new(device: i32) -> GpuDenseTier {
+            GpuDenseTier { device, mlps: HashMap::new(), bytes: 0, skipped: 0 }
+        }
+
+        /// Upload layer `li`'s MLP if it fits the device's *current* free VRAM
+        /// with `headroom` bytes to spare. Returns whether it landed.
+        ///
+        /// Non-per-row-int4 weights are refused rather than dequantized: the
+        /// f32 path costs 8× the VRAM, which would turn "all 64 layers" into
+        /// "eight layers" silently. The container guarantees int4 here (every
+        /// MLP tensor verified per-row int4 on the Qwen container), so a
+        /// refusal means something upstream changed and the operator should
+        /// hear about it rather than watch residency quietly collapse.
+        pub fn try_add(
+            &mut self,
+            li: usize,
+            gate: &QtWeight,
+            up: &QtWeight,
+            down: &QtWeight,
+            headroom: usize,
+        ) -> Result<bool, Error> {
+            use crate::weight::QuantFmt;
+            if gate.fmt != QuantFmt::Int4 || up.fmt != QuantFmt::Int4 || down.fmt != QuantFmt::Int4 {
+                return Err(Error::Format(format!(
+                    "gpu dense tier: layer {li} MLP is not per-row int4 ({:?}/{:?}/{:?}); \
+                     uploading it would cost 8x the VRAM as f32",
+                    gate.fmt, up.fmt, down.fmt
+                )));
+            }
+            let (gq, gs) = gate.raw();
+            let (uq, us) = up.raw();
+            let (dq, ds) = down.raw();
+            let need = gq.len() + uq.len() + dq.len() + 4 * (gs.len() + us.len() + ds.len());
+            let (free, _) = peregrine_cuda::mem_info(self.device)?;
+            if free < need.saturating_add(headroom) {
+                self.skipped += 1;
+                return Ok(false);
+            }
+            let e = GpuExpert::upload_int4(
+                self.device,
+                (gq, gs),
+                (uq, us),
+                (dq, ds),
+                gate.i,
+                gate.o,
+            )?;
+            self.mlps.insert(li, e);
+            self.bytes += need;
+            Ok(true)
+        }
+
+        /// Whether layer `li`'s MLP computes on the device.
+        pub fn has(&self, li: usize) -> bool {
+            self.mlps.contains_key(&li)
+        }
+
+        /// Run layer `li`'s SwiGLU on the device. `None` when the layer is not
+        /// resident — the caller then takes the CPU path, which is the same
+        /// arithmetic by a slower road.
+        pub fn mlp(&self, li: usize, x: &[f32], s_n: usize, hidden: usize) -> Option<Result<Vec<f32>, Error>> {
+            let e = self.mlps.get(&li)?;
+            Some(peregrine_cuda::dense_mlp_w4a16(e, x, s_n, hidden))
+        }
+
+        /// `(layers resident, bytes held, layers skipped for budget)`.
+        pub fn stats(&self) -> (usize, usize, usize) {
+            (self.mlps.len(), self.bytes, self.skipped)
+        }
+    }
+
     pub struct GpuTier {
         device: i32,
         experts: HashMap<(usize, usize), GpuExpert>,
@@ -2122,6 +2223,51 @@ mod stub {
     /// never constructed and the scheduler always takes the CPU/disk path.
     pub struct GpuTier {
         _never: (),
+    }
+
+    /// Empty dense tier for non-`cuda` builds: never constructed, always says
+    /// "not resident", so every caller takes the CPU MLP path unchanged.
+    pub struct GpuDenseTier {
+        _never: (),
+    }
+
+    impl GpuDenseTier {
+        /// Never actually constructed in a non-`cuda` build: `Model` gates the
+        /// whole tier on `COLI_GPU_DENSE`, and `try_add` here never accepts a
+        /// layer, so the tier is always dropped as empty. The constructor
+        /// exists so the caller needs no `cfg` of its own.
+        pub fn new(_device: i32) -> GpuDenseTier {
+            GpuDenseTier { _never: () }
+        }
+
+        pub fn try_add(
+            &mut self,
+            _li: usize,
+            _gate: &crate::weight::QtWeight,
+            _up: &crate::weight::QtWeight,
+            _down: &crate::weight::QtWeight,
+            _headroom: usize,
+        ) -> Result<bool, Error> {
+            Ok(false)
+        }
+
+        pub fn has(&self, _li: usize) -> bool {
+            false
+        }
+
+        pub fn mlp(
+            &self,
+            _li: usize,
+            _x: &[f32],
+            _s_n: usize,
+            _hidden: usize,
+        ) -> Option<Result<Vec<f32>, Error>> {
+            None
+        }
+
+        pub fn stats(&self) -> (usize, usize, usize) {
+            (0, 0, 0)
+        }
     }
 
     impl GpuTier {
