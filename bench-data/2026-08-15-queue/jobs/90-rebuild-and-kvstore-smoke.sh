@@ -8,7 +8,11 @@
 # design; the identity check is the smoke's point).
 set -u
 cd "$(dirname "$0")/../../.."
-if ! cargo build --release > bench-data/2026-08-15-queue/rebuild.log 2>&1; then
+# --features cuda: the serving binaries are CUDA-linked as of 2026-08-16. A plain
+# `cargo build --release` here would silently REPLACE them with CPU-only ones and
+# every later run would report "gpu=unavailable (CUDA backend not built)" with no
+# other symptom — the exact way the GPU stayed dark for months.
+if ! cargo build --release --features cuda > bench-data/2026-08-15-queue/rebuild.log 2>&1; then
   echo "release rebuild FAILED — refusing to run further queue jobs against a stale binary"
   touch bench-data/2026-08-15-queue/SKIP
   exit 1

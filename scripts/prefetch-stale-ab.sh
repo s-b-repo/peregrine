@@ -29,7 +29,9 @@ done
 [ -e "$DATA/SKIP" ] && { stamp "SKIP present — exiting without measuring"; exit 0; }
 
 stamp "rebuilding target/release (safe now: no serve arm mid-sweep can see a binary swap)"
-if ! cargo build --release > "$DATA/build.log" 2>&1; then
+# --features cuda: keep the CUDA link (a plain release build silently strips it,
+# leaving "gpu=unavailable (CUDA backend not built)" as the only symptom).
+if ! cargo build --release --features cuda > "$DATA/build.log" 2>&1; then
   stamp "release build FAILED — aborting (see $DATA/build.log)"
   exit 1
 fi
