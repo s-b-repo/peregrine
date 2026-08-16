@@ -171,17 +171,17 @@ its own status so nobody mistakes "documented" for "measured":
   Measurement: queue job 99, three arms (off / static / adaptive) at B=16.
   Off by default until it reports.
 
-### `COLI_PREFETCH_STALE_DROP` — screened positive (2026-08-15, same rule)
+### `COLI_PREFETCH_STALE_DROP` — confirmed, default ON (2026-08-16)
 
-- **`COLI_PREFETCH_STALE_DROP=1`** (default 0, off; window via
+- **`COLI_PREFETCH_STALE_DROP`** (default ON since d3b47c5, `=0` to disable; window via
   `COLI_PREFETCH_STALE_SLACK`, default 1 layer-step) — drop a queued
   speculative warm *before its disk read* once the forward sweep has moved
   past the layer window it was emitted for. **CONFIRMED, REPEATS=3
   (2026-08-16): 0.072 → 0.077 median (+6.9 %) at B=16**, with the counters
   showing the honest mechanism — speculative reads −68 %, total disk reads
   −2.2 % — wasted speculative bandwidth returned to demand reads rather than
-  a cache trade. A default flip is now evidence-backed; owner's call
-  (peregrine-89 authored the gate). The 2026-08-13 defaults run is
+  a cache trade. **Default flipped ON the same day (d3b47c5)**, with `=0` as
+  the escape hatch and both resolver sides under test. The 2026-08-13 defaults run is
   the motivating measurement: at B=16 the rings sit at 93 % duty, the
   unbounded prefetch queue backlogs, and **40 352 of 41 159 speculative reads
   (98.6 %) were classified wasted — ~12.6 % of all disk reads** on a run whose
