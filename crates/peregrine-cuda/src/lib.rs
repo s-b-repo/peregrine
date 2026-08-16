@@ -54,6 +54,14 @@ mod ffi {
             device: c_int,
         ) -> c_int;
         pub fn coli_cuda_tensor_free(tensor: *mut ColiCudaTensor);
+        pub fn coli_cuda_shared_mlp_w4a16(
+            gate: *mut ColiCudaTensor,
+            up: *mut ColiCudaTensor,
+            down: *mut ColiCudaTensor,
+            y: *mut f32,
+            x: *const f32,
+            s: c_int,
+        ) -> c_int;
         pub fn coli_cuda_expert_group(
             gates: *const *mut ColiCudaTensor,
             ups: *const *mut ColiCudaTensor,
@@ -448,6 +456,50 @@ pub fn expert_group(experts: &[&GpuExpert], rows: &[i32], x: &[f32], hidden: usi
     // only the autotuner exercises. Keeping the historical entry point in use
     // means the untuned path is the one that has always been running.
     expert_group_dispatch(experts, rows, x, hidden, None, None)
+}
+
+/// Run one **dense** SwiGLU MLP entirely on the device: `down(silu(gate·x) ⊙
+/// (up·x))` with int4 weights and f32 activations (`w4a16`), for `s_n` rows of
+/// `x[s_n, hidden]`, returning `[s_n, hidden]`.
+///
+/// The C kernel this binds (`coli_cuda_shared_mlp_w4a16`) was written for GLM's
+/// *shared* expert and then never called from Rust — it had no binding at all
+/// until Track D. A dense transformer layer's MLP is the same shape, which is
+/// what makes a resident dense model (Qwen3.8: 64 MLPs, 8.57 GB at int4) a GPU
+/// workload with no new kernel.
+///
+/// Requires the tensors to have been uploaded as **per-row int4**
+/// ([`GpuExpert::upload_int4`], `fmt=2`); the C entry validates the format and
+/// the shape triple and returns failure rather than computing something else.
+/// A failure here is reported, never fatal: the caller falls back to the CPU
+/// MLP for that layer, which is the same result by a slower road.
+#[cfg(feature = "cuda")]
+pub fn dense_mlp_w4a16(e: &GpuExpert, x: &[f32], s_n: usize, hidden: usize) -> Result<Vec<f32>, Error> {
+    if s_n == 0 || x.len() != s_n * hidden {
+        return Err(Error::Format(format!(
+            "dense_mlp_w4a16: x is {} floats, expected {s_n} x {hidden}",
+            x.len()
+        )));
+    }
+    let mut y = vec![0f32; s_n * hidden];
+    // SAFETY: `e`'s handles are live device tensors owned by `e` (freed only in
+    // its `Drop`); `x`/`y` are host buffers sized exactly as the C entry reads
+    // and writes them, checked above; `s_n` fits `c_int` for any batch this
+    // engine assembles.
+    let ok = unsafe {
+        ffi::coli_cuda_shared_mlp_w4a16(
+            e.gate,
+            e.up,
+            e.down,
+            y.as_mut_ptr(),
+            x.as_ptr(),
+            s_n as std::os::raw::c_int,
+        )
+    };
+    if ok == 0 {
+        return Err(Error::Format("dense_mlp_w4a16: device MLP failed (format/shape/launch)".into()));
+    }
+    Ok(y)
 }
 
 /// Which kernel arm an `expert_group` call took.
@@ -862,6 +914,75 @@ mod gpu_tests {
     static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn gpu_guard() -> std::sync::MutexGuard<'static, ()> {
         GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Track D's first equivalence check: the device dense-MLP path must agree
+    /// with the CPU SwiGLU it replaces, on the same int4 weights.
+    ///
+    /// Tolerance, not bit-identity, and deliberately so: the GPU reduces in a
+    /// different order (WMMA fragments) than the CPU's row loop, so the two
+    /// cannot be bit-equal and a test demanding that would be testing the wrong
+    /// property. What must hold is that the kernel computes *this* MLP —
+    /// dequantizing the same nibbles against the same per-row scales — which a
+    /// relative-error bound catches while wrong-layout or wrong-scale bugs
+    /// (the failure mode that cost a night on the CPU side) blow straight
+    /// through it.
+    #[test]
+    fn the_device_dense_mlp_agrees_with_the_cpu_swiglu() -> Result<(), Error> {
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let (hidden, inter, s_n) = (256usize, 512usize, 3usize);
+        let mut r = Lcg(0x5EED);
+        let gatef: Vec<f32> = (0..inter * hidden).map(|_| r.f() * 0.1).collect();
+        let upf: Vec<f32> = (0..inter * hidden).map(|_| r.f() * 0.1).collect();
+        let downf: Vec<f32> = (0..hidden * inter).map(|_| r.f() * 0.1).collect();
+        let (gq, gs) = quant_i4(&gatef, inter, hidden);
+        let (uq, us) = quant_i4(&upf, inter, hidden);
+        let (dq, ds) = quant_i4(&downf, hidden, inter);
+        let e = GpuExpert::upload_int4(0, (&gq, &gs), (&uq, &us), (&dq, &ds), hidden, inter)?;
+        let x: Vec<f32> = (0..s_n * hidden).map(|_| r.f()).collect();
+
+        let got = dense_mlp_w4a16(&e, &x, s_n, hidden)?;
+        assert_eq!(got.len(), s_n * hidden);
+
+        // CPU reference over the DEQUANTIZED weights — the same values the
+        // device holds, so this compares kernels rather than quantizers.
+        let deq = |q: &[u8], sc: &[f32], o: usize, i: usize| -> Vec<f32> {
+            let mut w = vec![0f32; o * i];
+            for oo in 0..o {
+                for ii in 0..i {
+                    let byte = q[oo * i.div_ceil(2) + ii / 2];
+                    let nib = if ii % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                    w[oo * i + ii] = (nib as f32 - 8.0) * sc[oo];
+                }
+            }
+            w
+        };
+        let (gw, uw, dw) =
+            (deq(&gq, &gs, inter, hidden), deq(&uq, &us, inter, hidden), deq(&dq, &ds, hidden, inter));
+        let mut want = vec![0f32; s_n * hidden];
+        for srow in 0..s_n {
+            let xr = &x[srow * hidden..(srow + 1) * hidden];
+            let mut h = vec![0f32; inter];
+            for j in 0..inter {
+                let g: f32 = (0..hidden).map(|k| gw[j * hidden + k] * xr[k]).sum();
+                let u: f32 = (0..hidden).map(|k| uw[j * hidden + k] * xr[k]).sum();
+                h[j] = (g / (1.0 + (-g).exp())) * u; // silu(g) * u
+            }
+            for o in 0..hidden {
+                want[srow * hidden + o] = (0..inter).map(|j| dw[o * inter + j] * h[j]).sum();
+            }
+        }
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        println!("dense-mlp gpu-vs-cpu: worst abs {worst:.3e} on scale {scale:.3e}");
+        assert!(
+            worst / scale < 5e-3,
+            "device dense MLP must match the CPU SwiGLU (worst {worst:.3e}, scale {scale:.3e})"
+        );
+        Ok(())
     }
 
     /// The measurement `todo.md` §2's defrag-pool item asked for instead of the
