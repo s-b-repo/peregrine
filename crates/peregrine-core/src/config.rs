@@ -103,13 +103,54 @@ fn gf(root: &Value, key: &str, default: f32) -> f32 {
 }
 
 impl Cfg {
-    /// Load and validate `<dir>/config.json`.
+    /// Load and validate `<dir>/config.json`, folding in
+    /// `<dir>/generation_config.json`'s stop tokens when the checkpoint ships
+    /// one. HF splits EOS across the two files — Qwen3.8 declares 248044 in
+    /// config.json but the ChatML turn terminator <|im_end|> (248046) only in
+    /// generation_config.json, so an engine reading one file serves answers
+    /// with a trailing <|im_end|> it never stops on. Union, never replace:
+    /// every id either file declares is kept, same rule as the array parse.
     pub fn load(dir: &Path) -> Result<Cfg, Error> {
         let path = dir.join("config.json");
         // read through the io_uring lane (no std::fs read path)
         let bytes = peregrine_io::read_file(&path).ctx(|| path.display().to_string())?;
         let root: Value = serde_json::from_slice(&bytes)?;
-        Cfg::from_json(&root)
+        let mut cfg = Cfg::from_json(&root)?;
+        // Absent is the normal case (GLM containers ship none), so only an
+        // existing-but-unreadable file is worth saying anything about — and it
+        // is an advisory, not a fatal: the model still runs, it just stops on
+        // config.json's ids alone.
+        let gen_path = dir.join("generation_config.json");
+        let gen_bytes = if gen_path.exists() {
+            match peregrine_io::read_file(&gen_path) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    peregrine_io::note_advisory_err("generation_config.json read", &e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(bytes) = gen_bytes {
+            match serde_json::from_slice::<Value>(&bytes) {
+                Ok(g) => {
+                    let extra: Vec<i64> = match g.get("eos_token_id") {
+                        Some(Value::Number(n)) => n.as_i64().into_iter().collect(),
+                        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_i64()).collect(),
+                        _ => Vec::new(),
+                    };
+                    for id in extra {
+                        let id = id as i32;
+                        if !cfg.stop_ids.contains(&id) {
+                            cfg.stop_ids.push(id);
+                        }
+                    }
+                }
+                Err(e) => peregrine_io::note_advisory_err("generation_config.json parse", &e),
+            }
+        }
+        Ok(cfg)
     }
 
     /// Parse a config from an already-decoded JSON value (used by tests).
@@ -831,6 +872,31 @@ mod tests {
         }
         let c = Cfg::from_json(&j)?;
         assert_eq!(c.full_attn, vec![false, false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn generation_config_stop_tokens_are_unioned_in() -> Result<(), Error> {
+        // config.json says 248044; generation_config.json says [248046, 248044]
+        // — the loaded set must carry both, each exactly once.
+        let d = std::env::temp_dir().join(format!("peregrine_genconf_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        std::fs::create_dir_all(&d)?;
+        let mut j = tiny_qwen_json();
+        j["eos_token_id"] = serde_json::json!(248044);
+        std::fs::write(d.join("config.json"), serde_json::to_vec(&j)?)?;
+        std::fs::write(
+            d.join("generation_config.json"),
+            serde_json::to_vec(&serde_json::json!({"eos_token_id": [248046, 248044]}))?,
+        )?;
+        let c = Cfg::load(&d)?;
+        assert_eq!(c.stop_ids, vec![248044, 248046], "union, deduped, config.json order first");
+        // Absent generation_config keeps the historical single-file behaviour.
+        std::fs::remove_file(d.join("generation_config.json"))?;
+        assert_eq!(Cfg::load(&d)?.stop_ids, vec![248044]);
+        std::fs::remove_dir_all(&d)?;
         Ok(())
     }
 

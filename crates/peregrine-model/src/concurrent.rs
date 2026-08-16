@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use peregrine_core::{Cfg, Context, Error, QtInfo, SafeTensors};
 use peregrine_io::{Bytes, CacheHit, OwnedReadReq, Reactor, ReadReq, RegionDone, WarmCache};
 
-use crate::gpu::{GpuTier, HeatTable};
+use crate::gpu::{GpuDenseTier, GpuTier, HeatTable};
 use crate::lane::LaneTimingsAccum;
 use crate::mlp::Mlp;
 use crate::predict::RouteHistory;
@@ -46,6 +46,10 @@ pub struct ForwardCtx<'a> {
     /// its owner, so the lock is uncontended). Empty in resident mode.
     pub reactors: &'a [Mutex<Reactor>],
     pub gpu: Option<&'a GpuTier>,
+    /// VRAM-resident dense MLPs (Track D). `Some` only for dense/hybrid
+    /// architectures with `COLI_GPU_DENSE` on and at least one layer uploaded;
+    /// a layer it does not hold computes on the CPU exactly as before.
+    pub gpu_dense: Option<&'a GpuDenseTier>,
     pub workers: usize,
     pub cfg: &'a Cfg,
     pub stream_experts: bool,
@@ -2263,6 +2267,7 @@ mod tests {
             dsa: false,
             reactors: &reactors,
             gpu: None,
+            gpu_dense: None,
             workers: 2,
             cfg: &cfg,
             stream_experts: true,

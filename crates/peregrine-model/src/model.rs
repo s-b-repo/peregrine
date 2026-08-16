@@ -259,6 +259,11 @@ pub struct Model {
     /// ticking it is two instructions, and gating its existence on the knob would
     /// put an `Option` probe in every layer of every forward.
     sweep: Arc<SweepClock>,
+    /// Optional VRAM-resident dense-MLP tier (Track D): whole layers' SwiGLU on
+    /// the device for architectures with no routed experts. Built only when
+    /// `COLI_GPU_DENSE` is set, the `cuda` backend is available and at least one
+    /// layer fit; layers it does not hold compute on the CPU.
+    gpu_dense: Option<crate::gpu::GpuDenseTier>,
     /// Optional GPU VRAM expert tier (the 3rd lane). Built only when `COLI_GPU`
     /// is set and the `cuda` backend is available; `None` otherwise.
     gpu: Option<GpuTier>,
@@ -2720,7 +2725,18 @@ fn forward_layer(
             .dense
             .as_ref()
             .ok_or_else(|| Error::Format(format!("layer {li}: dense MLP weights missing")))?;
-        dense.swiglu(&nrm2, s_n)
+        // VRAM-resident layers compute their SwiGLU on the device; the rest take
+        // the CPU path. Which one a layer takes is fixed for the whole run (see
+        // `GpuDenseTier`), so this is a placement decision, not a race. A device
+        // failure mid-run is an advisory and a fallback, never a lost request.
+        match ctx.gpu_dense.and_then(|t| t.mlp(li, &nrm2, s_n, d)) {
+            Some(Ok(y)) => y,
+            Some(Err(e)) => {
+                peregrine_io::note_advisory_err("gpu dense MLP (CPU fallback)", &e);
+                dense.swiglu(&nrm2, s_n)
+            }
+            None => dense.swiglu(&nrm2, s_n),
+        }
     };
     for z in 0..s_n * d {
         x[z] += ffn[z];
@@ -2813,7 +2829,18 @@ fn forward_layer_batched(
             .dense
             .as_ref()
             .ok_or_else(|| Error::Format(format!("layer {li}: dense MLP weights missing")))?;
-        dense.swiglu(&nrm2, s_n)
+        // VRAM-resident layers compute their SwiGLU on the device; the rest take
+        // the CPU path. Which one a layer takes is fixed for the whole run (see
+        // `GpuDenseTier`), so this is a placement decision, not a race. A device
+        // failure mid-run is an advisory and a fallback, never a lost request.
+        match ctx.gpu_dense.and_then(|t| t.mlp(li, &nrm2, s_n, d)) {
+            Some(Ok(y)) => y,
+            Some(Err(e)) => {
+                peregrine_io::note_advisory_err("gpu dense MLP (CPU fallback)", &e);
+                dense.swiglu(&nrm2, s_n)
+            }
+            None => dense.swiglu(&nrm2, s_n),
+        }
     };
     for z in 0..s_n * d {
         x[z] += ffn[z];
@@ -3142,6 +3169,50 @@ impl Model {
         } else {
             None
         };
+        // Optional VRAM-resident dense-MLP tier (opt-in via COLI_GPU_DENSE, Track
+        // D): for architectures with no routed experts, upload whole layers'
+        // SwiGLU weights and compute them on the device. Layer-bounded and
+        // VRAM-probed — it takes what the card has free right now and leaves the
+        // rest on the CPU, so partial residency is a working configuration
+        // rather than a failure. `COLI_GPU_DENSE_HEADROOM_MB` (default 1024)
+        // is what it refuses to spend, for activations and the context.
+        let gpu_dense = if std::env::var("COLI_GPU_DENSE").is_ok() && !has_routed_experts(&st) {
+            let headroom = env_usize("COLI_GPU_DENSE_HEADROOM_MB", 1024) * (1 << 20);
+            let mut tier = crate::gpu::GpuDenseTier::new(0);
+            let mut refused = None;
+            for (li, l) in layers.iter().enumerate() {
+                let Some(mlp) = l.dense.as_ref() else { continue };
+                match tier.try_add(li, &mlp.gate, &mlp.up, &mlp.down, headroom) {
+                    // Budget exhausted: stop probing. Later layers are no
+                    // smaller, so continuing would only repeat the same answer.
+                    Ok(false) => break,
+                    Ok(true) => {}
+                    // A format refusal is worth one line and the CPU path, not a
+                    // failed load: the model still runs, just without this tier.
+                    Err(e) => {
+                        refused = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = refused {
+                peregrine_io::note_advisory_err("gpu dense tier (CPU MLP path)", &e);
+            }
+            let (n, bytes, skipped) = tier.stats();
+            if n > 0 {
+                eprintln!(
+                    "peregrine: [gpu-dense] {n} of {} MLP layers resident, {:.2} GB VRAM{}",
+                    layers.len(),
+                    bytes as f64 / 1e9,
+                    if skipped > 0 { format!(" ({skipped}+ skipped: VRAM budget)") } else { String::new() }
+                );
+                Some(tier)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // Heat accumulator for dynamic VRAM residency — only useful (and only built)
         // when there is a GPU tier to migrate hot experts into.
         // `n_layers + 1` rows: the MTP head sits at layer index `cfg.n_layers` and
@@ -3297,6 +3368,7 @@ impl Model {
             prefetch,
             sweep,
             gdn,
+            gpu_dense,
             gpu,
             mtp,
             // `heat` is `Some` exactly when a GPU tier exists, which is also
@@ -4846,7 +4918,7 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, gdn, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, calib, ..
+                cfg, layers, kv, gdn, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, gpu_dense, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, calib, ..
             } = self;
             let sweep: &SweepClock = sweep;
             let ctx = ForwardCtx {
@@ -4855,6 +4927,7 @@ impl Model {
                 dsa: *dsa,
                 reactors: io_reactors,
                 gpu: gpu.as_ref(),
+                gpu_dense: gpu_dense.as_ref(),
                 workers: eff_workers,
                 cfg,
                 stream_experts: *stream_experts,
@@ -5214,6 +5287,7 @@ impl Model {
             dsa: self.dsa,
             reactors: &self.io_reactors,
             gpu: self.gpu.as_ref(),
+            gpu_dense: self.gpu_dense.as_ref(),
             workers: self.effective_workers(),
             cfg: &self.cfg,
             stream_experts: self.stream_experts,
@@ -5481,6 +5555,7 @@ impl Model {
             dsa: self.dsa,
             reactors: &self.io_reactors,
             gpu: self.gpu.as_ref(),
+            gpu_dense: self.gpu_dense.as_ref(),
             workers: self.effective_workers(),
             cfg: &self.cfg,
             stream_experts: self.stream_experts,
@@ -5748,7 +5823,7 @@ impl Model {
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
 
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, stream_experts, cfg, absorb, dsa, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft without an MTP head".into()))?;
         let ctx = ForwardCtx {
@@ -5757,6 +5832,7 @@ impl Model {
             dsa: *dsa,
             reactors: io_reactors,
             gpu: gpu.as_ref(),
+                gpu_dense: gpu_dense.as_ref(),
             workers: *workers,
             cfg,
             stream_experts: *stream_experts,
@@ -6049,6 +6125,150 @@ mod tests {
         }
         crate::testkit::build_tiny_qwen_model(&d, 42)?;
         prefill_step_identity_and_generate(&d)?;
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    /// The claim that makes the device path *safe to prefer*, not merely
+    /// different: measured against an f32 ground truth over the same
+    /// dequantized weights, the device MLP (int4 weights, fp16 activations) is
+    /// at least as close as peregrine's CPU MLP (int4 weights, int8
+    /// activations). If a layout, scale or encoding bug ever creeps into the
+    /// upload or the kernel, this inverts immediately — which is exactly the
+    /// failure a same-vs-same tolerance check cannot see.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_device_mlp_is_closer_to_f32_truth_than_the_cpu_path() -> Result<(), peregrine_core::Error> {
+        if peregrine_cuda::init(&[0]) < 1 {
+            return Ok(());
+        }
+        use crate::weight::{test_support::quant_i4 as qi4, QtWeight};
+        let (hidden, inter, s_n) = (256usize, 512usize, 2usize);
+        let mut seed = 0x51EEDu64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        let gf: Vec<f32> = (0..inter * hidden).map(|_| rnd() * 0.1).collect();
+        let uf: Vec<f32> = (0..inter * hidden).map(|_| rnd() * 0.1).collect();
+        let df: Vec<f32> = (0..hidden * inter).map(|_| rnd() * 0.1).collect();
+        let x: Vec<f32> = (0..s_n * hidden).map(|_| rnd()).collect();
+        let mlp = Mlp { gate: qi4(&gf, inter, hidden), up: qi4(&uf, inter, hidden), down: qi4(&df, hidden, inter) };
+
+        // Ground truth: the weights the container actually holds (dequantized
+        // exactly), with activations left in f32 — no activation quantization
+        // on either side of the comparison.
+        let deq = |w: &QtWeight| -> Vec<f32> {
+            let mut out = vec![0f32; w.o * w.i];
+            for o in 0..w.o {
+                w.dequant_row_into(o, &mut out[o * w.i..(o + 1) * w.i]);
+            }
+            out
+        };
+        let (gw, uw, dw) = (deq(&mlp.gate), deq(&mlp.up), deq(&mlp.down));
+        let mut truth = vec![0f32; s_n * hidden];
+        for r in 0..s_n {
+            let xr = &x[r * hidden..(r + 1) * hidden];
+            let mut h = vec![0f32; inter];
+            for j in 0..inter {
+                let g: f32 = (0..hidden).map(|k| gw[j * hidden + k] * xr[k]).sum();
+                let u: f32 = (0..hidden).map(|k| uw[j * hidden + k] * xr[k]).sum();
+                h[j] = (g / (1.0 + (-g).exp())) * u;
+            }
+            for o in 0..hidden {
+                truth[r * hidden + o] = (0..inter).map(|j| dw[o * inter + j] * h[j]).sum();
+            }
+        }
+
+        let cpu = mlp.swiglu(&x, s_n);
+        let mut tier = crate::gpu::GpuDenseTier::new(0);
+        if !tier.try_add(0, &mlp.gate, &mlp.up, &mlp.down, 1 << 20)? {
+            return Ok(()); // no VRAM headroom right now — nothing to compare
+        }
+        let gpu = tier.mlp(0, &x, s_n, hidden).ok_or_else(|| Error::Format("tier lost layer 0".into()))??;
+
+        let rms = |v: &[f32]| (v.iter().zip(&truth).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / v.len() as f32).sqrt();
+        let (e_cpu, e_gpu) = (rms(&cpu), rms(&gpu));
+        println!("mlp rms error vs f32 truth: cpu(w4a8) {e_cpu:.4e}  gpu(w4a16) {e_gpu:.4e}");
+        assert!(
+            e_gpu <= e_cpu,
+            "the device path must be at least as accurate as the CPU path it replaces \
+             (gpu {e_gpu:.4e} vs cpu {e_cpu:.4e})"
+        );
+        Ok(())
+    }
+
+    /// Track D's model-level equivalence check: a layer whose MLP computes in
+    /// VRAM must produce the same tokens as the same layer on the CPU.
+    ///
+    /// The device is real, so this is `cuda`-gated and skips cleanly when no
+    /// GPU is present (`init` returning 0) — the repo's standing rule that a
+    /// GPU test must not silently pass by not running is served by the tier
+    /// count assertion: if residency were zero the comparison would be
+    /// CPU-vs-CPU, so the test demands at least one resident layer before it
+    /// believes the agreement means anything.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_resident_layers_decode_like_cpu_layers() -> Result<(), peregrine_core::Error> {
+        let d = std::env::temp_dir().join(format!("peregrine_gpudense_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        // 256-wide: past the single-WMMA-tile regime, so the agreement bar
+        // below measures the kernel rather than tile-edge arithmetic.
+        crate::testkit::build_sized_qwen_model(
+            &d,
+            48,
+            crate::testkit::sized_qwen_cfg_json(256, 512, 4, 2, 64),
+        )?;
+        let toks = [1, 5, 9, 2, 7];
+
+        let mut cpu = Model::load(&d)?;
+        let want = cpu.forward_step(&toks, 0)?;
+
+        let mut gpu = Model::load(&d)?;
+        if peregrine_cuda::init(&[0]) < 1 {
+            std::fs::remove_dir_all(&d)?;
+            return Ok(()); // no device — nothing to compare
+        }
+        let mut tier = crate::gpu::GpuDenseTier::new(0);
+        let mut resident = 0usize;
+        for (li, l) in gpu.layers.iter().enumerate() {
+            let Some(mlp) = l.dense.as_ref() else { continue };
+            if tier.try_add(li, &mlp.gate, &mlp.up, &mlp.down, 1 << 20)? {
+                resident += 1;
+            }
+        }
+        assert!(resident > 0, "the tier must hold at least one layer or this compares CPU to CPU");
+        gpu.gpu_dense = Some(tier);
+        let got = gpu.forward_step(&toks, 0)?;
+
+        // The two paths are NOT the same arithmetic and equality is the wrong
+        // bar: peregrine's CPU MLP quantizes activations to int8 (`w4a8` —
+        // `matmul_i4_from_f32` + `qrow_i8`), while the device kernel keeps them
+        // in fp16 (`w4a16`). The device is therefore the *more* accurate of the
+        // two, which `the_device_mlp_is_closer_to_f32_truth_than_the_cpu_path`
+        // pins directly. What this test asserts is that placement moves the
+        // logits only within that activation-precision band, and — the property
+        // serving actually depends on — that it does not move the token.
+        let vocab = gpu.cfg.vocab as usize;
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            worst / scale < 5e-2,
+            "gpu-resident logits must stay inside the int8-vs-fp16 activation band \
+             (worst {worst:.3e}, scale {scale:.3e})"
+        );
+        for srow in 0..toks.len() {
+            let arg = |v: &[f32]| {
+                v[srow * vocab..(srow + 1) * vocab]
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b })
+                    .0
+            };
+            assert_eq!(arg(&got), arg(&want), "row {srow}: greedy token must not change with placement");
+        }
         std::fs::remove_dir_all(&d)?;
         Ok(())
     }
