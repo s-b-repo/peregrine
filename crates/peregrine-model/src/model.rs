@@ -2400,15 +2400,42 @@ fn has_routed_experts(st: &SafeTensors) -> bool {
     st.tensors().iter().any(|t| t.name.contains(".mlp.experts."))
 }
 
+/// Where a layer's tensors live and how to read it, for layers that do not
+/// follow the main stack's schedule. The Qwen MTP head's layer sits under its
+/// own `mtp.layers.0.` prefix and is always a *dense full-attention* layer
+/// whatever the stack does at that index — so prefix, attention kind and
+/// sparsity all need overriding. `None` on a field means "derive it from the
+/// stack", which is what every main-stack layer does.
+#[derive(Clone, Copy, Default)]
+struct LayerSite<'a> {
+    prefix: Option<&'a str>,
+    full_attn: Option<bool>,
+    sparse: Option<bool>,
+}
+
 fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Result<LayerW, Error> {
+    load_layer_at(st, i, cfg, stream_experts, LayerSite::default())
+}
+
+fn load_layer_at(
+    st: &SafeTensors,
+    i: usize,
+    cfg: &Cfg,
+    stream_experts: bool,
+    site: LayerSite<'_>,
+) -> Result<LayerW, Error> {
     let d = cfg.hidden as usize;
     let h = cfg.n_heads as usize;
     let (qkh, vh) = (cfg.qk_head as usize, cfg.v_head as usize);
     let (ql, kvl, qkn) = (cfg.q_lora as usize, cfg.kv_lora as usize, cfg.qk_nope as usize);
     let qkr = cfg.qk_rope as usize;
-    let pre = layer_prefix(cfg, i);
+    let pre = site.prefix.map_or_else(|| layer_prefix(cfg, i), |s| s.to_string());
     let p = |s: &str| format!("{pre}{s}");
-    let sparse = i >= cfg.first_dense as usize;
+    let sparse = site.sparse.unwrap_or(i >= cfg.first_dense as usize);
+    // Full-attention vs the arch's linear/MLA lane, overridable for off-stack layers.
+    let is_full_attn = site
+        .full_attn
+        .unwrap_or(cfg.arch == Arch::DenseGqa || cfg.full_attn.get(i).copied().unwrap_or(false));
 
     let attn = match cfg.arch {
         Arch::GlmMla => LayerAttn::Mla {
@@ -2420,9 +2447,7 @@ fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Re
             kv_b: QtWeight::load(st, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
             o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, h * vh)?,
         },
-        Arch::DenseGqa | Arch::HybridGdn
-            if cfg.arch == Arch::DenseGqa || cfg.full_attn.get(i).copied().unwrap_or(false) =>
-        {
+        Arch::DenseGqa | Arch::HybridGdn if is_full_attn => {
             let (nh, nkv, hd) = (cfg.n_heads as usize, cfg.n_kv_heads as usize, cfg.head_dim as usize);
             // attn_output_gate widens q_proj to [2*nh*hd, d]: query rows then
             // gate rows, the flat-chunk layout (Track C contract, gate-pinned).
@@ -3130,12 +3155,42 @@ impl Model {
         // index n_layers plus the embed/hidden projection and norms.
         let n = cfg.n_layers as usize;
         let mtp = if st.has(&format!("model.layers.{n}.eh_proj.weight")) {
+            // GLM: the MTP layer is the (n_layers)-th layer of the main stack.
             Some(MtpHead {
                 layer: load_layer(&st, n, &cfg, stream_experts)?,
                 eh_proj: QtWeight::load(&st, &format!("model.layers.{n}.eh_proj.weight"), d, 2 * d)?,
                 enorm: load_f32(&st, &format!("model.layers.{n}.enorm.weight"), d)?,
                 hnorm: load_f32(&st, &format!("model.layers.{n}.hnorm.weight"), d)?,
                 mtp_norm: load_f32(&st, &format!("model.layers.{n}.shared_head.norm.weight"), d)?,
+            })
+        } else if st.has("mtp.fc.weight") {
+            // Qwen family: the head lives under its own `mtp.` prefix, its single
+            // layer is dense full-attention whatever the stack does at index `n`
+            // (the hybrid's stack would say "linear attention" there), and — like
+            // every other norm in a Qwen3Next-family checkpoint — its norms are
+            // zero-centered. A mis-loaded head cannot corrupt output: every draft
+            // it proposes is verified by the main model, so the failure mode is a
+            // zero acceptance rate, not wrong tokens.
+            let zc = cfg.arch == Arch::HybridGdn;
+            let norm = |name: &str| -> Result<Vec<f32>, Error> {
+                if zc {
+                    load_norm_zero_centered(&st, name, d)
+                } else {
+                    load_f32(&st, name, d)
+                }
+            };
+            Some(MtpHead {
+                layer: load_layer_at(
+                    &st,
+                    n,
+                    &cfg,
+                    stream_experts,
+                    LayerSite { prefix: Some("mtp.layers.0."), full_attn: Some(true), sparse: Some(false) },
+                )?,
+                eh_proj: QtWeight::load(&st, "mtp.fc.weight", d, 2 * d)?,
+                enorm: norm("mtp.pre_fc_norm_embedding.weight")?,
+                hnorm: norm("mtp.pre_fc_norm_hidden.weight")?,
+                mtp_norm: norm("mtp.norm.weight")?,
             })
         } else {
             None
@@ -3606,6 +3661,21 @@ impl Model {
     /// Whether this model has an MTP head available for speculative decode.
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    /// Whether rejecting a draft is a pure KV rewind. `SeqKv::truncate` rewinds
+    /// the KV layers exactly, so on a KV-only arch a rejected speculative tail
+    /// leaves no trace. A recurrent arch does not have that property: the verify
+    /// forward advances each `GdnState` in place by `1 + drafts`, and a point
+    /// state cannot be truncated back — it must be snapshotted before the
+    /// forward and restored on partial acceptance (`SeqKv::gdn_snapshot` /
+    /// `gdn_restore`), with the accepted prefix re-advanced.
+    ///
+    /// The batch engine consults this so speculation can never silently run
+    /// ahead of that rollback being wired: enabling drafts on a recurrent arch
+    /// without it corrupts the state of every sequence that rejects a draft.
+    pub fn spec_reject_is_kv_only(&self) -> bool {
+        self.cfg.arch != Arch::HybridGdn
     }
 
     /// Which chat-prompt markup this checkpoint expects. GLM ships no chat

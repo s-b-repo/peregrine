@@ -895,7 +895,18 @@ fn run(
     let depth = knobs.draft_depth;
     let sampled_spec = knobs.draft_sampled;
     let conf_floor = knobs.spec_conf;
-    let has_mtp = model.has_mtp();
+    // Speculation additionally requires that rejecting a draft is a pure KV
+    // rewind. A recurrent arch's verify forward advances its GdnState in place
+    // and `truncate` cannot undo that, so drafts stay off there until the
+    // snapshot/restore rollback is wired into the accept path below — enabling
+    // them first would corrupt the state of every sequence that rejects one.
+    let has_mtp = model.has_mtp() && model.spec_reject_is_kv_only();
+    if model.has_mtp() && !model.spec_reject_is_kv_only() {
+        eprintln!(
+            "peregrine: [spec] MTP head present but speculation is off — this arch needs \
+             recurrent-state rollback on reject (not yet wired)"
+        );
+    }
     // A GDN sequence's context is a point state, not per-position rows: a
     // prefix hit or a disk checkpoint would need a state snapshot taken exactly
     // at the boundary. Until that trade is measured, hybrid models skip both
