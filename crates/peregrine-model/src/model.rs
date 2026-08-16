@@ -1004,9 +1004,10 @@ fn max_expert_region_bytes(st: &SafeTensors) -> usize {
 /// `step` has moved more than `slack` past their stamp, *before* paying the read.
 /// `slack` is in layer-steps: an item emitted during step `s` targets the layer
 /// executing at `s + 1`, so the default slack of 1 keeps exactly the window the
-/// emitter designed for. `slack == u64::MAX` disables the gate — the historical
-/// behaviour, and the default until the A/B says otherwise
-/// (`COLI_PREFETCH_STALE_DROP=1`, slack via `COLI_PREFETCH_STALE_SLACK`).
+/// emitter designed for. `slack == u64::MAX` disables the gate
+/// (`COLI_PREFETCH_STALE_DROP=0`) — the historical behaviour, which was the
+/// default until the 2026-08-16 REPEATS=3 confirmation licensed the flip
+/// (see [`Self::from_env_values`]; slack via `COLI_PREFETCH_STALE_SLACK`).
 ///
 /// Read from env at model build, not through a process-global `OnceLock`: the
 /// route-min-share measurement was voided by exactly that latch (both A/B arms in
@@ -1020,8 +1021,27 @@ struct SweepClock {
 
 impl SweepClock {
     fn from_env() -> SweepClock {
-        let on = matches!(std::env::var("COLI_PREFETCH_STALE_DROP").as_deref(), Ok("1") | Ok("true"));
-        let slack = if on { env_usize("COLI_PREFETCH_STALE_SLACK", 1) as u64 } else { u64::MAX };
+        SweepClock::from_env_values(
+            std::env::var("COLI_PREFETCH_STALE_DROP").ok().as_deref(),
+            std::env::var("COLI_PREFETCH_STALE_SLACK").ok().as_deref(),
+        )
+    }
+
+    /// The env resolution as a pure function of the two values, so both sides
+    /// of the default are testable without mutating the process environment.
+    ///
+    /// **Default ON as of 2026-08-16** — flipped on the REPEATS=3 confirmation
+    /// (B=16 medians 0.072 → 0.077 tok/s, +6.9%, matching the +7% screen;
+    /// bench-data/2026-08-15-queue/confirm-stale-drop-b16). `=0`/`false` is
+    /// the escape hatch back to the historical service-everything lane, same
+    /// pattern as every other measured default flip in this repo.
+    fn from_env_values(drop: Option<&str>, slack: Option<&str>) -> SweepClock {
+        let off = matches!(drop, Some("0") | Some("false"));
+        let slack = if off {
+            u64::MAX
+        } else {
+            slack.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1)
+        };
         SweepClock {
             step: std::sync::atomic::AtomicU64::new(0),
             slack: std::sync::atomic::AtomicU64::new(slack),
@@ -6303,12 +6323,23 @@ mod tests {
         // (deliberate bulk warms) and a MAX slack (gate off) are never stale.
         assert!(!warm_item_is_stale(u64::MAX, u64::MAX, 0), "bulk warms never go stale");
         assert!(!warm_item_is_stale(u64::MAX, 0, u64::MAX), "gate off admits any age");
-        // Unset env means gate off — the historical behaviour is the default until
-        // the A/B licenses a flip.
+        // Default flipped ON 2026-08-16 (confirmed +6.9% at B=16); the escape
+        // hatch restores the historical lane. Both sides via the pure resolver,
+        // no env mutation.
         assert_eq!(
-            SweepClock::from_env().slack.load(std::sync::atomic::Ordering::Relaxed),
+            SweepClock::from_env_values(None, None).slack.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "unset means the gate is on at slack 1"
+        );
+        assert_eq!(
+            SweepClock::from_env_values(Some("0"), None).slack.load(std::sync::atomic::Ordering::Relaxed),
             u64::MAX,
-            "stale-drop must be opt-in"
+            "=0 must restore the historical service-everything lane"
+        );
+        assert_eq!(
+            SweepClock::from_env_values(None, Some("3")).slack.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "slack stays independently tunable"
         );
     }
 
@@ -6349,11 +6380,14 @@ mod tests {
     }
 
     #[test]
-    fn gate_left_at_default_services_arbitrarily_late_warms() -> Result<(), peregrine_core::Error> {
-        // The load-time default (COLI_PREFETCH_STALE_DROP unset) is slack=MAX: an
-        // ancient stamp still streams, pinning "off = the historical behaviour".
+    fn gate_disarmed_services_arbitrarily_late_warms() -> Result<(), peregrine_core::Error> {
+        // The escape hatch's mechanism (slack=MAX, what COLI_PREFETCH_STALE_DROP=0
+        // resolves to): an ancient stamp still streams — "off = the historical
+        // behaviour" stays reachable now that the default is on. Armed
+        // explicitly rather than via env, which would race parallel tests.
         let dir = tmp_model_dir("stale_gate_off")?;
         let m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        m.sweep.slack.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         m.sweep.step.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
         let first_sparse = m.cfg.first_dense as usize;
         let pool = m.prefetch.as_ref().ok_or_else(|| Error::Format("no prefetch pool".into()))?;
