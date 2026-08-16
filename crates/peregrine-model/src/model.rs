@@ -322,6 +322,11 @@ pub struct Model {
     /// the *active* topic reuses. `None` disables — protection then uses the
     /// global-heat tiebreak exactly as before. Read at build, not OnceLock.
     topic_profiles: Option<crate::topic::TopicProfiles>,
+    /// Base decay interval (forwards) for the adaptive profile aging
+    /// (`COLI_TOPIC_HALFLIFE`, default 512; `0` = static all-time counters).
+    /// The effective interval scales down with routing entropy — see
+    /// [`crate::topic::decay_interval`].
+    topic_halflife: u64,
     /// CPU-lane worker count the governors may adjust at runtime, clamped to
     /// `[2, workers]`. Read once per forward when building `ForwardCtx`; the
     /// thermal / power / bandwidth governors write it between forwards.
@@ -3015,6 +3020,10 @@ impl Model {
         } else {
             None
         };
+        // Adaptive profile-aging interval. Default 512 forwards at stable
+        // routing (scaled down by entropy at run time); 0 keeps the static
+        // all-time counters, which is the committed non-adaptive behaviour.
+        let topic_halflife = env_usize("COLI_TOPIC_HALFLIFE", 512) as u64;
         let mut model = Model {
             route_hist_epoch: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -3068,6 +3077,7 @@ impl Model {
             last_iowq: Mutex::new(None),
             workload_class: Mutex::new(crate::workload::TokenClass::Prose),
             topic_profiles,
+            topic_halflife,
             effective_workers: std::sync::atomic::AtomicUsize::new(workers),
             governor: Mutex::new(GovernorState::new(workers)),
             entropy_ewma: Mutex::new(0.5),
@@ -3330,12 +3340,20 @@ impl Model {
         let class = *self.workload_class.lock();
         let first_dense = self.cfg.first_dense as usize;
         let n_layers = self.cfg.n_layers as usize;
-        let hist = hist.lock();
-        for layer in first_dense..n_layers {
-            if let Some(set) = hist.latest(layer) {
-                profiles.note(class, layer, set);
+        {
+            let hist = hist.lock();
+            for layer in first_dense..n_layers {
+                if let Some(set) = hist.latest(layer) {
+                    profiles.note(class, layer, set);
+                }
             }
         }
+        // Adaptive aging: advance this class's decay clock and, at the
+        // entropy-scaled interval, halve its counters so the profile tracks
+        // recent routing. The entropy EWMA is kept live for this by the guard
+        // in the post-forward telemetry block (widened to fire when topic
+        // routing is on). `topic_halflife == 0` makes this a no-op (static).
+        profiles.maybe_decay(class, self.routing_entropy_ewma(), self.topic_halflife);
     }
 
     /// Protect the experts predicted from `hist` (a single stream's routing) in the
@@ -3905,7 +3923,9 @@ impl Model {
         // feature reads this EWMA, so leaving it pinned at its initial value
         // collapsed half the Q-table to dead rows whenever COLI_ENTROPY_ADAPT
         // happened to be off.
-        if entropy_adapt_enabled() || self.learner.lock().is_some() {
+        // Topic routing's adaptive decay reads this EWMA too, so keep it live
+        // whenever topic profiles exist — not only under COLI_ENTROPY_ADAPT.
+        if entropy_adapt_enabled() || self.learner.lock().is_some() || self.topic_profiles.is_some() {
             if let Some(h) = self.routing_entropy() {
                 let mut e = self.entropy_ewma.lock();
                 *e = 0.7 * *e + 0.3 * h;

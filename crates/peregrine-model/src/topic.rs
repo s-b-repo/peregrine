@@ -52,16 +52,46 @@ fn class_index(class: TokenClass) -> usize {
     }
 }
 
-/// Per-class `(layer, expert)` routing-frequency counters.
+/// Adaptive decay interval, in forwards, for a class whose recent routing has
+/// normalized entropy `entropy` (0 = a single expert dominates every layer,
+/// 1 = uniform over the routed set). Pure so the adaptivity is unit-tested
+/// without a running model.
+///
+/// The point of the whole feature: a profile must *forget* at the rate the
+/// workload actually changes. Stable routing (low entropy) earns a long
+/// interval, so the profile accumulates confidence and holds a durable
+/// residency set; volatile routing (high entropy — a topic shift, a diverse
+/// code stream) earns a short one, so the profile re-forms around the new
+/// distribution within a few halvings instead of staying anchored to stale
+/// experts. Clamped to `[max(1, base/16), base]` so neither extreme runs away.
+pub fn decay_interval(base: u64, entropy: f32) -> u64 {
+    if base == 0 {
+        return 0; // decay disabled — the static all-time-counter behaviour
+    }
+    let e = entropy.clamp(0.0, 1.0);
+    // entropy 0 -> base (slowest), entropy 1 -> base/16 (fastest).
+    let scale = 1.0 - 0.9375 * e; // 1.0 .. 0.0625
+    let interval = (base as f64 * scale as f64) as u64;
+    interval.clamp((base / 16).max(1), base)
+}
+
+/// Per-class `(layer, expert)` routing-frequency counters with adaptive decay.
 ///
 /// One flat `[n_classes][n_layers * n_experts]` array of atomics: accumulation
 /// is a shared-borrow `fetch_add`, so the batch engine bumps it while holding a
-/// shared model borrow, same as [`crate::Model::set_workload_class`].
+/// shared model borrow, same as [`crate::Model::set_workload_class`]. Counts are
+/// periodically halved ([`Self::maybe_decay`]) so the profile tracks *recent*
+/// routing rather than the whole session — the "dynamic adaptive" half of the
+/// feature, on top of the static per-topic steering.
 pub struct TopicProfiles {
     n_layers: usize,
     n_experts: usize,
     /// `counts[class_index * stride + layer * n_experts + expert]`.
     counts: Vec<AtomicU64>,
+    /// Forwards observed for each class since its last decay.
+    steps: Vec<AtomicU64>,
+    /// Total decays applied, for the `[topic]` shutdown line.
+    decays: AtomicU64,
 }
 
 impl TopicProfiles {
@@ -71,7 +101,43 @@ impl TopicProfiles {
             n_layers,
             n_experts,
             counts: (0..PROFILE_CLASSES.len() * stride).map(|_| AtomicU64::new(0)).collect(),
+            steps: (0..PROFILE_CLASSES.len()).map(|_| AtomicU64::new(0)).collect(),
+            decays: AtomicU64::new(0),
         }
+    }
+
+    /// Advance the active class's decay clock by one forward and, when it
+    /// reaches the entropy-adaptive interval, halve that class's counters so the
+    /// profile ages toward its recent routing. `base_interval == 0` disables
+    /// decay entirely (the static behaviour). Returns whether a decay fired.
+    /// Cheap: the per-forward cost is one increment; the O(stride) halving scan
+    /// runs only once per interval (hundreds of forwards).
+    pub fn maybe_decay(&self, class: TokenClass, entropy: f32, base_interval: u64) -> bool {
+        if base_interval == 0 {
+            return false;
+        }
+        let ci = class_index(class);
+        let n = self.steps[ci].fetch_add(1, Ordering::Relaxed) + 1;
+        if n < decay_interval(base_interval, entropy) {
+            return false;
+        }
+        self.steps[ci].store(0, Ordering::Relaxed);
+        let base = ci * self.stride();
+        for c in &self.counts[base..base + self.stride()] {
+            // Halve in place; a slot that reaches 0 has been fully forgotten,
+            // which `is_warm`/`heat_for` already treat as "not seen".
+            let v = c.load(Ordering::Relaxed);
+            if v != 0 {
+                c.store(v >> 1, Ordering::Relaxed);
+            }
+        }
+        self.decays.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Total decays applied across all classes (telemetry).
+    pub fn decays(&self) -> u64 {
+        self.decays.load(Ordering::Relaxed)
     }
 
     fn stride(&self) -> usize {
@@ -228,6 +294,59 @@ mod tests {
         let a2 = pack(score, p.heat_for(TokenClass::Prose, 1, 2));
         let b2 = pack(score, p.heat_for(TokenClass::Prose, 1, 5));
         assert_eq!(a2, b2);
+    }
+
+    #[test]
+    fn decay_interval_shortens_as_routing_gets_more_volatile() {
+        // Monotone non-increasing in entropy: a more volatile workload forgets
+        // at least as fast, and the extremes hit the documented bounds.
+        assert_eq!(decay_interval(0, 0.5), 0, "base 0 disables decay");
+        assert_eq!(decay_interval(512, 0.0), 512, "stable routing → slowest (base)");
+        assert_eq!(decay_interval(512, 1.0), 32, "volatile routing → base/16");
+        let mut prev = u64::MAX;
+        for i in 0..=10 {
+            let e = i as f32 / 10.0;
+            let d = decay_interval(512, e);
+            assert!(d <= prev, "interval must not grow with entropy (e={e})");
+            assert!((32..=512).contains(&d));
+            prev = d;
+        }
+    }
+
+    #[test]
+    fn adaptive_decay_ages_the_profile_toward_recent_routing() {
+        let p = TopicProfiles::new(2, 8);
+        // Warm expert 3 hard under Code.
+        for _ in 0..100 {
+            p.note(TokenClass::Code, 0, &[3]);
+        }
+        assert_eq!(p.heat_for(TokenClass::Code, 0, 3), 100);
+        // A short base and max entropy → decay fires quickly; drive enough
+        // forwards to trigger at least one halving.
+        let mut fired = false;
+        for _ in 0..64 {
+            fired |= p.maybe_decay(TokenClass::Code, 1.0, 16);
+        }
+        assert!(fired, "a decay should have fired within 64 forwards at base 16");
+        assert!(p.decays() >= 1);
+        assert!(
+            p.heat_for(TokenClass::Code, 0, 3) < 100,
+            "the old routing must have aged down"
+        );
+        // A class that never saw traffic and never advanced its clock is
+        // untouched — decay is per active class.
+        assert_eq!(p.heat_for(TokenClass::Prose, 0, 3), 0);
+    }
+
+    #[test]
+    fn decay_disabled_keeps_the_static_all_time_counters() {
+        let p = TopicProfiles::new(2, 8);
+        for _ in 0..50 {
+            p.note(TokenClass::Math, 1, &[2]);
+            assert!(!p.maybe_decay(TokenClass::Math, 1.0, 0), "base 0 never decays");
+        }
+        assert_eq!(p.heat_for(TokenClass::Math, 1, 2), 50);
+        assert_eq!(p.decays(), 0);
     }
 
     #[test]
