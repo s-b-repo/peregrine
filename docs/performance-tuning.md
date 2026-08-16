@@ -108,43 +108,56 @@ forward verifies γ+1 rows and its routed union grows faster than acceptance rep
 Output is sequence-identical at temperature 0, as documented; it is simply slower.
 The advice may still hold where experts are **resident** rather than streamed.
 
-### Pending measurement: the 2026-08-15 ds4-port wave
+### The 2026-08-15 ds4-port wave — statuses as measured (updated 08-16)
 
-Four knobs ported from antirez's ds4/DwarfStar engine landed 2026-08-15, every
-one **off by default** until its A/B (running in `scripts/overnight-2026-08-15.sh`,
-results → `bench-data/2026-08-15-*/`) licenses a change. Listed here so nobody
-mistakes "documented" for "measured":
+Four knobs ported from antirez's ds4/DwarfStar engine, every one **off by
+default**. First verdicts are in (`bench-data/2026-08-15-*/`, and the
+2026-08-15 pass in [benchmarks.md](benchmarks.md)); each entry below carries
+its own status so nobody mistakes "documented" for "measured":
 
-- **Asymmetric expert requantization** — `peregrine-requantize --down keep
-  --keep-last-layers 6 --target int3-g64`: gate/up to int3-g64, `down_proj`
-  byte-identical, last 6 expert layers (incl. the MTP row) untouched. The one
-  untested point on the sub-int4 ladder after todo.md §13 closed every uniform
-  rung (uniform int3-g64: flip_rate 0.514). Predicted 383.73 → 355.25 GB
-  (−7.4 % container bytes); gate before trusting.
+- **Asymmetric expert requantization — MEASURED, FAILS its gate.**
+  `--down keep --keep-last-layers 6 --target int3-g64` converted
+  383.73 → 355.25 GB and delivered the predicted bytes (working set measured
+  live at 10.02 GB/token vs int4's 10.85), but `flip_rate = 0.447` — better
+  than uniform's 0.514, nowhere near licensable. The data-free RTN ladder is
+  now closed at every measured point, uniform or asymmetric (todo.md §13).
+  The open question moved to **calibrated rounding**: `--calib` +
+  `peregrine calib-capture` (ideas #7) are code-complete and share a future
+  overnight with the `--keep-last-layers 12` contingency.
 - **`COLI_SPEC_CONF`** (default 0, off) — stop an MTP draft early when the
   head's top-token probability drops under the floor. Depth-only: `accept_run`
   is untouched, so greedy output is bit-identical by construction (test:
-  `the_confidence_floor_never_changes_a_greedy_stream`). Rationale: every
-  drafted token is a verify row streaming expert bytes; the `COLI_DRAFT=4`
-  rejection above is exactly the cost this floor prunes. ds4 ships 0.6–0.7.
+  `the_confidence_floor_never_changes_a_greedy_stream`). **SCREENED +35 % at
+  B=16** (0.060 → 0.081 tok/s, `COLI_DRAFT=5` + floor 0.65, REPEATS=1) — the
+  `COLI_DRAFT=4` rejection above inverts once low-confidence drafts stop
+  paying for verify rows. REPEATS=3 confirmation in flight (queue job 20);
+  the default stays off until it lands.
 - **`COLI_ECACHE_GB=auto`** (+ `COLI_ECACHE_AUTO_FRAC`, default 0.80) — ds4's
   budget rule: a fraction of post-load `MemAvailable`, still capped by the
-  transient reserve + 1 GiB safety. Numeric spellings unchanged.
+  transient reserve + 1 GiB safety. Numeric spellings unchanged. **First arm
+  BROKE (not a negative — it never ran):** auto sized against *host*
+  MemAvailable inside the harness's 34G cgroup scope and got OOM-killed at
+  0/16 streams; fixed in 6704288 (leaf-to-root cgroup-v2 walk). Rerun is
+  queue job 93.
 - **`COLI_KV_STORE_DIR`** (+ `COLI_KV_STORE_MB` cap, default 16384;
   `COLI_KV_STORE_TRIM`, default 32) — disk-persisted KV sessions: completed
   prefixes ≥ 256 tokens checkpoint to disk and a restarted server restores
-  them instead of re-prefilling (~176 KiB stored per token vs ~10.85 GB of
-  expert reads re-streamed). Fingerprint + checksum + full-token compare gate
-  every load; a bad file means a cold prefill, never a wrong token. Note the
-  checkpoint files contain the session's token ids in the clear — point the
-  knob at storage with the same privacy expectations as the server log.
+  them instead of re-prefilling. **SMOKE-PROVEN: cold 2620.5 s → warm
+  391.9 s (6.7×)** on an 832-token restore from a 142.6 MiB checkpoint,
+  output byte-identical across the restart. Fingerprint + checksum +
+  full-token compare gate every load; a bad file means a cold prefill, never
+  a wrong token. Note the checkpoint files contain the session's token ids in
+  the clear — point the knob at storage with the same privacy expectations as
+  the server log.
 
-### Pending measurement: `COLI_PREFETCH_STALE_DROP` (2026-08-15, same rule)
+### `COLI_PREFETCH_STALE_DROP` — screened positive (2026-08-15, same rule)
 
 - **`COLI_PREFETCH_STALE_DROP=1`** (default 0, off; window via
   `COLI_PREFETCH_STALE_SLACK`, default 1 layer-step) — drop a queued
   speculative warm *before its disk read* once the forward sweep has moved
-  past the layer window it was emitted for. The 2026-08-13 defaults run is
+  past the layer window it was emitted for. **SCREENED +7 % at B=16**
+  (0.084 → 0.090 tok/s) and +5 % at B=1, REPEATS=1; the REPEATS=3
+  confirmation is queue job 10 and the default stays off until it reports. The 2026-08-13 defaults run is
   the motivating measurement: at B=16 the rings sit at 93 % duty, the
   unbounded prefetch queue backlogs, and **40 352 of 41 159 speculative reads
   (98.6 %) were classified wasted — ~12.6 % of all disk reads** on a run whose

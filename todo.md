@@ -198,22 +198,27 @@ of those intact. What replaces it, by the same test:
   measured negative** — what remains below 4 bits is vector quantization /
   incoherence processing (AQLM, QuIP#), a research project, not a converter flag.
   Artifact at `/srv/modelstripe/GLM-5.2-int3g64`; log `bench-data/2026-08-13-int3g64/`.
-- 🟡 **Pending (overnight 2026-08-15): the asymmetric/hybrid point, which the
-  closure above deliberately does not cover.** Every closed rung was *uniform* —
-  same scheme for gate/up/down across every layer. ds4/DwarfStar ships 2-bit
-  GLM-5.2/DeepSeek containers that hold up under agent workloads using an
-  **asymmetric** recipe: gate/up harder than down (down feeds the residual
-  stream directly; gate/up error launders through the SwiGLU first), plus the
-  last expert layers kept at full precision. `peregrine-requantize` grew
-  `--down keep` and `--keep-last-layers N` (2026-08-15) and the chain
-  (`scripts/overnight-2026-08-15.sh`) is converting
-  `/srv/modelstripe/GLM-5.2-i3g64-asym` (355.25 GB predicted, −7.4 %): gate/up
-  int3-g64, down byte-identical int4, last 6 expert layer indices (MTP row
-  included) untouched. Gate + container A/B run unattended; verdict lands in
-  `bench-data/2026-08-15-i3g64-asym/`. If it fails at `--keep-last-layers 12`
-  too, this closes beside its siblings and the converter flags stay (they cost
-  nothing and serve future formats). One cheap idle-priority run to test the
-  only remaining evidence-backed point on the ladder — not a reopening of RTN.
+- **MEASURED 2026-08-15, and the asymmetric point fails too: `flip_rate =
+  0.447266` (229/512).** The ds4/DwarfStar recipe — gate/up int3-g64, `down`
+  kept byte-identical int4 (residual-stream reasoning), last 6 expert layer
+  indices incl. the MTP row untouched — converted 383.73 → 355.25 GB and beat
+  the uniform rung's 0.514, but 45 % of top-1 predictions still move. The byte
+  claim held exactly (the gate's own working-set line: **10.02 GB/token vs
+  int4's 10.85**, the predicted −7.4 %). Verdict: **the data-free
+  round-to-nearest ladder is now closed at every measured point, symmetric or
+  asymmetric** — uniform int2-g64 1.000, uniform int3-g64 0.514, asymmetric
+  0.447. The converter flags stay (cost nothing, serve future formats).
+  Artifact `/srv/modelstripe/GLM-5.2-i3g64-asym` (355 GB, user's deletion
+  call); logs `bench-data/2026-08-15-i3g64-asym/`. **What this closure still
+  does NOT cover, and what replaced it as the open point: calibrated
+  (importance-weighted) rounding — ideas #7, CODE-COMPLETE the same day**
+  (`quant_i3_g64_weighted` + `peregrine-requantize --calib` +
+  `peregrine calib-capture`; per-layer mean-|x| channel stats pooled the AWQ
+  way, plain amax/3 always a search candidate so it can never lose to RTN on
+  its own objective). It shares a future overnight slot with the
+  `--keep-last-layers 12` contingency: one night, two rungs, one flip gate
+  each. If both fail, sub-int4 on this model needs vector quantization /
+  incoherence processing — a research project, recorded above.
 - Speculative, named so it is not rediscovered: expert-delta or shared-basis
   coding is the only idea here with a ceiling below 2 bits/weight, but it breaks
   `QtInfo::detect`'s per-tensor self-description and there is no evidence

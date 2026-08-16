@@ -697,3 +697,56 @@ trace and `peregrine-skipbound` bounded 19 200 experts and wrote
 `no usable frames`, so the "how many reads would bounds skip" number did not
 come out. The bounds artifact is real; the trace-format mismatch between
 `dump-routes` output and skipbound's reader is an open (small) defect.
+(Fixed 2026-08-15: the reader now parses dump-routes' real nested shape —
+see the 2026-08-15 pass below; the skip-fraction number itself is queue job
+97 on the existing artifacts.)
+
+## Benchmark pass — 2026-08-15 (ds4-port chain, `scripts/overnight-2026-08-15.sh`)
+
+Two final verdicts, one broken arm root-caused, two positive screens awaiting
+their REPEATS=3 confirmations (queue jobs 10/20 — fold their numbers in here
+when they land).
+
+**Asymmetric int3-g64 quality gate: FAILS — `flip_rate = 0.447266` (229/512).**
+The ds4/DwarfStar recipe — gate/up to int3-g64, `down_proj` kept byte-identical
+int4, last 6 expert layer indices (MTP row included) untouched — converted
+383.73 → 355.25 GB in one idle-priority pass and beat the uniform rung's 0.514,
+but not remotely enough: 45 % of top-1 predictions still move against the int4
+source on the committed corpus. The byte saving was real and measured live
+(the gate's own working-set line read **10.02 GB/token vs int4's 10.85**,
+the predicted −7.4 %). With uniform int2-g64 at 1.000, uniform int3-g64 at
+0.514, and the asymmetric/hybrid point at 0.447, **the data-free
+round-to-nearest ladder is now closed at every measured point, symmetric or
+not**. What remains genuinely open below 4 bits is *calibrated* rounding
+(importance-weighted scale search, ideas #7) — code-complete as of this pass
+(`quant_i3_g64_weighted`, `--calib`, `peregrine calib-capture`), sharing a
+future overnight slot with the `--keep-last-layers 12` contingency. Artifact:
+`/srv/modelstripe/GLM-5.2-i3g64-asym` (355 GB, deletion is the user's call);
+logs `bench-data/2026-08-15-i3g64-asym/`.
+
+**Disk-persisted KV sessions (COLI_KV_STORE_DIR) restart smoke: PASS.** Same
+long-prompt request before and after a full server restart: **cold 2620.5 s →
+warm 391.9 s (6.7×)**, with 832 prompt positions restored from a 142.6 MiB
+checkpoint (`tokens_restored=832` in the warm boot's `[kvstore]` line) and the
+served output **byte-identical** across the restart. This is the first feature
+in the repo that cuts *prefill* bytes across process lifetimes — each restored
+token is ~10.85 GB of expert reads not streamed, bought for ~175 KiB of
+checkpoint read back. Logs: `bench-data/2026-08-15-kvstore/`.
+
+**`COLI_ECACHE_GB=auto` arm: BROKE, root-caused, fixed.** The auto budget took
+80 % of *host* MemAvailable (43.4 GB) inside the harness's 34G MemoryMax scope
+— the cgroup probe read the root's `max` and never saw the transient scope's
+limit — planning a 54.4 GB peak that the kernel ended at 0/16 streams. Fixed
+in 6704288 (walk `/proc/self/cgroup` leaf-to-root for the tightest v2 limit);
+the measurement itself is still owed: queue job 93 reruns the arm on the fixed
+binary. The knob's *screen* is therefore still pending, not negative — the arm
+never ran.
+
+**Screens, pending confirmation (do not cite as measured):**
+`COLI_SPEC_CONF=0.65` with `COLI_DRAFT=5` screened **0.060 → 0.081 tok/s
+(+35 %) at B=16** (REPEATS=1; job 20 is the REPEATS=3 confirmation) — the
+draft-depth economics that made `COLI_DRAFT=4` a 1.57× regression invert once
+low-confidence drafts stop paying for verify rows.
+`COLI_PREFETCH_STALE_DROP=1` screened **0.084 → 0.090 (+7 %) at B=16** and
++5 % at B=1 (job 10 confirming now). Both screens exceeded the box's ±3 %
+long-run noise band, which is why they earned confirmations.
