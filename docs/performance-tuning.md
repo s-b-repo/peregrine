@@ -150,6 +150,23 @@ its own status so nobody mistakes "documented" for "measured":
   the clear — point the knob at storage with the same privacy expectations as
   the server log.
 
+### `COLI_TOPIC_ROUTING` — pending measurement (2026-08-15/16, same rule)
+
+- **`COLI_TOPIC_ROUTING=1`** (default 0, off; `COLI_TOPIC_HALFLIFE`, default
+  512 forwards, `0` = static all-time counters) — per-`TokenClass` expert-usage
+  profiles that break the warm-cache evictor's ties by the **active topic's**
+  routing frequency instead of the global heat distribution (which, on a
+  CPU-only box, does not otherwise exist). A coding request keeps coding-hot
+  experts resident through an interleaved prose request. The adaptive half
+  ages each profile at a volatility-driven rate: the decay interval scales
+  with the routing-entropy EWMA (stable routing → durable residency set,
+  volatile routing → interval drops to base/16 so the profile re-forms within
+  a few halvings). Correctness-neutral by construction — only the low-bits
+  tiebreak of an eviction priority changes, never a predicted set or any
+  get/insert — and profiles persist to a `topic_profiles.json` sidecar.
+  Measurement: queue job 99, three arms (off / static / adaptive) at B=16.
+  Off by default until it reports.
+
 ### `COLI_PREFETCH_STALE_DROP` — screened positive (2026-08-15, same rule)
 
 - **`COLI_PREFETCH_STALE_DROP=1`** (default 0, off; window via
