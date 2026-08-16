@@ -2960,11 +2960,15 @@ impl Model {
                 expert_disk: routed_bytes,
                 stream_experts,
                 ecache: ecache_budget_bytes() as u64,
-                stream_transient: stream_transient_reserve(
-                    io_rings(),
-                    default_workers(),
-                    4 * max_expert_region_bytes(&st),
-                ) as u64,
+                // Zero when nothing streams: the reserve exists for the io lane's
+                // in-flight expert slabs, and a resident model never builds one.
+                // Charging it anyway projected 10.2 GB of buffers for a model that
+                // fits whole in RAM, which refused the load outright.
+                stream_transient: if stream_experts {
+                    stream_transient_reserve(io_rings(), default_workers(), 4 * max_expert_region_bytes(&st)) as u64
+                } else {
+                    0
+                },
                 kv_pool: crate::ram::kv_pool_bytes(
                     cfg.kv_lora as u64,
                     cfg.qk_rope as u64,
@@ -3006,20 +3010,10 @@ impl Model {
         } else {
             stream_experts
         };
-        // A container with no routed-expert tensors has nothing to stream, and
-        // honoring a streaming request anyway builds rings, transient reserves
-        // and a warm cache for a lane that will never read a byte — measured on
-        // the first resident Qwen boot as a 10.2 GB stream reserve in the [ram]
-        // projection of a model that fits whole in RAM (serve hard-requests
-        // streaming, which is also why COLI_STREAM=0 appeared to be ignored).
-        // Same shape as the compressed override above: the container's own
-        // contents outrank the caller's flag, and the override says so out loud.
-        let stream_experts = if stream_experts && !has_routed_experts(&st) {
-            eprintln!("[peregrine] no routed-expert tensors — forcing resident mode (nothing to stream)");
-            false
-        } else {
-            stream_experts
-        };
+        // (The no-routed-experts override is applied once, above, before the RAM
+        // projection that depends on it — a merge briefly carried a second copy
+        // here, which was dead by construction since the first already cleared
+        // the flag.)
 
         let d = cfg.hidden as usize;
         let (kvl, qkr) = (cfg.kv_row_a() as usize, cfg.kv_row_b() as usize);
