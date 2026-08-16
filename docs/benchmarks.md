@@ -742,11 +742,33 @@ the measurement itself is still owed: queue job 93 reruns the arm on the fixed
 binary. The knob's *screen* is therefore still pending, not negative — the arm
 never ran.
 
-**Screens, pending confirmation (do not cite as measured):**
-`COLI_SPEC_CONF=0.65` with `COLI_DRAFT=5` screened **0.060 → 0.081 tok/s
-(+35 %) at B=16** (REPEATS=1; job 20 is the REPEATS=3 confirmation) — the
-draft-depth economics that made `COLI_DRAFT=4` a 1.57× regression invert once
-low-confidence drafts stop paying for verify rows.
-`COLI_PREFETCH_STALE_DROP=1` screened **0.084 → 0.090 (+7 %) at B=16** and
-+5 % at B=1 (job 10 confirming now). Both screens exceeded the box's ±3 %
-long-run noise band, which is why they earned confirmations.
+**Confirmations (REPEATS=3, landed 2026-08-16 — the screens above graduated):**
+
+**`COLI_SPEC_CONF=0.65` with `COLI_DRAFT=5`: CONFIRMED — 0.060 → 0.082
+median tok/s (+37 %) at B=16**, reps [0.06, 0.06, 0.06] vs [0.08, 0.08, 0.08]
+— every floored rep beat every unfloored one. The mechanism confirmed with the
+number: the floored arm read **289 059 disk expert-reads vs 369 955 (−22 %)**
+for the same 512 tokens — tok/s bought by *fewer bytes*, the honest direction.
+The draft-depth economics that made `COLI_DRAFT=4` a 1.57× regression invert
+once low-confidence drafts stop paying for verify rows. **What this does NOT
+yet license: a default flip.** Both arms drafted at depth 5; the standing
+no-speculation baseline sits near 0.072–0.076 in the adjacent A/Bs, so
+draft5+floor beats no-draft only cross-experiment (+~14 %, uncontrolled). The
+controlled draft0-vs-floored-depth sweep is queue job 96 — that verdict, not
+this one, decides whether speculation turns on by default. Logs:
+`bench-data/2026-08-15-queue/confirm-specconf-b16/`.
+
+**`COLI_PREFETCH_STALE_DROP=1`: CONFIRMED — 0.072 → 0.077 median (+6.9 %) at
+B=16** (reps [0.07, 0.07, 0.08] vs [0.09, 0.07, 0.08], noisier than the
+spec-conf pair but the medians clear the ±3 % band). Counters say why it is a
+real lever and not a cache trade: speculative `prefetch_reads` collapsed
+**45 188 → 14 258 (−68 %)** and total `disk_reads` *fell* 2.2 % — the gate
+returns wasted speculative bandwidth to demand reads, exactly the 98.6 %-waste
+diagnosis that motivated it. Logs:
+`bench-data/2026-08-15-queue/confirm-stale-drop-b16/`.
+
+**kvstore restart smoke, re-run on the async-writer binary (job 90): PASS
+again** — cold 2504.6 s → warm 389.0 s (6.4×), output byte-identical,
+`dropped_busy=0` (the depth-1 writer queue never cost a checkpoint in this
+workload). The 08-15 synchronous-path result reproduces on the shipped
+implementation. Logs: `bench-data/2026-08-15-queue/kvstore-smoke-async/`.

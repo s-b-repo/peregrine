@@ -127,11 +127,14 @@ its own status so nobody mistakes "documented" for "measured":
 - **`COLI_SPEC_CONF`** (default 0, off) — stop an MTP draft early when the
   head's top-token probability drops under the floor. Depth-only: `accept_run`
   is untouched, so greedy output is bit-identical by construction (test:
-  `the_confidence_floor_never_changes_a_greedy_stream`). **SCREENED +35 % at
-  B=16** (0.060 → 0.081 tok/s, `COLI_DRAFT=5` + floor 0.65, REPEATS=1) — the
-  `COLI_DRAFT=4` rejection above inverts once low-confidence drafts stop
-  paying for verify rows. REPEATS=3 confirmation in flight (queue job 20);
-  the default stays off until it lands.
+  `the_confidence_floor_never_changes_a_greedy_stream`). **CONFIRMED,
+  REPEATS=3 (2026-08-16): 0.060 → 0.082 median tok/s (+37 %) at B=16 with
+  `COLI_DRAFT=5` + floor 0.65, and −22 % disk reads for the same tokens** —
+  the `COLI_DRAFT=4` rejection above inverts once low-confidence drafts stop
+  paying for verify rows, and the win is bytes-shaped, not cache-shaped.
+  Defaults still unchanged on purpose: both confirmed arms drafted at depth 5,
+  so this licenses "if you speculate, floor it", not "speculate by default" —
+  the controlled draft0-vs-floored sweep (queue job 96) decides the latter.
 - **`COLI_ECACHE_GB=auto`** (+ `COLI_ECACHE_AUTO_FRAC`, default 0.80) — ds4's
   budget rule: a fraction of post-load `MemAvailable`, still capped by the
   transient reserve + 1 GiB safety. Numeric spellings unchanged. **First arm
@@ -144,7 +147,8 @@ its own status so nobody mistakes "documented" for "measured":
   prefixes ≥ 256 tokens checkpoint to disk and a restarted server restores
   them instead of re-prefilling. **SMOKE-PROVEN: cold 2620.5 s → warm
   391.9 s (6.7×)** on an 832-token restore from a 142.6 MiB checkpoint,
-  output byte-identical across the restart. Fingerprint + checksum +
+  output byte-identical across the restart — and re-proven on the shipped
+  async-writer binary (job 90: 2504.6 → 389.0 s, `dropped_busy=0`). Fingerprint + checksum +
   full-token compare gate every load; a bad file means a cold prefill, never
   a wrong token. Note the checkpoint files contain the session's token ids in
   the clear — point the knob at storage with the same privacy expectations as
@@ -172,9 +176,12 @@ its own status so nobody mistakes "documented" for "measured":
 - **`COLI_PREFETCH_STALE_DROP=1`** (default 0, off; window via
   `COLI_PREFETCH_STALE_SLACK`, default 1 layer-step) — drop a queued
   speculative warm *before its disk read* once the forward sweep has moved
-  past the layer window it was emitted for. **SCREENED +7 % at B=16**
-  (0.084 → 0.090 tok/s) and +5 % at B=1, REPEATS=1; the REPEATS=3
-  confirmation is queue job 10 and the default stays off until it reports. The 2026-08-13 defaults run is
+  past the layer window it was emitted for. **CONFIRMED, REPEATS=3
+  (2026-08-16): 0.072 → 0.077 median (+6.9 %) at B=16**, with the counters
+  showing the honest mechanism — speculative reads −68 %, total disk reads
+  −2.2 % — wasted speculative bandwidth returned to demand reads rather than
+  a cache trade. A default flip is now evidence-backed; owner's call
+  (peregrine-89 authored the gate). The 2026-08-13 defaults run is
   the motivating measurement: at B=16 the rings sit at 93 % duty, the
   unbounded prefetch queue backlogs, and **40 352 of 41 159 speculative reads
   (98.6 %) were classified wasted — ~12.6 % of all disk reads** on a run whose
