@@ -2326,6 +2326,22 @@ fn prefetch_worker(
     }
 }
 
+/// Load a Qwen3Next-family **zero-centered** RMSNorm weight as the effective
+/// gamma the engine's plain `w * x_hat` kernels expect: the checkpoint stores
+/// `w` with `forward = x_hat * (1 + w)` (weights initialized at ZERO —
+/// `Qwen3NextRMSNorm`, verbatim-verified 2026-08-16 after `x_hat * w` collapsed
+/// every activation of the real checkpoint), so storing `1 + w` at load keeps
+/// every hot path untouched. Applies to the hybrid's input/post layernorms,
+/// q/k norms and the final norm — NOT to the GDN's gated norm (`torch.ones`
+/// init, plain form) and NOT to classic Qwen3 or GLM, whose norms are plain.
+fn load_norm_zero_centered(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
+    let mut w = load_f32(st, name, n)?;
+    for v in &mut w {
+        *v += 1.0;
+    }
+    Ok(w)
+}
+
 fn load_f32(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
     let mut v = vec![0f32; n];
     st.read_f32(name, &mut v)?;
@@ -2378,8 +2394,16 @@ fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Re
                 wk: QtWeight::load(st, &p("self_attn.k_proj.weight"), nkv * hd, d)?,
                 wv: QtWeight::load(st, &p("self_attn.v_proj.weight"), nkv * hd, d)?,
                 o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, nh * hd)?,
-                q_norm: load_f32(st, &p("self_attn.q_norm.weight"), hd)?,
-                k_norm: load_f32(st, &p("self_attn.k_norm.weight"), hd)?,
+                q_norm: if cfg.arch == Arch::HybridGdn {
+                    load_norm_zero_centered(st, &p("self_attn.q_norm.weight"), hd)?
+                } else {
+                    load_f32(st, &p("self_attn.q_norm.weight"), hd)?
+                },
+                k_norm: if cfg.arch == Arch::HybridGdn {
+                    load_norm_zero_centered(st, &p("self_attn.k_norm.weight"), hd)?
+                } else {
+                    load_f32(st, &p("self_attn.k_norm.weight"), hd)?
+                },
             }
         }
         Arch::DenseGqa | Arch::HybridGdn => {
@@ -2444,8 +2468,16 @@ fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Re
     }
 
     Ok(LayerW {
-        in_ln: load_f32(st, &p("input_layernorm.weight"), d)?,
-        post_ln: load_f32(st, &p("post_attention_layernorm.weight"), d)?,
+        in_ln: if cfg.arch == Arch::HybridGdn {
+            load_norm_zero_centered(st, &p("input_layernorm.weight"), d)?
+        } else {
+            load_f32(st, &p("input_layernorm.weight"), d)?
+        },
+        post_ln: if cfg.arch == Arch::HybridGdn {
+            load_norm_zero_centered(st, &p("post_attention_layernorm.weight"), d)?
+        } else {
+            load_f32(st, &p("post_attention_layernorm.weight"), d)?
+        },
         attn,
         sparse,
         dense,
@@ -2881,7 +2913,11 @@ impl Model {
         };
         let embed = QtWeight::load(&st, embed_name, vocab, d)?;
         let lm_head = QtWeight::load(&st, "lm_head.weight", vocab, d)?;
-        let final_norm = load_f32(&st, norm_name, d)?;
+        let final_norm = if cfg.arch == Arch::HybridGdn {
+            load_norm_zero_centered(&st, norm_name, d)?
+        } else {
+            load_f32(&st, norm_name, d)?
+        };
 
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
         for i in 0..cfg.n_layers as usize {
