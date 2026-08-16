@@ -12,7 +12,11 @@
 set -u
 cd "$(dirname "$0")/../../.."
 export COLI_MODEL=${COLI_MODEL:-/home/cortix/models/GLM-5.2}
+# Three arms decompose the feature: off (baseline) vs static (steering, no
+# decay) isolates the value of topic steering; static vs adaptive (default
+# COLI_TOPIC_HALFLIFE=512, volatility-scaled) isolates the value of aging.
 REPEATS=3 MAX_TOKENS=32 PORT=8146 nice -n 5 scripts/bench-serve-envarms.sh \
   bench-data/2026-08-15-queue/topic-routing-b16 16 \
   bench-data/2026-08-15-queue/arms/topic-off.env \
+  bench-data/2026-08-15-queue/arms/topic-static.env \
   bench-data/2026-08-15-queue/arms/topic-on.env
