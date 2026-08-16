@@ -15,6 +15,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod attention;
+pub mod gdn;
 pub mod concurrent;
 pub mod dsa;
 pub mod gpu;
@@ -28,10 +29,12 @@ pub mod mtp;
 pub mod predeval;
 pub mod predict;
 pub mod ram;
+pub mod rlm;
 pub mod router;
 pub mod sample;
 pub mod telemetry;
 pub mod testkit;
+pub mod topic;
 pub mod weight;
 pub mod wmma_tune;
 pub mod workload;
@@ -46,16 +49,18 @@ pub use math::{
 };
 pub use mlp::{moe_forward, Mlp, MoeCfg};
 pub use model::{
-    accept_run, accept_run_sampled, lookahead_issued, save_automaton, save_macrostates, Model, SeqKv, Verified,
+    accept_run, accept_run_sampled, kv_dtype, lookahead_issued, save_automaton, save_macrostates, KvExport,
+    KvLayerExport, Model, SeqKv, Verified,
 };
 pub use iotune::{IoTuner, IowqCap};
 pub use lane::{Bias, BubbleTuner, LaneBalancer, LaneTimings, LaneTimingsAccum, Placement};
 pub use learn::{learn_mode, BanditScheduler, KnobArm, LearnMode, QAction, QScheduler, QState};
 pub use telemetry::{open_l3_miss_counter, PlanOptimizer, RuntimeTelemetry};
 pub use wmma_tune::{KernelShape, TileConfig, WmmaTuner};
-pub use workload::{classify_str, PhaseTracker, TokenClass};
+pub use workload::{classify_str, TokenClass};
 pub use predeval::{ArmReport, PredictEval};
 pub use predict::{phase_boost, Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
+pub use rlm::{rlm_enabled, rlm_layers, rlm_margin, rlm_max_depth, RLMController};
 pub use mtp::speculative_sample;
 pub use router::{
     batch_union, gate_share_below, gate_stats_snapshot, route, union_low_gate_snapshot, union_stats_snapshot, Routed,

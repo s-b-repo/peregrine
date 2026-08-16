@@ -185,6 +185,9 @@ fn run() -> Result<(), Error> {
             }
             // heat + history + co-activation seed for the next session
             model.save_route_stats(dirp)?;
+            // topic-routing profiles alongside, so a COLI_TOPIC_ROUTING boot
+            // starts warm (no-op when topic routing was off this run)
+            model.save_topic_profiles_here()?;
             eprintln!(
                 "galactic pass complete ({len}-token corpus): automaton.json, macrostates.json, \
                  routes.json, schedule.json, route_stats.json written to {dir}"
@@ -292,6 +295,51 @@ fn run() -> Result<(), Error> {
             eprintln!("wrote {n} forwards of routing trace to {out} ({} tokens)", corpus.len());
             Ok(())
         }
+        // `calib-capture <model-dir> <out.json> [corpus-len] [--text FILE]`: the
+        // ideas-#7 calibration pass — teacher-force the corpus with the capture
+        // hook installed and write the mean-|x|-per-channel sidecar that
+        // `peregrine-requantize --calib` reads. Composable with
+        // `COLI_PREDICT_EVAL=1` in the same process: the capture is passive, so
+        // one instrumented pass yields calibration stats and predictor recall
+        // together (the agreed shared disk slot).
+        Some("calib-capture") => {
+            let usage = || {
+                Error::Format(
+                    "usage: peregrine calib-capture <model-dir> <out.json> [corpus-len] [--text FILE]".into(),
+                )
+            };
+            let dir = args.get(2).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
+            let out = args.get(3).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
+            let len = args.get(4).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(2048);
+            let text = flag_value(&args, "--text");
+            let mut model = Model::load_streaming(Path::new(dir), true)?;
+            let corpus = match &text {
+                Some(path) => encode_text_corpus(dir, path, len, "calib-capture")?,
+                None => {
+                    // Louder sibling of dump-routes' warning, and rightly so: an
+                    // importance profile from uniform-random ids is noise that a
+                    // conversion would then bake into a container's rounding.
+                    eprintln!(
+                        "peregrine: calib-capture has no --text, so it is calibrating on \
+                         uniform-random token ids. Random ids produce hidden statistics no \
+                         real prompt would, so the sidecar will exist but its importance \
+                         profile is noise. Pass --text <file> before converting with it."
+                    );
+                    synth_corpus(model.cfg.vocab as usize, len)
+                }
+            };
+            model.enable_calib_capture(std::path::PathBuf::from(out));
+            let forced = model.teacher_forcing(&corpus)?;
+            match model.write_calib_sidecar()? {
+                Some(p) => eprintln!(
+                    "wrote calibration sidecar to {} ({} positions teacher-forced)",
+                    p.display(),
+                    forced.len()
+                ),
+                None => eprintln!("peregrine: capture was not enabled — nothing written"),
+            }
+            Ok(())
+        }
         // `route-stats <routes.json> [n_experts]`: read a trace written by
         // `dump-routes`/`galactic` and report what the router actually does —
         // consecutive-token expert overlap against the independence null, and
@@ -322,18 +370,44 @@ fn run() -> Result<(), Error> {
         // warm caches and two resident sets against one page cache, and the
         // slower container would be measured while the faster one evicted it.
         // Peak RSS here is one model's, not two.
+        //
+        // `--candidate-env KEY=VAL` (repeatable) applies a knob to the
+        // candidate arm only, by running that arm in a child process — the
+        // knobs worth gating this way latch once per process
+        // (`route_min_share` is a `OnceLock`), so an exported var would set
+        // both arms and the gate would compare the knob to itself: 0.000,
+        // indistinguishable from a lossless candidate. This is how todo.md's
+        // "knob set on the candidate side, unset on the source, same container
+        // both times" is actually run.
         Some("flip-rate") => {
             let usage = || {
                 Error::Format(
-                    "usage: peregrine flip-rate <source-dir> <candidate-dir> [--text FILE] [--tokens N]".into(),
+                    "usage: peregrine flip-rate <source-dir> <candidate-dir> [--text FILE] [--tokens N] [--candidate-env KEY=VAL]...".into(),
                 )
             };
             let src = args.get(2).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
-            let cand = args.get(3).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
+            // `--reference-json` replaces the candidate container: the reference
+            // arm was computed elsewhere (the HF bf16 offload runner,
+            // scripts/qwen-parity-reference.py) and dumped as
+            // {"tokens": [...], "argmax": [...]}. Token ids come FROM the dump,
+            // so tokenization is out of the equation entirely — the number is
+            // pure model-forward agreement.
+            let ref_json = flag_value(&args, "--reference-json");
+            let cand = match (args.get(3).filter(|s| !s.starts_with("--")), &ref_json) {
+                (Some(c), None) => Some(c.clone()),
+                (None, Some(_)) => None,
+                (Some(_), Some(_)) => {
+                    return Err(Error::Format(
+                        "flip-rate: give a candidate dir OR --reference-json, not both".into(),
+                    ))
+                }
+                (None, None) => return Err(usage()),
+            };
             let text = flag_value(&args, "--text");
             let n_tokens: usize = flag_value(&args, "--tokens")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256);
+            let cand_env = candidate_env_pairs(&args)?;
 
             let toks = match &text {
                 // The tokenizer comes from the *source* container: the ids must be
@@ -369,8 +443,35 @@ fn run() -> Result<(), Error> {
                 );
                 Ok((out, t))
             };
-            let (a, used) = run(src, &toks)?;
-            let (b, _) = run(cand, &used)?;
+            let mut ref_topk: Option<Vec<Vec<i32>>> = None;
+            let (a, b, cand_label) = match (&cand, &ref_json) {
+                (Some(cand), None) => {
+                    let (a, used) = run(src, &toks)?;
+                    let b = if cand_env.is_empty() {
+                        run(cand, &used)?.0
+                    } else {
+                        run_candidate_arm(cand, &used, &cand_env)?
+                    };
+                    (a, b, cand.clone())
+                }
+                (None, Some(path)) => {
+                    let reference = load_reference_dump(Path::new(path))?;
+                    let topk = reference.topk.clone();
+                    if text.is_some() {
+                        // The dump carries its own ids; a --text alongside it
+                        // would silently be ignored, which reads like it was used.
+                        return Err(Error::Format(
+                            "flip-rate: --reference-json carries its own token ids; drop --text".into(),
+                        ));
+                    }
+                    if !topk.is_empty() {
+                        ref_topk = Some(topk);
+                    }
+                    let (a, _) = run(src, &reference.tokens)?;
+                    (a, reference.argmax, path.clone())
+                }
+                _ => return Err(usage()),
+            };
 
             let rate = Model::prediction_flip_rate(&a, &b)
                 .ok_or_else(|| Error::Format("flip-rate: the two runs disagree on length".into()))?;
@@ -378,7 +479,16 @@ fn run() -> Result<(), Error> {
             println!("flips       {}", a.iter().zip(&b).filter(|(x, y)| x != y).count());
             println!("flip_rate   {rate:.6}");
             println!("source      {src}");
-            println!("candidate   {cand}");
+            println!("candidate   {cand_label}");
+            // Top-k containment, only when a reference dump carried top-k rows:
+            // of the positions where argmax flipped, how many landed inside the
+            // reference's own top-k (near-ties) vs outside it (real departures).
+            if let Some(topk) = ref_topk.filter(|t| t.len() == a.len()) {
+                let flips: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+                let near = flips.iter().filter(|&&i| topk[i].contains(&a[i])).count();
+                let k = topk.first().map_or(0, Vec::len);
+                println!("flips_in_reference_top{k}   {near} of {} flips", flips.len());
+            }
             // Top-1 agreement only, and on one text. It is a floor on quality,
             // not a summary of it: a container can hold top-1 and still shift
             // the distribution underneath, which this cannot see.
@@ -386,6 +496,64 @@ fn run() -> Result<(), Error> {
                 "peregrine: flip-rate is top-1 agreement under teacher forcing on ONE text. \
                  A low rate does not license the container on its own."
             );
+            Ok(())
+        }
+        // `flip-arm <dir>`: the candidate half of `flip-rate --candidate-env`,
+        // deliberately absent from the usage line — it is an internal protocol
+        // (token ids in on stdin, argmax predictions out on stdout, one id per
+        // line), and the flag on `flip-rate` is the operator surface. A child
+        // process rather than a second in-process load because the knobs this
+        // exists to A/B latch once per process; see `candidate_env_pairs`.
+        Some("flip-arm") => {
+            let dir = args
+                .get(2)
+                .ok_or_else(|| Error::Format("flip-arm (internal): peregrine flip-arm <model-dir> < token-ids".into()))?;
+            // The knobs this arm actually ran with, read back from its own
+            // environment rather than trusted from the parent's argv: a parent
+            // that failed to pass the env would measure a candidate identical
+            // to the source and print a flawless 0.000 — the vacuous-gate
+            // failure `flip_rate_gate.rs` exists to rule out. This line is what
+            // the CLI test pins.
+            let mut knobs: Vec<String> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("COLI_"))
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            knobs.sort();
+            let knobs = if knobs.is_empty() { "(no COLI_* set)".into() } else { knobs.join(" ") };
+            eprintln!("peregrine: flip-arm: env: {knobs}");
+            let mut toks = Vec::new();
+            for line in std::io::stdin().lock().lines() {
+                let line = line.map_err(|e| Error::Format(format!("flip-arm: stdin: {e}")))?;
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                toks.push(
+                    t.parse::<i32>()
+                        .map_err(|e| Error::Format(format!("flip-arm: not a token id: {t:?} ({e})")))?,
+                );
+            }
+            if toks.is_empty() {
+                return Err(Error::Format("flip-arm: no token ids arrived on stdin".into()));
+            }
+            let mut m = Model::load_streaming(Path::new(dir), true)?;
+            let t0 = std::time::Instant::now();
+            let out = m.teacher_forcing(&toks)?;
+            // Same shape as the in-process arm's timing line, so a two-arm log
+            // reads the same whichever way the candidate ran.
+            eprintln!(
+                "peregrine: flip-rate: {dir} — {} positions in one forward, {:.1}s",
+                out.len(),
+                t0.elapsed().as_secs_f64()
+            );
+            let mut w = String::new();
+            for p in &out {
+                w.push_str(&p.to_string());
+                w.push('\n');
+            }
+            std::io::stdout()
+                .write_all(w.as_bytes())
+                .map_err(|e| Error::Format(format!("flip-arm: stdout: {e}")))?;
             Ok(())
         }
         Some("route-stats") => {
@@ -448,8 +616,158 @@ fn run() -> Result<(), Error> {
 /// `--name value` lookup over the raw argv. Deliberately not a flag parser:
 /// this binary's subcommands are positional and the two flags `flip-rate` takes
 /// do not justify pulling one in.
+/// A reference argmax dump: `{"tokens": [...], "argmax": [...]}` — what
+/// `scripts/qwen-parity-reference.py` writes and `flip-rate --reference-json`
+/// consumes. Lengths must match: prediction `argmax[i]` belongs to position `i`
+/// under teacher forcing, same indexing as [`Model::teacher_forcing`].
+struct ReferenceDump {
+    tokens: Vec<i32>,
+    argmax: Vec<i32>,
+    /// Reference top-k ids per position, when the dump carries them: the
+    /// gray-zone tiebreaker (a candidate argmax inside the reference top-k is
+    /// a near-tie moved by quantization noise, not a wrong answer).
+    topk: Vec<Vec<i32>>,
+}
+
+fn load_reference_dump(path: &Path) -> Result<ReferenceDump, Error> {
+    let bytes = std::fs::read(path).map_err(|e| Error::Format(format!("read {}: {e}", path.display())))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| Error::Format(format!("{}: {e}", path.display())))?;
+    let ids = |key: &str| -> Result<Vec<i32>, Error> {
+        v.get(key)
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| Error::Format(format!("{}: missing \"{key}\" array", path.display())))?
+            .iter()
+            .map(|x| {
+                x.as_i64().map(|n| n as i32).ok_or_else(|| {
+                    Error::Format(format!("{}: non-integer entry in \"{key}\"", path.display()))
+                })
+            })
+            .collect()
+    };
+    let topk = match v.get("topk").and_then(|t| t.as_array()) {
+        None => Vec::new(),
+        Some(rows) => rows
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .ok_or_else(|| Error::Format(format!("{}: topk row is not an array", path.display())))?
+                    .iter()
+                    .map(|x| {
+                        x.as_i64().map(|n| n as i32).ok_or_else(|| {
+                            Error::Format(format!("{}: non-integer entry in topk", path.display()))
+                        })
+                    })
+                    .collect()
+            })
+            .collect::<Result<Vec<Vec<i32>>, Error>>()?,
+    };
+    let d = ReferenceDump { tokens: ids("tokens")?, argmax: ids("argmax")?, topk };
+    if d.tokens.len() != d.argmax.len() || d.tokens.is_empty() {
+        return Err(Error::Format(format!(
+            "{}: tokens ({}) and argmax ({}) must be equal-length and non-empty",
+            path.display(),
+            d.tokens.len(),
+            d.argmax.len()
+        )));
+    }
+    Ok(d)
+}
+
 fn flag_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// Every `--candidate-env KEY=VAL` occurrence, refusing any key that is also
+/// set in this process's environment.
+///
+/// The knobs these exist for latch in process-global `OnceLock`s
+/// (`route_min_share` is the motivating one), so "set on the candidate side
+/// only" cannot be done by exporting the var: it would latch identically in
+/// both arms and the gate would compare the knob to itself — reading 0.000
+/// exactly as a lossless candidate would. The candidate arm therefore runs in
+/// a child process (`flip-arm`), and a key the parent also holds is refused
+/// rather than warned about, because the source arm would silently run with it
+/// too and the warning would scroll past a flawless-looking number.
+fn candidate_env_pairs(args: &[String]) -> Result<Vec<(String, String)>, Error> {
+    let mut pairs = Vec::new();
+    let values = args
+        .iter()
+        .zip(args.iter().skip(1))
+        .filter(|(a, _)| *a == "--candidate-env")
+        .map(|(_, v)| v);
+    for kv in values {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| Error::Format(format!("flip-rate: --candidate-env wants KEY=VAL, got {kv:?}")))?;
+        if std::env::var_os(k).is_some() {
+            return Err(Error::Format(format!(
+                "flip-rate: {k} is set in this environment, so the source arm would run with it too \
+                 and the flip rate would compare the knob to itself. Unset it and pass it only \
+                 through --candidate-env."
+            )));
+        }
+        pairs.push((k.to_string(), v.to_string()));
+    }
+    Ok(pairs)
+}
+
+/// Run the candidate arm of `flip-rate` in a child process with `env` applied.
+///
+/// The fresh process is the point, not a convenience — see
+/// `candidate_env_pairs`. Token ids go down on stdin and predictions come back
+/// on stdout, one per line: no temp files to leak, and the library crates keep
+/// stdout clean (diagnostics are stderr-only), which stays inherited so the
+/// arm's banner and timing land in the same log as the parent's. No deadlock
+/// at any corpus size: the arm reads stdin to EOF before it writes anything.
+fn run_candidate_arm(dir: &str, toks: &[i32], env: &[(String, String)]) -> Result<Vec<i32>, Error> {
+    let exe =
+        std::env::current_exe().map_err(|e| Error::Format(format!("flip-rate: current_exe: {e}")))?;
+    for (k, v) in env {
+        eprintln!("peregrine: flip-rate: candidate arm only: {k}={v}");
+    }
+    let mut child = std::process::Command::new(exe)
+        .arg("flip-arm")
+        .arg(dir)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| Error::Format(format!("flip-rate: spawn flip-arm: {e}")))?;
+    {
+        let mut sin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Format("flip-rate: the flip-arm child has no stdin".into()))?;
+        let mut buf = String::new();
+        for t in toks {
+            buf.push_str(&t.to_string());
+            buf.push('\n');
+        }
+        sin.write_all(buf.as_bytes())
+            .map_err(|e| Error::Format(format!("flip-rate: write tokens to flip-arm: {e}")))?;
+        // Dropped here: EOF is how the arm knows the corpus is complete.
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Error::Format(format!("flip-rate: wait for flip-arm: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Format(format!("flip-rate: the candidate arm failed ({})", out.status)));
+    }
+    let text = String::from_utf8(out.stdout)
+        .map_err(|e| Error::Format(format!("flip-rate: candidate arm stdout: {e}")))?;
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            l.parse::<i32>().map_err(|e| {
+                Error::Format(format!(
+                    "flip-rate: the candidate arm wrote a non-token line to stdout: {l:?} ({e})"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Encode a text file into token ids with the tokenizer that travels with the
@@ -472,11 +790,15 @@ fn encode_text_corpus(dir: &str, path: &str, n_tokens: usize, who: &str) -> Resu
         std::fs::read(&tj).map_err(|e| Error::Format(format!("{who}: --text needs {}: {e}", tj.display())))?;
     let mut tk = peregrine_token::GigaTokenizer::from_hf_json_bytes(&json)
         .map_err(|e| Error::Format(format!("{who}: tokenizer: {e}")))?;
-    let ids: Vec<i32> = tk.encode(&raw).iter().map(|&i| i as i32).collect();
+    // encode_into + in-place widen: one buffer, not encode's Vec<u32> plus a
+    // second collected Vec<i32> of the whole corpus.
+    let mut ids: Vec<u32> = Vec::with_capacity(raw.len() / 3);
+    tk.encode_into(&raw, &mut ids);
     if ids.is_empty() {
         return Err(Error::Format(format!("{who}: --text encoded to no tokens")));
     }
-    Ok(ids.into_iter().take(n_tokens).collect())
+    ids.truncate(n_tokens);
+    Ok(ids.into_iter().map(|i| i as i32).collect())
 }
 
 fn synth_corpus(vocab: usize, n: usize) -> Vec<i32> {
@@ -568,6 +890,11 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
     // which is what `COLI_PREDICT_EVAL`'s scoreboard needs to be actionable.
     if let Some(name) = model.apply_predictor_override() {
         eprintln!("peregrine: prefetch predictor = {name} (COLI_PREDICT_SOURCE)");
+    } else if model.predictor_is_automaton() {
+        // Load's own pick is silent, and whether the automaton engaged depends
+        // on artifacts (`route_stats.json` transition history) that vary run to
+        // run — say so, so a log can tell an automaton run from a baseline one.
+        eprintln!("peregrine: prefetch predictor = automaton (from route-stats history)");
     }
     out.write_all(READY)?;
     out.flush()?;
@@ -643,9 +970,21 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                             .collect();
                         per.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                         if !per.is_empty() {
-                            let top: Vec<String> =
-                                per.iter().take(5).map(|(l, n)| format!("L{l}={n}")).collect();
-                            eprintln!("[ecache] busiest layers by disk reads: {}", top.join(" "));
+                            // The prefetch column beside the demand column: a
+                            // layer whose reads are mostly `pf` is being served
+                            // by the speculative lane; one with a big demand
+                            // count and no `pf` is where look-ahead is missing.
+                            // (`ecache_prefetch_reads_for_layer` is the demand
+                            // twin's counterpart and had no production caller.)
+                            let top: Vec<String> = per
+                                .iter()
+                                .take(5)
+                                .map(|(l, n)| {
+                                    let pf = model.ecache_prefetch_reads_for_layer(*l).unwrap_or(0);
+                                    format!("L{l}={n}+{pf}pf")
+                                })
+                                .collect();
+                            eprintln!("[ecache] busiest layers by disk+prefetch reads: {}", top.join(" "));
                         }
                         // prefetch effectiveness: how many speculative reads paid off,
                         // plus fadvise hints and (opt-in) verify mismatches.
@@ -662,10 +1001,13 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                         // rates are printed so neither can be read as the other.
                         let unclassified = pf.saturating_sub(used + wasted);
                         let yield_pct = if pf > 0 { 100.0 * used as f64 / pf as f64 } else { 0.0 };
+                        // `stale_dropped` is *not* part of `issued`: those items
+                        // never reached a read — bandwidth returned to demand.
+                        let sd = model.ecache_prefetch_stale_dropped().unwrap_or(0);
                         eprintln!(
                             "[prefetch] used={used} wasted={wasted} unclassified={unclassified} \
                              accuracy={acc:.1}% (of {} classified) yield={yield_pct:.1}% (of {pf} issued) \
-                             fadvise={fadv} verify_mismatch={vm}",
+                             fadvise={fadv} verify_mismatch={vm} stale_dropped={sd}",
                             used + wasted
                         );
                         // The unclassified slabs as bytes: how much of the budget
@@ -981,7 +1323,10 @@ fn run_bench(batch_args: &[String]) -> Result<(), Error> {
                 let mut drafts: Vec<Vec<i32>> = Vec::with_capacity(b);
                 for s in 0..b {
                     let hs = &hlast[s * d..(s + 1) * d];
-                    let draft = model.mtp_draft(toks[s], draft, hs)?;
+                    // No confidence floor on the bench path: `COLI_SPEC_CONF`
+                    // is a serve-engine knob, and the bench measures the fixed
+                    // depth it is told to.
+                    let draft = model.mtp_draft(toks[s], draft, hs, 0.0)?;
                     drafts.push(draft);
                 }
                 // verify `[next, draft...]` for every sequence in ONE forward —

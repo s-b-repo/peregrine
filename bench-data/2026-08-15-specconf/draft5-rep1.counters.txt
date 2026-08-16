@@ -1,0 +1,11 @@
+[expertmap] indexed=19456 coalescing=19200 (98.7%) -> 39936 reads per full sweep vs 116736 unmerged
+[workingset] 10.85 GB per token; prefetch-protect on (budget cannot hold a pass)
+[lane] 38 forwards: io 27510.4s (82%) cpu 5942.8s (18%) gpu 0.0s (0%) reduce 55.2s (0%)
+[lane] per forward: io 723.96s cpu 156.39s (lane-summed, so compare sum/wall for the overlap achieved)
+[lane] moe wall 7172.5s over 38 forwards (188.75s each); io duty 96% of 4 rings, cpu 0.8 workers busy
+[lane] cpu-lane bandwidth 1.19 GB/s over 7093.2 GB of expert slabs
+[lane] cache-lock wait 2.53s (0.0% of io thread time)
+[ecache] hits=14519 misses=383206 disk_reads=383206 prefetch_reads=7343 hit_rate=3.7%
+[ecache] resident: 454 slots, 8.59 GB of 8.59 GB budget (100.0% full)
+[prefetch] used=98 wasted=7162 unclassified=83 accuracy=1.3% (of 7260 classified) yield=1.3% (of 7343 issued) fadvise=0 verify_mismatch=0
+[prefetch] resident-unused: 0 slots, 0.00 GB of 8.59 GB budget (0.0%)

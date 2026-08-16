@@ -1,0 +1,18 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 39.0 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.4 + cache 2.1 -> peak 26.6 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: [workingset] one token routes 10.85 GB of experts against a 2.00 GB cache (18% of a pass) — no eviction order can hold a pass; prefetch-protect on
+peregrine: flip-rate: /home/cortix/models/GLM-5.2 — 512 positions in one forward, 512.0s
+peregrine: [ram] avail 29.9 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.4 + cache 2.1 -> peak 26.6 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: [workingset] one token routes 10.02 GB of experts against a 2.00 GB cache (20% of a pass) — no eviction order can hold a pass; prefetch-protect on
+peregrine: flip-rate: /srv/modelstripe/GLM-5.2-i3g64-asym — 512 positions in one forward, 590.1s
+positions   512
+flips       229
+flip_rate   0.447266
+source      /home/cortix/models/GLM-5.2
+candidate   /srv/modelstripe/GLM-5.2-i3g64-asym
+peregrine: flip-rate is top-1 agreement under teacher forcing on ONE text. A low rate does not license the container on its own.

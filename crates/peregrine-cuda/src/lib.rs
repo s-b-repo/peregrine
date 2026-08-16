@@ -43,6 +43,7 @@ mod ffi {
         pub fn coli_cuda_device_count() -> c_int;
         pub fn coli_cuda_probe_device_count() -> c_int;
         pub fn coli_cuda_mem_info(device: c_int, free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
+        pub fn coli_cuda_largest_free_block(device: c_int, out: *mut usize) -> c_int;
         pub fn coli_cuda_tensor_upload(
             tensor: *mut *mut ColiCudaTensor,
             weights: *const c_void,
@@ -250,6 +251,28 @@ pub fn mem_info(device: i32) -> Result<(usize, usize), Error> {
 }
 #[cfg(not(feature = "cuda"))]
 pub fn mem_info(_device: i32) -> Result<(usize, usize), Error> {
+    Err(Error::Format("cuda backend not built".into()))
+}
+
+/// Largest single VRAM allocation that currently succeeds on `device`, found by
+/// binary-searching real `cudaMalloc` probes (~13 of them on a 12 GB card, 2 MB
+/// grain). `free − largest` from [`mem_info`] is the fragmentation the defrag-pool
+/// question (`todo.md` §2) turns on. Diagnostic only: every probe is a live
+/// allocation, so never call this on a forward path.
+#[cfg(feature = "cuda")]
+pub fn largest_free_block(device: i32) -> Result<usize, Error> {
+    let mut out = 0usize;
+    // SAFETY: the out-pointer is valid; the C call only writes through it and
+    // returns 1 on success, 0 on a bad device / null pointer / failed query.
+    let ok = unsafe { ffi::coli_cuda_largest_free_block(device as c_int, &mut out) };
+    if ok == 1 {
+        Ok(out)
+    } else {
+        Err(Error::Format(format!("cuda largest_free_block(device={device}) failed")))
+    }
+}
+#[cfg(not(feature = "cuda"))]
+pub fn largest_free_block(_device: i32) -> Result<usize, Error> {
     Err(Error::Format("cuda backend not built".into()))
 }
 
@@ -839,6 +862,75 @@ mod gpu_tests {
     static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn gpu_guard() -> std::sync::MutexGuard<'static, ()> {
         GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The measurement `todo.md` §2's defrag-pool item asked for instead of the
+    /// pool. The engine's VRAM workload is exactly two block sizes (`int4_bytes`,
+    /// `f32_bytes`); this reproduces the worst churn `reheat`'s precision ladder
+    /// can produce — interleaved frees with every gap refilled at the *other*
+    /// format — and then asks the allocator whether free VRAM is still reachable
+    /// as one block. The bar is half: a fragmenting allocator collapses
+    /// `largest` to the ~24 MB block size, three orders below it, while a
+    /// coalescing one keeps `largest ≈ free` minus runtime headroom. If this
+    /// ever fails, the `cudaMallocAsync` pool earns its build; until then the
+    /// item stays closed on this number.
+    #[test]
+    fn vram_churn_of_the_two_expert_block_sizes_leaves_free_memory_in_one_block() -> Result<(), Error> {
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let base = largest_free_block(0)?;
+        let (free0, _) = mem_info(0)?;
+        assert!(base > 0 && base <= free0, "probe sanity: 0 < largest ({base}) <= free ({free0})");
+
+        // ~8 MB per f32 tensor triple at this shape; int4 is ~16× smaller.
+        let (hidden, inter) = (1024usize, 2048usize);
+        let mut r = Lcg(0xC0FFEE);
+        let gatef: Vec<f32> = (0..inter * hidden).map(|_| r.f() * 0.1).collect();
+        let upf: Vec<f32> = (0..inter * hidden).map(|_| r.f() * 0.1).collect();
+        let downf: Vec<f32> = (0..hidden * inter).map(|_| r.f() * 0.1).collect();
+        let (gq, gs) = quant_i4(&gatef, inter, hidden);
+        let (uq, us) = quant_i4(&upf, inter, hidden);
+        let (dq, ds) = quant_i4(&downf, hidden, inter);
+
+        let up_f32 = |_: usize| GpuExpert::upload(0, &gatef, &upf, &downf, hidden, inter);
+        let up_int4 =
+            |_: usize| GpuExpert::upload_int4(0, (&gq, &gs), (&uq, &us), (&dq, &ds), hidden, inter);
+
+        for round in 0..3usize {
+            // Alternate formats across 16 slots, drop every other slot, refill
+            // each gap at the other format: an f32-sized hole receives an
+            // int4-sized tenant and vice versa, which is the only way this
+            // workload can fragment at all.
+            let mut slots: Vec<Option<GpuExpert>> = Vec::new();
+            for i in 0..16usize {
+                let flip = (i + round) % 2 == 0;
+                slots.push(Some(if flip { up_f32(i)? } else { up_int4(i)? }));
+            }
+            for (i, s) in slots.iter_mut().enumerate() {
+                if i % 2 == 0 {
+                    *s = None;
+                }
+            }
+            for (i, s) in slots.iter_mut().enumerate() {
+                if s.is_none() {
+                    let flip = (i + round) % 2 == 0;
+                    *s = Some(if flip { up_int4(i)? } else { up_f32(i)? });
+                }
+            }
+        }
+
+        let (free1, _) = mem_info(0)?;
+        let largest = largest_free_block(0)?;
+        println!("vram-frag probe: free {free1} B, largest block {largest} B ({:.1}%)",
+                 largest as f64 / free1 as f64 * 100.0);
+        assert!(
+            largest.saturating_mul(2) >= free1,
+            "churning the two expert block sizes fragmented VRAM: largest allocatable block \
+             {largest} B is under half of free {free1} B — the defrag-pool item just reopened"
+        );
+        Ok(())
     }
 
     /// Per-row int4 quantize `w[o,i]` → (packed nibbles `o*ceil(i/2)`, `o` scales),

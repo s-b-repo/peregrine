@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use peregrine_core::{Cfg, Context, Error, SafeTensors};
+use peregrine_core::{Arch, Cfg, Context, Error, SafeTensors};
+use crate::gdn::GdnState;
 use peregrine_io::{Reactor, WarmCache};
 
 use crate::attention::{
@@ -29,13 +30,7 @@ use crate::weight::QtWeight;
 struct LayerW {
     in_ln: Vec<f32>,
     post_ln: Vec<f32>,
-    q_a: QtWeight,
-    q_a_ln: Vec<f32>,
-    q_b: QtWeight,
-    kv_a: QtWeight,
-    kv_a_ln: Vec<f32>,
-    kv_b: QtWeight,
-    o: QtWeight,
+    attn: LayerAttn,
     sparse: bool,
     dense: Option<Mlp>,          // dense layers (i < first_dense)
     router: Vec<f32>,            // [E, hidden] (sparse only)
@@ -47,16 +42,91 @@ struct LayerW {
     indexer: Option<IndexerWeights>,
 }
 
+/// Per-layer attention weights, one variant per architecture family. GLM's
+/// MLA is the historical shape; `Gqa` serves `Arch::DenseGqa` layers and the
+/// hybrid's full-attention layers; `Gdn` is the hybrid's gated-DeltaNet
+/// linear-attention layer (Track C).
+enum LayerAttn {
+    Mla {
+        q_a: QtWeight,
+        q_a_ln: Vec<f32>,
+        q_b: QtWeight,
+        kv_a: QtWeight,
+        kv_a_ln: Vec<f32>,
+        kv_b: QtWeight,
+        o: QtWeight,
+    },
+    Gqa {
+        wq: QtWeight,
+        wk: QtWeight,
+        wv: QtWeight,
+        o: QtWeight,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+    },
+    Gdn {
+        in_qkv: QtWeight,
+        in_z: QtWeight,
+        in_a: QtWeight,
+        in_b: QtWeight,
+        conv: Vec<f32>,
+        a_log: Vec<f32>,
+        dt_bias: Vec<f32>,
+        norm: Vec<f32>,
+        out: QtWeight,
+    },
+}
+
 impl LayerW {
-    fn attn(&self) -> AttnWeights<'_> {
-        AttnWeights {
-            q_a: &self.q_a,
-            q_a_ln: &self.q_a_ln,
-            q_b: &self.q_b,
-            kv_a: &self.kv_a,
-            kv_a_ln: &self.kv_a_ln,
-            kv_b: &self.kv_b,
-            o: &self.o,
+    /// The MLA weight view. Callers on MLA-only paths (the GLM forward, MTP,
+    /// absorb) reach attention through this; a non-MLA layer here is a wiring
+    /// bug reported as an error, never a panic.
+    fn attn(&self) -> Result<AttnWeights<'_>, Error> {
+        match &self.attn {
+            LayerAttn::Mla { q_a, q_a_ln, q_b, kv_a, kv_a_ln, kv_b, o } => Ok(AttnWeights {
+                q_a,
+                q_a_ln,
+                q_b,
+                kv_a,
+                kv_a_ln,
+                kv_b,
+                o,
+            }),
+            _ => Err(Error::Format("MLA attention path reached on a non-MLA layer".into())),
+        }
+    }
+
+    fn gqa(&self, gated: bool) -> Result<crate::attention::GqaWeights<'_>, Error> {
+        match &self.attn {
+            LayerAttn::Gqa { wq, wk, wv, o, q_norm, k_norm } => Ok(crate::attention::GqaWeights {
+                wq,
+                wk,
+                wv,
+                o,
+                q_norm,
+                k_norm,
+                gated,
+            }),
+            _ => Err(Error::Format("GQA attention path reached on a non-GQA layer".into())),
+        }
+    }
+
+    fn gdn(&self) -> Result<crate::gdn::GdnWeights<'_>, Error> {
+        match &self.attn {
+            LayerAttn::Gdn { in_qkv, in_z, in_a, in_b, conv, a_log, dt_bias, norm, out } => {
+                Ok(crate::gdn::GdnWeights {
+                    in_qkv,
+                    in_z,
+                    in_a,
+                    in_b,
+                    conv,
+                    a_log,
+                    dt_bias,
+                    norm,
+                    out,
+                })
+            }
+            _ => Err(Error::Format("GDN attention path reached on a non-GDN layer".into())),
         }
     }
 }
@@ -98,6 +168,10 @@ pub struct Model {
     final_norm: Vec<f32>,
     lm_head: QtWeight,
     kv: Vec<LayerKv>,
+    /// Per-layer gated-DeltaNet recurrent state for the engine's own sequence
+    /// (`Arch::HybridGdn` linear layers; `None` slots elsewhere). The linear
+    /// layers' analogue of `kv` — constant-size, reset with it.
+    gdn: Vec<Option<GdnState>>,
     /// When set, routed experts are streamed from `st` per layer on demand
     /// instead of held resident — required to run models that exceed RAM
     /// (e.g. the 744B GLM-5.2). `LayerW::experts` is empty in this mode.
@@ -112,6 +186,13 @@ pub struct Model {
     /// Removes the per-request re-derivation of both an expert's on-disk
     /// location and its quantized format.
     expert_index: Option<crate::concurrent::ExpertIndex>,
+    /// fd → device-ordinal table for device-pure io claims
+    /// (`COLI_IO_DEVICE_SCHED`, read once here at build — not OnceLock-latched,
+    /// for the same A/B-aliasing reason as `SweepClock`). `Some` only when
+    /// experts stream through >1 ring AND the shards actually span >1 device;
+    /// everywhere else `None` keeps the concurrent lane's historical blind
+    /// cursor, which is behavior-identical on a single device.
+    fd_device_table: Option<std::collections::HashMap<std::os::unix::io::RawFd, u8>>,
     /// Bytes one token's routing touches (0 when experts are resident). The
     /// threshold that decides whether capacity or policy binds this deployment.
     expert_per_token_bytes: u64,
@@ -172,15 +253,34 @@ pub struct Model {
     /// [`prefetch_worker`] for what the separate ring does and does not buy.
     /// `Some` alongside `ecache`.
     prefetch: Option<PrefetchPool>,
+    /// Layer-step clock + staleness policy shared with the prefetch workers, so a
+    /// speculative warm whose layer window has passed is dropped before it costs a
+    /// disk read (`COLI_PREFETCH_STALE_DROP`; see [`SweepClock`]). Always present —
+    /// ticking it is two instructions, and gating its existence on the knob would
+    /// put an `Option` probe in every layer of every forward.
+    sweep: Arc<SweepClock>,
     /// Optional GPU VRAM expert tier (the 3rd lane). Built only when `COLI_GPU`
     /// is set and the `cuda` backend is available; `None` otherwise.
     gpu: Option<GpuTier>,
     /// Optional MTP head for speculative decode; `None` unless the checkpoint has
     /// the `model.layers.{n_layers}.eh_proj` tensors.
     mtp: Option<MtpHead>,
+    /// RLM controller (always present; inert when `COLI_RLM` is unset, in which
+    /// case [`crate::rlm::RLMController::should_recurse`] always returns `false`
+    /// and the emitted token stream is byte-identical to the non-RLM path).
+    /// Decides when a token's forward needs recursive refinement passes; the
+    /// recursive pass itself is [`Self::forward_hidden_recursive`].
+    rlm: crate::rlm::RLMController,
     /// Routing-frequency accumulator driving heat-ranked VRAM residency; `Some`
     /// only when a GPU tier exists (bumped during the forward, read by `reheat`).
     heat: Option<HeatTable>,
+    /// Deferred-spill log (`COLI_GPU_SPILL`): `(layer, expert)` pairs the lane
+    /// balancer verdicted [`crate::lane::Placement::GpuSpill`] mid-forward.
+    /// Acting on the verdict needs `&mut GpuTier`, which a forward holds by `&`,
+    /// so the pairs queue here and [`Self::reheat`] drains them between forwards
+    /// into the heat snapshot ahead of the ranking. `Some` only when the knob is
+    /// on and a GPU tier exists.
+    spill_log: Option<Mutex<Vec<(usize, usize)>>>,
     /// Per-lane wall-time accumulator. `moe_forward_concurrent` bumps this each
     /// layer; the model reads and resets it between forwards to feed the bubble
     /// tuner. Always present (cheap — four atomic counters).
@@ -217,6 +317,16 @@ pub struct Model {
     /// selects per-class prefetch-breadth overrides. Defaults to `Prose`
     /// (== base policy unless the operator set per-class envs).
     workload_class: Mutex<crate::workload::TokenClass>,
+    /// Topic-based smart routing (`COLI_TOPIC_ROUTING=1`): per-`TokenClass`
+    /// expert-usage profiles that bias warm-cache eviction toward the experts
+    /// the *active* topic reuses. `None` disables — protection then uses the
+    /// global-heat tiebreak exactly as before. Read at build, not OnceLock.
+    topic_profiles: Option<crate::topic::TopicProfiles>,
+    /// Base decay interval (forwards) for the adaptive profile aging
+    /// (`COLI_TOPIC_HALFLIFE`, default 512; `0` = static all-time counters).
+    /// The effective interval scales down with routing entropy — see
+    /// [`crate::topic::decay_interval`].
+    topic_halflife: u64,
     /// CPU-lane worker count the governors may adjust at runtime, clamped to
     /// `[2, workers]`. Read once per forward when building `ForwardCtx`; the
     /// thermal / power / bandwidth governors write it between forwards.
@@ -248,6 +358,12 @@ pub struct Model {
     /// artifacts (route stats, layout hints, kernel tuning) can be re-persisted
     /// without threading the path through the caller each time.
     checkpoint_dir: std::path::PathBuf,
+    /// Calibration capture (`COLI_CALIB_CAPTURE=<out.json>`, ideas #7): the
+    /// output path and the running per-layer channel sums. `None` in serving —
+    /// the env is read once at load (no OnceLock; `enable_calib_capture` is
+    /// the test/tool seam), and a `None` here costs one branch per sparse
+    /// layer per forward.
+    calib: Option<(std::path::PathBuf, Mutex<CalibAccum>)>,
     /// Optional expert-order hint per layer, loaded from `<dir>/schedule.json`
     /// (emitted by `peregrine-layout-reorg`). When present, the concurrent
     /// scheduler sorts each layer's streamed-expert plan by this order so the
@@ -269,6 +385,13 @@ pub struct Model {
 /// split cache from a contiguous one.
 pub struct SeqKv {
     layers: Vec<LayerKv>,
+    /// Per-layer gated-DeltaNet recurrent state (`Arch::HybridGdn` linear
+    /// layers; `None` slots everywhere else). A linear layer's whole context
+    /// lives here rather than in `layers` — constant-size, order-dependent,
+    /// and (unlike KV rows) not sliceable by position, which is why a sequence
+    /// carrying any of these is excluded from prefix caching and disk sessions
+    /// until the snapshot trade is measured (Track C phase 2a).
+    gdn: Vec<Option<GdnState>>,
 }
 
 /// `COLI_KV_DTYPE`: the element type every KV cache in this process is built
@@ -277,6 +400,29 @@ pub struct SeqKv {
 /// An unrecognised value is **reported and ignored**, not silently coerced: a
 /// typo'd dtype that quietly halved precision would change token values with
 /// nothing in the output saying so.
+/// `COLI_GPU_SPILL=1`: act on the lane balancer's [`crate::lane::Placement::GpuSpill`]
+/// verdicts by queueing the spilled `(layer, expert)` pairs for the next
+/// residency generation (see `Model::spill_log`). Off by default — the verdict
+/// stays advisory, the historical behavior.
+fn gpu_spill_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("COLI_GPU_SPILL").as_deref(), Ok("1") | Ok("true")))
+}
+
+/// Fold drained spill verdicts into a heat snapshot ahead of the residency
+/// ranking: each spill event bumps its expert's count by one, so an expert the
+/// balancer kept wanting resident outranks an equally-routed one it never
+/// asked for — proportional to how often it was asked, rather than jumping the
+/// whole queue on a single verdict. Pure so the arithmetic is testable without
+/// a GPU.
+fn merge_spills(counts: &mut [u32], spills: &[(usize, usize)], n_experts: usize) {
+    for &(layer, e) in spills {
+        if let Some(c) = counts.get_mut(layer * n_experts + e) {
+            *c = c.saturating_add(1);
+        }
+    }
+}
+
 pub fn kv_dtype() -> KvDtype {
     static V: std::sync::OnceLock<KvDtype> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -304,8 +450,24 @@ impl SeqKv {
     /// [`Self::new`] at an explicit element type, so a test can exercise the
     /// narrow path without a process-wide environment variable.
     pub fn with_dtype(cfg: &Cfg, dt: KvDtype) -> SeqKv {
-        let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
-        SeqKv { layers: (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, dt)).collect() }
+        let (kvl, qkr) = (cfg.kv_row_a() as usize, cfg.kv_row_b() as usize);
+        SeqKv {
+            layers: (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, dt)).collect(),
+            gdn: (0..cfg.n_layers as usize)
+                .map(|i| {
+                    (cfg.arch == peregrine_core::Arch::HybridGdn
+                        && !cfg.full_attn.get(i).copied().unwrap_or(true))
+                    .then(|| GdnState::new(cfg))
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether any layer's context is a recurrent state rather than KV rows.
+    /// The prefix cache and the disk KV store consult this: a point state has
+    /// no per-position slices to share or checkpoint.
+    pub fn has_recurrent_state(&self) -> bool {
+        self.gdn.iter().any(Option::is_some)
     }
 
     /// Positions cached so far (the sequence length); all layers share it.
@@ -318,11 +480,42 @@ impl SeqKv {
         self.layers.first().is_none_or(|k| k.is_empty())
     }
 
-    /// Rewind every layer to `new_len` (speculative-decode reject cleanup).
+    /// Rewind every KV layer to `new_len` (speculative-decode reject cleanup).
+    ///
+    /// **KV rows only.** A recurrent (GDN) layer's context cannot rewind by
+    /// truncation — rejected tokens are already folded into its memory. The
+    /// spec-decode contract for hybrid sequences is [`Self::gdn_snapshot`]
+    /// before the verify forward, [`Self::gdn_restore`] on partial acceptance,
+    /// and this truncate for the KV half — in that order.
     pub fn truncate(&mut self, new_len: usize) {
         for k in &mut self.layers {
             k.truncate(new_len);
         }
+    }
+
+    /// Snapshot every recurrent layer's context, `None` when no layer is
+    /// recurrent (KV-only architectures: [`Self::truncate`] alone suffices,
+    /// and the caller skips the ~151 MB copy entirely). One snapshot per
+    /// verify step, dropped on full acceptance — the common case.
+    pub fn gdn_snapshot(&self) -> Option<Vec<(usize, crate::gdn::GdnSnapshot)>> {
+        let snaps: Vec<(usize, crate::gdn::GdnSnapshot)> =
+            self.gdn.iter().enumerate().filter_map(|(i, g)| g.as_ref().map(|g| (i, g.snapshot()))).collect();
+        (!snaps.is_empty()).then_some(snaps)
+    }
+
+    /// Restore a [`Self::gdn_snapshot`] taken from this sequence. Layer indices
+    /// and geometry are checked; a mismatch is a wiring bug reported as an
+    /// error before any state is touched on that layer.
+    pub fn gdn_restore(&mut self, snaps: &[(usize, crate::gdn::GdnSnapshot)]) -> Result<(), Error> {
+        for (li, snap) in snaps {
+            let st = self
+                .gdn
+                .get_mut(*li)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| Error::Format(format!("gdn restore: layer {li} carries no recurrent state")))?;
+            st.restore(snap)?;
+        }
+        Ok(())
     }
 
     /// Logical bytes across every layer: what this sequence would cost holding
@@ -365,8 +558,130 @@ impl SeqKv {
     /// seed any prompt it is a prefix of, and the result is the same as having
     /// prefilled those tokens directly.
     pub fn clone_prefix(&self, n: usize) -> SeqKv {
-        SeqKv { layers: self.layers.iter().map(|k| k.clone_prefix(n)).collect() }
+        // A GDN state is only meaningful at exactly its own length — there is
+        // no "state at position n" to slice out. Callers gate on
+        // [`Self::has_recurrent_state`]; if one slips through at the wrong
+        // length, a fresh state (plus an advisory) is strictly safer than a
+        // silently wrong one, because the clone then decodes as if the prefix
+        // had never been seen by the linear layers — visible garbage, not a
+        // plausible-looking near-miss.
+        let gdn = self
+            .gdn
+            .iter()
+            .map(|g| match g {
+                Some(st) if st.len == n => Some(st.clone()),
+                Some(st) => {
+                    peregrine_io::note_advisory_err(
+                        "SeqKv::clone_prefix on recurrent state",
+                        &format!("state at {} cloned at {n}; reset instead", st.len),
+                    );
+                    Some(GdnState::new_like(st))
+                }
+                None => None,
+            })
+            .collect();
+        SeqKv { layers: self.layers.iter().map(|k| k.clone_prefix(n)).collect(), gdn }
     }
+
+    /// The first `n` positions of every layer as plain `f32` vectors — the
+    /// disk-persistence seam (`COLI_KV_STORE_DIR`). Reads go through the same
+    /// [`KvSpan`](crate::attention::KvSpan)s attention itself uses, so the
+    /// export sees exactly the values a forward would.
+    ///
+    /// Round-trip exactness: an `f16` cache exports through the widening
+    /// `f16 → f32` (exact), and [`Self::import`] re-narrows values that were
+    /// `f16` back to the identical bits — so export/import is lossless for
+    /// both dtypes *when the importing cache uses the same dtype*, which the
+    /// disk store enforces via its header.
+    pub fn export_prefix(&self, n: usize) -> KvExport {
+        let n = n.min(self.len());
+        let layers = self
+            .layers
+            .iter()
+            .map(|k| {
+                // The indexer stream is exported only when it is row-aligned
+                // with the latents from position 0. Mid-sequence DSA enablement
+                // leaves `ix` shorter than `len` with its rows belonging to
+                // *later* positions; exporting those as rows 0..ix_rows would
+                // rebuild a silently misaligned cache. Dropping `ix` is safe —
+                // it degrades DSA selection for the restored prefix, never
+                // correctness of the latents.
+                let ixw = if k.index_len() == k.len() { k.ix_width() } else { 0 };
+                let mut lc = Vec::new();
+                let mut rc = Vec::new();
+                let mut ix = Vec::new();
+                k.lc_span(n).extend_f32(n, k.kv_lora_width(), &mut lc);
+                k.rc_span(n).extend_f32(n, k.qk_rope_width(), &mut rc);
+                if ixw > 0 {
+                    k.ix_span(n).extend_f32(n, ixw, &mut ix);
+                }
+                KvLayerExport { lc, rc, ix, ix_width: ixw }
+            })
+            .collect();
+        KvExport { n, layers }
+    }
+
+    /// Rebuild a cache from an export — the inverse of [`Self::export_prefix`].
+    /// Widths are validated against `cfg` before any row lands, and every row
+    /// goes through the same order-checked [`LayerKv::append`] path prefill
+    /// uses, so an import can never construct a cache prefill could not.
+    pub fn import(cfg: &Cfg, dt: KvDtype, ex: &KvExport) -> Result<SeqKv, Error> {
+        let (kvl, qkr) = (cfg.kv_row_a() as usize, cfg.kv_row_b() as usize);
+        if ex.layers.len() != cfg.n_layers as usize {
+            return Err(Error::Format(format!(
+                "KV import: {} layers in the export, model has {}",
+                ex.layers.len(),
+                cfg.n_layers
+            )));
+        }
+        let mut kv = SeqKv::with_dtype(cfg, dt);
+        for (k, le) in kv.layers.iter_mut().zip(&ex.layers) {
+            if le.lc.len() != ex.n * kvl || le.rc.len() != ex.n * qkr {
+                return Err(Error::Format(format!(
+                    "KV import: layer stream lengths ({}, {}) do not match {} rows of ({kvl}, {qkr})",
+                    le.lc.len(),
+                    le.rc.len(),
+                    ex.n
+                )));
+            }
+            if le.ix_width > 0 && le.ix.len() != ex.n * le.ix_width {
+                return Err(Error::Format(format!(
+                    "KV import: indexer stream is {} elements, expected {} rows of {}",
+                    le.ix.len(),
+                    ex.n,
+                    le.ix_width
+                )));
+            }
+            for r in 0..ex.n {
+                k.append(r, &le.lc[r * kvl..(r + 1) * kvl], &le.rc[r * qkr..(r + 1) * qkr])?;
+            }
+            if le.ix_width > 0 {
+                for row in le.ix.chunks_exact(le.ix_width) {
+                    k.append_index_key(row);
+                }
+            }
+        }
+        Ok(kv)
+    }
+}
+
+/// One layer's exported KV streams (see [`SeqKv::export_prefix`]): flat
+/// row-major `f32`, `n` rows each of the layer's own widths.
+pub struct KvLayerExport {
+    pub lc: Vec<f32>,
+    pub rc: Vec<f32>,
+    /// DSA indexer keys; empty (with `ix_width == 0`) when the layer has none
+    /// or they were not aligned enough to export.
+    pub ix: Vec<f32>,
+    pub ix_width: usize,
+}
+
+/// A `SeqKv` prefix as plain vectors — the unit the serve-side disk store
+/// (`COLI_KV_STORE_DIR`) serializes and restores.
+pub struct KvExport {
+    /// Positions exported.
+    pub n: usize,
+    pub layers: Vec<KvLayerExport>,
 }
 
 /// Memory this process may actually use, in bytes (0 if unreadable): the smaller of
@@ -492,18 +807,66 @@ fn host_mem_available_bytes() -> u64 {
     0
 }
 
+/// The `0::<path>` line of a `/proc/self/cgroup` dump — the process's own v2
+/// cgroup, relative to the hierarchy root. Pure so the parse is testable.
+fn self_cgroup_v2_rel(contents: &str) -> Option<&str> {
+    contents.lines().find_map(|l| l.strip_prefix("0::")).map(str::trim)
+}
+
+/// Every directory from the process's cgroup up to the hierarchy root, leaf
+/// first. The kernel enforces the *tightest* limit on this path, and a
+/// transient `systemd-run --scope -p MemoryMax=` puts its limit several levels
+/// below the root — the 2026-08-15 stage-5 arm OOM'd exactly there: auto
+/// ecache read the root's `max`, sized 26 GB inside a 34G scope that already
+/// held the weights, and the kernel ended the arm at boot. Pure for the test.
+fn cgroup_walk_dirs(rel: &str) -> Vec<std::path::PathBuf> {
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let mut dir = root.join(rel.trim_start_matches('/'));
+    let mut dirs = Vec::new();
+    loop {
+        dirs.push(dir.clone());
+        if dir == root || !dir.pop() {
+            break;
+        }
+    }
+    dirs
+}
+
 /// Bytes left inside this process's cgroup memory controller, `None` when there is no
 /// limit or no controller. Tries v2's unified hierarchy first, then v1.
 ///
-/// Reads the cgroup *root* paths rather than resolving `/proc/self/cgroup`, because in
-/// the case that matters — a containerized process — the container's cgroup is
-/// mounted as its root, so these are its own limits.
+/// v2 is probed twice, and the tighter answer wins: once walking
+/// `/proc/self/cgroup` up to the root (the transient-scope case above), and
+/// once at the cgroup *root* paths — because in a containerized process the
+/// container's cgroup is mounted as its root and `/proc/self/cgroup` may name
+/// a path its mount namespace does not expose.
 fn cgroup_available_bytes() -> Option<u64> {
-    let v2 = (read_cgroup_file("/sys/fs/cgroup/memory.max"), read_cgroup_file("/sys/fs/cgroup/memory.current"));
-    if let (Some(max), Some(cur)) = v2 {
-        if let Some(v) = crate::ram::cgroup_v2_available(&max, &cur) {
-            return Some(v);
+    let mut best: Option<u64> = None;
+    let mut consider = |max: Option<String>, cur: Option<String>| {
+        if let (Some(max), Some(cur)) = (max, cur) {
+            if let Some(v) = crate::ram::cgroup_v2_available(&max, &cur) {
+                best = Some(best.map_or(v, |b| b.min(v)));
+            }
         }
+    };
+    if let Some(rel) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .as_deref()
+        .and_then(self_cgroup_v2_rel)
+    {
+        for dir in cgroup_walk_dirs(rel) {
+            consider(
+                read_cgroup_file(&dir.join("memory.max").to_string_lossy()),
+                read_cgroup_file(&dir.join("memory.current").to_string_lossy()),
+            );
+        }
+    }
+    consider(
+        read_cgroup_file("/sys/fs/cgroup/memory.max"),
+        read_cgroup_file("/sys/fs/cgroup/memory.current"),
+    );
+    if best.is_some() {
+        return best;
     }
     let limit = read_cgroup_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")?;
     // An unreadable usage file means "unknown", which the parser reads as zero
@@ -534,22 +897,70 @@ fn read_cgroup_file(path: &str) -> Option<String> {
     }
 }
 
-/// Warm-cache byte budget from the environment: `COLI_ECACHE_GB` (GiB float) if
-/// set, else 10% of `MemAvailable` capped at 2 GiB. `0` (or an unparseable value)
+/// How `COLI_ECACHE_GB` was spelled: an explicit byte budget, or the ds4-style
+/// `auto` fraction of `MemAvailable`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EcacheSpec {
+    /// Explicit GiB (`0` = disabled) — the historical spelling, byte-for-byte.
+    Fixed(usize),
+    /// `auto`: this fraction of `MemAvailable` at resolution time.
+    AutoFrac(f64),
+}
+
+/// Pure parse of the `COLI_ECACHE_GB` spelling (`frac` is
+/// `COLI_ECACHE_AUTO_FRAC`, consulted only for `auto`). `None` = unparseable;
+/// the caller notes the advisory and disables the cache, the historical
+/// behavior for garbage input.
+///
+/// The default fraction is ds4/DwarfStar's budget rule — 80% of the backend's
+/// recommended working set — which lands here as 80% of post-load
+/// `MemAvailable`: read after the resident weights are mapped, so they are
+/// already netted out, exactly the subtraction ds4 does explicitly. Clamped to
+/// (0, 0.95]: a fraction of 1.0 would hand the cache every byte the box has
+/// left, and `cap_ecache_budget`'s reserve-and-safety cut still applies on top.
+fn parse_ecache_spec(v: &str, frac: Option<&str>) -> Option<EcacheSpec> {
+    const GIB: f64 = (1u64 << 30) as f64;
+    let t = v.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        let f = frac
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .map(|f| f.min(0.95))
+            .unwrap_or(0.80);
+        return Some(EcacheSpec::AutoFrac(f));
+    }
+    t.parse::<f64>().ok().map(|g| EcacheSpec::Fixed((g.max(0.0) * GIB) as usize))
+}
+
+/// Warm-cache byte budget from the environment: `COLI_ECACHE_GB` (GiB float,
+/// or `auto` for a `COLI_ECACHE_AUTO_FRAC` share of `MemAvailable`) if set,
+/// else 10% of `MemAvailable` capped at 2 GiB. `0` (or an unparseable value)
 /// disables the cache. Kept independent of the streaming-vs-resident RAM
 /// heuristic so the two knobs don't interfere.
 fn ecache_budget_bytes() -> usize {
     const GIB: f64 = (1u64 << 30) as f64;
     match std::env::var("COLI_ECACHE_GB") {
         Ok(v) => {
-            let g: f64 = match v.trim().parse() {
-                Ok(g) => g,
+            let frac_env = match std::env::var("COLI_ECACHE_AUTO_FRAC") {
+                Ok(f) => Some(f),
+                Err(std::env::VarError::NotPresent) => None,
                 Err(e) => {
-                    peregrine_io::note_advisory_err("COLI_ECACHE_GB parse (cache disabled)", &e);
-                    0.0
+                    peregrine_io::note_advisory_err("COLI_ECACHE_AUTO_FRAC read", &e);
+                    None
                 }
             };
-            return (g.max(0.0) * GIB) as usize;
+            return match parse_ecache_spec(&v, frac_env.as_deref()) {
+                Some(EcacheSpec::Fixed(b)) => b,
+                Some(EcacheSpec::AutoFrac(f)) => (f * mem_available_bytes() as f64) as usize,
+                None => {
+                    let e = std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("expected GiB or 'auto', got {v:?}"),
+                    );
+                    peregrine_io::note_advisory_err("COLI_ECACHE_GB parse (cache disabled)", &e);
+                    0
+                }
+            };
         }
         Err(std::env::VarError::NotPresent) => {}
         Err(e) => peregrine_io::note_advisory_err("COLI_ECACHE_GB read", &e),
@@ -651,10 +1062,95 @@ fn max_expert_region_bytes(st: &SafeTensors) -> usize {
     max + 2 * peregrine_io::ALIGN
 }
 
+/// The layer-step clock the forward loops advance and the prefetch workers read.
+///
+/// Exists because a speculative warm is only worth its disk read *inside the layer
+/// boundary it was emitted for*. The 2026-08-13 defaults run measured the failure
+/// mode this closes: at B=16 the rings run at 93 % duty, the unbounded prefetch
+/// queue backlogs by minutes, and by the time the lane services an item the demand
+/// path has long since streamed — and the cache long since evicted — that expert.
+/// 40 352 of 41 159 speculative reads (98.6 %) were classified wasted, ~12.6 % of
+/// all disk reads on an engine whose wall clock *is* its disk time. A late
+/// speculation is not a cheap miss; it is a demand read's bandwidth spent on a
+/// guess about a token that already happened.
+///
+/// `step` advances once per layer the forward sweep executes (decode, batched
+/// decode, and external-KV prefill — the paths whose demand reads churn the cache).
+/// A `Warm` batch is stamped with `step` at emit; the worker drops items once
+/// `step` has moved more than `slack` past their stamp, *before* paying the read.
+/// `slack` is in layer-steps: an item emitted during step `s` targets the layer
+/// executing at `s + 1`, so the default slack of 1 keeps exactly the window the
+/// emitter designed for. `slack == u64::MAX` disables the gate
+/// (`COLI_PREFETCH_STALE_DROP=0`) — the historical behaviour, which was the
+/// default until the 2026-08-16 REPEATS=3 confirmation licensed the flip
+/// (see [`Self::from_env_values`]; slack via `COLI_PREFETCH_STALE_SLACK`).
+///
+/// Read from env at model build, not through a process-global `OnceLock`: the
+/// route-min-share measurement was voided by exactly that latch (both A/B arms in
+/// one process saw the first arm's value), and this knob exists to be A/B'd.
+struct SweepClock {
+    /// Layer-step ordinal, monotonically increasing across the model's lifetime.
+    step: std::sync::atomic::AtomicU64,
+    /// Layer-steps past its stamp a warm item stays serviceable; `u64::MAX` = gate off.
+    slack: std::sync::atomic::AtomicU64,
+}
+
+impl SweepClock {
+    fn from_env() -> SweepClock {
+        SweepClock::from_env_values(
+            std::env::var("COLI_PREFETCH_STALE_DROP").ok().as_deref(),
+            std::env::var("COLI_PREFETCH_STALE_SLACK").ok().as_deref(),
+        )
+    }
+
+    /// The env resolution as a pure function of the two values, so both sides
+    /// of the default are testable without mutating the process environment.
+    ///
+    /// **Default ON as of 2026-08-16** — flipped on the REPEATS=3 confirmation
+    /// (B=16 medians 0.072 → 0.077 tok/s, +6.9%, matching the +7% screen;
+    /// bench-data/2026-08-15-queue/confirm-stale-drop-b16). `=0`/`false` is
+    /// the escape hatch back to the historical service-everything lane, same
+    /// pattern as every other measured default flip in this repo.
+    fn from_env_values(drop: Option<&str>, slack: Option<&str>) -> SweepClock {
+        let off = matches!(drop, Some("0") | Some("false"));
+        let slack = if off {
+            u64::MAX
+        } else {
+            slack.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1)
+        };
+        SweepClock {
+            step: std::sync::atomic::AtomicU64::new(0),
+            slack: std::sync::atomic::AtomicU64::new(slack),
+        }
+    }
+
+    /// The current layer-step, for stamping a `Warm` batch at emit time.
+    fn now(&self) -> u64 {
+        self.step.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Advance one layer-step. Called by the forward loops as each layer executes.
+    fn tick(&self) {
+        self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a warm item stamped at `stamp` is past its service window at `now`.
+///
+/// Pure, so the boundary cases are testable without a model or a lane thread. A
+/// `u64::MAX` stamp (the bulk warms: `tiers.json` seed, expert replicas — deliberate
+/// transfers, not layer-boundary speculation) saturates to a zero age and is never
+/// stale; likewise `slack == u64::MAX` (gate off) admits any age.
+fn warm_item_is_stale(now: u64, stamp: u64, slack: u64) -> bool {
+    now.saturating_sub(stamp) > slack
+}
+
 /// Messages to the background prefetch lane.
 enum PrefetchMsg {
     /// Warm these experts into the shared cache (skipping ones already resident).
-    Warm(Vec<crate::concurrent::PrefetchItem>),
+    /// The `u64` is the [`SweepClock`] stamp at emit; `u64::MAX` marks a deliberate
+    /// (non-speculative) warm the stale gate must never drop.
+    Warm(Vec<crate::concurrent::PrefetchItem>, u64),
     /// Page-cache-hint these low-confidence experts via `fadvise(WILLNEED)` — no
     /// streaming, no cache insert (multi-path tier 2).
     Hint(Vec<crate::concurrent::HintItem>),
@@ -732,7 +1228,13 @@ fn prefetch_lanes() -> usize {
 /// Spawn `lanes` prefetch workers sharing `cache`, each on its own ring. Read
 /// `COLI_PREFETCH_VERIFY` fresh here (not a process-global) so it can be toggled at
 /// load time: when set, each worker re-reads and byte-compares its speculative loads.
-fn spawn_prefetch_pool(cache: &Arc<Mutex<WarmCache>>, st: &SafeTensors, direct: bool, lanes: usize) -> Result<PrefetchPool, Error> {
+fn spawn_prefetch_pool(
+    cache: &Arc<Mutex<WarmCache>>,
+    st: &SafeTensors,
+    direct: bool,
+    lanes: usize,
+    sweep: &Arc<SweepClock>,
+) -> Result<PrefetchPool, Error> {
     let lanes = lanes.max(1);
     let verify = matches!(std::env::var("COLI_PREFETCH_VERIFY").as_deref(), Ok("1") | Ok("true"));
     let mut handles = Vec::with_capacity(lanes);
@@ -742,12 +1244,13 @@ fn spawn_prefetch_pool(cache: &Arc<Mutex<WarmCache>>, st: &SafeTensors, direct: 
             reactor.configure_slab(max_expert_region_bytes(st), 2);
         }
         let cache = Arc::clone(cache);
+        let sweep = Arc::clone(sweep);
         let (tx, rx) = crossbeam_channel::unbounded::<PrefetchMsg>();
         let join = std::thread::Builder::new()
             .name(format!("peregrine-prefetch-{i}"))
             .spawn(move || {
                 numa_pin_worker(i); // opt-in NUMA affinity (COLI_NUMA_PIN=1)
-                prefetch_worker(reactor, cache, rx, direct, verify)
+                prefetch_worker(reactor, cache, rx, direct, verify, sweep)
             })
             .map_err(|e| Error::Format(format!("spawn prefetch thread: {e}")))?;
         handles.push(PrefetchHandle { tx, join: Some(join) });
@@ -833,10 +1336,12 @@ fn route_hist_depth() -> usize {
 /// `[0.0, 1.0]` (default 0.6 → 6000 bp); read once.
 ///
 /// The knob is spelled as a fraction because that is what it meant when only
-/// [`crate::PhaseTracker`] read it — and until 2026-08-08 `PhaseTracker` was the *only*
+/// `PhaseTracker` read it — and until 2026-08-08 that struct was the *only*
 /// reader, while having no production caller, so the documented default governed
 /// nothing. The live predictor used a hardcoded `6000`. This converts at the boundary
 /// so one env var drives both and the units stay honest on each side.
+/// (`PhaseTracker` itself was deleted 2026-08-14 on the `COLI_PREDICT_EVAL`
+/// scoreboard — see `workload.rs`'s module doc; the fraction spelling stays.)
 fn phase_threshold_bp() -> u32 {
     use std::sync::OnceLock;
     static BP: OnceLock<u32> = OnceLock::new();
@@ -917,7 +1422,8 @@ fn router_lookahead_batch() -> bool {
 
 /// The arms the predictor scoreboard compares, in the order the forward loop stashes
 /// them. See [`predict_eval_init`].
-const PREDICT_EVAL_ARMS: [&str; 3] = ["router-lookahead", "predictor", "prev-token"];
+const PREDICT_EVAL_ARMS: [&str; 4] =
+    ["router-lookahead", "router-lookahead-2", "predictor", "prev-token"];
 
 /// Build the predictor scoreboard when `COLI_PREDICT_EVAL=1`
 /// (`COLI_PREDICT_EVAL_N` candidates per arm, default: the model's top-k, so recall
@@ -926,6 +1432,14 @@ const PREDICT_EVAL_ARMS: [&str; 3] = ["router-lookahead", "predictor", "prev-tok
 /// Three arms, chosen so the comparison is the one that matters:
 ///
 /// - **`router-lookahead`** — layer `L+1`'s router applied to layer `L`'s output.
+/// - **`router-lookahead-2`** — layer `L+1`'s router applied to layer `L-1`'s
+///   output: the same prediction issued one full layer-sweep earlier. At 93% io
+///   duty a Δ=1 warm often cannot finish before its layer executes (the late
+///   fraction of the measured 98.6% prefetch waste), so lead time — not recall —
+///   is what Δ=2 buys; this arm prices the recall it costs (residual-stream
+///   drift across the skipped layer). The first sparse layer of each step has no
+///   two-back producer and scores an empty prediction there — a fixed, small
+///   understatement shared by every step, not noise.
 /// - **`predictor`** — whatever [`PredictSource`] is configured: momentum, the
 ///   transition automaton, macro-states. A statistic over the router's past answers.
 /// - **`prev-token`** — the previous token's routed set at that layer, verbatim. The
@@ -1396,6 +1910,9 @@ struct PrefetchCtx<'a> {
     /// Under O_DIRECT the page cache is bypassed, so tier-2 hints are pointless and
     /// suppressed.
     direct: bool,
+    /// Stamps each `Warm` batch with the layer-step it was emitted in, so the lane
+    /// can drop it unread once its window has passed ([`SweepClock`]).
+    sweep: &'a SweepClock,
 }
 
 impl PrefetchCtx<'_> {
@@ -1457,7 +1974,7 @@ impl PrefetchCtx<'_> {
                 rank += 1;
             }
         }
-        if !warms.is_empty() && self.prefetch.tx.send(PrefetchMsg::Warm(warms)).is_err() {
+        if !warms.is_empty() && self.prefetch.tx.send(PrefetchMsg::Warm(warms, self.sweep.now())).is_err() {
             peregrine_io::note_advisory_err("prefetch warm dispatch", &"prefetch lane is down");
         }
         if !hints.is_empty() && self.prefetch.tx.send(PrefetchMsg::Hint(hints)).is_err() {
@@ -1486,6 +2003,9 @@ struct LookaheadCtx<'a> {
     /// Same load-time expert map [`PrefetchCtx`] carries; `None` falls back to
     /// re-deriving plans per request, which is what this path did before.
     expert_index: Option<&'a crate::concurrent::ExpertIndex>,
+    /// Stamps each `Warm` batch with the layer-step it was emitted in, so the lane
+    /// can drop it unread once its window has passed ([`SweepClock`]).
+    sweep: &'a SweepClock,
 }
 
 impl LookaheadCtx<'_> {
@@ -1530,7 +2050,7 @@ impl LookaheadCtx<'_> {
             return;
         }
         LOOKAHEAD_ISSUED.fetch_add(warms.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        if self.prefetch.tx.send(PrefetchMsg::Warm(warms)).is_err() {
+        if self.prefetch.tx.send(PrefetchMsg::Warm(warms, self.sweep.now())).is_err() {
             peregrine_io::note_advisory_err("lookahead dispatch", &"prefetch lane is down");
         }
     }
@@ -1645,15 +2165,19 @@ fn router_ranks_for_batch(l: &LayerW, cfg: &Cfg, x: &[f32], s_n: usize, per_row:
 /// token's set there, which is precisely the `prev-token` baseline. Predicting before
 /// scoring, or scoring after the next layer runs, would quietly change what both
 /// numbers mean.
-fn score_and_stash(
-    eval: &Mutex<crate::predeval::PredictEval>,
-    rh: &Mutex<RouteHistory>,
-    predictor: &PredictSource,
-    layers: &[LayerW],
-    cfg: &Cfg,
-    li: usize,
-    x: &[f32],
-) {
+/// The forward-invariant borrows [`score_and_stash`] needs, bundled so the
+/// per-layer call stays under clippy's argument limit (the per-layer inputs
+/// `li`/`x`/`deep` travel separately). Built once before the layer loop.
+struct ScoreCtx<'a> {
+    eval: &'a Mutex<crate::predeval::PredictEval>,
+    rh: &'a Mutex<RouteHistory>,
+    predictor: &'a PredictSource,
+    layers: &'a [LayerW],
+    cfg: &'a Cfg,
+}
+
+fn score_and_stash(sc: &ScoreCtx, li: usize, x: &[f32], deep: &mut [Vec<i32>]) {
+    let ScoreCtx { eval, rh, predictor, layers, cfg } = sc;
     let width = eval.lock().width();
     let next = li + 1;
     let predict_next = next < layers.len() && layers[next].sparse && next >= cfg.first_dense as usize;
@@ -1686,11 +2210,26 @@ fn score_and_stash(
         (actual, prev, statistical)
     };
     let lookahead = if predict_next { router_ranks_for(&layers[next], cfg, x, width) } else { Vec::new() };
+    // The Δ=2 leg: `deep[next]` holds layer `next`'s router ranked against the
+    // hidden as it stood one layer earlier — stashed by the previous call. Take
+    // it (empty on the first sparse layer of the step, scored as such), then
+    // rank two-ahead against the current hidden for the call after this one.
+    // `deep` is per-forward-step state owned by the layer loop, so a stale
+    // prediction can never leak across tokens.
+    let lookahead2 = if predict_next {
+        std::mem::take(&mut deep[next])
+    } else {
+        Vec::new()
+    };
+    let two = li + 2;
+    if two < layers.len() && layers[two].sparse && two >= cfg.first_dense as usize {
+        deep[two] = router_ranks_for(&layers[two], cfg, x, width);
+    }
     let mut ev = eval.lock();
     ev.score(li, &actual);
     if predict_next {
         // Arm order must match `PREDICT_EVAL_ARMS`.
-        ev.stash(next, vec![lookahead, statistical, prev]);
+        ev.stash(next, vec![lookahead, lookahead2, statistical, prev]);
     }
 }
 
@@ -1746,6 +2285,7 @@ fn prefetch_worker(
     rx: crossbeam_channel::Receiver<PrefetchMsg>,
     direct: bool,
     verify: bool,
+    sweep: Arc<SweepClock>,
 ) {
     loop {
         // `recv`'s only error is `Disconnected` — the model dropped its sender,
@@ -1755,8 +2295,17 @@ fn prefetch_worker(
             Err(crossbeam_channel::RecvError) => break,
         };
         match msg {
-            PrefetchMsg::Warm(items) => {
+            PrefetchMsg::Warm(items, stamp) => {
                 for item in items {
+                    // Checked per item, not per batch: a batch can take long enough
+                    // to service that it goes stale midway, and the whole point is
+                    // to stop *before* the read. Two relaxed loads — cheaper than
+                    // the cache probe below.
+                    let slack = sweep.slack.load(std::sync::atomic::Ordering::Relaxed);
+                    if warm_item_is_stale(sweep.now(), stamp, slack) {
+                        cache.lock().note_prefetch_stale_dropped(1);
+                        continue;
+                    }
                     let key = item.key();
                     if cache.lock().contains(key) {
                         continue; // already warm — don't re-read
@@ -1808,6 +2357,22 @@ fn prefetch_worker(
     }
 }
 
+/// Load a Qwen3Next-family **zero-centered** RMSNorm weight as the effective
+/// gamma the engine's plain `w * x_hat` kernels expect: the checkpoint stores
+/// `w` with `forward = x_hat * (1 + w)` (weights initialized at ZERO —
+/// `Qwen3NextRMSNorm`, verbatim-verified 2026-08-16 after `x_hat * w` collapsed
+/// every activation of the real checkpoint), so storing `1 + w` at load keeps
+/// every hot path untouched. Applies to the hybrid's input/post layernorms,
+/// q/k norms and the final norm — NOT to the GDN's gated norm (`torch.ones`
+/// init, plain form) and NOT to classic Qwen3 or GLM, whose norms are plain.
+fn load_norm_zero_centered(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
+    let mut w = load_f32(st, name, n)?;
+    for v in &mut w {
+        *v += 1.0;
+    }
+    Ok(w)
+}
+
 fn load_f32(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
     let mut v = vec![0f32; n];
     st.read_f32(name, &mut v)?;
@@ -1817,13 +2382,114 @@ fn load_f32(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
 /// Load one transformer layer (`model.layers.{i}.*`). In streaming mode the
 /// routed experts are left on disk (presence-checked only); otherwise resident.
 /// Reused for both the main stack and the MTP head layer.
+/// The per-layer tensor prefix for this architecture — GLM/DeepSeek and dense
+/// Qwen3 checkpoints put the stack at `model.layers.*`; the Qwen3.5 hybrid's
+/// text stack lives under `model.language_model.layers.*` (the VL wrapper's
+/// naming, kept verbatim per the Track C contract).
+fn layer_prefix(cfg: &Cfg, i: usize) -> String {
+    match cfg.arch {
+        Arch::GlmMla | Arch::DenseGqa => format!("model.layers.{i}."),
+        Arch::HybridGdn => format!("model.language_model.layers.{i}."),
+    }
+}
+
+/// Whether the container carries any routed-expert tensors at all. A model
+/// without them (dense Qwen3, the Qwen3.5 hybrid, a hypothetical all-dense
+/// GLM) has nothing the streaming lane could ever read.
+fn has_routed_experts(st: &SafeTensors) -> bool {
+    st.tensors().iter().any(|t| t.name.contains(".mlp.experts."))
+}
+
+/// Where a layer's tensors live and how to read it, for layers that do not
+/// follow the main stack's schedule. The Qwen MTP head's layer sits under its
+/// own `mtp.layers.0.` prefix and is always a *dense full-attention* layer
+/// whatever the stack does at that index — so prefix, attention kind and
+/// sparsity all need overriding. `None` on a field means "derive it from the
+/// stack", which is what every main-stack layer does.
+#[derive(Clone, Copy, Default)]
+struct LayerSite<'a> {
+    prefix: Option<&'a str>,
+    full_attn: Option<bool>,
+    sparse: Option<bool>,
+}
+
 fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Result<LayerW, Error> {
+    load_layer_at(st, i, cfg, stream_experts, LayerSite::default())
+}
+
+fn load_layer_at(
+    st: &SafeTensors,
+    i: usize,
+    cfg: &Cfg,
+    stream_experts: bool,
+    site: LayerSite<'_>,
+) -> Result<LayerW, Error> {
     let d = cfg.hidden as usize;
     let h = cfg.n_heads as usize;
     let (qkh, vh) = (cfg.qk_head as usize, cfg.v_head as usize);
-    let (ql, kvl, qkr, qkn) = (cfg.q_lora as usize, cfg.kv_lora as usize, cfg.qk_rope as usize, cfg.qk_nope as usize);
-    let p = |s: &str| format!("model.layers.{i}.{s}");
-    let sparse = i >= cfg.first_dense as usize;
+    let (ql, kvl, qkn) = (cfg.q_lora as usize, cfg.kv_lora as usize, cfg.qk_nope as usize);
+    let qkr = cfg.qk_rope as usize;
+    let pre = site.prefix.map_or_else(|| layer_prefix(cfg, i), |s| s.to_string());
+    let p = |s: &str| format!("{pre}{s}");
+    let sparse = site.sparse.unwrap_or(i >= cfg.first_dense as usize);
+    // Full-attention vs the arch's linear/MLA lane, overridable for off-stack layers.
+    let is_full_attn = site
+        .full_attn
+        .unwrap_or(cfg.arch == Arch::DenseGqa || cfg.full_attn.get(i).copied().unwrap_or(false));
+
+    let attn = match cfg.arch {
+        Arch::GlmMla => LayerAttn::Mla {
+            q_a: QtWeight::load(st, &p("self_attn.q_a_proj.weight"), ql, d)?,
+            q_a_ln: load_f32(st, &p("self_attn.q_a_layernorm.weight"), ql)?,
+            q_b: QtWeight::load(st, &p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
+            kv_a: QtWeight::load(st, &p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d)?,
+            kv_a_ln: load_f32(st, &p("self_attn.kv_a_layernorm.weight"), kvl)?,
+            kv_b: QtWeight::load(st, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
+            o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, h * vh)?,
+        },
+        Arch::DenseGqa | Arch::HybridGdn if is_full_attn => {
+            let (nh, nkv, hd) = (cfg.n_heads as usize, cfg.n_kv_heads as usize, cfg.head_dim as usize);
+            // attn_output_gate widens q_proj to [2*nh*hd, d]: query rows then
+            // gate rows, the flat-chunk layout (Track C contract, gate-pinned).
+            let q_rows = if cfg.attn_gate { 2 * nh * hd } else { nh * hd };
+            LayerAttn::Gqa {
+                wq: QtWeight::load(st, &p("self_attn.q_proj.weight"), q_rows, d)?,
+                wk: QtWeight::load(st, &p("self_attn.k_proj.weight"), nkv * hd, d)?,
+                wv: QtWeight::load(st, &p("self_attn.v_proj.weight"), nkv * hd, d)?,
+                o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, nh * hd)?,
+                q_norm: if cfg.arch == Arch::HybridGdn {
+                    load_norm_zero_centered(st, &p("self_attn.q_norm.weight"), hd)?
+                } else {
+                    load_f32(st, &p("self_attn.q_norm.weight"), hd)?
+                },
+                k_norm: if cfg.arch == Arch::HybridGdn {
+                    load_norm_zero_centered(st, &p("self_attn.k_norm.weight"), hd)?
+                } else {
+                    load_f32(st, &p("self_attn.k_norm.weight"), hd)?
+                },
+            }
+        }
+        Arch::DenseGqa | Arch::HybridGdn => {
+            let (kh, vh_l, kd, vd) = (
+                cfg.lin_k_heads as usize,
+                cfg.lin_v_heads as usize,
+                cfg.lin_k_dim as usize,
+                cfg.lin_v_dim as usize,
+            );
+            let conv_dim = 2 * kh * kd + vh_l * vd;
+            LayerAttn::Gdn {
+                in_qkv: QtWeight::load(st, &p("linear_attn.in_proj_qkv.weight"), conv_dim, d)?,
+                in_z: QtWeight::load(st, &p("linear_attn.in_proj_z.weight"), vh_l * vd, d)?,
+                in_a: QtWeight::load(st, &p("linear_attn.in_proj_a.weight"), vh_l, d)?,
+                in_b: QtWeight::load(st, &p("linear_attn.in_proj_b.weight"), vh_l, d)?,
+                conv: load_f32(st, &p("linear_attn.conv1d.weight"), conv_dim * cfg.lin_conv_k as usize)?,
+                a_log: load_f32(st, &p("linear_attn.A_log"), vh_l)?,
+                dt_bias: load_f32(st, &p("linear_attn.dt_bias"), vh_l)?,
+                norm: load_f32(st, &p("linear_attn.norm.weight"), vd)?,
+                out: QtWeight::load(st, &p("linear_attn.out_proj.weight"), d, vh_l * vd)?,
+            }
+        }
+    };
 
     let (mut dense, mut router, mut router_bias, mut shared, mut experts) =
         (None, Vec::new(), Vec::new(), None, Vec::new());
@@ -1844,7 +2510,7 @@ fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Re
             down: QtWeight::load(st, &p("mlp.shared_experts.down_proj.weight"), d, si)?,
         });
         for e in 0..e_n {
-            let pe = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
+            let pe = |s: &str| format!("{pre}mlp.experts.{e}.{s}");
             if stream_experts {
                 // don't hold experts resident; verify presence so a malformed
                 // checkpoint fails at load, not mid-decode.
@@ -1865,15 +2531,17 @@ fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Re
     }
 
     Ok(LayerW {
-        in_ln: load_f32(st, &p("input_layernorm.weight"), d)?,
-        post_ln: load_f32(st, &p("post_attention_layernorm.weight"), d)?,
-        q_a: QtWeight::load(st, &p("self_attn.q_a_proj.weight"), ql, d)?,
-        q_a_ln: load_f32(st, &p("self_attn.q_a_layernorm.weight"), ql)?,
-        q_b: QtWeight::load(st, &p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
-        kv_a: QtWeight::load(st, &p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d)?,
-        kv_a_ln: load_f32(st, &p("self_attn.kv_a_layernorm.weight"), kvl)?,
-        kv_b: QtWeight::load(st, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
-        o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, h * vh)?,
+        in_ln: if cfg.arch == Arch::HybridGdn {
+            load_norm_zero_centered(st, &p("input_layernorm.weight"), d)?
+        } else {
+            load_f32(st, &p("input_layernorm.weight"), d)?
+        },
+        post_ln: if cfg.arch == Arch::HybridGdn {
+            load_norm_zero_centered(st, &p("post_attention_layernorm.weight"), d)?
+        } else {
+            load_f32(st, &p("post_attention_layernorm.weight"), d)?
+        },
+        attn,
         sparse,
         dense,
         router,
@@ -1908,15 +2576,95 @@ fn rmsnorm_rows(x: &[f32], w: &[f32], s_n: usize, d: usize, eps: f32) -> Vec<f32
 /// Forward one transformer layer in place: `x += attn(norm(x)); x += ffn(norm(x))`.
 /// Shared by the main stack and the MTP head; the sparse-MoE streaming/GPU lanes
 /// apply exactly as in the main loop. Compute state travels in [`ForwardCtx`].
+/// One layer's mutable sequence state: the KV cache every architecture except
+/// GDN appends to, and the GDN recurrent state when the calling path can
+/// supply one (`None` on external-KV / replay / MTP paths, which is what makes
+/// a GDN layer there a clean error instead of silent corruption).
+struct LayerState<'a> {
+    kv: &'a mut LayerKv,
+    gdn: Option<&'a mut GdnState>,
+}
+
+/// Accumulator for the calibration capture pass (`COLI_CALIB_CAPTURE`, ideas
+/// #7): per expert-bearing layer, `Σ|x|` per hidden channel over every
+/// main-stream row that reached the MoE branch, plus that layer's row count.
+/// Pooled per layer on purpose — every expert in a layer sees the same
+/// pre-gating hidden distribution, which is what makes ~16 routed
+/// samples/expert/layer of per-expert statistics unnecessary.
+///
+/// Rows are `n_layers + 1` in the `HeatTable` convention. The MTP row exists
+/// but never accumulates: capture runs draft nothing, and draft forwards
+/// deliberately carry `calib: None`. Its sidecar row is therefore empty and
+/// the converter falls back to data-free rounding for the MTP experts —
+/// combine `--calib` with `--keep-last-layers` when they should be protected
+/// instead.
+pub struct CalibAccum {
+    sums: Vec<Vec<f64>>,
+    rows: Vec<u64>,
+    hidden: usize,
+}
+
+impl CalibAccum {
+    fn new(n_layers: usize, hidden: usize) -> CalibAccum {
+        CalibAccum { sums: vec![Vec::new(); n_layers + 1], rows: vec![0; n_layers + 1], hidden }
+    }
+
+    /// Fold `s_n` rows of a layer's MoE input into the running per-channel
+    /// `Σ|x|`. The row width is trusted to be `hidden` — the caller passes the
+    /// same `nrm2` it hands the router.
+    fn accumulate(&mut self, li: usize, x: &[f32], s_n: usize) {
+        let d = self.hidden;
+        let (Some(sum), Some(rows)) = (self.sums.get_mut(li), self.rows.get_mut(li)) else {
+            return;
+        };
+        if sum.is_empty() {
+            sum.resize(d, 0.0);
+        }
+        for r in 0..s_n {
+            let Some(row) = x.get(r * d..(r + 1) * d) else { break };
+            for (acc, &v) in sum.iter_mut().zip(row) {
+                *acc += f64::from(v.abs());
+            }
+        }
+        *rows += s_n as u64;
+    }
+
+    /// The sidecar value: mean `|x|` per channel per layer, empty rows for
+    /// layers that never accumulated (dense layers, the MTP row).
+    fn to_sidecar_json(&self) -> serde_json::Value {
+        let layers: Vec<serde_json::Value> = self
+            .sums
+            .iter()
+            .zip(&self.rows)
+            .map(|(sum, &n)| {
+                if sum.is_empty() || n == 0 {
+                    serde_json::json!([])
+                } else {
+                    let means: Vec<f64> = sum.iter().map(|s| s / n as f64).collect();
+                    serde_json::json!(means)
+                }
+            })
+            .collect();
+        serde_json::json!({
+            "version": 1,
+            "stat": "mean_abs",
+            "hidden": self.hidden,
+            "positions": self.rows.iter().copied().max().unwrap_or(0),
+            "layers": layers,
+        })
+    }
+}
+
 fn forward_layer(
     l: &LayerW,
     li: usize,
-    kv: &mut LayerKv,
+    state: LayerState<'_>,
     ctx: &ForwardCtx,
     x: &mut [f32],
     s_n: usize,
     pos_base: usize,
 ) -> Result<(), Error> {
+    let LayerState { kv, gdn } = state;
     let cfg = ctx.cfg;
     let d = cfg.hidden as usize;
     let eps = cfg.eps;
@@ -1934,16 +2682,34 @@ fn forward_layer(
     // with an indexer and `COLI_DSA=1` takes the dense-sparse path even when
     // `COLI_MLA_ABSORB` is also set — stated here rather than left to
     // whichever branch happened to come first.
-    let attn = match (ctx.dsa.then_some(()).and(l.indexer.as_ref()), ctx.absorb) {
-        (Some(ix), _) => mla_attention_dsa_indexed(&l.attn(), ix, &nrm, s_n, pos_base, kv, cfg)?,
-        (None, true) => mla_attention_absorb(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?,
-        (None, false) => mla_attention(&l.attn(), &nrm, s_n, pos_base, kv, cfg)?,
+    let attn = match &l.attn {
+        LayerAttn::Gqa { .. } => crate::attention::gqa_attention(&l.gqa(cfg.attn_gate)?, &nrm, s_n, pos_base, kv, cfg)?,
+        LayerAttn::Gdn { .. } => {
+            // A GDN layer's context lives in a recurrent state, not the KV
+            // cache. Paths that cannot supply one (external-KV serving, RLM
+            // replay, the GLM MTP head) get a clean refusal — Track C phase 2
+            // gives serving its own per-sequence state.
+            let st_g = gdn.ok_or_else(|| {
+                Error::Format(format!("layer {li}: gated-DeltaNet needs a recurrent state on this path (hybrid serving is Track C phase 2)"))
+            })?;
+            crate::gdn::gdn_forward(&l.gdn()?, &nrm, s_n, st_g, cfg)?
+        }
+        LayerAttn::Mla { .. } => match (ctx.dsa.then_some(()).and(l.indexer.as_ref()), ctx.absorb) {
+            (Some(ix), _) => mla_attention_dsa_indexed(&l.attn()?, ix, &nrm, s_n, pos_base, kv, cfg)?,
+            (None, true) => mla_attention_absorb(&l.attn()?, &nrm, s_n, pos_base, kv, cfg)?,
+            (None, false) => mla_attention(&l.attn()?, &nrm, s_n, pos_base, kv, cfg)?,
+        },
     };
     for z in 0..s_n * d {
         x[z] += attn[z];
     }
     let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
     let ffn: Vec<f32> = if l.sparse {
+        // Calibration capture sees exactly what the router is about to see —
+        // the one place "the MoE input's channel magnitudes" is unambiguous.
+        if let Some(cal) = ctx.calib {
+            cal.lock().accumulate(li, &nrm2, s_n);
+        }
         if ctx.stream_experts {
             moe_forward_dispatch(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
         } else {
@@ -1972,6 +2738,7 @@ fn forward_layer_batched(
     l: &LayerW,
     li: usize,
     caches: &mut [&mut LayerKv],
+    gstates: &mut [Option<&mut GdnState>],
     rows_at: RowLayout,
     ctx: &ForwardCtx,
     x: &mut [f32],
@@ -1981,12 +2748,61 @@ fn forward_layer_batched(
     let eps = cfg.eps;
     let s_n = rows_at.len();
     let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
-    let attn = mla_attention_rows(&l.attn(), &nrm, rows_at, caches, cfg, ctx.absorb)?;
+    let attn = match &l.attn {
+        LayerAttn::Mla { .. } => mla_attention_rows(&l.attn()?, &nrm, rows_at, caches, cfg, ctx.absorb)?,
+        LayerAttn::Gqa { .. } => {
+            // Batched GQA decode: each row attends its own cache, so the batch
+            // form is the single form per row (the MoE-free analogue of what
+            // mla_attention_rows does; rows share nothing but weights).
+            let w = l.gqa(cfg.attn_gate)?;
+            let mut out = vec![0.0f32; s_n * d];
+            for s in 0..s_n {
+                let row = crate::attention::gqa_attention(
+                    &w,
+                    &nrm[s * d..(s + 1) * d],
+                    1,
+                    rows_at.pos_of[s],
+                    caches[rows_at.owner[s]],
+                    cfg,
+                )?;
+                out[s * d..(s + 1) * d].copy_from_slice(&row);
+            }
+            out
+        }
+        LayerAttn::Gdn { .. } => {
+            // Row s advances its owner's recurrent state by one token. Rows of
+            // one owner arrive in ascending position order (decode is one row
+            // per sequence; a fused prefill chunk is consecutive positions of
+            // one sequence), and this loop runs them in row order — the same
+            // sequential contract `gdn_one_call_matches_stepwise` pins.
+            let w = l.gdn()?;
+            let mut out = vec![0.0f32; s_n * d];
+            for s in 0..s_n {
+                let owner = rows_at.owner[s];
+                let st = gstates
+                    .get_mut(owner)
+                    .and_then(|g| g.as_deref_mut())
+                    .ok_or_else(|| {
+                        Error::Format(format!(
+                            "layer {li}: row {s}'s sequence {owner} has no recurrent state (cache built for another architecture?)"
+                        ))
+                    })?;
+                let row = crate::gdn::gdn_forward(&w, &nrm[s * d..(s + 1) * d], 1, st, cfg)?;
+                out[s * d..(s + 1) * d].copy_from_slice(&row);
+            }
+            out
+        }
+    };
     for z in 0..s_n * d {
         x[z] += attn[z];
     }
     let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
     let ffn: Vec<f32> = if l.sparse {
+        // Same capture point as `forward_layer` — the batched rows are main
+        // stream too (draft rows never reach here with `calib` set).
+        if let Some(cal) = ctx.calib {
+            cal.lock().accumulate(li, &nrm2, s_n);
+        }
         if ctx.stream_experts {
             moe_forward_dispatch(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
         } else {
@@ -2086,6 +2902,20 @@ impl Model {
         } else {
             stream_experts
         };
+        // A container with no routed-expert tensors has nothing to stream, and
+        // honoring a streaming request anyway builds rings, transient reserves
+        // and a warm cache for a lane that will never read a byte — measured on
+        // the first resident Qwen boot as a 10.2 GB stream reserve in the [ram]
+        // projection of a model that fits whole in RAM (serve hard-requests
+        // streaming, which is also why COLI_STREAM=0 appeared to be ignored).
+        // Same shape as the compressed override above: the container's own
+        // contents outrank the caller's flag, and the override says so out loud.
+        let stream_experts = if stream_experts && !has_routed_experts(&st) {
+            eprintln!("[peregrine] no routed-expert tensors — forcing resident mode (nothing to stream)");
+            false
+        } else {
+            stream_experts
+        };
 
         // Preflight: can this machine hold what is about to be loaded? Every byte
         // needed is already in the headers, so the verdict costs no extra I/O and
@@ -2149,14 +2979,36 @@ impl Model {
         } else {
             stream_experts
         };
+        // A container with no routed-expert tensors has nothing to stream, and
+        // honoring a streaming request anyway builds rings, transient reserves
+        // and a warm cache for a lane that will never read a byte — measured on
+        // the first resident Qwen boot as a 10.2 GB stream reserve in the [ram]
+        // projection of a model that fits whole in RAM (serve hard-requests
+        // streaming, which is also why COLI_STREAM=0 appeared to be ignored).
+        // Same shape as the compressed override above: the container's own
+        // contents outrank the caller's flag, and the override says so out loud.
+        let stream_experts = if stream_experts && !has_routed_experts(&st) {
+            eprintln!("[peregrine] no routed-expert tensors — forcing resident mode (nothing to stream)");
+            false
+        } else {
+            stream_experts
+        };
 
         let d = cfg.hidden as usize;
-        let (kvl, qkr) = (cfg.kv_lora as usize, cfg.qk_rope as usize);
+        let (kvl, qkr) = (cfg.kv_row_a() as usize, cfg.kv_row_b() as usize);
         let vocab = cfg.vocab as usize;
 
-        let embed = QtWeight::load(&st, "model.embed_tokens.weight", vocab, d)?;
+        let (embed_name, norm_name) = match cfg.arch {
+            Arch::GlmMla | Arch::DenseGqa => ("model.embed_tokens.weight", "model.norm.weight"),
+            Arch::HybridGdn => ("model.language_model.embed_tokens.weight", "model.language_model.norm.weight"),
+        };
+        let embed = QtWeight::load(&st, embed_name, vocab, d)?;
         let lm_head = QtWeight::load(&st, "lm_head.weight", vocab, d)?;
-        let final_norm = load_f32(&st, "model.norm.weight", d)?;
+        let final_norm = if cfg.arch == Arch::HybridGdn {
+            load_norm_zero_centered(&st, norm_name, d)?
+        } else {
+            load_f32(&st, norm_name, d)?
+        };
 
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
         for i in 0..cfg.n_layers as usize {
@@ -2164,6 +3016,12 @@ impl Model {
         }
 
         let kv = (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, kv_dtype())).collect();
+        let gdn: Vec<Option<GdnState>> = (0..cfg.n_layers as usize)
+            .map(|i| {
+                (cfg.arch == Arch::HybridGdn && !cfg.full_attn.get(i).copied().unwrap_or(true))
+                    .then(|| GdnState::new(&cfg))
+            })
+            .collect();
         // The concurrent MoE lane needs its own ring, set up once, so a layer's
         // experts stream while the CPU pool computes. Only in streaming mode.
         // `new_streaming` honours the `COLI_SQPOLL` opt-in; other Reactors in
@@ -2183,6 +3041,23 @@ impl Model {
                     peregrine_io::note_advisory_err("register shard fds with io_uring (plain-fd reads)", &e);
                 }
                 v.push(Mutex::new(r));
+            }
+            // One boot line reporting what the rings actually run with, read
+            // back from the rings themselves rather than echoed from env: the
+            // sqpoll-on bench arm ran for a day with nothing in any log saying
+            // whether `COLI_SQPOLL` took, and `COLI_REGBUF` has a history of
+            // being inert — a knob whose effect no output can confirm is a
+            // knob that silently dies. `is_registered` verifies the first
+            // shard fd's fixed-file slot survived registration.
+            if let Some(first) = v.first() {
+                let r = first.lock();
+                let fixed = st.shard_fds().first().is_some_and(|&fd| r.is_registered(fd));
+                eprintln!(
+                    "peregrine: [io] rings={} sqpoll={} fixed_files={}",
+                    v.len(),
+                    if r.is_sqpoll() { "on" } else { "off" },
+                    if fixed { "registered" } else { "plain-fd" },
+                );
             }
             v
         } else {
@@ -2244,10 +3119,11 @@ impl Model {
         // Prefetch lane: a background worker warming the next token's predicted
         // experts into the shared cache via its own ring. Spawned only when the
         // cache exists (streaming mode). `route_hist` is the predictor's state.
+        let sweep = Arc::new(SweepClock::from_env());
         let (route_hist, prefetch) = match &ecache {
             Some(cache) => (
                 Some(Mutex::new(RouteHistory::new(cfg.n_layers as usize, route_hist_depth()))),
-                Some(spawn_prefetch_pool(cache, &st, direct, prefetch_lanes())?),
+                Some(spawn_prefetch_pool(cache, &st, direct, prefetch_lanes(), &sweep)?),
             ),
             None => (None, None),
         };
@@ -2279,12 +3155,42 @@ impl Model {
         // index n_layers plus the embed/hidden projection and norms.
         let n = cfg.n_layers as usize;
         let mtp = if st.has(&format!("model.layers.{n}.eh_proj.weight")) {
+            // GLM: the MTP layer is the (n_layers)-th layer of the main stack.
             Some(MtpHead {
                 layer: load_layer(&st, n, &cfg, stream_experts)?,
                 eh_proj: QtWeight::load(&st, &format!("model.layers.{n}.eh_proj.weight"), d, 2 * d)?,
                 enorm: load_f32(&st, &format!("model.layers.{n}.enorm.weight"), d)?,
                 hnorm: load_f32(&st, &format!("model.layers.{n}.hnorm.weight"), d)?,
                 mtp_norm: load_f32(&st, &format!("model.layers.{n}.shared_head.norm.weight"), d)?,
+            })
+        } else if st.has("mtp.fc.weight") {
+            // Qwen family: the head lives under its own `mtp.` prefix, its single
+            // layer is dense full-attention whatever the stack does at index `n`
+            // (the hybrid's stack would say "linear attention" there), and — like
+            // every other norm in a Qwen3Next-family checkpoint — its norms are
+            // zero-centered. A mis-loaded head cannot corrupt output: every draft
+            // it proposes is verified by the main model, so the failure mode is a
+            // zero acceptance rate, not wrong tokens.
+            let zc = cfg.arch == Arch::HybridGdn;
+            let norm = |name: &str| -> Result<Vec<f32>, Error> {
+                if zc {
+                    load_norm_zero_centered(&st, name, d)
+                } else {
+                    load_f32(&st, name, d)
+                }
+            };
+            Some(MtpHead {
+                layer: load_layer_at(
+                    &st,
+                    n,
+                    &cfg,
+                    stream_experts,
+                    LayerSite { prefix: Some("mtp.layers.0."), full_attn: Some(true), sparse: Some(false) },
+                )?,
+                eh_proj: QtWeight::load(&st, "mtp.fc.weight", d, 2 * d)?,
+                enorm: norm("mtp.pre_fc_norm_embedding.weight")?,
+                hnorm: norm("mtp.pre_fc_norm_hidden.weight")?,
+                mtp_norm: norm("mtp.norm.weight")?,
             })
         } else {
             None
@@ -2317,6 +3223,48 @@ impl Model {
                 if prefetch_protect { "on" } else { "off" },
             );
         }
+        // Device-pure io claims (`COLI_IO_DEVICE_SCHED=1`): built only when the
+        // claim grouping can differ from the blind cursor — streaming, >1 ring,
+        // and shards genuinely on >1 device. The env read happens here at build
+        // so two A/B arms in one process can never alias through a latch.
+        let fd_device_table = if stream_experts
+            && io_reactors.len() > 1
+            && std::env::var("COLI_IO_DEVICE_SCHED").is_ok_and(|v| v.trim() == "1")
+        {
+            let table: std::collections::HashMap<std::os::unix::io::RawFd, u8> =
+                st.fd_devices().into_iter().collect();
+            let devices = table.values().collect::<std::collections::BTreeSet<_>>().len();
+            (devices > 1).then(|| {
+                eprintln!(
+                    "peregrine: [io] device-pure claims on ({devices} devices, {} shard fds)",
+                    table.len()
+                );
+                table
+            })
+        } else {
+            None
+        };
+        // Topic-based smart routing (`COLI_TOPIC_ROUTING=1`): per-class expert
+        // profiles for cache-residency bias. Env read here at build (not
+        // OnceLock), and only when experts stream — a resident model has no
+        // eviction to steer. Seeds from a `topic_profiles.json` sidecar if the
+        // checkpoint carries one and its shape matches, so a boot starts warm.
+        let topic_profiles = if stream_experts
+            && std::env::var("COLI_TOPIC_ROUTING").is_ok_and(|v| v.trim() == "1")
+        {
+            let tag = config_tag(&cfg);
+            let seeded = read_optional_artifact(dir, "topic_profiles.json")
+                .and_then(|v| crate::topic::TopicProfiles::from_json(&v, &tag, cfg.n_layers as usize, cfg.n_experts as usize));
+            Some(seeded.unwrap_or_else(|| {
+                crate::topic::TopicProfiles::new(cfg.n_layers as usize, cfg.n_experts as usize)
+            }))
+        } else {
+            None
+        };
+        // Adaptive profile-aging interval. Default 512 forwards at stable
+        // routing (scaled down by entropy at run time); 0 keeps the static
+        // all-time counters, which is the committed non-adaptive behaviour.
+        let topic_halflife = env_usize("COLI_TOPIC_HALFLIFE", 512) as u64;
         let mut model = Model {
             route_hist_epoch: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -2332,6 +3280,7 @@ impl Model {
             direct,
             st,
             expert_index,
+            fd_device_table,
             expert_per_token_bytes,
             prefetch_protect,
             io_reactors,
@@ -2346,8 +3295,13 @@ impl Model {
             perf_llc_last: 0,
             perf_llc_ewma: 0.0,
             prefetch,
+            sweep,
+            gdn,
             gpu,
             mtp,
+            // `heat` is `Some` exactly when a GPU tier exists, which is also
+            // the only world where a spill verdict can mean anything.
+            spill_log: (gpu_spill_enabled() && heat.is_some()).then(|| Mutex::new(Vec::new())),
             heat,
             lane_timings: Arc::new(crate::lane::LaneTimingsAccum::new()),
             lane_totals: Arc::new(crate::lane::LaneTimingsAccum::new()),
@@ -2363,6 +3317,8 @@ impl Model {
             ),
             last_iowq: Mutex::new(None),
             workload_class: Mutex::new(crate::workload::TokenClass::Prose),
+            topic_profiles,
+            topic_halflife,
             effective_workers: std::sync::atomic::AtomicUsize::new(workers),
             governor: Mutex::new(GovernorState::new(workers)),
             entropy_ewma: Mutex::new(0.5),
@@ -2372,8 +3328,20 @@ impl Model {
             learned_prefetch: std::sync::atomic::AtomicUsize::new(0),
             last_forward_at: Mutex::new(None),
             checkpoint_dir: dir.to_path_buf(),
+            calib: None,
             layout_schedule: load_layout_schedule(dir),
+            rlm: crate::rlm::RLMController::new(),
         };
+        // Calibration capture (ideas #7): read per load, not through a
+        // OnceLock latch — the seam `enable_calib_capture` is what tests and
+        // the calib-capture subcommand use, this env spelling is for co-runs
+        // (e.g. alongside COLI_PREDICT_EVAL in one instrumented pass).
+        match std::env::var("COLI_CALIB_CAPTURE") {
+            Ok(p) if !p.trim().is_empty() => model.enable_calib_capture(std::path::PathBuf::from(p.trim())),
+            Ok(_) => {}
+            Err(std::env::VarError::NotPresent) => {}
+            Err(e) => peregrine_io::note_advisory_err("COLI_CALIB_CAPTURE read", &e),
+        }
         // Upgrade the predictor to the offline transition automaton if a matching
         // `automaton.json` sits next to the checkpoint (else stay on momentum),
         // then blend in the macro-state table if one is present.
@@ -2494,7 +3462,7 @@ impl Model {
                 Err(e) => peregrine_io::note_advisory_err("tier-seed prefetch resolve", &e),
             }
         }
-        if !items.is_empty() && pool.lane(0).tx.send(PrefetchMsg::Warm(items)).is_err() {
+        if !items.is_empty() && pool.lane(0).tx.send(PrefetchMsg::Warm(items, u64::MAX)).is_err() {
             peregrine_io::note_advisory_err("prefetch warm dispatch", &"prefetch lane is down");
         }
     }
@@ -2503,9 +3471,12 @@ impl Model {
     /// predictor's history (a new sequence has no useful routing history); the
     /// warm cache itself persists (a warm expert is warm regardless of sequence).
     pub fn reset(&mut self) {
-        let (kvl, qkr) = (self.cfg.kv_lora as usize, self.cfg.qk_rope as usize);
+        let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
         for k in &mut self.kv {
             *k = LayerKv::with_dtype(kvl, qkr, kv_dtype());
+        }
+        for g in self.gdn.iter_mut().flatten() {
+            g.reset();
         }
         if let Some(h) = &self.route_hist {
             h.lock().clear();
@@ -2514,6 +3485,8 @@ impl Model {
         if let Some(c) = &self.ecache {
             c.lock().clear_priorities();
         }
+        // RLM: reset per-token recursion state so the new sequence starts clean.
+        self.rlm.reset();
     }
 
     /// Set the current workload class (from the serving layer's prompt
@@ -2555,6 +3528,7 @@ impl Model {
                 warm_paths: policy.warm_paths,
                 hint_paths: policy.hint_paths,
                 direct: self.direct,
+                sweep: self.sweep.as_ref(),
             }),
             _ => None,
         }
@@ -2576,6 +3550,7 @@ impl Model {
                 st: &self.st,
                 cfg: &self.cfg,
                 expert_index: self.expert_index.as_ref(),
+                sweep: self.sweep.as_ref(),
             }),
             _ => None,
         }
@@ -2593,6 +3568,35 @@ impl Model {
         }
     }
 
+    /// Fold this decode step's routing into the active topic's profile
+    /// (`COLI_TOPIC_ROUTING`). Once per forward, off the batched-matmul path, so
+    /// the atomics are uncontended; a no-op unless topic routing is on and a
+    /// route history exists. Learning is unconditional on `prefetch_protect` —
+    /// the profile is worth building even when the evictor is not consuming it,
+    /// so a later request (or a persisted sidecar) can.
+    fn accumulate_topic(&self) {
+        let (Some(profiles), Some(hist)) = (&self.topic_profiles, &self.route_hist) else {
+            return;
+        };
+        let class = *self.workload_class.lock();
+        let first_dense = self.cfg.first_dense as usize;
+        let n_layers = self.cfg.n_layers as usize;
+        {
+            let hist = hist.lock();
+            for layer in first_dense..n_layers {
+                if let Some(set) = hist.latest(layer) {
+                    profiles.note(class, layer, set);
+                }
+            }
+        }
+        // Adaptive aging: advance this class's decay clock and, at the
+        // entropy-scaled interval, halve its counters so the profile tracks
+        // recent routing. The entropy EWMA is kept live for this by the guard
+        // in the post-forward telemetry block (widened to fire when topic
+        // routing is on). `topic_halflife == 0` makes this a no-op (static).
+        profiles.maybe_decay(class, self.routing_entropy_ewma(), self.topic_halflife);
+    }
+
     /// Protect the experts predicted from `hist` (a single stream's routing) in the
     /// shared cache. Shared by the single-stream path and per-sequence batched prefetch.
     fn protect_from(&self, hist: &Mutex<RouteHistory>) {
@@ -2603,6 +3607,15 @@ impl Model {
         let n_experts = self.cfg.n_experts as usize;
         let first_dense = self.cfg.first_dense as usize;
         let n_layers = self.cfg.n_layers as usize;
+        // Topic-based smart routing: when the active topic's profile is warm, its
+        // per-class routing frequency is the eviction tiebreak instead of the
+        // global heat — so a coding request keeps coding-hot experts resident
+        // through an interleaved prose request. Falls back to global heat while
+        // the class is still cold, so it is never worse than the pre-topic
+        // behaviour. Still correctness-neutral: only the low-bits tiebreak of a
+        // protection priority changes, never the predicted set or any read.
+        let topic = self.topic_profiles.as_ref().map(|p| (p, *self.workload_class.lock()));
+        let topic = topic.filter(|(p, class)| p.is_warm(*class));
         // Build the whole protection set under the *history* lock only, then
         // apply it in one short cache-lock hold. Previously both locks were held
         // across all 78 layers × K predictions; the cache lock is contended by
@@ -2613,8 +3626,11 @@ impl Model {
             let mut v = Vec::new();
             for layer in first_dense..n_layers {
                 for (e, score) in self.predictor.predict_layer(layer, &hist) {
-                    let h = heat.as_ref().and_then(|c| c.get(layer * n_experts + e as usize).copied()).unwrap_or(0);
-                    v.push(((layer as u32, e), pack_prio(score, h)));
+                    let tie = match &topic {
+                        Some((p, class)) => p.heat_for(*class, layer, e as usize),
+                        None => heat.as_ref().and_then(|c| c.get(layer * n_experts + e as usize).copied()).unwrap_or(0),
+                    };
+                    v.push(((layer as u32, e), pack_prio(score, tie)));
                 }
             }
             v
@@ -2645,6 +3661,30 @@ impl Model {
     /// Whether this model has an MTP head available for speculative decode.
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    /// Whether rejecting a draft is a pure KV rewind. `SeqKv::truncate` rewinds
+    /// the KV layers exactly, so on a KV-only arch a rejected speculative tail
+    /// leaves no trace. A recurrent arch does not have that property: the verify
+    /// forward advances each `GdnState` in place by `1 + drafts`, and a point
+    /// state cannot be truncated back — it must be snapshotted before the
+    /// forward and restored on partial acceptance (`SeqKv::gdn_snapshot` /
+    /// `gdn_restore`), with the accepted prefix re-advanced.
+    ///
+    /// The batch engine consults this so speculation can never silently run
+    /// ahead of that rollback being wired: enabling drafts on a recurrent arch
+    /// without it corrupts the state of every sequence that rejects a draft.
+    pub fn spec_reject_is_kv_only(&self) -> bool {
+        self.cfg.arch != Arch::HybridGdn
+    }
+
+    /// Which chat-prompt markup this checkpoint expects. GLM ships no chat
+    /// template and uses `[gMASK]<sop><|role|>` markup; the Qwen-family arches
+    /// (DenseGqa / HybridGdn) use ChatML (`<|im_start|>role\n…<|im_end|>`). The
+    /// serving layer selects its prompt builder from this so a Qwen model is not
+    /// fed GLM control tokens (which tokenize to garbage and degenerate output).
+    pub fn uses_chatml_prompt(&self) -> bool {
+        !matches!(self.cfg.arch, Arch::GlmMla)
     }
 
     /// `(hits, misses, disk_reads)` from the warm tier, or `None` when not
@@ -2682,6 +3722,16 @@ impl Model {
     /// Experts the prefetch lane has streamed ahead of time (off the critical path).
     pub fn ecache_prefetch_reads(&self) -> Option<u64> {
         self.ecache.as_ref().map(|c| c.lock().prefetch_reads)
+    }
+
+    /// O_DIRECT landing buffers checked out across the streaming rings right
+    /// now (`None` when experts are resident — no rings). Stuck at the pool
+    /// cap means reads are serializing on buffer availability.
+    pub fn io_slab_in_use(&self) -> Option<usize> {
+        if self.io_reactors.is_empty() {
+            return None;
+        }
+        Some(self.io_reactors.iter().map(|r| r.lock().slab_in_use()).sum())
     }
 
     /// Prefetch-lane reads the warm tier has attributed to `layer` (lets the
@@ -2722,6 +3772,12 @@ impl Model {
     /// correct system; nonzero signals an I/O bug).
     pub fn ecache_verify_mismatch(&self) -> Option<u64> {
         self.ecache.as_ref().map(|c| c.lock().verify_mismatch)
+    }
+
+    /// Speculative warm items the lane discarded unread because their layer window
+    /// had passed (`COLI_PREFETCH_STALE_DROP`). Each is a disk read not spent.
+    pub fn ecache_prefetch_stale_dropped(&self) -> Option<u64> {
+        self.ecache.as_ref().map(|c| c.lock().prefetch_stale_dropped)
     }
 
     /// The warm cache's achieved compression ratio (uncompressed ÷ admitted).
@@ -2833,6 +3889,7 @@ impl Model {
             warm_paths: policy.warm_paths,
             hint_paths: policy.hint_paths,
             direct: self.direct,
+            sweep: self.sweep.as_ref(),
         };
         for layer in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
             ctx.emit_layer(layer);
@@ -2897,7 +3954,7 @@ impl Model {
                 }
             }
         }
-        if !items.is_empty() && pool.lane(0).tx.send(PrefetchMsg::Warm(items)).is_err() {
+        if !items.is_empty() && pool.lane(0).tx.send(PrefetchMsg::Warm(items, u64::MAX)).is_err() {
             peregrine_io::note_advisory_err("prefetch warm dispatch", &"prefetch lane is down");
         }
     }
@@ -3023,6 +4080,34 @@ impl Model {
         &self.checkpoint_dir
     }
 
+    /// Install the calibration accumulator (ideas #7), directing the sidecar
+    /// to `out`. The explicit seam behind `COLI_CALIB_CAPTURE`, so tests and
+    /// the `calib-capture` subcommand never touch process env (the same
+    /// rationale as `load_streaming_ecache`). Subsequent main-stream forwards
+    /// fold every sparse layer's MoE input into per-channel `Σ|x|`; call
+    /// [`Self::write_calib_sidecar`] to persist the means.
+    pub fn enable_calib_capture(&mut self, out: std::path::PathBuf) {
+        let (n_layers, hidden) = (self.cfg.n_layers as usize, self.cfg.hidden as usize);
+        self.calib = Some((out, Mutex::new(CalibAccum::new(n_layers, hidden))));
+    }
+
+    /// Write the captured calibration means as the sidecar `--calib` reads
+    /// (`{"version":1,"stat":"mean_abs",...}`), atomically. Deliberately an
+    /// explicit call rather than a `Drop` hook: a crashed or interrupted
+    /// capture writes nothing, instead of persisting a partial mean that
+    /// would silently calibrate every later conversion. `Ok(None)` when
+    /// capture was never enabled.
+    pub fn write_calib_sidecar(&self) -> Result<Option<std::path::PathBuf>, Error> {
+        let Some((out, acc)) = &self.calib else {
+            return Ok(None);
+        };
+        let v = acc.lock().to_sidecar_json();
+        let bytes =
+            serde_json::to_vec_pretty(&v).map_err(|e| Error::Format(format!("calibration sidecar: {e}")))?;
+        peregrine_core::durable::write_atomic(out, &bytes)?;
+        Ok(Some(out.clone()))
+    }
+
     /// Snapshot this forward's per-lane wall time into the bubble tuner and the
     /// `last_lane` cache readers of `lane_timings()` observe. Idempotent —
     /// calling twice in a row returns zeros the second time because the
@@ -3103,7 +4188,9 @@ impl Model {
         // feature reads this EWMA, so leaving it pinned at its initial value
         // collapsed half the Q-table to dead rows whenever COLI_ENTROPY_ADAPT
         // happened to be off.
-        if entropy_adapt_enabled() || self.learner.lock().is_some() {
+        // Topic routing's adaptive decay reads this EWMA too, so keep it live
+        // whenever topic profiles exist — not only under COLI_ENTROPY_ADAPT.
+        if entropy_adapt_enabled() || self.learner.lock().is_some() || self.topic_profiles.is_some() {
             if let Some(h) = self.routing_entropy() {
                 let mut e = self.entropy_ewma.lock();
                 *e = 0.7 * *e + 0.3 * h;
@@ -3425,6 +4512,25 @@ impl Model {
         self.save_route_stats(&dir)
     }
 
+    /// Persist the topic-routing profiles to `<checkpoint_dir>/topic_profiles.json`
+    /// so the next boot with `COLI_TOPIC_ROUTING=1` starts warm on this
+    /// workload mix. Best-effort and a no-op when topic routing is off — a
+    /// shutdown path can call it unconditionally.
+    /// Whether this model's sequences can be prefix-cached and disk-
+    /// checkpointed. False for `Arch::HybridGdn`: a GDN layer's context is a
+    /// point state, and a prefix hit would need a state snapshot taken exactly
+    /// at the boundary (~151 MB per entry at 27B dims) — a trade to measure,
+    /// not assume (Track C phase 2a).
+    pub fn prefix_cachable(&self) -> bool {
+        self.cfg.arch != Arch::HybridGdn
+    }
+
+    pub fn save_topic_profiles_here(&self) -> Result<(), Error> {
+        let Some(profiles) = &self.topic_profiles else { return Ok(()) };
+        let path = self.checkpoint_dir.join("topic_profiles.json");
+        crate::topic::save_profiles(profiles, &config_tag(&self.cfg), &path)
+    }
+
     /// Serialize the current routing history and heat snapshot to
     /// `<dir>/route_stats.json`. Overwrites any existing file. Best-effort — a
     /// missing history or non-writable dir returns `Ok(())` without an error, so
@@ -3740,8 +4846,9 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, st, expert_index, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, lane_timings, layout_schedule, absorb, dsa, ..
+                cfg, layers, kv, gdn, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, calib, ..
             } = self;
+            let sweep: &SweepClock = sweep;
             let ctx = ForwardCtx {
                 st,
                 absorb: *absorb,
@@ -3753,15 +4860,18 @@ impl Model {
                 stream_experts: *stream_experts,
                 ecache: ecache.as_deref(),
                 route_log: route_hist.as_ref(),
+                calib: calib.as_ref().map(|(_, a)| a),
                 route_log_multi: None,
                 direct: *direct,
                 heat: heat.as_ref(),
+                spill: spill_log.as_ref(),
                 timings: Some(lane_timings.as_ref()),
                 balancer: balancer.as_ref(),
                 heat_counts: heat_snapshot.as_deref(),
                 layout_schedule: layout_schedule.as_deref(),
                 affinity: Some(aff.as_ref()),
                 expert_index: expert_index.as_ref(),
+                fd_devices: fd_device_table.as_ref(),
             };
             // Layer look-ahead: a shared prefetch view over the same field borrows, so
             // each layer's next-token prefetch is emitted the moment that layer
@@ -3781,6 +4891,7 @@ impl Model {
                     warm_paths: policy.warm_paths,
                     hint_paths: policy.hint_paths,
                     direct: *direct,
+                    sweep,
                 }),
                 _ => None,
             };
@@ -3819,6 +4930,7 @@ impl Model {
                         st,
                         cfg,
                         expert_index: None,
+                        sweep,
                     })
                 }
                 _ => None,
@@ -3828,9 +4940,14 @@ impl Model {
             // recall against it would not be the number any of these predictors is
             // trying to hit.
             let eval = (s_n == 1).then_some(predict_eval.as_ref()).flatten();
+            // Per-step carry for the Δ=2 eval arm: `deep[t]` is layer `t`'s
+            // predicted set ranked two layers early. Fresh each forward step.
+            let mut deep: Vec<Vec<i32>> =
+                if eval.is_some() { vec![Vec::new(); layers.len()] } else { Vec::new() };
             let layers: &[LayerW] = layers;
             for (li, l) in layers.iter().enumerate() {
-                forward_layer(l, li, &mut kv[li], &ctx, &mut x, s_n, pos_base)?;
+                sweep.tick();
+                forward_layer(l, li, LayerState { kv: &mut kv[li], gdn: gdn[li].as_mut() }, &ctx, &mut x, s_n, pos_base)?;
                 if let Some(pfc) = &pfc {
                     pfc.emit_layer(li);
                 }
@@ -3847,7 +4964,8 @@ impl Model {
                     // prediction stashed for `li` one layer ago — while `latest(li+1)`
                     // is still the *previous token's* set there, which is exactly the
                     // baseline arm.
-                    score_and_stash(eval, rh, predictor, layers, cfg, li, &x);
+                    let sc = ScoreCtx { eval, rh, predictor, layers, cfg };
+                    score_and_stash(&sc, li, &x, &mut deep);
                 }
             }
         }
@@ -3856,6 +4974,10 @@ impl Model {
         if !lookahead {
             self.enqueue_prefetch();
         }
+        // Topic-based smart routing: fold this step's routing into the active
+        // topic's profile before protection consumes it. Independent of the
+        // protect flag — the profile is learned even when unused.
+        self.accumulate_topic();
         // Predictive eviction: protect the experts we expect to reuse next.
         if self.prefetch_protect {
             self.update_cache_protection();
@@ -3943,6 +5065,144 @@ impl Model {
         Ok(self.lm_head.apply_vec(&xf, s_n))
     }
 
+    /// **RLM recursive pass** — re-runs the last `K = COLI_RLM_LAYERS` transformer
+    /// layers of the main stack on a refined `h`, returning refined logits
+    /// `[s_n, vocab]`. Used by [`Self::generate`] and [`Self::generate_speculative`]
+    /// when [`crate::rlm::RLMController::should_recurse`] indicates the first-pass
+    /// logits are uncertain.
+    ///
+    /// The recursive pass **never appends to the main KV** — the cross-layer
+    /// attention it performs reads the same cache a regular decode at `pos_base`
+    /// would, but writes nothing to it. This matches the property used by the MTP
+    /// draft path (`mtp_draft_with`), and keeps "one extra pass on this token" from
+    /// silently inflating context length or breaking the truncate-rewind contract in
+    /// speculative decode.
+    ///
+    /// Routing is **not logged** into `route_hist` (the `forward_ctx()` context sets
+    /// `route_log: None`), for the same reason drafts must not overwrite the
+    /// main-stream router history — recursive refinement at one token must not
+    /// skew the prefetch predictor against future tokens. The 3-lane scheduler and
+    /// warm cache still serve the recursive pass normally — on the second pass for a
+    /// contested token, most routed experts are already warm in `ecache`, which is
+    /// the cache-amortization win that makes RLM a net speedup rather than a slowdown
+    /// in the disk-bound regime (see `README.md` "warm cache 3.58× on repeat forward").
+    ///
+    /// When `COLI_RLM` is unset, callers never invoke this (the controller's
+    /// `should_recurse` returns `false`), so this path has zero effect on bit-identity
+    /// gates. Off-by-default correctness is therefore structural, not a runtime
+    /// branch in the hot path.
+    pub(crate) fn forward_hidden_recursive(
+        &self,
+        h: &mut [f32],
+        s_n: usize,
+        pos_base: usize,
+    ) -> Result<Vec<f32>, Error> {
+        self.forward_hidden_recursive_with(h, s_n, pos_base, &|li| self.kv[li].clone_prefix(pos_base))
+    }
+
+    /// [`Self::forward_hidden_recursive`] over an **external** per-sequence KV
+    /// (the serve engine's [`SeqKv`]) instead of the model-resident cache. Same
+    /// exclusions, same throwaway-tail contract — the replay reads the cached
+    /// causal prefix `[0, pos_base)` of `seq` and writes nothing back.
+    pub(crate) fn forward_hidden_recursive_seq(
+        &self,
+        seq: &SeqKv,
+        h: &mut [f32],
+        s_n: usize,
+        pos_base: usize,
+    ) -> Result<Vec<f32>, Error> {
+        self.forward_hidden_recursive_with(h, s_n, pos_base, &|li| seq.layers[li].clone_prefix(pos_base))
+    }
+
+    /// Shared body of the two entries above, parameterized on where a replay
+    /// layer's KV prefix comes from (`kv_at` receives the **absolute** layer
+    /// index and returns a throwaway clone at `pos_base`).
+    fn forward_hidden_recursive_with(
+        &self,
+        h: &mut [f32],
+        s_n: usize,
+        pos_base: usize,
+        kv_at: &dyn Fn(usize) -> LayerKv,
+    ) -> Result<Vec<f32>, Error> {
+        let n_layers = self.cfg.n_layers as usize;
+        let k = crate::rlm::rlm_layers().min(n_layers);
+        let start = n_layers - k;
+        let d = self.cfg.hidden as usize;
+        let eps = self.cfg.eps;
+        // Fresh local KV per replay layer — **not** `LayerKv::new()`, but
+        // `clone_prefix(pos_base)` of the real per-layer cache: `mla_attention`
+        // always appends at `pos_base`, so the throwaway must see all `pos_base`
+        // positions already populated. `clone_prefix` shares those rows by
+        // `Arc` (zero-copy on the shared-prefix path) and gives the replay its
+        // own private tail to append position `pos_base` into — the recursive
+        // pass's attention reads the real cached past and writes nothing back,
+        // exactly like `mtp_draft_with` on a fresh local KV. Bit-identical KV
+        // state on the real cache because we never touch its tail.
+        let mut kv_local: Vec<LayerKv> = (0..k).map(|i| kv_at(start + i)).collect();
+        // Build a route-logging-off ForwardCtx (the prefill/draft shape), reusing
+        // the resident scheduler, GPU lane and warm cache. Replays do not touch
+        // the lane telemetry (timings = None), so bubble/IO tuners stay on the
+        // main forward's signal. Scoped so the `&self` borrow ends before the
+        // `lm_head` re-borrow (clippy: a `drop` here would be a `drop_non_drop`
+        // noise — the lifetime, not the destructor, is what we want to bound).
+        let lg = {
+            let ctx = self.forward_ctx();
+            for (i, l) in self.layers[start..].iter().enumerate() {
+                forward_layer(l, start + i, LayerState { kv: &mut kv_local[i], gdn: None }, &ctx, h, s_n, pos_base)?;
+            }
+            // Drop `kv_local` here is unnecessary — it owns no shared `&self`
+            // borrow; the constraint is just `ctx` going out of scope.
+            let xf = rmsnorm_rows(h, &self.final_norm, s_n, d, eps);
+            self.lm_head.apply_vec(&xf, s_n)
+        };
+        Ok(lg)
+    }
+
+    /// RLM controller telemetry — recursive passes triggered this run, and the
+    /// number of tokens that triggered at least one. `(0, 0)` unless `COLI_RLM=1`.
+    /// Intended for the `/metrics` scrape path or the engine-shutdown summary,
+    /// same role as `lookahead_issued()` for the router look-ahead.
+    pub fn rlm_stats(&self) -> (u64, u64) {
+        (self.rlm.passes_emitted(), self.rlm.tokens_recursed())
+    }
+
+    /// RLM refinement for an external-KV driver (the serve engine): refine one
+    /// row's pre-final-norm hidden `h` and its `logits_row` in place, looping
+    /// the same uncertainty policy and depth cap as the model-resident
+    /// composition in [`Self::generate_speculative`]. Returns whether any pass
+    /// ran; `Ok(false)` immediately — no copies, no KV clones — when
+    /// `COLI_RLM` is unset, which is what keeps the serve path bit-identical
+    /// with RLM off.
+    ///
+    /// The depth counter is **local** (the controller's per-token `depth` needs
+    /// `&mut`, and the batched accept loop holds the model by `&`); the shared
+    /// statistics go through [`crate::rlm::RLMController::note_pass`], so
+    /// `/metrics` and the shutdown summary see external passes too.
+    pub fn rlm_refine_external(
+        &self,
+        seq: &SeqKv,
+        pos: usize,
+        h: &mut [f32],
+        logits_row: &mut [f32],
+        temp: f32,
+    ) -> Result<bool, Error> {
+        if !crate::rlm::rlm_enabled() {
+            return Ok(false);
+        }
+        let vocab = self.cfg.vocab as usize;
+        let max_depth = crate::rlm::rlm_max_depth();
+        let mut depth = 0usize;
+        while depth < max_depth && crate::rlm::wants_recursion(&logits_row[..vocab], temp) {
+            depth += 1;
+            self.rlm.note_pass(depth == 1);
+            // The replay returns final_norm + lm_head over the refined hidden —
+            // exactly the recompute the model-resident composition does.
+            let lg = self.forward_hidden_recursive_seq(seq, h, 1, pos)?;
+            logits_row[..vocab].copy_from_slice(&lg[..vocab]);
+        }
+        Ok(depth > 0)
+    }
+
     /// Build the per-forward compute context from the resident model state with
     /// prefetch/route-logging **disabled** — the shape the external-KV batched and
     /// prefill paths use (the B-way expert union is not a useful next-token
@@ -3959,15 +5219,19 @@ impl Model {
             stream_experts: self.stream_experts,
             ecache: self.ecache.as_deref(),
             route_log: None,
+            calib: self.calib.as_ref().map(|(_, a)| a),
             route_log_multi: None,
             direct: self.direct,
             heat: self.heat.as_ref(),
+            // No balancer in this context, so no spill verdict can occur.
+            spill: None,
             timings: None,
             balancer: None,
             heat_counts: None,
             layout_schedule: self.layout_schedule.as_deref(),
             affinity: None,
             expert_index: self.expert_index.as_ref(),
+            fd_devices: self.fd_device_table.as_ref(),
         }
     }
 
@@ -3988,7 +5252,12 @@ impl Model {
         }
         let ctx = self.forward_ctx();
         for (li, l) in self.layers.iter().enumerate() {
-            forward_layer(l, li, &mut seq.layers[li], &ctx, &mut x, s_n, pos_base)?;
+            // Advancing the sweep clock here matters even though this path emits no
+            // speculation: a prefill's demand reads churn the cache exactly like a
+            // decode step's, so a warm item queued just before a long prefill is
+            // stale by the end of it — and should read as such.
+            self.sweep.tick();
+            forward_layer(l, li, LayerState { kv: &mut seq.layers[li], gdn: seq.gdn[li].as_mut() }, &ctx, &mut x, s_n, pos_base)?;
         }
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
         Ok(self.lm_head.apply_vec(&xf, s_n))
@@ -4217,15 +5486,18 @@ impl Model {
             stream_experts: self.stream_experts,
             ecache: self.ecache.as_deref(),
             route_log: None,
+            calib: self.calib.as_ref().map(|(_, a)| a),
             route_log_multi: histories,
             direct: self.direct,
             heat: self.heat.as_ref(),
+            spill: self.spill_log.as_ref(),
             timings: Some(self.lane_timings.as_ref()),
             balancer: balancer.as_ref(),
             heat_counts: heat_snapshot.as_deref(),
             layout_schedule: self.layout_schedule.as_deref(),
             affinity: Some(aff.as_ref()),
             expert_index: self.expert_index.as_ref(),
+            fd_devices: self.fd_device_table.as_ref(),
         };
         // Router look-ahead, on the same decode-only rule as `forward_hidden`. B == 1
         // *is* a decode step — the serving engine reaching this path with one live
@@ -4250,8 +5522,17 @@ impl Model {
         let la = (la_width > 0).then(|| self.lookahead_ctx()).flatten();
         let layers: &[LayerW] = &self.layers;
         for (li, l) in layers.iter().enumerate() {
-            let mut caches: Vec<&mut LayerKv> = seqs.iter_mut().map(|sk| &mut sk.layers[li]).collect();
-            forward_layer_batched(l, li, &mut caches, RowLayout { pos_of, owner }, &ctx, &mut x)?;
+            self.sweep.tick();
+            // Disjoint split per sequence: the KV cache and the GDN state are
+            // separate fields, so one pass hands the batched layer both.
+            let (mut caches, mut gstates): (Vec<&mut LayerKv>, Vec<Option<&mut GdnState>>) = seqs
+                .iter_mut()
+                .map(|sk| {
+                    let SeqKv { layers, gdn } = &mut **sk;
+                    (&mut layers[li], gdn[li].as_mut())
+                })
+                .unzip();
+            forward_layer_batched(l, li, &mut caches, &mut gstates, RowLayout { pos_of, owner }, &ctx, &mut x)?;
             if let Some(la) = &la {
                 la.emit(layers, li + 1, &x, la_width);
             }
@@ -4270,9 +5551,19 @@ impl Model {
         // Frequency, recency and clock read together: `COLI_GPU_TIER_SWAP=lfru`
         // scores the first two against the third, and three separate reads would
         // let a generation age its stamps against a clock from another forward.
-        let Some((counts, last, clock)) = self.heat.as_ref().map(|h| h.snapshot_all()) else {
+        let Some((mut counts, last, clock)) = self.heat.as_ref().map(|h| h.snapshot_all()) else {
             return Ok(());
         };
+        // Drain the deferred-spill log (`COLI_GPU_SPILL`) into this generation's
+        // snapshot before the ranking: every mid-forward `GpuSpill` verdict since
+        // the last reheat bumps its expert, so what the balancer kept asking for
+        // finally outranks what it never did. The uploads still go through the
+        // ranking's own budgeted path (`admit_uploads`, `COLI_PCIE_BUDGET_MB`) —
+        // this changes the order of candidates, not the spend limit.
+        if let Some(log) = self.spill_log.as_ref() {
+            let drained = std::mem::take(&mut *log.lock());
+            merge_spills(&mut counts, &drained, self.cfg.n_experts as usize);
+        }
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.reheat(&self.st, &self.cfg, &crate::gpu::HeatView { counts: &counts, last: &last, clock })?;
         }
@@ -4293,8 +5584,26 @@ impl Model {
         }
         self.reset();
         let vocab = self.cfg.vocab as usize;
-        let logits = self.forward_step(prompt, 0)?;
-        let mut next = sampler.pick(&logits[(prompt.len() - 1) * vocab..prompt.len() * vocab], -1) as i32;
+        let d = self.cfg.hidden as usize;
+        let eps = self.cfg.eps;
+
+        // Inline forward+head without `forward_step` so we keep the pre-final-norm
+        // hidden (`h_last`) in hand for RLM recursion. `forward_step` stays
+        // unchanged — same algebra, bit-identical.
+        let mut x_all = self.forward_hidden(prompt, 0)?;
+        let xf = rmsnorm_rows(&x_all, &self.final_norm, prompt.len(), d, eps);
+        let logits = self.lm_head.apply_vec(&xf, prompt.len());
+        let mut h_last = x_all[(prompt.len() - 1) * d..prompt.len() * d].to_vec();
+        let mut lg = logits[(prompt.len() - 1) * vocab..prompt.len() * vocab].to_vec();
+        // RLM refinement loop: each pass refines `h_last` and recomputes the head.
+        // `should_recurse` returns `false` for the whole call site when `COLI_RLM`
+        // is unset, so the block below is the bit-identical pass-0 logits sample.
+        while self.rlm.should_recurse(&lg, sampler.temp) {
+            self.forward_hidden_recursive(&mut h_last, 1, prompt.len() - 1)?;
+            let xf2 = rmsnorm_rows(&h_last, &self.final_norm, 1, d, eps);
+            lg = self.lm_head.apply_vec(&xf2, 1);
+        }
+        let mut next = sampler.pick(&lg, -1) as i32;
         let mut out = vec![next];
         // Stop ids end generation here as they do on the speculative path. They
         // used to be honored only by `generate_speculative`, so the same model
@@ -4305,8 +5614,21 @@ impl Model {
         }
         for step in 1..n_new {
             let pos = prompt.len() + step - 1; // first decode attends at prompt.len()
-            let lg = self.forward_step(&[next], pos)?;
-            next = sampler.pick(&lg[..vocab], -1) as i32;
+            // RLM: reset per-token recursion at the start of each step.
+            self.rlm.reset();
+            // Forward to last-layer hidden with the single next token.
+            x_all = self.forward_hidden(&[next], pos)?;
+            h_last = x_all[..d].to_vec();
+            let xf = rmsnorm_rows(&x_all, &self.final_norm, 1, d, eps);
+            lg = self.lm_head.apply_vec(&xf, 1);
+            // RLM recursion: refine `h_last` and recompute logits while the
+            // controller says to. No-op (structurally — see `rlm.rs:114`) when off.
+            while self.rlm.should_recurse(&lg, sampler.temp) {
+                self.forward_hidden_recursive(&mut h_last, 1, pos)?;
+                let xf2 = rmsnorm_rows(&h_last, &self.final_norm, 1, d, eps);
+                lg = self.lm_head.apply_vec(&xf2, 1);
+            }
+            next = sampler.pick(&lg, -1) as i32;
             out.push(next);
             if step.is_multiple_of(RSS_GUARD_EVERY) {
                 self.rss_guard();
@@ -4361,8 +5683,13 @@ impl Model {
     /// That matters — the batching thread holds `&Model` while several
     /// sequences draft, and a `&mut` here would have serialised them behind the
     /// one borrow.
-    pub fn mtp_draft(&self, next_tok: i32, g_draft: usize, hlast: &[f32]) -> Result<Vec<i32>, Error> {
-        self.mtp_draft_with(next_tok, g_draft, hlast, |lo| crate::sample::argmax(lo) as i32)
+    /// `conf_floor > 0` stops the draft early when the MTP head's top-token
+    /// probability drops under it (`0.0` = draft the full depth, the historical
+    /// behavior). Depth-only: acceptance is the caller's `accept_run`, so the
+    /// floor can never change an emitted token — it trades draft depth for
+    /// fewer rejected verify rows, each of which streams expert bytes.
+    pub fn mtp_draft(&self, next_tok: i32, g_draft: usize, hlast: &[f32], conf_floor: f32) -> Result<Vec<i32>, Error> {
+        self.mtp_draft_with(next_tok, g_draft, hlast, conf_floor, |lo| crate::sample::argmax(lo) as i32)
     }
 
     /// Draft `g_draft` tokens **sampled from `sampler`'s own distribution**,
@@ -4387,10 +5714,11 @@ impl Model {
         next_tok: i32,
         g_draft: usize,
         hlast: &[f32],
+        conf_floor: f32,
         sampler: &mut Sampler,
     ) -> Result<(Vec<i32>, Vec<Vec<f32>>), Error> {
         let mut qs: Vec<Vec<f32>> = Vec::with_capacity(g_draft);
-        let drafts = self.mtp_draft_with(next_tok, g_draft, hlast, |lo| {
+        let drafts = self.mtp_draft_with(next_tok, g_draft, hlast, conf_floor, |lo| {
             let (t, q) = sampler.pick_with_distribution(lo);
             qs.push(q);
             t as i32
@@ -4411,13 +5739,14 @@ impl Model {
         next_tok: i32,
         g_draft: usize,
         hlast: &[f32],
+        conf_floor: f32,
         mut pick: impl FnMut(&[f32]) -> i32,
     ) -> Result<Vec<i32>, Error> {
         let d = self.cfg.hidden as usize;
         let eps = self.cfg.eps;
         let vocab = self.cfg.vocab as usize;
         let n_layers = self.cfg.n_layers as usize;
-        let (kvl, qkr) = (self.cfg.kv_lora as usize, self.cfg.qk_rope as usize);
+        let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
 
         let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, stream_experts, cfg, absorb, dsa, .. } =
             self;
@@ -4433,15 +5762,18 @@ impl Model {
             stream_experts: *stream_experts,
             ecache: ecache.as_deref(),
             route_log: None, // drafts must not overwrite the main-stream prediction
+            calib: None, // drafts replay accumulated positions — counting them double-weights
             route_log_multi: None,
             direct: *direct,
             heat: None, // speculative drafts must not skew residency heat
+            spill: None, // drafts must not queue uploads for a speculative future
             timings: None, // drafts must not skew the main-stream lane balance
             balancer: None, // drafts run under the plain static residency policy
             heat_counts: None,
             layout_schedule: None, // drafts benefit less from disk-order tuning
             affinity: None,
             expert_index: None,
+            fd_devices: None, // drafts keep the blind claim cursor, like the rest of their tuning
         };
         let mut kv = LayerKv::new(kvl, qkr);
         let mut h = hlast.to_vec(); // pre-final-norm hidden
@@ -4467,9 +5799,18 @@ impl Model {
             cat.extend_from_slice(&hn);
             let mut hx = mtp.eh_proj.apply_vec(&cat, 1);
             // one MTP transformer layer at relative position g (fresh local KV)
-            forward_layer(&mtp.layer, n_layers, &mut kv, &ctx, &mut hx, 1, g)?;
+            forward_layer(&mtp.layer, n_layers, LayerState { kv: &mut kv, gdn: None }, &ctx, &mut hx, 1, g)?;
             let row = rmsnorm_rows(&hx, &mtp.mtp_norm, 1, d, eps);
             let logit = lm_head.apply_vec(&row, 1);
+            // The confidence gate (ds4's DSpark idea): a step whose top token
+            // holds less than `conf_floor` of the distribution ends the draft
+            // *before* `pick` — the low-confidence token itself is excluded,
+            // since it would be the likeliest wasted verify row. Breaking
+            // before `pick` also keeps the sampled path's `drafts`/`qs`
+            // aligned by construction.
+            if conf_floor > 0.0 && crate::sample::top_prob(&logit) < conf_floor {
+                break;
+            }
             let t2 = pick(&logit);
             draft.push(t2);
             tok = t2;
@@ -4512,7 +5853,10 @@ impl Model {
             let budget = n_new - out.len();
             // draft at most budget-1 (we always emit `next` this round)
             let g_want = g_draft.min(budget.saturating_sub(1));
-            let draft = if g_want > 0 { self.mtp_draft(next, g_want, &hlast)? } else { Vec::new() };
+            // No confidence floor here: the serve engine resolves
+            // `COLI_SPEC_CONF`; this single-sequence path keeps the historical
+            // fixed depth so its output-identity contract stays trivially true.
+            let draft = if g_want > 0 { self.mtp_draft(next, g_want, &hlast, 0.0)? } else { Vec::new() };
             let g = draft.len();
 
             // verify [next, draft...] in one forward
@@ -4544,9 +5888,37 @@ impl Model {
                     break;
                 }
             }
-            // the model's prediction at position k is the next token to process
-            next = crate::sample::argmax(&logits_b[k * vocab..(k + 1) * vocab]) as i32;
+            // the model's prediction at position k is the next token to process.
+            // (Recomputed after the RLM refinement below if the controller
+            // requested extra passes; the logits/route history is held to the
+            // same exclusion `mtp_draft_with` enforces on drafts — `route_log`
+            // is `None` via `forward_ctx`.)
             hlast = xb[k * d..(k + 1) * d].to_vec();
+            // MTP + RLM composition — only the post-acceptance contested position.
+            // We just emitted positions `[next, draft[..k]]`. `next` for the next
+            // round is set to `logits_b[k]`'s argmax. If that footing was
+            // uncertain (greedy top-2 margin < `COLI_RLM_MARGIN`), refine
+            // `hlast = xb[k*d..]` with a recursive pass and recompute `next`.
+            //
+            // Self-consistent bounds:
+            // - we never resume from a rejected draft token (it was already
+            //   wrong for a reason; one more pass on a wrong-but-now-rejected
+            //   position is the born-corrected case)
+            // - we never recurse on row 0 — `next` was already committed as
+            //   argmax earlier in this same block (`out.push(next)` above)
+            //   and is treated as confirmed
+            //
+            // Bit-identical to plain `generate_speculative` when `COLI_RLM`
+            // unset: `should_recurse` returns `false` for the whole loop.
+            self.rlm.reset();
+            let mut lb_k = logits_b[k * vocab..(k + 1) * vocab].to_vec();
+            while self.rlm.should_recurse(&lb_k, 0.0) {
+                self.forward_hidden_recursive(&mut hlast, 1, pos + k)?;
+                let xf2 = rmsnorm_rows(&hlast, &self.final_norm, 1, d, eps);
+                let lg2 = self.lm_head.apply_vec(&xf2, 1);
+                lb_k = lg2[..vocab].to_vec();
+            }
+            next = crate::sample::argmax(&lb_k) as i32;
             // committed this round: `next` (already emitted) + k accepted drafts
             let committed = 1 + k;
             self.truncate_kv(pos + committed);
@@ -4581,6 +5953,23 @@ mod tests {
     use crate::sample::argmax;
     use crate::testkit::build_tiny_model;
     use std::path::PathBuf;
+
+    #[test]
+    fn merge_spills_bumps_by_multiplicity_and_ignores_out_of_range() {
+        // 2 layers × 4 experts. Expert (1,2) spilled three times, (0,0) once;
+        // a stale pair past the table must be ignored, not panic or wrap.
+        let mut counts = vec![10u32, 0, 0, 0, 0, 0, 5, 0];
+        merge_spills(&mut counts, &[(1, 2), (0, 0), (1, 2), (1, 2), (7, 3)], 4);
+        assert_eq!(counts, vec![11, 0, 0, 0, 0, 0, 8, 0]);
+        // Saturation, not overflow, at the ceiling.
+        let mut hot = vec![u32::MAX];
+        merge_spills(&mut hot, &[(0, 0)], 1);
+        assert_eq!(hot, vec![u32::MAX]);
+        // Empty drain is a no-op.
+        let mut same = vec![3u32, 4];
+        merge_spills(&mut same, &[], 2);
+        assert_eq!(same, vec![3, 4]);
+    }
 
     /// The protect default has to flip at one token's working set, because the
     /// mechanism measured +193 hits below that line and −381 above it. Pinning
@@ -4623,6 +6012,153 @@ mod tests {
         }
         build_tiny_model(&d)?;
         Ok(d)
+    }
+
+    /// End-to-end check shared by the two Track C architectures: load from a
+    /// tiny fixture, prove one prefill call and token-at-a-time decode produce
+    /// bit-identical last-position logits (through reset), and run a short
+    /// greedy generate. The strongest whole-stack self-consistency available
+    /// before the real-container parity gate.
+    fn prefill_step_identity_and_generate(dir: &PathBuf) -> Result<(), peregrine_core::Error> {
+        let mut m = Model::load(dir)?;
+        let toks = [1, 5, 9, 2, 7];
+        let vocab = m.cfg.vocab as usize;
+        let all = m.forward_step(&toks, 0)?;
+        let last_all = &all[(toks.len() - 1) * vocab..];
+        m.reset();
+        let mut last = Vec::new();
+        for (i, &t) in toks.iter().enumerate() {
+            last = m.forward_step(&[t], i)?;
+        }
+        assert!(
+            last_all.iter().zip(&last).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "prefill and stepwise decode must be bit-identical through the whole stack"
+        );
+        m.reset();
+        let mut s = Sampler::new(0.0, 0.95, 1);
+        let out = m.generate(&toks, 4, &mut s)?;
+        assert_eq!(out.len(), 4, "greedy generate must emit the requested tokens");
+        Ok(())
+    }
+
+    #[test]
+    fn dense_gqa_model_loads_decodes_and_is_step_consistent() -> Result<(), peregrine_core::Error> {
+        let d = std::env::temp_dir().join(format!("peregrine_qwen_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_qwen_model(&d, 42)?;
+        prefill_step_identity_and_generate(&d)?;
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_container_without_experts_refuses_to_stream() -> Result<(), peregrine_core::Error> {
+        // serve hard-requests streaming for every model; a container with no
+        // routed-expert tensors must land resident anyway — no ecache, no
+        // rings, no 10.2 GB stream reserve — and still decode.
+        let d = std::env::temp_dir().join(format!("peregrine_noexp_stream_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_hybrid_model(&d, 47)?;
+        let mut m = Model::load_streaming_ecache(&d, true, 8 << 20)?; // caller asks; container declines
+        assert!(
+            m.ecache_prefetch_reads().is_none(),
+            "no streaming apparatus may be built for a container with nothing to stream"
+        );
+        let logits = m.forward_step(&[1, 5, 9], 0)?;
+        assert_eq!(logits.len(), 3 * m.cfg.vocab as usize, "resident decode still works");
+        // ...while a GLM container under the identical call keeps its cache —
+        // the override is evidence-gated, not arch-gated.
+        let g = tmp_model_dir("noexp_glm_ctrl")?;
+        let mg = Model::load_streaming_ecache(&g, true, 8 << 20)?;
+        assert!(mg.ecache_prefetch_reads().is_some(), "a MoE container must still stream");
+        std::fs::remove_dir_all(&d)?;
+        std::fs::remove_dir_all(&g)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_external_kv_and_batched_decode_match_the_internal_path() -> Result<(), peregrine_core::Error> {
+        // Phase 2a's contract in one test: (a) prefill through the external-KV
+        // path (what serving uses) is bit-identical to the engine's internal
+        // path — proving the GDN state threads through SeqKv correctly; (b) a
+        // 2-sequence batched decode is bit-identical to each sequence decoded
+        // solo — proving per-owner state isolation in the batched layer.
+        let d = std::env::temp_dir().join(format!("peregrine_hybrid_serve_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_hybrid_model(&d, 44)?;
+        let mut m = Model::load(&d)?;
+        let vocab = m.cfg.vocab as usize;
+        let prompts: [&[i32]; 2] = [&[1, 5, 9, 2, 7], &[4, 4, 8, 3]];
+
+        // (a) internal vs external prefill, prompt 0.
+        let internal = m.forward_step(prompts[0], 0)?;
+        let last_internal = &internal[(prompts[0].len() - 1) * vocab..];
+        let mut seq0 = SeqKv::new(&m.cfg);
+        let external = m.forward_prefill_seq(prompts[0], &mut seq0, 0)?;
+        let last_external = &external[(prompts[0].len() - 1) * vocab..];
+        assert!(
+            last_internal.iter().zip(last_external).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "external-KV prefill must match the internal path bit for bit"
+        );
+
+        // (b) batched decode vs solo continuation, both sequences, 3 steps.
+        // Solo: continue each sequence with single-token external prefills.
+        let mut solo_logits = vec![Vec::new(), Vec::new()];
+        let mut solo_seqs = Vec::new();
+        for (i, p) in prompts.iter().enumerate() {
+            let mut sk = SeqKv::new(&m.cfg);
+            m.forward_prefill_seq(p, &mut sk, 0)?;
+            let mut next = 11i32 + i as i32; // arbitrary in-vocab continuations
+            for step in 0..3 {
+                let lg = m.forward_prefill_seq(&[next], &mut sk, p.len() + step)?;
+                solo_logits[i] = lg;
+                next += 1;
+            }
+            solo_seqs.push(sk);
+        }
+        // Batched: same continuations through forward_step_batched.
+        let mut b0 = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(prompts[0], &mut b0, 0)?;
+        let mut b1 = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(prompts[1], &mut b1, 0)?;
+        let mut batched_last = Vec::new();
+        for step in 0..3 {
+            let toks = [11 + step as i32, 12 + step as i32];
+            let pos = [prompts[0].len() + step, prompts[1].len() + step];
+            let mut seqs: Vec<&mut SeqKv> = vec![&mut b0, &mut b1];
+            batched_last = m.forward_step_batched(&toks, &mut seqs, &pos, None)?;
+        }
+        for i in 0..2 {
+            let got = &batched_last[i * vocab..(i + 1) * vocab];
+            assert!(
+                got.iter().zip(&solo_logits[i]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "batched decode must match sequence {i}'s solo continuation bit for bit"
+            );
+        }
+        assert!(b0.has_recurrent_state(), "hybrid sequences must carry recurrent state");
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_model_loads_decodes_and_is_step_consistent() -> Result<(), peregrine_core::Error> {
+        // Exercises every hybrid mechanism through the full stack: two GDN
+        // layers (conv ring + recurrent state), one output-gated GQA layer
+        // with partial rotary, the language_model tensor prefix, and reset.
+        let d = std::env::temp_dir().join(format!("peregrine_hybrid_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_hybrid_model(&d, 43)?;
+        prefill_step_identity_and_generate(&d)?;
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
     }
 
     /// `accept_run_sampled` must emit the request's own distribution.
@@ -5132,6 +6668,98 @@ mod tests {
     }
 
     #[test]
+    fn stale_predicate_draws_the_window_where_the_emitter_designed_it() {
+        // An item emitted during step s targets the layer executing at s + 1, so at
+        // slack=1 it is fresh through that layer and dead the step after.
+        assert!(!warm_item_is_stale(10, 10, 1), "same-step service is fresh");
+        assert!(!warm_item_is_stale(11, 10, 1), "the target layer's own step is fresh");
+        assert!(warm_item_is_stale(12, 10, 1), "one step past the target layer is stale");
+        // The two sentinel values disarm the gate from either side: a MAX stamp
+        // (deliberate bulk warms) and a MAX slack (gate off) are never stale.
+        assert!(!warm_item_is_stale(u64::MAX, u64::MAX, 0), "bulk warms never go stale");
+        assert!(!warm_item_is_stale(u64::MAX, 0, u64::MAX), "gate off admits any age");
+        // Default flipped ON 2026-08-16 (confirmed +6.9% at B=16); the escape
+        // hatch restores the historical lane. Both sides via the pure resolver,
+        // no env mutation.
+        assert_eq!(
+            SweepClock::from_env_values(None, None).slack.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "unset means the gate is on at slack 1"
+        );
+        assert_eq!(
+            SweepClock::from_env_values(Some("0"), None).slack.load(std::sync::atomic::Ordering::Relaxed),
+            u64::MAX,
+            "=0 must restore the historical service-everything lane"
+        );
+        assert_eq!(
+            SweepClock::from_env_values(None, Some("3")).slack.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "slack stays independently tunable"
+        );
+    }
+
+    #[test]
+    fn a_stale_warm_batch_is_dropped_before_it_costs_a_disk_read() -> Result<(), peregrine_core::Error> {
+        let dir = tmp_model_dir("stale_drop")?;
+        let m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        // Arm the gate and age the clock *before* anything is enqueued, so the
+        // drop decision is already fixed when the lane dequeues — no race with the
+        // worker thread, unlike advancing the clock after a send.
+        m.sweep.slack.store(1, std::sync::atomic::Ordering::Relaxed);
+        m.sweep.step.store(10, std::sync::atomic::Ordering::Relaxed);
+        let first_sparse = m.cfg.first_dense as usize;
+        let pool = m.prefetch.as_ref().ok_or_else(|| Error::Format("no prefetch pool".into()))?;
+        // Stamped at step 0, ten steps ago: the layer window this item was emitted
+        // for is long gone, which is exactly the 98.6%-wasted shape of the
+        // 2026-08-13 B=16 run.
+        let item = crate::concurrent::prefetch_item(m.expert_index.as_ref(), &m.st, &m.cfg, first_sparse, 0)?;
+        if pool.lane(0).tx.send(PrefetchMsg::Warm(vec![item], 0)).is_err() {
+            return Err(Error::Format("prefetch lane is down".into()));
+        }
+        m.prefetch_barrier();
+        let streamed = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        let dropped = m.ecache_prefetch_stale_dropped().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert_eq!(streamed, 0, "a stale item must be dropped before the read, not after");
+        assert_eq!(dropped, 1, "the drop must be counted, or the [prefetch] line can't show the win");
+        // The same item stamped at the current step is inside its window and
+        // streams normally — the gate kills lateness, not speculation.
+        let item = crate::concurrent::prefetch_item(m.expert_index.as_ref(), &m.st, &m.cfg, first_sparse, 0)?;
+        if pool.lane(0).tx.send(PrefetchMsg::Warm(vec![item], 10)).is_err() {
+            return Err(Error::Format("prefetch lane is down".into()));
+        }
+        m.prefetch_barrier();
+        let streamed = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert_eq!(streamed, 1, "a fresh item must stream exactly as before the gate existed");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn gate_disarmed_services_arbitrarily_late_warms() -> Result<(), peregrine_core::Error> {
+        // The escape hatch's mechanism (slack=MAX, what COLI_PREFETCH_STALE_DROP=0
+        // resolves to): an ancient stamp still streams — "off = the historical
+        // behaviour" stays reachable now that the default is on. Armed
+        // explicitly rather than via env, which would race parallel tests.
+        let dir = tmp_model_dir("stale_gate_off")?;
+        let m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        m.sweep.slack.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        m.sweep.step.store(1_000_000, std::sync::atomic::Ordering::Relaxed);
+        let first_sparse = m.cfg.first_dense as usize;
+        let pool = m.prefetch.as_ref().ok_or_else(|| Error::Format("no prefetch pool".into()))?;
+        let item = crate::concurrent::prefetch_item(m.expert_index.as_ref(), &m.st, &m.cfg, first_sparse, 0)?;
+        if pool.lane(0).tx.send(PrefetchMsg::Warm(vec![item], 0)).is_err() {
+            return Err(Error::Format("prefetch lane is down".into()));
+        }
+        m.prefetch_barrier();
+        let streamed = m.ecache_prefetch_reads().ok_or_else(|| Error::Format("no ecache".into()))?;
+        let dropped = m.ecache_prefetch_stale_dropped().ok_or_else(|| Error::Format("no ecache".into()))?;
+        assert_eq!(streamed, 1, "gate off: even a million-step-old warm still streams");
+        assert_eq!(dropped, 0, "gate off must count nothing");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn multipath_warm_tier_streams_not_hints() -> Result<(), peregrine_core::Error> {
         // warm-all policy streams predicted experts and issues no fadvise hints.
         let dir = tmp_model_dir("multipath_warm")?;
@@ -5439,6 +7067,58 @@ mod tests {
     }
 
     #[test]
+    fn self_cgroup_rel_takes_the_v2_line_and_ignores_v1_noise() {
+        // A hybrid dump: v1 controllers above, the v2 line among them.
+        let dump = "12:pids:/user.slice\n1:name=systemd:/init.scope\n0::/user.slice/user-1000.slice/run-abc.scope\n";
+        assert_eq!(
+            self_cgroup_v2_rel(dump),
+            Some("/user.slice/user-1000.slice/run-abc.scope")
+        );
+        assert_eq!(self_cgroup_v2_rel("12:pids:/x\n"), None, "no v2 line, no walk");
+    }
+
+    #[test]
+    fn cgroup_walk_visits_leaf_to_root_so_the_tightest_limit_wins() {
+        // The stage-5 OOM shape: the MemoryMax lives on the transient scope,
+        // not the root — every level must be visited or the limit is missed.
+        let dirs = cgroup_walk_dirs("/user.slice/run-abc.scope");
+        let s: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        assert_eq!(
+            s,
+            vec![
+                "/sys/fs/cgroup/user.slice/run-abc.scope",
+                "/sys/fs/cgroup/user.slice",
+                "/sys/fs/cgroup",
+            ]
+        );
+        // Root-relative spelling degenerates to the root probe alone.
+        assert_eq!(cgroup_walk_dirs("/"), vec![std::path::PathBuf::from("/sys/fs/cgroup")]);
+    }
+
+    #[test]
+    fn ecache_spec_parses_numbers_auto_and_rejects_garbage() {
+        const GIB: usize = 1 << 30;
+        // The historical numeric spelling is untouched, fractions included.
+        assert_eq!(parse_ecache_spec("8", None), Some(EcacheSpec::Fixed(8 * GIB)));
+        assert_eq!(parse_ecache_spec("0.5", None), Some(EcacheSpec::Fixed(GIB / 2)));
+        assert_eq!(parse_ecache_spec("0", None), Some(EcacheSpec::Fixed(0)));
+        assert_eq!(parse_ecache_spec("-2", None), Some(EcacheSpec::Fixed(0)), "negative clamps to disabled");
+        // `auto` takes ds4's 0.80 unless COLI_ECACHE_AUTO_FRAC narrows it.
+        assert_eq!(parse_ecache_spec("auto", None), Some(EcacheSpec::AutoFrac(0.80)));
+        assert_eq!(parse_ecache_spec(" AUTO ", None), Some(EcacheSpec::AutoFrac(0.80)), "case/space insensitive");
+        assert_eq!(parse_ecache_spec("auto", Some("0.5")), Some(EcacheSpec::AutoFrac(0.5)));
+        // The fraction clamps to 0.95 — 1.0 would hand the cache every free
+        // byte — and nonsense fractions fall back to the default rather than 0.
+        assert_eq!(parse_ecache_spec("auto", Some("1.4")), Some(EcacheSpec::AutoFrac(0.95)));
+        assert_eq!(parse_ecache_spec("auto", Some("0")), Some(EcacheSpec::AutoFrac(0.80)));
+        assert_eq!(parse_ecache_spec("auto", Some("nan")), Some(EcacheSpec::AutoFrac(0.80)));
+        assert_eq!(parse_ecache_spec("auto", Some("gibberish")), Some(EcacheSpec::AutoFrac(0.80)));
+        // Garbage spellings surface as None so the caller can disable-with-advisory.
+        assert_eq!(parse_ecache_spec("lots", None), None);
+        assert_eq!(parse_ecache_spec("", None), None);
+    }
+
+    #[test]
     fn rmsnorm_rows_parallel_matches_serial() {
         // rmsnorm_rows runs rows on the compute pool when the row is wide enough
         // (d >= 256); use d=512 so the parallel path engages, and assert it stays
@@ -5472,6 +7152,108 @@ mod tests {
         let external = m.forward_prefill_seq(&toks, &mut seq, 0)?;
         assert_eq!(internal, external, "external-KV prefill must equal internal forward_step");
         assert_eq!(seq.len(), toks.len());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn kv_export_import_round_trips_bit_identically() -> Result<(), peregrine_core::Error> {
+        // The disk-persistence seam's whole contract: a cache rebuilt from an
+        // export must be indistinguishable from the live one — the values it
+        // exports again are equal, and (the decisive check) a forward continued
+        // from it produces bit-identical logits. Both dtypes, since f16 narrows
+        // on append and must re-narrow to the same bits.
+        let dir = tmp_model_dir("kvexport")?;
+        let m = Model::load(&dir)?;
+        let toks = [1i32, 5, 9, 2, 7, 3];
+        for dt in [KvDtype::F32, KvDtype::F16] {
+            let mut live = SeqKv::with_dtype(&m.cfg, dt);
+            m.forward_prefill_seq(&toks, &mut live, 0)?;
+            let ex = live.export_prefix(live.len());
+            assert_eq!(ex.n, toks.len());
+            let restored = SeqKv::import(&m.cfg, dt, &ex)?;
+            assert_eq!(restored.len(), live.len());
+
+            let again = restored.export_prefix(restored.len());
+            for (a, b) in ex.layers.iter().zip(&again.layers) {
+                assert!(a.lc.iter().zip(&b.lc).all(|(x, y)| x.to_bits() == y.to_bits()), "lc drifted ({dt:?})");
+                assert!(a.rc.iter().zip(&b.rc).all(|(x, y)| x.to_bits() == y.to_bits()), "rc drifted ({dt:?})");
+                assert_eq!(a.lc.len(), b.lc.len());
+                assert_eq!(a.rc.len(), b.rc.len());
+            }
+
+            let (mut a, mut b) = (live, restored);
+            let pos = toks.len();
+            let mut one: [&mut SeqKv; 1] = [&mut a];
+            let from_live = m.forward_rows_batched(&[7], &[0], &mut one, &[pos], None)?;
+            let mut one: [&mut SeqKv; 1] = [&mut b];
+            let from_restored = m.forward_rows_batched(&[7], &[0], &mut one, &[pos], None)?;
+            assert!(
+                from_live.iter().zip(&from_restored).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "a forward from the restored cache must be bit-identical ({dt:?})"
+            );
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn calib_capture_accumulates_moe_inputs_and_writes_the_sidecar() -> Result<(), peregrine_core::Error> {
+        // The ideas-#7 capture hook end to end at model level: teacher-force a
+        // corpus with capture enabled, and the sidecar must hold mean-|x|
+        // vectors exactly where experts live — dense layer 0 empty, layers 1–2
+        // populated at hidden width, the MTP row empty (capture never drafts).
+        let dir = tmp_model_dir("calibcap")?;
+        let mut m = Model::load(&dir)?;
+        assert!(m.write_calib_sidecar()?.is_none(), "no capture enabled → nothing to write");
+
+        let out = dir.join("calib_channels.json");
+        m.enable_calib_capture(out.clone());
+        let toks = [1i32, 5, 9, 2, 7, 3, 11, 4];
+        m.teacher_forcing(&toks)?;
+        let p = m
+            .write_calib_sidecar()?
+            .ok_or_else(|| peregrine_core::Error::Format("sidecar expected".into()))?;
+        assert_eq!(p, out);
+
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&out)?)
+            .map_err(|e| peregrine_core::Error::Format(format!("sidecar parse: {e}")))?;
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["stat"], "mean_abs");
+        assert_eq!(v["hidden"], 16);
+        assert_eq!(v["positions"], toks.len());
+        let layers = v["layers"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        assert_eq!(layers.len(), 4, "3 layers + the MTP row");
+        assert!(layers[0].as_array().is_some_and(Vec::is_empty), "dense layer 0 has no MoE input");
+        assert!(layers[3].as_array().is_some_and(Vec::is_empty), "the MTP row never accumulates");
+        for l in [1, 2] {
+            let row = layers[l].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            assert_eq!(row.len(), 16, "layer {l} at hidden width");
+            let vals: Vec<f64> = row.iter().filter_map(|x| x.as_f64()).collect();
+            assert_eq!(vals.len(), 16);
+            assert!(vals.iter().all(|x| x.is_finite() && *x >= 0.0), "means are |x| averages");
+            assert!(vals.iter().any(|x| *x > 0.0), "a real forward leaves nonzero magnitude");
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn kv_import_refuses_mismatched_shapes() -> Result<(), peregrine_core::Error> {
+        let dir = tmp_model_dir("kvimportbad")?;
+        let m = Model::load(&dir)?;
+        let mut live = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&[1, 5, 9, 2], &mut live, 0)?;
+        let mut ex = live.export_prefix(live.len());
+        // Truncated stream → refused, not silently misaligned.
+        if let Some(l0) = ex.layers.first_mut() {
+            l0.lc.pop();
+        }
+        assert!(SeqKv::import(&m.cfg, KvDtype::F32, &ex).is_err(), "a short lc stream must be refused");
+        // Wrong layer count → refused.
+        let mut ex = live.export_prefix(live.len());
+        ex.layers.pop();
+        assert!(SeqKv::import(&m.cfg, KvDtype::F32, &ex).is_err(), "a missing layer must be refused");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -5778,9 +7560,16 @@ mod tests {
         // And it is what the drafter accepts: `mtp_draft` takes `&self`, so
         // several sequences can draft from one `&Model` without serialising.
         if m.has_mtp() {
-            let draft = m.mtp_draft(tok, 2, &hidden)?;
+            let draft = m.mtp_draft(tok, 2, &hidden, 0.0)?;
             assert_eq!(draft.len(), 2, "the head drafts to the requested depth");
             assert!(draft.iter().all(|&t| t >= 0 && (t as usize) < vocab), "drafts must be real token ids");
+            // An impossible floor stops the draft at depth 0; the tokens a
+            // permissive floor keeps are a prefix of the unfloored draft —
+            // the gate may only shorten, never redirect.
+            let none = m.mtp_draft(tok, 2, &hidden, 1.1)?;
+            assert!(none.is_empty(), "a floor above 1.0 must draft nothing");
+            let floored = m.mtp_draft(tok, 2, &hidden, 1e-9)?;
+            assert_eq!(floored, draft, "an always-passing floor must not change the draft");
         }
         std::fs::remove_dir_all(&dir)?;
         Ok(())

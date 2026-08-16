@@ -10,6 +10,7 @@
 // is its own crate root, so the attribute has to be repeated per target.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod import;
 pub mod prune;
 pub mod requant;
 pub mod reshard;
@@ -533,8 +534,9 @@ pub struct OverlapStats {
     /// previous position also routed. This is the quantity a perfect one-step
     /// cache would hit, i.e. what "cross-token locality" should mean.
     pub mean_overlap: f64,
-    /// Mean `|A ∩ B| / |A ∪ B|` (Jaccard). Reported alongside because
-    /// `PhaseTracker` steers on Jaccard distance, so the two stay comparable.
+    /// Mean `|A ∩ B| / |A ∪ B|` (Jaccard). Reported alongside because the
+    /// engine's phase signal (`PredictSource::PhaseAware`) steers on Jaccard
+    /// distance, so the two stay comparable.
     pub mean_jaccard: f64,
     /// Mean routed-set size, so the reader can size the null below.
     pub mean_set_size: f64,
@@ -735,6 +737,20 @@ pub fn format_route_stats(trace: &[Vec<Vec<i32>>], n_experts: usize) -> String {
 /// over the original. Multi-shard checkpoints are rejected (out of scope for
 /// the rewrite; the loader handles them unmodified).
 pub fn apply_layout(model_dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error> {
+    apply_layout_with(model_dir, ordered, None)
+}
+
+/// [`apply_layout`] with an optional compression override for the rewritten
+/// expert payloads. `None` preserves each tensor's existing scheme verbatim
+/// (the historical behavior); `Some(Zstd)` compresses the routed-expert
+/// tensors during the rewrite — the one production seam where re-encoding is
+/// free, since every payload is already in memory on its way to a new file.
+/// Non-expert tensors keep their scheme either way (they are hot-path reads).
+pub fn apply_layout_with(
+    model_dir: &Path,
+    ordered: &[Vec<i32>],
+    compress: Option<peregrine_core::Compression>,
+) -> Result<(), Error> {
     use peregrine_core::{pack, SafeTensors};
     let st = SafeTensors::open(model_dir).ctx(|| format!("open {}", model_dir.display()))?;
     if st.paths().len() != 1 {
@@ -783,6 +799,13 @@ pub fn apply_layout(model_dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error>
         };
         let mut b = pack::Blob::new(t.name.clone(), dtype_str, t.shape.clone(), raw);
         b.compression = t.compression;
+        // Expert payloads only: the dense path and head are read on every
+        // token and should not grow a decompress step from a layout rewrite.
+        if let Some(c) = compress {
+            if parse(&t.name).is_some() {
+                b = b.with_compression(c);
+            }
+        }
         blobs.push(b);
     }
     // Write to a temp dir entry then swap in.

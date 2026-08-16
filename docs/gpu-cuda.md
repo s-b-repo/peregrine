@@ -211,9 +211,19 @@ single-device assumption is exactly two lines (`gpu.rs:1444` `init(&[0])` and
 `COLI_CUDA_MAX_DEVICES` contexts.
 
 Of the items that are *not* hardware-blocked, persistent CUDA kernels are
-declined above; the `cudaMallocAsync` pool wants a largest-free-block
-measurement before anyone builds it (two block sizes and a monotone startup
-burst make fragmentation unlikely); and idle-cycle GPU compute splits into an
+declined above; the `cudaMallocAsync` pool is **closed on measurement
+(2026-08-13)** — `coli_cuda_largest_free_block` (a binary search over real
+`cudaMalloc` probes, ~13 of them at a 2 MB grain) reports the largest single
+allocation that still succeeds, and after three rounds of the worst churn the
+engine can produce (interleaved frees of the two expert block sizes with every
+gap refilled at the *other* format) the RTX 3060 still hands back **96.7 % of
+free VRAM as one block**. Fragmentation is the gap between that and 100 %, and
+a pool cannot buy back ~3 % headroom the runtime itself holds.
+`vram_churn_of_the_two_expert_block_sizes_leaves_free_memory_in_one_block`
+pins it at a ≥ 50 % bar — generous enough to survive other tenants on the
+card, three orders above the ~24 MB collapse a genuinely fragmenting
+allocator would show — so if a future driver regresses this, the item reopens
+by a test failure instead of a hunch. Idle-cycle GPU compute splits into an
 engine-idle half that an in-tree negative result already argues against and a
 mid-forward-spill half that is a different feature. See `todo.md`.
 

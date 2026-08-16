@@ -1,0 +1,24 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)
+peregrine: pcie 0000:01:00.0 2.5 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 42.3 GB | resident 10.9 + KV 0.7 + stream 11.5 + slack 1.4 + cache 2.1 -> peak 26.6 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: [workingset] one token routes 10.85 GB of experts against a 2.00 GB cache (18% of a pass) — no eviction order can hold a pass; prefetch-protect on
+[tokenizer] gigatoken BPE active, vocab=154856
+peregrine-serve listening on http://127.0.0.1:8147
+peregrine-serve shutting down
+[prefix-cache] hits=0 tokens_reused=0 entries=1 resident=154.4 MiB
+[kvstore] saved=1 loaded=0 tokens_restored=0 entries=1 resident=142.6 MiB
+[expertmap] indexed=19456 coalescing=19200 (98.7%) -> 39936 reads per full sweep vs 116736 unmerged
+[workingset] 10.85 GB per token; prefetch-protect on (budget cannot hold a pass)
+[lane] 7 forwards: io 225.6s (89%) cpu 25.7s (10%) gpu 0.0s (0%) reduce 1.1s (0%)
+[lane] per forward: io 32.23s cpu 3.67s (lane-summed, so compare sum/wall for the overlap achieved)
+[lane] moe wall 81.4s over 7 forwards (11.63s each); io duty 69% of 4 rings, cpu 0.3 workers busy
+[lane] cpu-lane bandwidth 3.10 GB/s over 79.4 GB of expert slabs
+[lane] cache-lock wait 0.02s (0.0% of io thread time)
+[ecache] hits=305 misses=105771 disk_reads=105771 prefetch_reads=2653 hit_rate=0.3%
+[ecache] resident: 113 slots, 2.14 GB of 2.15 GB budget (99.5% full)
+[prefetch] used=116 wasted=2446 unclassified=91 accuracy=4.5% (of 2562 classified) yield=4.4% (of 2653 issued) fadvise=0 verify_mismatch=0
+[prefetch] resident-unused: 5 slots, 0.09 GB of 2.15 GB budget (4.4%)
+peregrine-serve: batch engine still busy after 30s; route_stats.json and the [ecache]/[prefetch] counters may be incomplete

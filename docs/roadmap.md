@@ -2,57 +2,53 @@
 
 # Roadmap & status
 
-The audited, per-item roadmap is [`todo.md`](../todo.md) — 108 tracked items
+The audited, per-item roadmap is [`todo.md`](../todo.md) — 137 tracked items
 with file:line evidence, status verified against the codebase. This page is
 the summary.
 
-## Where things stand (2026-07-30)
+## Where things stand (2026-08-13)
 
 | Scope | ✅ Done | 🟡 Partial | ⬜ Not started | Completion |
 |---|---:|---:|---:|---:|
-| **Full roadmap** (108 items) | 89 | 6 | 13 | **~82 % strict · ~85 % weighted** |
-| **Priority shortlist** (19) | 15 | 1 | 3 | **~79 % strict · ~82 % weighted** |
+| **Full roadmap** (137 items) | 128 | 1 | 8 | **~93 % strict · ~94 % weighted** |
+| **Priority shortlist** (20) | 17 | 0 | 3 | **85 % strict** |
 
-Per-section: Prefetch **9/9** · GPU 5/9 · Caching **12/12** · I/O 9/11 ·
-Memory/NUMA **4/5** · Scheduling 16/18 · Disk-layout **10/10** · Workload
-**5/5** · Compilation **5/5** · Self-optimizing 9/10 · Multi-GPU 0/4 ·
-Attention/serving 2/5 · Workload-reduction 3/5.
+Per-section: Prefetch **11/11** · GPU 9/10 · Caching **13/13** · I/O 10/11 ·
+Memory/NUMA **8/8** · Scheduling 16/18 · Disk-layout **10/10** · Workload
+**5/5** · Compilation **5/5** · Self-optimizing **10/10** · Multi-GPU 0/4 ·
+Attention/serving **7/7** · Workload-reduction **15/16**.
 
-The 19 open items split three ways, and only the first group is blocked here.
+What remains open splits four ways, and only the first group is blocked here
+(the 2026-07-30 revision of this page said ten items needed hardware; five of
+those have since shipped or closed on this box — the full audit trail is in
+`todo.md`):
 
-**Needs hardware (10)** — `nvcc` + an NVIDIA GPU, ≥ 2 GPUs, a GPUDirect Storage
-driver stack, or multiple hosts:
+**Needs hardware this box lacks (5)** — ≥ 2 GPUs, a GPUDirect Storage driver
+stack, or multiple hosts. Each has a design naming its `file:line` seam in
+[scale-out-design.md](scale-out-design.md): GPUDirect Storage; multi-GPU
+expert ownership/migration; NVLink-aware placement; VRAM replication;
+distributed sharding across hosts.
 
-- Persistent CUDA kernels (threadblocks looping dequeue → compute → enqueue)
-- CUDA Graphs wired into the decode loop (capture/replay itself is built and tested)
-- GPU-side fused reduce; `cudaMallocAsync` pool for `reheat` churn
-- Idle-cycle GPU compute (PCIe bandwidth scheduling shipped: `COLI_PCIE_BUDGET_MB`)
-- GPUDirect Storage (SSD → VRAM direct)
-- Multi-GPU expert ownership/migration, NVLink-aware placement, VRAM
-  replication (the tier is hardcoded to `device=0` today)
-- Distributed inference across hosts with expert sharding
+**CUDA work this box could do — resolved by evidence instead (3).** Persistent
+kernels are declined (they would delete the shipped CUDA-graph cache to solve
+the same problem, monopolize the one non-blocking stream, and defeat the
+`scratch_gen` guard); the `cudaMallocAsync` defrag pool **closed on
+measurement 2026-08-13** (the probe was built instead: after worst-case churn
+of the two expert block sizes, 96.7 % of free VRAM is still one block);
+engine-idle GPU warming has an in-tree negative result, and the mid-forward
+spill half is blocked on a `&mut GpuTier` seam, not on CUDA.
 
-**Open by choice (1)** — CPU/GPU split GEMM: the CPU half computes int4 and the
-GPU half f32, and a timing-derived split point would make low-order output bits
-depend on machine timing, so the same prompt would give different logits run to
-run.
+**Open by choice (1)** — CPU/GPU split GEMM: timing-derived split points would
+make logits depend on machine timing, and it cuts zero bytes per token. Its
+named replacement, `COLI_ROUTE_MIN_SHARE`, was **gated 2026-08-13 and failed
+at the setting worth having**: τ=0.05 flips 27.9 % of top-1 predictions for a
+~12.5 % read saving ([bench-data](../bench-data/2026-08-13-route-min-share/README.md)).
 
-**Pure CPU work, blocked only by size (8)** — and this is where the remaining
-throughput is, since caching plateaus at this capacity ratio (0.6% warm-cache
-hit rate on a 10 GB cache; see the §5.2 correction) and §1–§11 all optimize how
-fast bytes move rather than how many:
-
-- Fuse prefill rows into the decode batch (two disjoint forwards today, each
-  streaming its own expert union)
-- KV cache quantization (the KV is f32; ~180 MB per 1k tokens)
-- Paged / block-pooled KV (per-sequence contiguous `Vec`s, capped by count not bytes)
-- int2 checkpoint conversion — **the converter shipped** (`peregrine-requantize`, measured 2.69 GB → 1.35 GB on a real GLM-5.2 shard); what remains is a full-checkpoint run and a flip-rate measurement
-- Heat-tiered on-disk precision (hot int4 / cold int2 — needs no loader change)
-- Wire three features that ship tested but unreachable, found by the [R]
-  reachability pass: the registered-buffer read path (`COLI_REGBUF` is read by no
-  code), the `perf_event_open` LLC-miss counter (`COLI_PERF_COUNTERS` is inert —
-  nothing calls the opener), and the slab pool's generation tagging
-  (`checkout_tagged`/`checkin_tagged` have zero callers)
+**Machine time (1)** — int2-g64 converted and **measured: flip_rate 1.000, a
+closed negative** (2-bit round-to-nearest is not enough for this model; the
+container decodes correctly). int3-g64 (12.7 % smaller than int4) is the one
+untested rung on the precision ladder; the requantizer and the flip-rate gate
+are both ready for it.
 
 ## What shipped, in waves
 

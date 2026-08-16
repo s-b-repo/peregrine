@@ -1,0 +1,19 @@
+== env-arm sweep: B=16 max_tokens=32 repeats=3 memmax=34G
+== arms: bench-data/2026-08-15-stale-drop/arms/stale-off.env bench-data/2026-08-15-stale-drop/arms/stale-on.env
+== model=/home/cortix/models/GLM-5.2
+== git: f8adef7
+-- rep 1 arm stale-off.env
+  page cache dropped
+  loaded in ~14s
+[stale-off-rep1] 512 tok in 7092.587s = 0.072 tok/s (streams ok 16/16, ttft med Nones)
+-- rep 1 arm stale-on.env
+  page cache dropped
+  loaded in ~14s
+[stale-on-rep1] 512 tok in 6042.934s = 0.085 tok/s (streams ok 16/16, ttft med Nones)
+-- rep 2 arm stale-on.env
+  page cache dropped
+  loaded in ~20s
+[stale-on-rep2] 512 tok in 6978.61s = 0.073 tok/s (streams ok 16/16, ttft med Nones)
+-- rep 2 arm stale-off.env
+  page cache dropped
+  loaded in ~16s

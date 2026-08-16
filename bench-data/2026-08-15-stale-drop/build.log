@@ -1,0 +1,9 @@
+   Compiling peregrine-io v0.1.0 (/home/cortix/peregrine/crates/peregrine-io)
+   Compiling peregrine-core v0.1.0 (/home/cortix/peregrine/crates/peregrine-core)
+   Compiling peregrine-tools v0.1.0 (/home/cortix/peregrine/crates/peregrine-tools)
+   Compiling peregrine-model v0.1.0 (/home/cortix/peregrine/crates/peregrine-model)
+   Compiling peregrine-cuda v0.1.0 (/home/cortix/peregrine/crates/peregrine-cuda)
+   Compiling peregrine-sched v0.1.0 (/home/cortix/peregrine/crates/peregrine-sched)
+   Compiling peregrine-engine v0.1.0 (/home/cortix/peregrine/crates/peregrine-engine)
+   Compiling peregrine-serve v0.1.0 (/home/cortix/peregrine/crates/peregrine-serve)
+    Finished `release` profile [optimized] target(s) in 1m 03s

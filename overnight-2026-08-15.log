@@ -1,0 +1,62 @@
+== [2026-08-15 02:16:17] stage 0: asymmetric dry-run + free-space preflight
+== [2026-08-15 02:16:17] stage 0: needs ~355.25 GB, 1009 GB free on the stripe
+== [2026-08-15 02:16:17] stage 1: asymmetric int3-g64 conversion (disk-heavy; ionice idle)
+== [2026-08-15 04:25:43] stage 2: flip-rate gate (512 positions; uniform int3-g64 scored 0.514 here)
+== [2026-08-15 04:44:40] stage 2: flip_rate 0.447266 > 0.05 — skipping stage 3; contingency is --keep-last-layers 12, else todo.md §13 gains another closed rung
+== [2026-08-15 04:44:40] stage 4: COLI_SPEC_CONF A/B at B=16 (REPEATS=1, source container)
+== env-arm sweep: B=16 max_tokens=32 repeats=1 memmax=34G
+== arms: bench-data/2026-08-15-specconf/arms/draft5.env bench-data/2026-08-15-specconf/arms/draft5-conf065.env
+== model=/home/cortix/models/GLM-5.2
+== git: 34b04da
+-- rep 1 arm draft5.env
+  page cache dropped
+  loaded in ~24s
+[draft5-rep1] 512 tok in 8484.294s = 0.06 tok/s (streams ok 16/16, ttft med Nones)
+-- rep 1 arm draft5-conf065.env
+  page cache dropped
+  loaded in ~24s
+[draft5-conf065-rep1] 512 tok in 6287.501s = 0.081 tok/s (streams ok 16/16, ttft med Nones)
+
+== medians (aggregate tok/s at B=16)
+             arm  runs  median tok/s      all
+          draft5     1         0.060   [0.06]
+  draft5-conf065     1         0.081   [0.08]
+
+Differences inside the +-3% long-run band are not results. Check the
+.counters.txt reads: tok/s bought by proportionally more disk_reads is
+not a lever, it is a cache trade.
+== [2026-08-15 08:52:27] stage 5: COLI_ECACHE_GB fixed-8 vs auto A/B at B=16 (REPEATS=1)
+== env-arm sweep: B=16 max_tokens=32 repeats=1 memmax=34G
+== arms: bench-data/2026-08-15-ecache-auto/arms/ecache8.env bench-data/2026-08-15-ecache-auto/arms/ecache-auto.env
+== model=/home/cortix/models/GLM-5.2
+== git: 34b04da
+-- rep 1 arm ecache8.env
+  page cache dropped
+  loaded in ~12s
+[ecache8-rep1] 512 tok in 5794.306s = 0.088 tok/s (streams ok 16/16, ttft med Nones)
+-- rep 1 arm ecache-auto.env
+  page cache dropped
+  loaded in ~28s
+[ecache-auto-rep1] 0 tok in 32.686s = 0.0 tok/s (streams ok 0/16, ttft med Nones)
+  arm failed (ecache-auto.env rep=1)
+
+== medians (aggregate tok/s at B=16)
+          arm  runs  median tok/s      all
+      ecache8     1         0.088   [0.09]
+  ecache-auto     0             —
+
+Differences inside the +-3% long-run band are not results. Check the
+.counters.txt reads: tok/s bought by proportionally more disk_reads is
+not a lever, it is a cache trade.
+== [2026-08-15 10:31:01] stage 6: kvstore restart smoke (identity + prefill collapse)
+== kvstore smoke: cold run
+loaded in ~28s
+cold request: 2620.5s
+== kvstore smoke: restart run (same request)
+loaded in ~12s
+warm request: 391.9s (cold was 2620.5s)
+bench-data/2026-08-15-kvstore/server-cold.log:[kvstore] saved=1 loaded=0 tokens_restored=0 entries=1 resident=142.6 MiB
+bench-data/2026-08-15-kvstore/server-warm.log:[kvstore] saved=0 loaded=1 tokens_restored=832 entries=1 resident=142.6 MiB
+outputs identical across the restart (33 chars)
+store holds 1 checkpoint(s)
+== [2026-08-15 11:22:55] chain complete

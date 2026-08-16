@@ -157,3 +157,134 @@ fn build_tiny_model_cfg(dir: &Path, seed: u64, cfg_json: serde_json::Value) -> R
 pub fn build_tiny_model(dir: &Path) -> Result<(), Error> {
     build_tiny_model_seeded(dir, 0xC0FFEE)
 }
+
+/// The tiny classic-Qwen3 (dense GQA) config — Track C's GQA core fixture.
+/// Dims mirror `peregrine_core::config`'s tests and C2's importer fixture.
+pub fn tiny_qwen_cfg_json() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "qwen3", "vocab_size": 32, "hidden_size": 16,
+        "intermediate_size": 8, "num_hidden_layers": 2,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 4,
+        "rope_theta": 10000.0, "rms_norm_eps": 1e-6, "eos_token_id": 0
+    })
+}
+
+/// The tiny Qwen3.5-hybrid config: 3 layers (linear, linear, full), the
+/// output-gated attention, partial rotary 0.25 — every hybrid mechanism at toy
+/// dims. Kept in sync with the config tests and C2's importer fixture.
+pub fn tiny_hybrid_cfg_json() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "vocab_size": 32, "hidden_size": 16, "intermediate_size": 8,
+            "num_hidden_layers": 3, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 8,
+            "layer_types": ["linear_attention", "linear_attention", "full_attention"],
+            "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+            "linear_key_head_dim": 4, "linear_value_head_dim": 4,
+            "linear_conv_kernel_dim": 4, "attn_output_gate": true,
+            "partial_rotary_factor": 0.25,
+            "rope_parameters": {"rope_theta": 10000000.0, "partial_rotary_factor": 0.25},
+            "rms_norm_eps": 1e-6, "eos_token_id": 0
+        }
+    })
+}
+
+/// Write a tiny random dense-GQA (classic Qwen3) model into `dir`.
+pub fn build_tiny_qwen_model(dir: &Path, seed: u64) -> Result<(), Error> {
+    build_tiny_gqa_family(dir, seed, tiny_qwen_cfg_json())
+}
+
+/// Write a tiny random Qwen3.5-hybrid model into `dir`.
+pub fn build_tiny_hybrid_model(dir: &Path, seed: u64) -> Result<(), Error> {
+    build_tiny_gqa_family(dir, seed, tiny_hybrid_cfg_json())
+}
+
+/// Shared writer for the two Qwen-family fixtures: emits exactly the Track C
+/// tensor contract (HF names verbatim, int4 + `.qs` matrices, float norms and
+/// GDN scalars, int8 embed/lm_head) so the production loader is what the tests
+/// exercise — no test-only naming.
+fn build_tiny_gqa_family(dir: &Path, seed: u64, cfg_json: serde_json::Value) -> Result<(), Error> {
+    let cfg: Cfg = Cfg::from_json(&cfg_json)?;
+    let hybrid = cfg.arch == peregrine_core::Arch::HybridGdn;
+    let mut r = Lcg(seed);
+    let rnd = |n: usize, r: &mut Lcg| (0..n).map(|_| r.f()).collect::<Vec<f32>>();
+    let d = cfg.hidden as usize;
+    let (nh, nkv, hd) = (cfg.n_heads as usize, cfg.n_kv_heads as usize, cfg.head_dim as usize);
+    let vocab = cfg.vocab as usize;
+    let di = cfg.dense_inter as usize;
+
+    let mut blobs = Vec::new();
+    let w4 = |blobs: &mut Vec<Blob>, name: &str, o: usize, i: usize, r: &mut Lcg| {
+        let w = rnd(o * i, r);
+        let (q, s) = quant_i4(&w, o, i);
+        blobs.push(Blob::new(name.to_string(), "U8", vec![o as i64, (i.div_ceil(2)) as i64], q));
+        blobs.push(Blob::new(format!("{name}.qs"), "F32", vec![o as i64], f32_bytes(&s)));
+    };
+    let wf = |blobs: &mut Vec<Blob>, name: &str, n: usize, r: &mut Lcg| {
+        let v: Vec<f32> = (0..n).map(|_| 1.0 + r.f() * 0.1).collect();
+        blobs.push(Blob::new(name.to_string(), "F32", vec![n as i64], f32_bytes(&v)));
+    };
+
+    let stem = if hybrid { "model.language_model" } else { "model" };
+    let w = rnd(vocab * d, &mut r);
+    let (q, s) = quant_i8(&w, vocab, d);
+    blobs.push(Blob::new(format!("{stem}.embed_tokens.weight"), "U8", vec![vocab as i64, d as i64], q));
+    blobs.push(Blob::new(format!("{stem}.embed_tokens.weight.qs"), "F32", vec![vocab as i64], f32_bytes(&s)));
+    let w = rnd(vocab * d, &mut r);
+    let (q, s) = quant_i8(&w, vocab, d);
+    blobs.push(Blob::new("lm_head.weight".to_string(), "U8", vec![vocab as i64, d as i64], q));
+    blobs.push(Blob::new("lm_head.weight.qs".to_string(), "F32", vec![vocab as i64], f32_bytes(&s)));
+    wf(&mut blobs, &format!("{stem}.norm.weight"), d, &mut r);
+
+    for i in 0..cfg.n_layers as usize {
+        let p = |s: &str| format!("{stem}.layers.{i}.{s}");
+        wf(&mut blobs, &p("input_layernorm.weight"), d, &mut r);
+        wf(&mut blobs, &p("post_attention_layernorm.weight"), d, &mut r);
+        let full = !hybrid || cfg.full_attn.get(i).copied().unwrap_or(false);
+        if full {
+            let q_rows = if cfg.attn_gate { 2 * nh * hd } else { nh * hd };
+            w4(&mut blobs, &p("self_attn.q_proj.weight"), q_rows, d, &mut r);
+            w4(&mut blobs, &p("self_attn.k_proj.weight"), nkv * hd, d, &mut r);
+            w4(&mut blobs, &p("self_attn.v_proj.weight"), nkv * hd, d, &mut r);
+            w4(&mut blobs, &p("self_attn.o_proj.weight"), d, nh * hd, &mut r);
+            wf(&mut blobs, &p("self_attn.q_norm.weight"), hd, &mut r);
+            wf(&mut blobs, &p("self_attn.k_norm.weight"), hd, &mut r);
+        } else {
+            let (kh, vh, kd, vd, taps) = (
+                cfg.lin_k_heads as usize,
+                cfg.lin_v_heads as usize,
+                cfg.lin_k_dim as usize,
+                cfg.lin_v_dim as usize,
+                cfg.lin_conv_k as usize,
+            );
+            let conv_dim = 2 * kh * kd + vh * vd;
+            w4(&mut blobs, &p("linear_attn.in_proj_qkv.weight"), conv_dim, d, &mut r);
+            w4(&mut blobs, &p("linear_attn.in_proj_z.weight"), vh * vd, d, &mut r);
+            w4(&mut blobs, &p("linear_attn.in_proj_a.weight"), vh, d, &mut r);
+            w4(&mut blobs, &p("linear_attn.in_proj_b.weight"), vh, d, &mut r);
+            let conv = rnd(conv_dim * taps, &mut r);
+            blobs.push(Blob::new(
+                p("linear_attn.conv1d.weight"),
+                "F32",
+                vec![conv_dim as i64, 1, taps as i64],
+                f32_bytes(&conv),
+            ));
+            let a_log: Vec<f32> = (0..vh).map(|_| r.f() * 0.5).collect();
+            blobs.push(Blob::new(p("linear_attn.A_log"), "F32", vec![vh as i64], f32_bytes(&a_log)));
+            let dtb: Vec<f32> = (0..vh).map(|_| r.f() * 0.5).collect();
+            blobs.push(Blob::new(p("linear_attn.dt_bias"), "F32", vec![vh as i64], f32_bytes(&dtb)));
+            wf(&mut blobs, &p("linear_attn.norm.weight"), vd, &mut r);
+            w4(&mut blobs, &p("linear_attn.out_proj.weight"), d, vh * vd, &mut r);
+        }
+        w4(&mut blobs, &p("mlp.gate_proj.weight"), di, d, &mut r);
+        w4(&mut blobs, &p("mlp.up_proj.weight"), di, d, &mut r);
+        w4(&mut blobs, &p("mlp.down_proj.weight"), d, di, &mut r);
+    }
+
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&cfg_json)?)?;
+    write_safetensors(dir, &blobs)?;
+    Ok(())
+}

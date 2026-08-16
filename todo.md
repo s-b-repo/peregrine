@@ -17,7 +17,7 @@ concurrent CPU/GPU/SSD scheduler + `io_uring`.
 
 | Scope | ✅ Done | 🟡 Partial | ⬜ Not started | Total | Completion |
 |---|---:|---:|---:|---:|---:|
-| **Full roadmap** | 127 | 1 | 9 | 137 | **~93% strict · ~93% weighted** |
+| **Full roadmap** | 130 | 0 | 8 | 138 | **~94% strict · ~94% weighted** |
 | **Priority shortlist** | 17 | 0 | 3 | 20 | **85% strict · 85% weighted** |
 
 *Strict = Done ÷ Total. Weighted = (Done + ½·Partial) ÷ Total. "Fast matrix multiplication" is excluded.
@@ -30,7 +30,7 @@ which is the honest reading: the roadmap was ~89% done against a scope that excl
 strict figure has barely moved since because each wave opens roughly as much as it closes. Counts are generated from the checkboxes below — recount with
 `awk '/^## 1\./,/^## ❄️/' todo.md | grep -c '^- \[x\]'`.*
 
-**Per-section:** Prefetch **11/11 ✅** · GPU 8/10 · Caching **13/13 ✅** · I/O 10/11 · Memory/NUMA
+**Per-section:** Prefetch **11/11 ✅** · GPU 9/10 · Caching **13/13 ✅** · I/O 10/11 · Memory/NUMA
 **8/8 ✅** · Scheduling 16/18 · Disk-layout **10/10 ✅** · Workload **5/5 ✅** · Compilation
 **5/5 ✅** · Self-optimizing **10/10 ✅** · Multi-GPU 0/4 · Attention/serving **7/7 ✅** ·
 Workload-reduction **15/16**.
@@ -43,9 +43,61 @@ response memo in §12. The borrowed **negative** results are recorded in
 per-expert bit allocation, routed-tail truncation and prefill-path look-ahead, and they put an
 open question against §1's entire statistical predictor stack.*
 
-## 📌 What is actually left (2026-08-08)
+## 📌 What is actually left (2026-08-08; defrag + min-share closed 2026-08-13)
 
-**Ten roadmap line-items (1 partial + 9 not started).** The 2026-08-08 wave
+**2026-08-15 wave (the ds4 port — verdicts pending overnight).** Four
+techniques from [antirez's ds4/DwarfStar](https://github.com/antirez/ds4)
+(same problem shape: GLM-5.2 experts streamed on consumer hardware) landed as
+code; every knob is off by default and `scripts/overnight-2026-08-15.sh` is
+measuring them — numbers land in `bench-data/2026-08-15-*/` and get copied
+here and into docs/benchmarks.md when the chain finishes. (1) **Asymmetric
+expert requantization** (`--down keep --keep-last-layers 6`, §13's pending
+bullet — the only untested evidence-backed point left on the sub-int4
+ladder). (2) **`COLI_SPEC_CONF`** — confidence-gated MTP draft depth;
+depth-only, `accept_run` untouched, greedy output pinned bit-identical by an
+engine test. The §6/`performance-tuning.md` `COLI_DRAFT=4` rejection (each
+rejected verify row streams its own expert bytes) is precisely the waste it
+prunes, so the 08-13 rejection gets a second look with the floor at 0.65.
+(3) **`COLI_ECACHE_GB=auto`** — ds4's 80 %-of-available budget rule over the
+existing reserve/safety caps. (4) **`COLI_KV_STORE_DIR`** — disk-persisted KV
+sessions (`serve/src/kvstore.rs`): completed prefixes ≥256 tokens checkpoint
+to disk (fingerprint + checksum + full-token compare; ~176 KiB/token) and a
+restarted server restores them instead of re-streaming ~10.85 GB/token of
+prefill; the in-memory prefix cache's disk extension, promoted back on first
+hit. Added later the same day, same off-by-default rule: (5)
+**`COLI_PREFETCH_STALE_DROP`** — the prefetch worker drops a queued
+speculative warm *before* its disk read once the sweep has moved
+`COLI_PREFETCH_STALE_SLACK` (default 1) layer-steps past its emit stamp.
+Motivated by the 08-13 defaults counters: at B=16 the unbounded prefetch
+queue backlogs behind 93 %-duty rings and 98.6 % of speculative reads
+(40 352/41 159, ~12.6 % of *all* disk reads) were serviced too late to be
+anything but waste. Advisory-lane-only, so output is untouched by
+construction; `[prefetch]` now prints `stale_dropped=`; A/B queued behind
+the overnight chain (`scripts/prefetch-stale-ab.sh`, results →
+`bench-data/2026-08-15-stale-drop/`).
+
+**2026-08-13 evening wave (two sessions, coordinated).** Beyond the min-share
+gate (measured negative at every τ — see §6's replacement item) and the VRAM
+defrag probe (96.7 % of free VRAM in one block after worst-case churn — §2
+closed), the serving axis moved: **RLM now runs under `peregrine-serve`**
+(`Model::rlm_refine_external` over each request's own KV; it had been a silent
+no-op there since the feature landed), **the prefix cache learns generated
+tokens** (a retiring sequence freezes prompt+output, so a multi-turn client's
+next request is a refcount bump instead of re-prefilling the assistant turn it
+was just sent), **MTP speculation finally reports** (`/metrics` `spec`
+accept-rate + `[spec]` shutdown line — the number `COLI_DRAFT` tuning was
+missing), and three output-neutral defaults flipped on
+(`COLI_FUSE_PREFILL=1`, `COLI_PREFILL_CHUNK_DIV=4`,
+`COLI_PREFIX_CACHE_MB=2048`; every one keeps a `=0` escape hatch). `[R]` went
+**24 → 17** by wiring the six dormant observability fns (io boot line reads
+sqpoll/fixed-file state back from the rings, automaton banner, per-layer
+prefetch column, slab occupancy on `/metrics`, `rlm_stats`, and
+`--compress zstd` on the layout rewrite giving `with_compression` its
+production caller). The vendored tokenizer got its own measured pass
+(+19 % line / +15 % warm-parallel, ids byte-identical;
+[tokenizer.md](docs/tokenizer.md#2026-08-13-speed-pass)).
+
+**Eight roadmap line-items (8 not started, all hardware-blocked or declined; the last partial — §3b `PhaseTracker` — closed 2026-08-14 on the scoreboard below).** The 2026-08-08 wave
 closed §2's CUDA-graph decode wiring and its GPU-side fused reduce — the last
 two engineering 🟡s — and took the `[R]` dead-code count **29 → 22** by wiring
 `moe_engine_installed`, `pick_lfru`/`pick_swap`, `speculative_sample`, and
@@ -86,12 +138,17 @@ rather than an implementation on spec:
   defeats the `scratch_gen` guard, whose whole mechanism is *discard and
   recapture* and you cannot discard a running kernel. Reasons recorded in
   `docs/gpu-cuda.md` so this is not reopened without new evidence.
-- **`cudaMallocAsync` defrag pool — measure first, and expect to close it.**
-  There are exactly **two** distinct block sizes (`int4_bytes`, `f32_bytes`) and
-  startup is a monotone allocation burst, which is the textbook non-fragmenting
-  workload. The decisive number is largest-free-block vs free-bytes, which
-  `coli_cuda_mem_info` is one binary-searched `cudaMalloc` away from reporting.
-  Build the probe, not the pool.
+- **`cudaMallocAsync` defrag pool — measured 2026-08-13, and it closed exactly
+  as predicted.** There are exactly **two** distinct block sizes (`int4_bytes`,
+  `f32_bytes`) and startup is a monotone allocation burst, which is the textbook
+  non-fragmenting workload. The probe was built instead of the pool:
+  `coli_cuda_largest_free_block` binary-searches real `cudaMalloc` probes
+  (~13 at a 2 MB grain), and after three rounds of the worst churn the engine
+  can produce — interleaved frees of the two block sizes, every gap refilled at
+  the *other* format — the RTX 3060 still returns **96.7 % of free VRAM as one
+  block**. `vram_churn_of_the_two_expert_block_sizes_leaves_free_memory_in_one_block`
+  pins it at a ≥ 50 % bar, so a future allocator regression reopens the item by
+  test failure rather than by hunch. Closed as a measured negative; see §2.
 - **Idle-cycle GPU compute — the item was two items, and one of them is
   declined.** *Engine-idle* GPU warming has a ready-made hook
   (`Model::idle_maintenance`) and a result already in the tree against it:
@@ -109,17 +166,63 @@ weight matrices on an engine whose whole problem is bytes. A timing-independent
 `COLI_SPLIT_FRAC` would have fixed the determinism objection while leaving both
 of those intact. What replaces it, by the same test:
 
-- **`COLI_ROUTE_MIN_SHARE`, sized by the flip-rate gate — no new code.** The
-  2026-08-07 counters give it a real ceiling for the first time: at B=16,
-  **12.5 % of routed selections carry under 5 % of the gate mass**
-  (`below_0.5%=1.0%`, `below_1%=1.3%`, `below_2%=2.4%`, `below_5%=12.5%`). The
-  knob ships and is off only because nobody had a quality number, and the number
-  is now one command away — run `peregrine flip-rate` with the knob set on the
-  candidate side and unset on the source, *same container both times*, so there
-  is no conversion cost at all. This is the highest value-per-hour item on the
-  roadmap.
+- **`COLI_ROUTE_MIN_SHARE`, sized by the flip-rate gate — MEASURED 2026-08-13,
+  and the answer at the setting that mattered is no.** The 2026-08-07 counters
+  gave it a real ceiling: at B=16, **12.5 % of routed selections carry under
+  5 % of the gate mass** (`below_0.5%=1.0%`, `below_1%=1.3%`, `below_2%=2.4%`,
+  `below_5%=12.5%`). Two corrections from actually running it. First, "the
+  number is one command away — no new code" was wrong: `route_min_share()`
+  latches in a process-global `OnceLock` and both flip-rate arms ran in one
+  process, so setting the env var truncated *both* arms and the gate read a
+  vacuous 0.000 — `flip-rate` had to grow `--candidate-env` (the candidate arm
+  as a child process, refusing any key the parent also holds; pinned by three
+  CLI tests). Second, the result: **τ=0.05 flips 27.9 % of top-1 predictions
+  and τ=0.02 flips 20.7 %** (143/512 and 106/512, real prose, same container
+  both arms —
+  [bench-data/2026-08-13-route-min-share](bench-data/2026-08-13-route-min-share/README.md)).
+  The weak-gate tail carries real signal, and the near-flat curve between the
+  two settings says the damage sits in the *thinnest* slice of the tail —
+  experts under 2 % of a position's gate mass are still load-bearing for the
+  argmax, and τ=0.02's byte ceiling was only ~2.4 % of selections to begin
+  with. **Closed as a measured negative at every useful setting.** With
+  routing slack (this) and precision slack (int2) both measured absent, the
+  workload-reduction menu narrows to formats that keep every expert but
+  shrink its bytes. int3-g64 was the untested rung; it was measured 2026-08-14 and **fails** (see below).
 - **int2-g64 is not the answer** — measured this pass at `flip_rate = 1.000`.
-  See §13. `int3-g64` (12.7 % smaller than int4) is the untested rung.
+  See §13. `int3-g64` was the last untested rung, and it fails too (2026-08-14):
+  **`flip_rate = 0.514` (263/512)** against the int4 source on the committed prose
+  corpus — half the top-1 predictions move. The container is real (the candidate
+  arm's working set read 9.35 GB/token vs int4's 10.85, so the 13.4 % byte saving
+  was genuinely there) but the scheme is not licensed. With int2 at 1.000 and
+  min-share at 0.21–0.28, **every sub-int4 round-to-nearest rung is now a
+  measured negative** — what remains below 4 bits is vector quantization /
+  incoherence processing (AQLM, QuIP#), a research project, not a converter flag.
+  Artifact at `/srv/modelstripe/GLM-5.2-int3g64`; log `bench-data/2026-08-13-int3g64/`.
+- **MEASURED 2026-08-15, and the asymmetric point fails too: `flip_rate =
+  0.447266` (229/512).** The ds4/DwarfStar recipe — gate/up int3-g64, `down`
+  kept byte-identical int4 (residual-stream reasoning), last 6 expert layer
+  indices incl. the MTP row untouched — converted 383.73 → 355.25 GB and beat
+  the uniform rung's 0.514, but 45 % of top-1 predictions still move. The byte
+  claim held exactly (the gate's own working-set line: **10.02 GB/token vs
+  int4's 10.85**, the predicted −7.4 %). Verdict: **the data-free
+  round-to-nearest ladder is now closed at every measured point, symmetric or
+  asymmetric** — uniform int2-g64 1.000, uniform int3-g64 0.514, asymmetric
+  0.447. The converter flags stay (cost nothing, serve future formats).
+  Artifact `/srv/modelstripe/GLM-5.2-i3g64-asym` (355 GB, user's deletion
+  call); logs `bench-data/2026-08-15-i3g64-asym/`. **What this closure still
+  does NOT cover, and what replaced it as the open point: calibrated
+  (importance-weighted) rounding — ideas #7, CODE-COMPLETE the same day**
+  (`quant_i3_g64_weighted` + `peregrine-requantize --calib` +
+  `peregrine calib-capture`; per-layer mean-|x| channel stats pooled the AWQ
+  way, plain amax/3 always a search candidate so it can never lose to RTN on
+  its own objective). The planned two-rung
+  overnight (keep-last-12 + calibrated) was SHELVED 2026-08-16 by product
+  decision — GLM byte-reduction lost priority to the Qwen resident-serving
+  track, and partial GPU offload is the VRAM-fit route there. The calibrated
+  tooling stays in the tree as the instrument of record
+  (`--calib`, `calib-capture`, jobs-available/200-two-rung-int3.sh is the
+  how-to) if sub-int4 is ever revisited; if both rungs were to fail, vector
+  quantization / incoherence processing remains the only road below 4 bits.
 - Speculative, named so it is not rediscovered: expert-delta or shared-basis
   coding is the only idea here with a ceiling below 2 bits/weight, but it breaks
   `QtInfo::detect`'s per-tensor self-description and there is no evidence
@@ -162,7 +265,7 @@ carried as a pending item. Details in §13.
   independently — vector quantization or incoherence processing, as AQLM and
   QuIP# do — which is a research project, not a converter flag. Recorded as a
   closed negative result rather than a pending one: the container exists, the
-  gate ran, the answer is in. `int3-g64` (3.5 bits effective, 12.7 % smaller than
+  gate ran, the answer is in. `int3-g64` (3.5 bits effective, measured 13.4 % smaller than
   int4) is the untested point on this ladder and the only one still worth a run.
 
   **The "blocked on the cable" claim this bullet used to make was wrong**, and
@@ -539,7 +642,7 @@ thing that owns the model — **the first numbers ever seen from the serving pat
 - [x] ✅ **Router look-ahead** (2026-08-03) — every predictor above is a statistic over the router's *past answers*; this one asks the router. At the end of layer `L`, apply layer `L+1`'s own `post_ln` + router to layer `L`'s output and prefetch that ranking's top `COLI_ROUTER_LOOKAHEAD_N` (default 6) — one extra `E×D` matvec against resident weights, no artifact, no format change, works on the first token of a cold process where every history-based predictor is still empty. Correctness-neutral: the authoritative router still runs at `L+1` and still decides, pinned by `router_lookahead_cannot_move_a_token` (streamed decode bit-identical to resident). **Decode only** — WASTE built the prefill-chunk version and measured bytes read +6.9 % with flat wall clock, because a chunk layer's speculative records are exactly what eviction takes first and its readers are never idle. Speculative reads stay out of `misses`. `model.rs::LookaheadCtx`, `router.rs::route_ranks`; `COLI_ROUTER_LOOKAHEAD` _(★★★★★ · Medium)_
 - [x] ✅ **Predictor scoreboard** (2026-08-03) — `COLI_PREDICT_EVAL=1` scores the router look-ahead, the configured `PredictSource` and a previous-token baseline against the routing that actually happened, and prints recall + precision-by-rank at shutdown (`[predict-eval]`). Built because the §1 spine is entirely correctness-neutral, which means **no test can catch a predictor that has degraded to noise** — it costs throughput silently. Pure and unit-tested (`predeval.rs`); an arm that abstains is counted as silent rather than wrong, and recall counts distinct coverage so a degenerate arm cannot report >1. **This is the open question against every other item in this section**: WASTE measured held-out co-occurrence at 29.0 % recall@16 against "reuse the previous token's set" at 29.5 %, i.e. no better than the baseline the cache already exploits for free. Whether `automaton.json` / `macrostates.json` beat it *here* is now measurable and unmeasured `predeval.rs`, `model.rs::score_and_stash`
 
-## 2. GPU Execution — 7/9
+## 2. GPU Execution — 8/9
 
 - [ ] ⬜ Persistent CUDA kernels _(★★★★★ · Hard, CUDA-only)_ — kernels launched per-batch, no threadblock loop
 - [x] ✅ CUDA Graphs into decode (`COLI_CUDA_GRAPH`) — per-shape capture/replay of the `expert_group` launch sequence; see the shortlist entry for the `scratch_gen` invalidation guard and the two excluded arms. The whole-`forward_layer` graph remains open and is tracked under §2's device-resident work, not here `backend_cuda.cu`, `peregrine-cuda/src/lib.rs` _(★★★★☆ · Medium, CUDA-only)_
@@ -547,7 +650,7 @@ thing that owns the model — **the first numbers ever seen from the serving pat
 - [x] ✅ Zero-copy GPU uploads via pinned memory `backend_cuda.cu:356-359,610-611` _(★★★☆☆ · Easy)_
 - [x] ✅ Persistent GPU memory pools — 24 pre-allocated scratch slots reused across layers `backend_cuda.cu:892-899`
 - [x] ✅ Format-split expert dispatch — `all_s4` is computed over the whole routed group (`backend_cuda.cu:638,645`), so **one** wider-precision resident dropped every expert in that `expert_group` call off the int4 Tensor-Core and packed-W4 fast paths. `GpuTier::compute` now issues one `expert_group` per residency format via the pure `partition_by_format` / `scatter_by_index` pair, restoring job order before returning so `concurrent.rs`'s positional zip and the `pos`-keyed reduce are untouched. Repeated calls per layer are safe: the kernel syncs before returning (`backend_cuda.cu:745-750`) and scratch is per-device grow-only (`:341-359`). Partition/scatter pure and unit-tested (round-trip is a bijection, malformed input errors rather than misaligning); the dispatch loop is type-checked under `--features cuda`. **Does not always reach Tensor Cores** — `:674` additionally gates TC on *every* job in the call clearing `tc_min` rows, a separate partition axis `gpu.rs` _(★★★☆☆ · Medium, CUDA-only)_
-- [ ] ⬜ GPU memory defragmentation during decode — residents fixed at startup; `cudaMallocAsync` pool is the planned fix (CUDA-only)
+- [x] ✅ **GPU memory defragmentation during decode — CLOSED on measurement (2026-08-13): there is nothing to defragment.** The planned fix was a `cudaMallocAsync` pool; the roadmap's own note said to build the probe first and expect the answer to be no. It was: `coli_cuda_largest_free_block` (binary search over live `cudaMalloc` probes, 2 MB grain) reports **96.7 % of free VRAM allocatable as a single block** after three rounds of interleaved alloc/free of the two expert block sizes with each gap refilled at the other format — the worst churn `reheat`'s precision ladder can produce, and the only interleaving this workload has. The ~3 % gap is runtime headroom, which a pool cannot return. Guarded by `vram_churn_of_the_two_expert_block_sizes_leaves_free_memory_in_one_block` (bar at 50 % — three orders above the ~24 MB collapse real fragmentation would show), so the item reopens by test failure if a driver ever regresses coalescing `cuda/backend_cuda.cu`, `peregrine-cuda/src/lib.rs`
 - [x] ✅ Online kernel autotuning for GEMM tile sizes — `WmmaTuner` records per-shape kernel_ms and picks the best tile config, persists as `kernel_tuning.json`; the CUDA-side dispatch selector is a follow-up `wmma_tune.rs`
 - [x] ✅ Runtime SIMD kernel selection (CPU) — AVX2 vs AVX-VNNI chosen at runtime `idot.rs:40-61`
 - [x] ✅ **Stream-ordering defect in the `pipe_*` primitives — found while preparing graph capture, and it was not only a capture problem** (2026-08-07). `ctx->stream` is created `cudaStreamNonBlocking`, so it does **not** implicitly synchronize with the legacy default stream. `pipe_rmsnorm`, `pipe_rmsnorm_s`, `pipe_rope`, `pipe_rope_base`, `pipe_rows_add`, `pipe_gemm` and `pipe_copy2d` all launched with no stream argument — i.e. on the default stream — while `pipe_silu_mul` and `pipe_add` used `ctx->stream`. **Any chain mixing them had no ordering guarantee at all**: a `silu_mul` could read a buffer a `rmsnorm` had not finished writing. Nothing was wrong in practice only because no live path builds such a chain; it would have surfaced the moment the device-resident forward wired one, as intermittently wrong logits with no failing test. Two further instances in the **live** GPU path: `tensor_upload` and `tensor_update` convert int4 offset-encoded weights with a default-stream kernel whose consumers (`expert_group`) run on `ctx->stream` — a `reheat` refresh has a far shorter window than a startup upload — now synchronized before return, which is the contract every caller already assumed. Pinned by `graph_capture_records_ops_only_from_the_context_stream`, which is deterministic rather than race-dependent: capture records `ctx->stream`, so an op on another stream is silently **absent from the graph**, and the test replays onto a poisoned buffer so a skipped normalization cannot pass on leftovers from the eager pass `cuda/backend_cuda.cu`, `peregrine-cuda/src/lib.rs`
@@ -579,7 +682,7 @@ code that never runs cannot be wrong — it can only mislead.*
 - [x] ✅ **`peregrine-sched` is now the correctness oracle** (2026-08-06) — no crate depends on it and production MoE is `concurrent.rs::moe_forward_concurrent`, so a second implementation of the same computation was a second thing to keep correct with nothing checking it. `streamed_matches_the_production_concurrent_path` closes that: it builds a `testkit` container, runs the **production** path over it through a real `ForwardCtx`, and points this crate's `DiskQt`s at **the same container bytes** via `SafeTensors::region` — the same triples `concurrent.rs`'s private `tplan` builds from — so the two engines read one file rather than two. Both entry points take the router weights as arguments, so routing is identical by construction and only the expert path is under test. Tolerance, not bits: the lanes accumulate in different orders and `f32 +=` is not associative; bit-identity is asserted *within* each engine, never across them. Guarded against passing vacuously by requiring the reference output to be non-zero, and verified to bite (a 1.5× `routed_scale` on one side fails it). The crate's own `concurrent_matches_sequential` — which compares against the *resident* reference, not the concurrent path, and whose name said otherwise (`docs/testing-and-quality.md` flagged it) — is renamed `streamed_matches_the_resident_reference` `peregrine-sched/src/lib.rs`
 - [x] ✅ **MTP speculative decode — wired in both binaries** — `generate_speculative` was unreachable from either. The stdio server takes `--draft N` / `COLI_DRAFT`, and the batched HTTP engine speculates per sequence with all sequences' `1 + γ` rows in *one* forward, so B sequences share one routed-expert union — B separate speculative decodes would stream B unions off the disk that is already the bottleneck. Greedy requests only (argmax acceptance is sequence-identical; temperature > 0 is merely distribution-preserving), drafts capped by the remaining `max_new`, and speculated rows recorded into a scratch history so a rejected draft never warms experts for a token that never existed. **colibrì's "net loss" figure was taken at depth 2**, where 2.46 accepted is already 82% of that configuration's ceiling of 3 — which is why the default guidance is 4–6, and why the reason to wire it was never completeness
 
-- [ ] 🟡 **`PhaseTracker` (`workload.rs`) — a fifth, found 2026-08-08, and deliberately left unwired.** Nothing in the engine constructs one; the live phase signal is `PredictSource::PhaseAware`, which compares the newest two frames per prediction and holds no state. The cost was not zero while it sat there: `COLI_PHASE_THRESHOLD` was documented with a default of 0.6 and **`PhaseTracker` was its only reader**, so the knob the docs offered governed nothing, and the predictor that *should* have obeyed it used a hardcoded `6000` bp. That half is fixed — the threshold is now converted at the boundary and read by the predictor — so what remains unreachable is the struct, not the setting. **Kept rather than deleted because it is not a duplicate**: it holds an EWMA of frame-to-frame distance plus `since_change`, i.e. a *window* after a shift, and `PhaseAware` can express no such thing — it re-decides instantaneously at every layer. Whether a window beats the instantaneous check is precisely what `COLI_PREDICT_EVAL` exists to answer, and until it does, wiring this would be a guess with a control loop attached — the failure mode §3c's own note warns about, facing the other way. The reason is recorded at the definition `workload.rs`
+- [x] ✅ **`PhaseTracker` — deleted 2026-08-14 on the evidence it was kept to wait for.** It sat unwired because only `COLI_PREDICT_EVAL` could say whether its post-shift *window* beat `PhaseAware`'s instantaneous check, and the scoreboard had never been run. It ran (2026-08-14, real checkpoint, `GEN 64`, 4 725 layer transitions, width 16): router-lookahead **recall 92.5 % / precision 46.3 %**, PhaseAware 58.1 % / 29.3 %, prev-token baseline 38.9 % / 38.3 %. PhaseAware does beat the baseline windowless on recall, but the router look-ahead — the shipped default — dominates the whole statistical stack on *both* axes, so a window refinement to an arm 34 recall points behind it has no path to relevance. Struct, re-export and tests deleted; `COLI_PHASE_THRESHOLD` stays (the predictor reads it). This also resolves the open question the 2026-08-03 borrowed negatives put against §1's statistical predictor stack: answered, in the look-ahead's favor. Run archived at `bench-data/2026-08-13-predict-eval/` `workload.rs`
 
 ## 3c. Dead-code sweep (2026-08-07, extended 2026-08-08)
 
@@ -728,7 +831,7 @@ the same three are still deliberately unwired for the reasons above.
 - [x] ✅ Whole-model execution compiler — **pragmatic:** `peregrine compile-plan` bundles every profile-derived artifact into one config-tagged `plan.json` ("compiled execution plan") consumed atomically by `Model::load`; no IR/binary codegen (explicitly out of scope) `engine/main.rs`, `model.rs::try_load_plan`
 - [x] ✅ Profile-guided inference compilation — **pragmatic:** the compiled plan's every input is a recorded profile (routes, heat, timings, learned policy) — profile-guided execution planning rather than compiler PGO `plan.json` pipeline above
 - [x] ✅ Runtime specialization of hot paths — **pragmatic (dispatch-level, not codegen):** per-shape probe-then-memoize serial-vs-parallel dispatch for every matmul shape under `COLI_SHAPE_SPECIALIZE=1`; extends the global SIMD selection to per-shape decisions `weight.rs::shape_dispatch`
-- [x] ✅ Tensor layout auto-conversion — alternate `kblock` (group-major) on-disk layout with header tag + `layout_gs_bytes`; the loader permutes tagged tensors back to the kernels' native layout at read (`from_kblock`), byte-identical round trip `pack.rs`, `safetensors.rs`
+- [x] ✅ Tensor layout auto-conversion — alternate `kblock` (group-major) on-disk layout with header tag + `layout_gs_bytes`; the loader permutes tagged tensors back to the kernels' native layout at read (`from_kblock`), byte-identical round trip `pack.rs`, `safetensors.rs`. *Honest caveat (2026-08-13): the ✅ covers the reader; the writer (`Blob::with_kblock_layout`) still has only test callers — wiring it into a rewrite tool needs per-tensor format detection + group math `apply_layout` doesn't have, so no container has ever actually been produced in kblock layout.*
 - [x] ✅ Mixed-precision execution per expert — `plan_precision` promotes the hottest `COLI_GPU_F32_FRAC` of residents to f32, rest int4 (pure, unit-tested); wired into `real::GpuTier::reheat` with per-expert format tracking + re-upload-on-change (type-checked under `--features cuda`) `gpu.rs`
 
 ## 10. Learning-Based & Self-Optimizing Runtime — 9/10
@@ -799,7 +902,7 @@ change, and needs the two shipped measurement items first.*
 
 - [x] ✅ Gate-mass measurement — every routed expert costs a full ~18.9 MB read regardless of its gate weight, and nothing had ever inspected that weight: the reduce multiplies it in and moves on. `gate_share_below` tallies, per position, how many kept experts carry a share below 0.5/1/2/5% of the position's gate mass; `COLI_GATE_STATS=1` accumulates process-wide and the engine prints `[gate] routed=… below_1%=…`. Shares are relative to the kept sum, so the figure is invariant to `norm_topk` and `routed_scale`. Pure and unit-tested, including the flat-router case that correctly reports *no* tail `router.rs`
 - [x] ✅ Prediction flip-rate gate — the suite is built entirely on bit-identity anchors, so a deliberately lossy change fails every existing assertion by construction and there was no way to say what it cost. `Model::prediction_flip_rate` reports the fraction of teacher-forcing positions two runs disagree on, returning `None` on a length mismatch so "no data" cannot read as "no change". Top-1 agreement only — a distributional metric (NLL/KL) needs per-position logit capture, which `teacher_forcing` does not expose `model.rs`
-- [x] ✅ Adaptive top-k / expert-budget truncation — `COLI_ROUTE_MIN_SHARE=<τ>` drops trailing selections carrying less than τ of a position's gate mass. Every routed expert costs a full ~18.9 MB read regardless of weight, so an expert carrying 1% of the mass costs what the top expert costs. Truncation happens inside `route()` *before* normalization, so the existing `norm_topk` block renormalizes the survivors and the MoE sum keeps its original scale rather than quietly shrinking by the dropped mass. Only a **trailing run** is dropped and slot order is preserved — selection ranks by the bias-augmented `choice` while the stored weight is the plain sigmoid, so weights are not monotonic, and the batch-union plus position-keyed reduce both depend on that order. At least one expert always survives. `keff` already existed and is honored at all four consumption sites, so no plumbing was needed. **This is the first knob in the engine that changes token values** — off by default; size it with `COLI_GATE_STATS`, gate it with `prediction_flip_rate` `router.rs`
+- [x] ✅ Adaptive top-k / expert-budget truncation — `COLI_ROUTE_MIN_SHARE=<τ>` drops trailing selections carrying less than τ of a position's gate mass. Every routed expert costs a full ~18.9 MB read regardless of weight, so an expert carrying 1% of the mass costs what the top expert costs. Truncation happens inside `route()` *before* normalization, so the existing `norm_topk` block renormalizes the survivors and the MoE sum keeps its original scale rather than quietly shrinking by the dropped mass. Only a **trailing run** is dropped and slot order is preserved — selection ranks by the bias-augmented `choice` while the stored weight is the plain sigmoid, so weights are not monotonic, and the batch-union plus position-keyed reduce both depend on that order. At least one expert always survives. `keff` already existed and is honored at all four consumption sites, so no plumbing was needed. **This is the first knob in the engine that changes token values** — off by default; size it with `COLI_GATE_STATS`, gate it with `prediction_flip_rate`. **Gated on the real checkpoint 2026-08-13 and it stays off: τ=0.05 flips 27.9 % and τ=0.02 flips 20.7 % of top-1 predictions** (512 positions of prose, same container both arms, via `flip-rate --candidate-env`); the tail the gate-mass counters called negligible is negligible in *mass*, not in *effect* `router.rs`
 - [x] ✅ **Gate-mass mixed-precision loading — CLOSED on measurement (2026-08-07). The ceiling is 0.5% of reads at B=16.** Measured on the real GLM-5.2 checkpoint, one batch size per fresh process:
 
   | B | selections | distinct reads | share | all-low-gate | fraction |
@@ -813,7 +916,7 @@ change, and needs the two shipped measurement items first.*
 
   Internal consistency check that the number is real: at B=1 the all-low-gate fraction (1.3 %) equals the independently-computed `[gate] below_1%` (1.3 %) exactly, as it must — with one row, "every row wants it weakly" *is* "the gate share is below 1 %".
 
-  **What the same run did size is the honest lever.** `[gate] below_5%` measured **12.5–14.3 %**, so `COLI_ROUTE_MIN_SHARE=0.05` drops about an eighth of routed selections — the first time that knob has had a real-checkpoint number to be set from. Gate it with `prediction_flip_rate` before using it; it is still the only knob in the engine that changes token values.
+  **What the same run did size is the honest lever.** `[gate] below_5%` measured **12.5–14.3 %**, so `COLI_ROUTE_MIN_SHARE=0.05` drops about an eighth of routed selections — the first time that knob has had a real-checkpoint number to be set from. Gate it with `prediction_flip_rate` before using it; it is still the only knob in the engine that changes token values. **Gated 2026-08-13: τ=0.05 flips 27.9 % of top-1 predictions on real prose and τ=0.02 flips 20.7 % — the lever fails at every setting worth having.** See [bench-data/2026-08-13-route-min-share](bench-data/2026-08-13-route-min-share/README.md).
 
   *(Original entry, kept because the reasoning is what the measurement confirmed.)* The idea: threshold the router's gate magnitudes and load a low-gate expert at int2-g64 instead of dropping it, which is strictly better than `COLI_ROUTE_MIN_SHARE`'s binary keep/drop. **Three structures stand in the way, all verified in source**: `prefetch_hint_item(st, cfg, layer, expert)` locates an expert's 6 regions with no precision variant; the warm cache is keyed `(u32, u32)` = (layer, expert), so two precisions of one expert collide; and `batch_union` unions expert *ids* across rows, discarding which row wanted them — so at the moment the read is issued, the gate weight that would select a precision is already gone. **But the deeper problem is not plumbing.** A read is issued once per *union entry*, not once per row. An expert one row leans on and another barely wants must be read at the higher precision, because one of its consumers needs it. So the saving exists only for experts that are low-gate for **every** row routing them — and that share shrinks as the batch grows. Per-token precision selection is in direct tension with the batch-union amortization the engine already depends on. `union_all_low_gate` measures exactly that ceiling and `batching_erases_the_per_token_precision_decision` pins the mechanism: the same expert with the same gate weights is a low-precision candidate alone and is not when batched, purely because of who it shares a read with. `COLI_UNION_STATS=1` now prints `all-low-gate reads=…/…` at shutdown beside the sharing figure. **Next step is the measurement, not the feature**: if that fraction is small at realistic batch sizes, the dual-precision container, the cache re-keying and the region-locator variant buy nothing, and `COLI_ROUTE_MIN_SHARE` remains the honest lever.
 
@@ -830,7 +933,7 @@ change, and needs the two shipped measurement items first.*
 - [x] ✅ **GPU residency is sized from the container, not the request** — `build_with` derived `bytes_per_expert` from `COLI_GPU_INT4` alone, but raw int4 residency needs all three projections to be per-row int4; anything else (grouped int4, int8, int3-g64, int2-g64) uploads dequantized to f32 at **8×**. Planning `N` experts and uploading `8N` worth did not crash — the per-expert byte tracker stopped it — it silently delivered a tier ~8× smaller than asked for, with nothing reporting the shortfall. `experts_are_per_row_int4` probes the container and `resident_bytes_per_expert` sizes from the answer, with a warning when the request and the container disagree. `validation-runbook` §4 flagged this for int3; every sub-4-bit format since made it likelier `gpu.rs`
 - [x] ✅ **`KvSpan` — the seam four KV items were each blocked behind** — every reader demanded one contiguous `&[f32]`: `RowAttn` held `lc: &'a [f32]`, the dense core bulk-matmulled the whole prefix in a single `kv_b.apply_vec(&cache.lc[..tk*kvl], tk)`, the absorb core indexed `cache_rc[t*qk_rope..]` per position. A refcounted prefix is *discontiguous with its owned tail*, a block table is discontiguous by construction, and narrowing the element type changes the slice type — so sharing, paging and KV quantization were not three items but one refactor each of them needed first. Doing prefix sharing "cheaply" while preserving contiguity is **not possible**: the sequence appends on the very next decode step, so a copy-on-write materializes immediately and buys nothing. `KvSpan` is `Copy`, allocation-free, two runs (`head`/`tail`); two runs rather than a block list because that is the case that exists today, and its operations generalize to a block table without touching a caller. (The reader contract narrowed further when the element type became configurable — see the `COLI_KV_DTYPE` entry above — but the seam is the same one.) **Bit-identity is proven, not assumed** — `kv_span_split_attention_is_bit_identical_to_contiguous` splits the cache at *every* position `0..=nt` and requires every output bit to match. Achievable here, unlike vLLM's paged attention (which breaks batch invariance by reducing over cached and current K/V separately), because splitting changes only *where a row is read*, never the order rows accumulate in `attention.rs`
 - [x] ✅ **Refcounted prefix sharing — the admission-path deep copy is gone** — `SeqKv::clone_prefix` copied the entire shared prefix into the new sequence on **every** admission: ~350 MB for a 2 k-token shared system prompt at 175.5 KiB/token, which is the exact workload the prefix cache exists to serve, so the cache's hit path paid a memcpy proportional to its own benefit. `LayerKv` now holds an immutable `Arc` prefix plus a private tail; a `clone_prefix` whose depth falls inside an already-frozen prefix is a refcount bump and copies nothing, and the prefix cache's entries are themselves `clone_prefix` results, so every hit takes that path. A shallower match reuses the same allocation at a narrower view rather than re-copying. Bit-identical by construction — same bytes, same order, never written — and asserted by `a_shared_prefix_produces_the_same_bits_as_a_private_copy` on **both** cores. The speculative rewind can land *inside* a shared prefix, so `truncate` narrows this cache's view instead of the buffer; truncating the buffer would silently shorten every concurrent sequence seeded from it, corruption nothing downstream would catch (`rewinding_into_a_shared_prefix_leaves_other_holders_intact`). **`COLI_KV_BUDGET_MB` had to learn this in the same change** or it would cancel it: charging a shared prompt to every viewer would refuse admissions over RAM that was never allocated, so `resident_kv` counts each private tail plus one charge per distinct allocation, identified by the allocation itself `attention.rs`, `model.rs`, `batch.rs`
-- [ ] 🟡 **int2 expert storage — converted; the quality gate is running** (2026-08-08). `pack::quant_i2` is the format's **first producer**. int2 had been fully consumable since M1 (container detector, scalar + AVX2 dot kernels, dequantizer, CUDA `row_bytes`/`weight_at`) and completely unproducible, so no checkpoint ever used it. Four 2-bit fields per byte, biased `+2`, verified against the decoders' own bit layout and against `QtInfo::detect` inferring fmt 3 from byte count alone. **The conversion that was blocking this was started on 2026-08-08 at `--target int2-g64`, not `int2`** — per-row int2's `amax / 1` convention makes the `-2` level unreachable (it would need `|w| ≥ 1.5·amax`, impossible when `amax` *is* the row maximum), so the per-row format is effectively ternary and `quant_i2_g64`'s scale + zero-point per 64 values is strictly better. Measured plan on the real GLM-5.2 checkpoint: **118 478 tensors, 58 368 requantized, 383.73 GB → 286.29 GB (74.6 %)** across 58 shards — *not* the "exactly halves" the original entry projected from the weight plane alone, because per-group scales and the copied-through non-expert tensors are real bytes. Output at `/mnt/models/GLM-5.2-int2g64` (root is at 98 %, so it had nowhere else to go), which is USB 2.0 — the job wrote at a measured ~12.5 MB/s and took **~6.5 h**. **It was killed once at 76 GB / 16 shards** when the harness tore down its process group, and restarted detached (`setsid nohup`, log at `int2g64-convert.log`) — the partial output was removed rather than resumed, because the converter is a one-shot stream and 16 shards with no index is not a container, just 76 GB that looks like one.
+- [x] ✅ **int2 expert storage — closed as a measured negative** (converted 2026-08-08; gate ran, `flip_rate = 1.000000` — see the top-of-file §4 entry; checkbox flipped 2026-08-13, which is also when the dashboard's 137-vs-138 mismatch this line caused was found and fixed). `pack::quant_i2` is the format's **first producer**. int2 had been fully consumable since M1 (container detector, scalar + AVX2 dot kernels, dequantizer, CUDA `row_bytes`/`weight_at`) and completely unproducible, so no checkpoint ever used it. Four 2-bit fields per byte, biased `+2`, verified against the decoders' own bit layout and against `QtInfo::detect` inferring fmt 3 from byte count alone. **The conversion that was blocking this was started on 2026-08-08 at `--target int2-g64`, not `int2`** — per-row int2's `amax / 1` convention makes the `-2` level unreachable (it would need `|w| ≥ 1.5·amax`, impossible when `amax` *is* the row maximum), so the per-row format is effectively ternary and `quant_i2_g64`'s scale + zero-point per 64 values is strictly better. Measured plan on the real GLM-5.2 checkpoint: **118 478 tensors, 58 368 requantized, 383.73 GB → 286.29 GB (74.6 %)** across 58 shards — *not* the "exactly halves" the original entry projected from the weight plane alone, because per-group scales and the copied-through non-expert tensors are real bytes. Output at `/mnt/models/GLM-5.2-int2g64` (root is at 98 %, so it had nowhere else to go), which is USB 2.0 — the job wrote at a measured ~12.5 MB/s and took **~6.5 h**. **It was killed once at 76 GB / 16 shards** when the harness tore down its process group, and restarted detached (`setsid nohup`, log at `int2g64-convert.log`) — the partial output was removed rather than resumed, because the converter is a one-shot stream and 16 shards with no index is not a container, just 76 GB that looks like one. *(2026-08-13: `/mnt/models` is empty — the int2-g64 container is gone. Nothing is lost: the scheme failed the gate, and re-producing it is one `peregrine-requantize` run if a future scheme comparison wants the artifact.)*
 
   **The conversion has since finished** and this entry's own gate — "stays 🟡 until that line appears" — is satisfied: the log's final line reports 58 shards at 286.29 GB, and `.requant-progress.json` reads `tensors_done: 118478, shards: 58`, which the converter writes only after `requantize()` returns `Ok`. `du -sh` gives 267 GiB, which *is* 286.7 GB — the two figures differ by units, not by a truncated run.
 

@@ -1,0 +1,47 @@
+== [2026-08-15 03:00:37] waiting on the overnight chain ('chain complete' in overnight-2026-08-15.log); touch bench-data/2026-08-15-stale-drop/SKIP to cancel
+== [2026-08-15 11:25:41] rebuilding target/release (safe now: no serve arm mid-sweep can see a binary swap)
+== [2026-08-15 11:26:44] A/B at B=16 (REPEATS=1, the wasted-read regime)
+== env-arm sweep: B=16 max_tokens=32 repeats=1 memmax=34G
+== arms: bench-data/2026-08-15-stale-drop/arms/stale-off.env bench-data/2026-08-15-stale-drop/arms/stale-on.env
+== model=/home/cortix/models/GLM-5.2
+== git: 34b04da
+-- rep 1 arm stale-off.env
+  page cache dropped
+  loaded in ~12s
+[stale-off-rep1] 512 tok in 6122.969s = 0.084 tok/s (streams ok 16/16, ttft med Nones)
+-- rep 1 arm stale-on.env
+  page cache dropped
+  loaded in ~18s
+[stale-on-rep1] 512 tok in 5699.149s = 0.09 tok/s (streams ok 16/16, ttft med Nones)
+
+== medians (aggregate tok/s at B=16)
+        arm  runs  median tok/s      all
+  stale-off     1         0.084   [0.08]
+   stale-on     1         0.090   [0.09]
+
+Differences inside the +-3% long-run band are not results. Check the
+.counters.txt reads: tok/s bought by proportionally more disk_reads is
+not a lever, it is a cache trade.
+== [2026-08-15 14:49:11] A/B at B=1 (REPEATS=1, predicted near-no-op)
+== env-arm sweep: B=1 max_tokens=32 repeats=1 memmax=34G
+== arms: bench-data/2026-08-15-stale-drop/arms/stale-off.env bench-data/2026-08-15-stale-drop/arms/stale-on.env
+== model=/home/cortix/models/GLM-5.2
+== git: 34b04da
+-- rep 1 arm stale-off.env
+  page cache dropped
+  loaded in ~28s
+[stale-off-rep1] 32 tok in 586.836s = 0.055 tok/s (streams ok 1/1, ttft med Nones)
+-- rep 1 arm stale-on.env
+  page cache dropped
+  loaded in ~28s
+[stale-on-rep1] 32 tok in 550.625s = 0.058 tok/s (streams ok 1/1, ttft med Nones)
+
+== medians (aggregate tok/s at B=1)
+        arm  runs  median tok/s      all
+  stale-off     1         0.055   [0.06]
+   stale-on     1         0.058   [0.06]
+
+Differences inside the +-3% long-run band are not results. Check the
+.counters.txt reads: tok/s bought by proportionally more disk_reads is
+not a lever, it is a cache trade.
+== [2026-08-15 15:10:29] done — compare tok/s, disk_reads and the [prefetch] stale_dropped=/used= split in bench-data/2026-08-15-stale-drop

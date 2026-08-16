@@ -20,7 +20,7 @@ every default is in the code at the path given.
 **Most knobs are output-neutral**: they change how fast a token arrives, never
 which token it is. Those can be A/B'd freely against a bit-identity assertion.
 
-**Five knobs change token values.** They are real quality/performance trades, not
+**Six knobs change token values.** They are real quality/performance trades, not
 tuning, and each must be gated with `Model::prediction_flip_rate` against the
 unmodified configuration before you rely on it:
 
@@ -30,6 +30,7 @@ unmodified configuration before you rely on it:
 | [`COLI_ROUTE_MIN_SHARE`](#coli_route_min_share) | drops low-gate experts from the MoE sum |
 | [`COLI_DSA`](#coli_dsa) | attends only the indexer's top-k cached positions |
 | [`COLI_MLA_ABSORB`](#coli_mla_absorb) | absorb and dense agree algebraically, not numerically |
+| [`COLI_RLM`](#coli_rlm--recursive-refinement-at-contested-decode-positions) | recursive refinement of contested decode positions, may shift the argmax |
 | [`COLI_CUDA_FUSED_REDUCE`](#coli_cuda_fused_reduce) | low bits only — `f32 +=` is not associative |
 
 > Earlier revisions of this page opened by claiming *"every one of them affects
@@ -236,7 +237,7 @@ the oracle test already compares. `COLI_IO_DEPTH` sets its ring depth.
 | `COLI_REPLICATE_K` | 0 | top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
 | `COLI_NUMA_PIN` | off | pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
 | `COLI_SHAPE_SPECIALIZE` | off | per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
-| `COLI_PREFILL_CHUNK_DIV` | 0 | prefill chunk becomes `max(64, pos/d)` — [note](#coli_prefill_chunk_div) |
+| `COLI_PREFILL_CHUNK_DIV` | **4** (2026-08-13) | prefill chunk becomes `max(64, pos/d)`; `0` = fixed 64 — [note](#coli_prefill_chunk_div) |
 
 ### `COLI_PREFILL_CHUNK_DIV`
 
@@ -425,11 +426,14 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 |---|---|---|
 | `COLI_BATCH_SLA_MS` | unset | shrink the working batch cap on latency overrun; regrow on slack |
 | `COLI_ADAPTIVE_WINDOW` | 1 | run prefill every Nth engine tick (decode-heavy window) |
-| `COLI_FUSE_PREFILL` | off | prefill chunk rides the decode batch's forward — [note](#coli_fuse_prefill) |
+| `COLI_FUSE_PREFILL` | **on** (2026-08-13) | prefill chunk rides the decode batch's forward; `=0` restores two forwards — [note](#coli_fuse_prefill) |
 | `COLI_MEMO_ENTRIES` / `COLI_MEMO_MB` | 32 / 64 | exact response memo — [note](#coli_memo_entries--coli_memo_mb) |
 | `COLI_KV_BUDGET_MB` | 0 | resident-KV byte ceiling for admission — [note](#coli_kv_budget_mb) |
 | `COLI_KV_POOL_MB` | 0 | recycle a retired sequence's KV allocations — [note](#coli_kv_pool_mb) |
-| `COLI_PREFIX_CACHE_MB` | 0 | cross-request KV prefix cache; matched by comparing tokens, not hashing |
+| `COLI_PREFIX_CACHE_MB` | **2048** (2026-08-13) | cross-request KV prefix cache (`0` disables); caches prompts *and* generated tokens, matched by comparing tokens, not hashing |
+| `COLI_MAX_BATCH_ROWS` | 0 | ceiling on rows in one fused forward (chunk yields first; bounds draft depth); `0` = uncapped |
+| `COLI_QUEUE_DEPTH` | 0 | admission backlog cap; a submit at the cap gets an OpenAI-shaped 503 instead of queueing forever; `0` = unbounded |
+| `COLI_TOK_MERGE_SIMD` | auto | tokenizer short-merge tier A/B (`auto`\|`scalar`\|`avx2`\|`avx512`); auto = measured scalar default — see [tokenizer.md](tokenizer.md) |
 | `COLI_DRAFT` | 0 | MTP speculative-decode depth — [note](#coli_draft) |
 | `COLI_DRAFT_SAMPLED` | off | extend speculation to temperature > 0 — [note](#coli_draft_sampled) |
 | `X-Peregrine-Priority` | (HTTP header) | `high`/`1`/`true` → drained ahead of normal-priority requests |
@@ -584,6 +588,63 @@ single-sequence decode.
 *cache*, and in a decode batch every sequence has its own, so nothing is shared and
 the cost grows with context — which is the problem absorb exists to solve. That is now
 your decision against a documented default rather than one the code took silently.
+
+### `COLI_RLM` — recursive refinement at contested decode positions
+
+Enable the **Recursive Language Model** controller in the decode loop. After a token's
+ordinary forward produces logits, the controller inspects them (top-2 margin for
+greedy, distribution entropy for sampled) and, if the pass was *uncertain*, triggers
+one or more recursive passes that re-run a configurable subset of transformer layers
+on the refined hidden state, then recompute the head. Easy tokens terminate after
+pass 0 (the ordinary forward); contested tokens spend extra compute for sharper
+logits. Same horizontal-vs-vertical dynamicity split as MTP, on a different axis:
+MTP runs layers ahead *across positions*, RLM runs layers *deeper at one position*.
+
+| Sub-knob | Default | Effect |
+|---|---|---|
+| `COLI_RLM` | off | master switch |
+| `COLI_RLM_DEPTH` | 2 | max recursive passes per token (cap 4) |
+| `COLI_RLM_LAYERS` | 4 | how many of the last transformer layers each pass re-runs |
+| `COLI_RLM_MARGIN` | 0.1 | greedy: top-2 logit gap below which to recurse |
+| — | — | sampled: recursion threshold is entropy > 0.5 (hardcoded, see `rlm.rs:128`) |
+
+**Why this is the right shape for peregrine specifically.** The recursive pass
+re-runs the warm/expert-cache-hot path, **not** the cold-disk path. On the second pass
+for a contested token the routed expert set is mostly the same as pass 1 (the hidden
+has barely moved), so the warm cache serves most of it — measured at 100 % hit on a
+repeated forward (README's "warm cache 3.58×" figure). The recursive pass therefore
+runs from `ecache`, not SSD: extra compute for one contested token costs a fraction of
+its first-pass time. This is also why the recursive pass goes through `forward_ctx()`
+with `route_log: None` and `timings: None` — drafts must not skew the prefetch
+predictor (`modeled after `mtp_draft_with`'s isolation contract).
+
+**Composition with MTP** — `generate_speculative` recurses only at the
+post-acceptance contested position (the row whose logits decide the next round's
+`next`): drafted tokens are accepted/rejected by argmax of the verify forward, and
+any accepted or rejected position is *already decided* — recursion there would either
+contradict the spec-decode contract or burn compute on a token that won't be emitted.
+Position 0 (`next`) is committed as argmax before the recursion loop and is left
+alone. The contract `speculative_matches_greedy` enforces (each token is the model's
+argmax) holds: the refined `next` is still just an argmax, of a sharper
+distribution.
+
+**Telemetry.** `Model::rlm_stats()` returns `(recursive_passes_emitted,
+tokens_that_triggered_at_least_one_pass)`, surfaced on serve's `/metrics`
+(`rlm` object), the engine `[rlm]` shutdown line, and `(0, 0)` when `COLI_RLM`
+is unset — same role as `lookahead_issued()` for the router look-ahead.
+
+**Status**: wired in both decode surfaces (2026-08-13) — the stdio engine via
+`model.rs::generate` / `generate_speculative`, and `peregrine-serve`'s batched
+accept loop via `Model::rlm_refine_external` over each request's own KV (same
+policy, same depth cap, local depth counter; composed with MTP exactly as the
+model-resident path: raw logits decide acceptance, only the post-acceptance
+contested row refines, sampled speculative runs are never refined). Arity /
+margin decisions in `crates/peregrine-model/src/rlm.rs`. Off-by-default,
+structurally inert (the enabled check precedes any copy or clone, so the
+bit-identity gates stay byte-identical). **Quality unmeasured on a real
+checkpoint.** Size the trade against `Model::prediction_flip_rate` — that is
+the offline metric for "did recursion move the argmax on contested tokens" —
+which is exactly what an operator considering `COLI_RLM=1` wants to know first.
 
 ---
 

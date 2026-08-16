@@ -49,6 +49,144 @@ const CORPUS: &[&str] = &[
     "a",
 ];
 
+/// The real GLM-5.2 `tokenizer.json` (154 820 vocab / 321 649 merges / 36 added
+/// tokens — the scheme serve actually runs, on the `Olmo3` fast arm), or `None`
+/// to skip: the checkpoint is 20 MB and lives outside the repo, so this gate
+/// runs where the model does (`COLI_MODEL`, else the box-conventional
+/// `~/models/GLM-5.2`) and skips — never fails — elsewhere. The GPT-2 fixture
+/// tests above keep the committed-corpus bar; these keep the production-vocab
+/// bar.
+fn glm_tokenizer_bytes() -> Option<Vec<u8>> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::var("COLI_MODEL") {
+        candidates.push(std::path::PathBuf::from(dir).join("tokenizer.json"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join("models/GLM-5.2/tokenizer.json"));
+    }
+    candidates.into_iter().find_map(|p| std::fs::read(&p).ok())
+}
+
+/// GLM-specific additions to [`CORPUS`]: the real chat markers (genuine added
+/// tokens in this vocab, unlike under GPT-2 where the same strings tokenize as
+/// plain text), digit runs against the `\p{N}{1,3}` pretokenizer arm, CJK-heavy
+/// prose, and the newline-run arm (`\s*[\r\n]+`) that distinguishes Olmo3 from
+/// the GPT-4 family.
+const GLM_EXTRA: &[&str] = &[
+    "[gMASK]<sop><|system|>\nYou are a helpful assistant.<|user|>\nhi<|assistant|>\n",
+    "<|user|>\n<|assistant|>\n<|observation|>\n<|endoftext|>",
+    "12345678901234567890 and 1 22 333 4444 55555",
+    "你好世界。这是一个中文句子，包含标点符号！还有数字１２３和English混排。",
+    "line\n\n\nruns\r\n\r\nof\n \n newlines",
+    "    indented code block\n\tdef f(x):\n\t\treturn x ** 2\n",
+    "混合 mixed 语言 language 文本 text ，。！？【】《》",
+];
+
+#[test]
+fn glm_matches_hf_id_for_id() -> Result<(), String> {
+    let Some(bytes) = glm_tokenizer_bytes() else {
+        eprintln!("skipping: GLM tokenizer.json absent (set COLI_MODEL or place ~/models/GLM-5.2)");
+        return Ok(());
+    };
+    let (mut giga, hf) = both(&bytes)?;
+    for text in CORPUS.iter().chain(GLM_EXTRA) {
+        let g: Vec<u32> = giga.encode(text);
+        let encoded = hf.encode(*text, false).map_err(|e| format!("hf encode {text:?}: {e}"))?;
+        assert_eq!(g, encoded.get_ids().to_vec(), "encode mismatch on {text:?}");
+        let decoded = giga.decode(&g);
+        assert_eq!(String::from_utf8_lossy(&decoded), *text, "decode round trip on {text:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn glm_encode_into_and_batch_match_encode() -> Result<(), String> {
+    let Some(bytes) = glm_tokenizer_bytes() else {
+        eprintln!("skipping: GLM tokenizer.json absent (set COLI_MODEL or place ~/models/GLM-5.2)");
+        return Ok(());
+    };
+    let (mut giga, _hf) = both(&bytes)?;
+
+    // `encode_into` is the same engine entry as `encode` minus the fresh Vec —
+    // assert it anyway, so a future fast path through one and not the other
+    // cannot drift silently.
+    let mut buf: Vec<u32> = Vec::new();
+    for text in CORPUS.iter().chain(GLM_EXTRA) {
+        buf.clear();
+        giga.encode_into(text, &mut buf);
+        assert_eq!(buf, giga.encode(text), "encode_into mismatch on {text:?}");
+    }
+
+    // Bulk documents big enough to clear the per-worker byte gate, so the
+    // parallel path (chunking + worker handout) actually engages rather than
+    // silently falling back to the serial loop it is being compared against.
+    let base: String = CORPUS.iter().chain(GLM_EXTRA).flat_map(|s| s.chars()).collect();
+    let doc: String = std::iter::repeat_with(|| base.as_str()).take(64).collect();
+    let docs: Vec<&str> = std::iter::repeat_with(|| doc.as_str()).take(48).collect();
+    let par = giga.encode_batch(&docs, 2);
+    assert_eq!(par.len(), docs.len(), "one id vector per document");
+    let serial = giga.encode(&doc);
+    for (i, ids) in par.iter().enumerate() {
+        assert_eq!(ids, &serial, "encode_batch doc {i} mismatch vs serial encode");
+    }
+    Ok(())
+}
+
+/// The real Qwen3.8-27B `tokenizer.json` (248 044 vocab / 247 587 merges / 33
+/// added tokens; Qwen2-style BPE with a Split+ByteLevel pretokenizer and an
+/// **NFC normalizer** — the first vocab here that normalizes at all), or
+/// `None` to skip where the checkpoint hasn't landed. Track C2's tokenizer
+/// gate: it runs before the 55 GB of weights exist, which is the whole point.
+fn qwen_tokenizer_bytes() -> Option<Vec<u8>> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::var("PEREGRINE_QWEN_DIR") {
+        candidates.push(std::path::PathBuf::from(dir).join("tokenizer.json"));
+    }
+    candidates.push(std::path::PathBuf::from("/srv/modelstripe/qwen/Qwen3.8-27B/tokenizer.json"));
+    candidates.into_iter().find_map(|p| std::fs::read(&p).ok())
+}
+
+/// Qwen-specific additions to [`CORPUS`]: the ChatML markers (genuine added
+/// tokens in this vocab), one-digit-at-a-time numerals (this pattern splits
+/// `\p{N}` singly, unlike GLM's `{1,3}`), CJK + mixed prose, and — the probe
+/// that matters — composed vs decomposed accents, which NFC folds together
+/// before BPE ever runs.
+const QWEN_EXTRA: &[&str] = &[
+    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+    "<|endoftext|><|im_start|><|im_end|>",
+    "1 22 333 4444 55555 and 12345678901234567890",
+    "你好世界。中文标点，测试！Qwen 混排 English 123。",
+    "composed \u{00e9} versus decomposed e\u{0301} under NFC",
+    "mark runs: a\u{0301}\u{0327} q\u{0303} under \\p{M} in the split",
+    "line\n\n\nruns\r\n\r\nof\n \n newlines",
+];
+
+#[test]
+fn qwen_matches_hf_id_for_id() -> Result<(), String> {
+    let Some(bytes) = qwen_tokenizer_bytes() else {
+        eprintln!("skipping: Qwen tokenizer.json absent (set PEREGRINE_QWEN_DIR)");
+        return Ok(());
+    };
+    let (mut giga, hf) = both(&bytes)?;
+    for text in CORPUS.iter().chain(QWEN_EXTRA) {
+        let g: Vec<u32> = giga.encode(text);
+        let encoded = hf.encode(*text, false).map_err(|e| format!("hf encode {text:?}: {e}"))?;
+        assert_eq!(g, encoded.get_ids().to_vec(), "encode mismatch on {text:?}");
+        // Oracle-vs-oracle on decode: NFC means decode(encode(x)) reproduces
+        // NFC(x), not necessarily x, so the input is the wrong reference —
+        // the two decoders agreeing is the property serve needs.
+        let hf_text = hf
+            .decode(encoded.get_ids(), false)
+            .map_err(|e| format!("hf decode {text:?}: {e}"))?;
+        assert_eq!(
+            String::from_utf8_lossy(&giga.decode(&g)),
+            hf_text,
+            "decode mismatch on {text:?}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn giga_matches_hf_id_for_id() -> Result<(), String> {
     let bytes = fixture_bytes()?;

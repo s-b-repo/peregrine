@@ -6,6 +6,8 @@ use crate::bpe::{
 };
 #[cfg(target_arch = "aarch64")]
 use crate::bpe::bpe_merge_symbols_short_neon;
+#[cfg(target_arch = "x86_64")]
+use crate::bpe::{bpe_merge_symbols_short_avx2, bpe_merge_symbols_short_avx512};
 use crate::pretokenize::{
     FastCl100kPretokenizer, FastDeepSeekV3Pretokenizer, FastOlmo3Pretokenizer,
     FastQwen2Pretokenizer, FastQwen35Pretokenizer, FastR50kPretokenizer, PRETOKEN_CHUNK,
@@ -16,6 +18,48 @@ use eyre::Result;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+
+/// Local modification (vendoring): the x86 short-merge tier, latched once per
+/// process from `COLI_TOK_MERGE_SIMD` (`auto`|`scalar`|`avx2`|`avx512`).
+/// `auto`/unset keeps the measured default (scalar — see the dispatch comment
+/// in `merge_short`); a requested tier the CPU lacks falls back to scalar
+/// rather than UB. A/B by running the bench twice in separate processes, one
+/// arm per value — the latch-once shape is the same as the engine's
+/// `route_min_share`, and the same caveat applies: it cannot be flipped
+/// within a process.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+enum X86MergeTier {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_merge_tier() -> X86MergeTier {
+    static TIER: std::sync::OnceLock<X86MergeTier> = std::sync::OnceLock::new();
+    *TIER.get_or_init(|| {
+        match std::env::var("COLI_TOK_MERGE_SIMD").as_deref().map(str::trim) {
+            Ok("avx512") if std::arch::is_x86_feature_detected!("avx512f") => X86MergeTier::Avx512,
+            Ok("avx2") if std::arch::is_x86_feature_detected!("avx2") => X86MergeTier::Avx2,
+            _ => X86MergeTier::Scalar,
+        }
+    })
+}
+
+/// Local modification (vendoring): storage newtype for the reused
+/// [`SpanBatch`] chunk scratch (see the `span_scratch` field doc).
+///
+/// # Safety (the `Send` impl)
+/// `BatchEntry.ptr` makes `SpanBatch` `!Send` by default, which would make
+/// `Tokenizer` unsendable — but between encode calls the scratch is inert
+/// storage: the stale `ptr`s are never dereferenced (the only deref,
+/// [`SpanBatch::span`], is contract-bound to entries written by the current
+/// call's fill). A `Tokenizer` crossing threads carries dead integers here,
+/// nothing more.
+pub(crate) struct SpanScratch(Box<SpanBatch<'static>>);
+// SAFETY: see the type doc — the wrapped ptrs are inert between calls.
+unsafe impl Send for SpanScratch {}
 
 /// Byte-level BPE tokenizer (tiktoken / GPT-2 style).
 ///
@@ -63,6 +107,20 @@ pub struct Tokenizer {
     /// performs no per-pretoken allocations.
     merge_scratch: MergeScratch,
     symbol_scratch: Vec<TokenId>,
+    // Local modification (vendoring): reused chunk scratch for the
+    // probe/emit machinery. `SpanBatch` is 8.7 KB zero-initialized; it was
+    // built fresh in every `memoized_encode`/`memoized_encode_flat` call,
+    // and `for_each_piece` makes one such call *per added-token segment* —
+    // a chat-template prompt with ~11 markers paid ~11 constructions per
+    // encode. Held as `'static` only for storage: the entries' `ptr`s go
+    // stale the moment a call returns, and are never read again — every
+    // call's fill overwrites entries `[0, n)` before `span(i)` (the only
+    // deref, contract-bound to `i < n`) can observe them; stale slack
+    // entries are read purely as integers by the prefetch-ahead, which the
+    // `SPAN_BATCH_SLACK` contract already declares harmless. Upstream
+    // solves the same cost with its `EncodeState`; a field keeps the
+    // vendored call surface unchanged.
+    span_scratch: Option<SpanScratch>,
     /// Pretokenization scheme used by [`Self::encode_with_added_tokens`].
     pub(crate) pretokenizer_type: PretokenizerType,
     /// Added tokens (special and non-special), matched atomically in the raw
@@ -333,6 +391,7 @@ impl Tokenizer {
             pretoken_cache_long: HashMap::with_hasher(rustc_hash::FxBuildHasher {}),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
+            span_scratch: None, // Local modification (vendoring): see field doc
             pretokenizer_type: PretokenizerType::GPT2,
             added_tokens: Vec::new(),
             added_matcher: None,
@@ -550,16 +609,38 @@ impl Tokenizer {
         match pair_ranks {
             #[cfg(target_arch = "aarch64")]
             Some(table) => bpe_merge_symbols_short_neon(table, buf, n),
-            // x86-64 stays scalar ON PURPOSE: the AVX-512/AVX2 ports of the
-            // min-rank scan (`bpe_merge_symbols_short_avx512/_avx2`, kept as
-            // tested reference) measured ~1% SLOWER on cold encode_st (Zen 5,
-            // gpt2, 100 MB and 1 GB OWT, interleaved min-of-5) — the x86
-            // horizontal reduce is a 4-step dependent chain plus a
-            // vector->GPR transfer on the serial merge chain, and the
-            // `target_feature` boundary blocks inlining, while the scalar
-            // scan's `rank < best` branches predict well on Zen 5. See
-            // profiling/x86_port_plan.md §6.
-            #[cfg(not(target_arch = "aarch64"))]
+            // x86-64 defaults to scalar ON PURPOSE: the AVX-512/AVX2 ports of
+            // the min-rank scan (`bpe_merge_symbols_short_avx512/_avx2`)
+            // measured ~1% SLOWER on cold encode_st (Zen 5, gpt2, 100 MB and
+            // 1 GB OWT, interleaved min-of-5) — the x86 horizontal reduce is
+            // a 4-step dependent chain plus a vector->GPR transfer on the
+            // serial merge chain, and the `target_feature` boundary blocks
+            // inlining, while the scalar scan's `rank < best` branches
+            // predict well on Zen 5. See profiling/x86_port_plan.md §6.
+            //
+            // Local modification (vendoring): that verdict is upstream's, on
+            // other silicon and a 50k-merge vocab. `COLI_TOK_MERGE_SIMD=
+            // {auto|scalar|avx2|avx512}` re-opens it as a measurement (this
+            // box: AVX2-only i5-1235U, GLM-5.2's 321k merges) without making
+            // an untested tier anyone's default — `auto`/unset keeps scalar,
+            // and a tier the CPU lacks falls back to scalar rather than UB.
+            // Both vector tiers are differential-tested against the scalar
+            // reference (`short_merges_match_vec_merge_loop`).
+            #[cfg(target_arch = "x86_64")]
+            Some(table) => match x86_merge_tier() {
+                // SAFETY: `x86_merge_tier` only returns a vector tier after
+                // `is_x86_feature_detected!` confirmed it on this CPU.
+                X86MergeTier::Avx512 => unsafe { bpe_merge_symbols_short_avx512(table, buf, n) },
+                // SAFETY: as above — AVX2 confirmed at tier selection.
+                X86MergeTier::Avx2 => unsafe { bpe_merge_symbols_short_avx2(table, buf, n) },
+                X86MergeTier::Scalar => bpe_merge_symbols_short_scalar(
+                    |a, b| table.rank(a, b),
+                    |a, b| table.prefetch_rank(a, b),
+                    buf,
+                    n,
+                ),
+            },
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             Some(table) => bpe_merge_symbols_short_scalar(
                 |a, b| table.rank(a, b),
                 |a, b| table.prefetch_rank(a, b),
@@ -691,6 +772,7 @@ impl Tokenizer {
             ),
             merge_scratch: MergeScratch::default(),
             symbol_scratch: Vec::new(),
+            span_scratch: None, // Local modification (vendoring): see field doc
             pretokenizer_type: self.pretokenizer_type,
             added_tokens: self.added_tokens.clone(),
             added_matcher: self.added_matcher.clone(),
@@ -1019,17 +1101,21 @@ impl Tokenizer {
         mut pretokens: impl PretokenSpans<'i>,
         mut f: impl FnMut(&[TokenId]),
     ) {
-        let mut batch = SpanBatch::new();
+        // Local modification (vendoring): reuse the held scratch instead of
+        // zeroing 8.7 KB per call; see `take_span_scratch` for the
+        // lifetime-cast soundness argument.
+        let mut batch = self.take_span_scratch();
+        let batch_view = Self::scratch_view(&mut batch);
         let mut out: Vec<u32> = Vec::new();
         let mut ends = [0usize; PRETOKEN_CHUNK];
         loop {
             let cache = &self.pretoken_cache;
-            let n = pretokens.fill_spans_keyed(&mut batch, &|h| cache.prefetch_l2(h));
+            let n = pretokens.fill_spans_keyed(batch_view, &|h| cache.prefetch_l2(h));
             if n == 0 {
                 break;
             }
             out.clear();
-            self.probe_emit_chunk(&batch, n, &mut out, |i, w| ends[i] = w);
+            self.probe_emit_chunk(batch_view, n, &mut out, |i, w| ends[i] = w);
             let mut start = 0;
             for &end in &ends[..n] {
                 // SAFETY: TokenId is repr(transparent) over u32, and the
@@ -1046,6 +1132,7 @@ impl Tokenizer {
                 break;
             }
         }
+        self.span_scratch = Some(batch);
     }
 
     /// Flat variant of [`Self::memoized_encode`]: the identical token
@@ -1066,18 +1153,52 @@ impl Tokenizer {
         mut pretokens: impl PretokenSpans<'i>,
         out: &mut Vec<u32>,
     ) {
-        let mut batch = SpanBatch::new();
+        // Local modification (vendoring): reuse the held scratch instead of
+        // zeroing 8.7 KB per call — `for_each_piece` calls this once per
+        // added-token segment, so a chat-template prompt paid the
+        // construction ~once per marker. See `take_span_scratch`.
+        let mut batch = self.take_span_scratch();
+        let batch_view = Self::scratch_view(&mut batch);
         loop {
             let cache = &self.pretoken_cache;
-            let n = pretokens.fill_spans_keyed(&mut batch, &|h| cache.prefetch_l2(h));
+            let n = pretokens.fill_spans_keyed(batch_view, &|h| cache.prefetch_l2(h));
             if n == 0 {
                 break;
             }
-            self.probe_emit_chunk(&batch, n, out, |_, _| {});
+            self.probe_emit_chunk(batch_view, n, out, |_, _| {});
             if n < PRETOKEN_CHUNK {
                 break;
             }
         }
+        self.span_scratch = Some(batch);
+    }
+
+    /// Local modification (vendoring): the held [`SpanBatch`] scratch, or a
+    /// fresh one on first use / after a panic unwound past the put-back.
+    /// Callers reborrow it at the input lifetime via [`Self::scratch_view`]
+    /// and return it to `self.span_scratch` when done.
+    fn take_span_scratch(&mut self) -> SpanScratch {
+        self.span_scratch.take().unwrap_or_else(|| SpanScratch(Box::new(SpanBatch::new())))
+    }
+
+    /// Local modification (vendoring): reborrow the storage-lifetime scratch
+    /// at the current input lifetime.
+    ///
+    /// # Safety argument (why the cast is sound)
+    /// `SpanBatch`'s lifetime parameter exists only in `PhantomData`; the
+    /// entries hold raw `ptr`s, never references. A `&mut SpanBatch<'static>`
+    /// cannot coerce to `&mut SpanBatch<'i>` (mutable references are
+    /// invariant), so the reborrow is a pointer cast. It cannot be observed:
+    /// within one encode call, `fill_spans_keyed` overwrites entries `[0, n)`
+    /// before [`SpanBatch::span`] (the only place a `ptr` is dereferenced,
+    /// contract-bound to `i < n` of that same fill) reads any of them, and
+    /// after the call returns the stale `ptr`s are only ever *loaded as
+    /// integers* by the emit loop's prefetch-ahead on a later call — which
+    /// the [`SPAN_BATCH_SLACK`] contract already declares harmless for
+    /// never-written slack entries, the identical situation.
+    fn scratch_view<'i, 'b>(batch: &'b mut SpanScratch) -> &'b mut SpanBatch<'i> {
+        // SAFETY: lifetime-only cast; see the argument above.
+        unsafe { &mut *(batch.0.as_mut() as *mut SpanBatch<'static> as *mut SpanBatch<'i>) }
     }
 
     /// Probe-and-emit for one chunk: branchless flat emit with a single

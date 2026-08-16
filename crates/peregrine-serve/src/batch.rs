@@ -49,13 +49,13 @@ static NEXT_SEQ_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// [`prefill_chunk`].
 const PREFILL_CHUNK: usize = 64;
 
-/// Divisor for the adaptive prefill chunk (`COLI_PREFILL_CHUNK_DIV`). `0`/unset
-/// keeps the historical fixed [`PREFILL_CHUNK`].
+/// Divisor for the adaptive prefill chunk (`COLI_PREFILL_CHUNK_DIV`).
+/// Default **4** (2026-08-13): geometric chunk boundaries keep the total
+/// dense-path reconstruction linear in prompt length instead of quadratic —
+/// see [`prefill_chunk`], whose math is what this default buys. `0` restores
+/// the historical fixed [`PREFILL_CHUNK`] exactly.
 fn prefill_chunk_div() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_PREFILL_CHUNK_DIV").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
-    })
+    std::env::var("COLI_PREFILL_CHUNK_DIV").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(4)
 }
 
 /// How many prompt tokens to prefill in one step, given how many are already cached.
@@ -71,8 +71,9 @@ fn prefill_chunk_div() -> usize {
 /// **Chunk size cannot change the output** — each token still attends exactly its
 /// causal prefix, which is what `engine_chunked_prefill_matches_reference` and
 /// `prefill_seq_matches_forward_step` already assert. The only thing traded is how
-/// long one prefill step blocks the decode batch, so this stays opt-in and the
-/// default reproduces the historical fixed chunk exactly.
+/// long one prefill step blocks the decode batch — which is why the divisor is a
+/// knob (`COLI_PREFILL_CHUNK_DIV=0` restores the historical fixed chunk exactly)
+/// even though the default is now the geometric schedule.
 /// Pure so the schedule is unit-testable — `iotune.rs` documents why a
 /// process-wide `OnceLock` for an enable flag makes a feature untestable.
 fn prefill_chunk(pos: usize, div: usize) -> usize {
@@ -83,17 +84,18 @@ fn prefill_chunk(pos: usize, div: usize) -> usize {
 }
 
 /// Byte budget for the cross-request prefix cache (`COLI_PREFIX_CACHE_MB`).
-/// `0`/unset disables it, which is the historical behaviour: every request
-/// prefills its whole prompt from scratch.
+/// Default **2048 MB** (2026-08-13): prefix reuse is bit-identical by
+/// construction (refcounted rows, same math), so the only trade is RAM, and
+/// 2 GB buys multi-turn conversations their assistant turns back on an engine
+/// where every re-prefilled token streams ~11 GB of experts. `0` disables it —
+/// the historical behaviour: every request prefills its whole prompt from
+/// scratch.
 fn prefix_cache_budget() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_PREFIX_CACHE_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or(0)
-    })
+    std::env::var("COLI_PREFIX_CACHE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(2048)
+        .saturating_mul(1024 * 1024)
 }
 
 /// Prompts shorter than this are not worth caching: the snapshot copy would cost
@@ -140,12 +142,10 @@ impl PrefixCache {
         self.budget > 0
     }
 
-    /// Longest cached prefix of `prompt`, as a seeded cache and its length.
-    ///
-    /// Never returns the whole prompt: prefill must still run for at least one
-    /// position, since that forward is what produces the logits the first token
-    /// is sampled from.
-    fn lookup(&mut self, prompt: &[i32]) -> Option<(SeqKv, usize)> {
+    /// Index and match length of the best entry for `prompt`, touching no
+    /// counters — shared by [`Self::lookup`] and [`PrefixStore`]'s probe of
+    /// whether the disk index can do better before it reads a checkpoint.
+    fn best_match(&self, prompt: &[i32]) -> Option<(usize, usize)> {
         if !self.enabled() || prompt.len() < 2 {
             return None;
         }
@@ -157,7 +157,16 @@ impl PrefixCache {
                 best = Some((i, n));
             }
         }
-        let (i, n) = best?;
+        best
+    }
+
+    /// Longest cached prefix of `prompt`, as a seeded cache and its length.
+    ///
+    /// Never returns the whole prompt: prefill must still run for at least one
+    /// position, since that forward is what produces the logits the first token
+    /// is sampled from.
+    fn lookup(&mut self, prompt: &[i32]) -> Option<(SeqKv, usize)> {
+        let (i, n) = self.best_match(prompt)?;
         self.clock += 1;
         let clock = self.clock;
         let e = self.entries.get_mut(i)?;
@@ -177,6 +186,18 @@ impl PrefixCache {
         if self.entries.iter().any(|e| e.tokens.len() >= prompt.len() && e.tokens.starts_with(prompt)) {
             return;
         }
+        // Entries the new one strictly covers are redundant — any lookup they
+        // could serve, the longer entry serves at least as well. Dropping them
+        // here keeps a conversation's turn-by-turn retires from accumulating
+        // one entry per turn (each a prefix of the next).
+        let used = &mut self.used;
+        self.entries.retain(|e| {
+            let covered = e.tokens.len() < prompt.len() && prompt.starts_with(&e.tokens);
+            if covered {
+                *used = used.saturating_sub(e.bytes);
+            }
+            !covered
+        });
         let snapshot = kv.clone_prefix(prompt.len());
         let bytes = snapshot.bytes();
         if bytes > self.budget {
@@ -197,6 +218,55 @@ impl PrefixCache {
             };
             self.used -= self.entries.swap_remove(victim).bytes;
         }
+    }
+}
+
+/// The in-memory prefix cache plus its optional disk extension
+/// (`COLI_KV_STORE_DIR`, see [`crate::kvstore`]). One type, one `&mut`
+/// parameter, everywhere the engine used to pass the cache — wrapping instead
+/// of widening signatures, since `finish_prefill_chunk` already sits at the
+/// strict audit's argument limit.
+struct PrefixStore {
+    mem: PrefixCache,
+    disk: Option<crate::kvstore::KvSessionStore>,
+}
+
+impl PrefixStore {
+    fn new(mem_budget: usize, disk: Option<crate::kvstore::KvSessionStore>) -> PrefixStore {
+        PrefixStore { mem: PrefixCache::new(mem_budget), disk }
+    }
+
+    /// Memory first. The disk is consulted only when its index says it can
+    /// beat memory's best match — a pure token compare, no file I/O — which is
+    /// the after-restart case and the conversation-continued-across-restart
+    /// case. A disk hit is promoted into memory, so each checkpoint is read at
+    /// most once per process and every later request takes the cheap path.
+    fn lookup(&mut self, prompt: &[i32]) -> Option<(SeqKv, usize)> {
+        let mem_n = self.mem.best_match(prompt).map_or(0, |(_, n)| n);
+        if let Some(disk) = &mut self.disk {
+            if disk.best_match_len(prompt) > mem_n {
+                if let Some((kv, n)) = disk.load_longest(prompt) {
+                    if n > mem_n {
+                        self.mem.insert(&prompt[..n], &kv);
+                        return Some((kv, n));
+                    }
+                }
+            }
+        }
+        self.mem.lookup(prompt)
+    }
+
+    /// Every insert is offered to the disk first (its own floor, trim, and
+    /// dedup decide whether anything is written), then cached in memory.
+    /// Because qualifying entries reach the disk at insert time, memory
+    /// eviction never loses anything the disk wanted and shutdown needs no
+    /// separate persist pass — the ds4 trigger list (long prefill, eviction,
+    /// shutdown) collapses to this one hook.
+    fn insert(&mut self, prompt: &[i32], kv: &SeqKv) {
+        if let Some(disk) = &mut self.disk {
+            disk.save(prompt, kv);
+        }
+        self.mem.insert(prompt, kv);
     }
 }
 
@@ -290,6 +360,26 @@ pub struct EngineTelemetry {
     /// `None` without a warm cache.
     pub ecache: Option<(u64, u64, u64)>,
     pub prefetch_reads: u64,
+    /// MTP speculation, cumulative: drafts proposed and drafts the model's
+    /// accept rule kept. The ratio is the only number that says whether
+    /// `COLI_DRAFT`'s depth is earning its rows — each proposed draft is a
+    /// verify row in the batched forward, and a rejected one is a row of
+    /// wasted expert reads. Both zero when speculation is off.
+    pub spec_proposed: u64,
+    pub spec_accepted: u64,
+    /// Drafts the `COLI_SPEC_CONF` floor cut short of their requested depth,
+    /// cumulative. Zero when the floor is off (the default).
+    pub spec_conf_stops: u64,
+    /// RLM recursive refinement `(passes_emitted, tokens_recursed)`,
+    /// cumulative — `(0, 0)` unless `COLI_RLM=1`.
+    pub rlm: (u64, u64),
+    /// Disk-persisted KV sessions `(saved, loaded, tokens_restored)`,
+    /// cumulative — `None` unless `COLI_KV_STORE_DIR` is set.
+    pub kvstore: Option<(u64, u64, u64)>,
+    /// O_DIRECT slab buffers currently checked out across the streaming rings
+    /// (`None` when experts are resident). Stuck at the pool cap = reads are
+    /// serializing on buffer availability.
+    pub io_slab_in_use: Option<usize>,
 }
 
 /// Handle for submitting requests to the engine thread. Cheap to clone and
@@ -300,18 +390,51 @@ pub struct EngineHandle {
     tx_high: mpsc::UnboundedSender<EngineRequest>,
     /// Published by the engine thread each tick; read by `/metrics`.
     telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
+    /// Requests sent but not yet drained by the engine (see [`queue_depth_cap`]).
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Resolved [`queue_depth_cap`]; 0 = unbounded.
+    queue_cap: usize,
+}
+
+/// Why [`EngineHandle::submit`] refused a request.
+#[derive(Debug)]
+pub enum SubmitRefused {
+    /// `COLI_QUEUE_DEPTH` backpressure — the backlog is at its cap; the client
+    /// should retry (HTTP 503), and nothing about the request was wrong.
+    Full,
+    /// The engine thread is gone (shutdown or crash).
+    Down(String),
+}
+
+impl From<SubmitRefused> for Error {
+    fn from(r: SubmitRefused) -> Error {
+        match r {
+            SubmitRefused::Full => Error::Format("engine queue is full (COLI_QUEUE_DEPTH)".into()),
+            SubmitRefused::Down(m) => Error::Format(format!("batch engine is not running: {m}")),
+        }
+    }
 }
 
 impl EngineHandle {
     /// Submit a request at its `priority` — the engine drains high-priority
-    /// requests before normal ones each tick. Errors only if the engine thread
-    /// has already shut down.
-    pub fn submit(&self, req: EngineRequest) -> Result<(), Error> {
+    /// requests before normal ones each tick. Refuses with
+    /// [`SubmitRefused::Full`] against a backlog at `COLI_QUEUE_DEPTH`, or
+    /// [`SubmitRefused::Down`] once the engine thread has shut down.
+    pub fn submit(&self, req: EngineRequest) -> Result<(), SubmitRefused> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Approximate on purpose: two racing submits can both pass a cap-1
+        // check. The cap is overload shedding, not an admission invariant —
+        // off-by-a-few under race is fine, silently unbounded is not.
+        if self.queue_cap > 0 && self.queued.load(Relaxed) >= self.queue_cap {
+            return Err(SubmitRefused::Full);
+        }
         let ch = match req.priority {
             Priority::High => &self.tx_high,
             Priority::Normal => &self.tx_normal,
         };
-        ch.send(req).map_err(|send_err| Error::Format(format!("batch engine is not running: {send_err}")))
+        ch.send(req).map_err(|send_err| SubmitRefused::Down(send_err.to_string()))?;
+        self.queued.fetch_add(1, Relaxed);
+        Ok(())
     }
 
     /// The engine's most recent published telemetry. All-zero before the first
@@ -321,53 +444,117 @@ impl EngineHandle {
     }
 }
 
+/// State shared between the engine thread and its [`EngineHandle`], bundled
+/// so `run` stays within the argument count its own comment defends.
+struct EngineShared {
+    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Every engine-loop knob, resolved from the environment **once at spawn** and
+/// threaded through — never a process-wide `OnceLock`. Two reasons, both
+/// already paid for in this repo: an `OnceLock` latch voided the
+/// route-min-share A/B (both arms in one process read the first arm's value —
+/// `todo.md` §6), and the `spawn_fused`/`spawn_tuned`/`spawn_spec` ladder below
+/// existed purely so tests could dodge the latch knob-by-knob. Tests now
+/// override fields on this struct instead; the parser functions keep their
+/// documentation and defaults and are called exactly once, from [`Self::from_env`].
+#[derive(Clone, Copy)]
+struct EngineKnobs {
+    /// `COLI_FUSE_PREFILL` — see [`fuse_prefill`].
+    fuse_prefill: bool,
+    /// `COLI_PREFILL_CHUNK_DIV` — see [`prefill_chunk_div`].
+    prefill_chunk_div: usize,
+    /// `COLI_PREFIX_CACHE_MB` in bytes — see [`prefix_cache_budget`].
+    prefix_cache_budget: usize,
+    /// `COLI_BATCH_SLA_MS` — see [`batch_sla_ms`].
+    batch_sla_ms: Option<u64>,
+    /// `COLI_DRAFT` — see [`draft_depth`].
+    draft_depth: usize,
+    /// `COLI_DRAFT_SAMPLED` — see [`draft_sampled`].
+    draft_sampled: bool,
+    /// `COLI_SPEC_CONF` — see [`spec_conf`].
+    spec_conf: f32,
+    /// `COLI_MAX_BATCH_ROWS` — see [`max_batch_rows`].
+    max_batch_rows: usize,
+    /// `COLI_QUEUE_DEPTH` — see [`queue_depth_cap`].
+    queue_depth_cap: usize,
+    /// `COLI_ADAPTIVE_WINDOW` — see [`adaptive_window_ratio`].
+    adaptive_window_ratio: u64,
+    /// `COLI_KV_BUDGET_MB` in bytes — see [`kv_budget_bytes`].
+    kv_budget_bytes: usize,
+}
+
+impl EngineKnobs {
+    /// The one place the engine reads its environment.
+    fn from_env() -> EngineKnobs {
+        EngineKnobs {
+            fuse_prefill: fuse_prefill(),
+            prefill_chunk_div: prefill_chunk_div(),
+            prefix_cache_budget: prefix_cache_budget(),
+            batch_sla_ms: batch_sla_ms(),
+            draft_depth: draft_depth(),
+            draft_sampled: draft_sampled(),
+            spec_conf: spec_conf(),
+            max_batch_rows: max_batch_rows(),
+            queue_depth_cap: queue_depth_cap(),
+            adaptive_window_ratio: adaptive_window_ratio(),
+            kv_budget_bytes: kv_budget_bytes(),
+        }
+    }
+}
+
 /// Spawn the engine on a dedicated OS thread that owns `model`, batching up to
 /// `max_batch` sequences per step. Returns a submit handle and the thread's join
 /// handle (the thread exits once every [`EngineHandle`] is dropped and all active
 /// sequences finish).
 pub fn spawn(model: Model, max_batch: usize) -> Result<(EngineHandle, JoinHandle<()>), Error> {
+    spawn_with_knobs(model, max_batch, EngineKnobs::from_env())
+}
+
+/// [`spawn`] with the knobs supplied by the caller — production hands it
+/// [`EngineKnobs::from_env`]; tests hand it a struct with the fields under test
+/// overridden, so no test ever mutates the process environment.
+fn spawn_with_knobs(
+    model: Model,
+    max_batch: usize,
+    knobs: EngineKnobs,
+) -> Result<(EngineHandle, JoinHandle<()>), Error> {
     let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
     let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
     let cap = max_batch.max(1);
     let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
-    let tel = telemetry.clone();
+    let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shared = EngineShared { telemetry: telemetry.clone(), queued: queued.clone() };
     let join = std::thread::Builder::new()
         .name("peregrine-batch".to_string())
-        .spawn(move || run(model, rx_normal, rx_high, cap, fuse_prefill(), tel))
+        .spawn(move || run(model, rx_normal, rx_high, cap, knobs, shared))
         .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high, telemetry }, join))
+    Ok((EngineHandle { tx_normal, tx_high, telemetry, queued, queue_cap: knobs.queue_depth_cap }, join))
 }
 
-/// [`spawn`] with the prefill/decode fusion forced on or off.
-///
-/// Exists because `COLI_FUSE_PREFILL` resolves through a process-wide
-/// `OnceLock`, and a test that mutated the environment would race every other
-/// test in the binary — the same reason `iotune.rs` gives for not gating a
-/// feature on one.
+/// [`spawn`] with the prefill/decode fusion forced on or off (test knob override).
 #[cfg(test)]
 fn spawn_fused(model: Model, max_batch: usize, fuse: bool) -> Result<(EngineHandle, JoinHandle<()>), Error> {
     spawn_tuned(model, max_batch, fuse, None)
 }
 
-/// Override for the speculation knobs, `None` meaning "read the environment".
-/// Production passes the default (all `None`); tests force values so they never
-/// race each other on the process-wide `OnceLock`s the environment resolves
-/// through. Bundled rather than passed as two parameters because `run_tuned`
-/// already sits at clippy's argument limit, and because the two are one
-/// decision: sampled speculation without a depth is not a configuration.
+/// Override for the speculation knobs, `None` meaning "the environment's value".
+/// Kept as the test ladder's argument shape; it folds into [`EngineKnobs`] in
+/// [`spawn_spec`]. Bundled rather than passed as parameters because the two are
+/// one decision: sampled speculation without a depth is not a configuration.
+#[cfg(test)]
 #[derive(Clone, Copy, Default)]
 struct SpecOverride {
     /// `COLI_DRAFT`.
     depth: Option<usize>,
     /// `COLI_DRAFT_SAMPLED`.
     sampled: Option<bool>,
+    /// `COLI_SPEC_CONF`.
+    conf: Option<f32>,
 }
 
-/// [`spawn`] with the fusion and the speculation knobs forced.
-///
-/// These resolve through process-wide `OnceLock`s, and a test that mutated the
-/// environment would race every other test in the binary — the same reason
-/// `iotune.rs` gives for not gating a feature on one.
+/// [`spawn`] with the fusion and the speculation depth forced (test knob override).
 #[cfg(test)]
 fn spawn_tuned(
     model: Model,
@@ -375,7 +562,7 @@ fn spawn_tuned(
     fuse: bool,
     depth: Option<usize>,
 ) -> Result<(EngineHandle, JoinHandle<()>), Error> {
-    spawn_spec(model, max_batch, fuse, SpecOverride { depth, sampled: None })
+    spawn_spec(model, max_batch, fuse, SpecOverride { depth, sampled: None, conf: None })
 }
 
 /// [`spawn_tuned`] with the sampled-speculation knob forced too.
@@ -386,26 +573,26 @@ fn spawn_spec(
     fuse: bool,
     spec: SpecOverride,
 ) -> Result<(EngineHandle, JoinHandle<()>), Error> {
-    let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
-    let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
-    let cap = max_batch.max(1);
-    let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
-    let tel = telemetry.clone();
-    let join = std::thread::Builder::new()
-        .name("peregrine-batch-test".to_string())
-        .spawn(move || run_tuned(model, rx_normal, rx_high, cap, fuse, spec, tel))
-        .map_err(|e| Error::Format(format!("spawn batch engine thread: {e}")))?;
-    Ok((EngineHandle { tx_normal, tx_high, telemetry }, join))
+    let mut knobs = EngineKnobs::from_env();
+    knobs.fuse_prefill = fuse;
+    if let Some(d) = spec.depth {
+        knobs.draft_depth = d;
+    }
+    if let Some(s) = spec.sampled {
+        knobs.draft_sampled = s;
+    }
+    if let Some(c) = spec.conf {
+        knobs.spec_conf = c;
+    }
+    spawn_with_knobs(model, max_batch, knobs)
 }
 
 /// Latency SLA target for adaptive batching, in milliseconds. When set
-/// (`COLI_BATCH_SLA_MS=<n>` or via [`spawn_with_sla`] callers), the engine
+/// (`COLI_BATCH_SLA_MS=<n>`, or an [`EngineKnobs`] override in tests), the engine
 /// shrinks the working batch cap on p95-latency overrun and grows it back when
 /// slack appears. Unset → static `max_batch` (the historical default).
 fn batch_sla_ms() -> Option<u64> {
-    use std::sync::OnceLock;
-    static V: OnceLock<Option<u64>> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("COLI_BATCH_SLA_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0))
+    std::env::var("COLI_BATCH_SLA_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0)
 }
 
 /// Speculative draft depth for the batched engine (`COLI_DRAFT`). `0`/unset is
@@ -415,8 +602,30 @@ fn batch_sla_ms() -> Option<u64> {
 /// model class came from a depth-2 fork where 2.46 accepted was already 82% of
 /// that configuration's ceiling of 3.
 fn draft_depth() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("COLI_DRAFT").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0))
+    std::env::var("COLI_DRAFT").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+}
+
+/// Confidence floor for the MTP draft (`COLI_SPEC_CONF`, clamped to `[0, 1)`).
+/// `0`/unset drafts the full `COLI_DRAFT` depth — the historical behavior and
+/// the default until an A/B licenses otherwise.
+///
+/// The ds4/DSpark observation this ports: draft yield is bimodal — predictable
+/// continuations accept nearly everything, uncertain ones reject nearly
+/// everything — and the MTP head's own top-token probability separates the two
+/// before any verify row is spent. Every drafted token becomes a verify row in
+/// the batched forward, and a rejected row is a row of wasted expert reads, so
+/// stopping a low-confidence draft attacks bytes/accepted-token directly.
+/// Depth-only by design: `accept_run`'s greedy identity is untouched, so this
+/// knob can never change emitted tokens (ds4's version gates acceptance too and
+/// documents output drift; peregrine's invariant forbids that trade).
+/// ds4 ships 0.6 (Metal) / 0.7 (CUDA) as defaults — 0.65 is the A/B arm.
+fn spec_conf() -> f32 {
+    std::env::var("COLI_SPEC_CONF")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(0.0, 0.999_999))
+        .unwrap_or(0.0)
 }
 
 /// Extend speculation to temperature > 0 requests via rejection sampling
@@ -435,8 +644,7 @@ fn draft_depth() -> usize {
 /// head is a good proposal distribution at temperature is a modelling question,
 /// and a bad one costs acceptance rate rather than correctness.
 fn draft_sampled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("COLI_DRAFT_SAMPLED").ok().as_deref(), Some("1") | Some("true")))
+    matches!(std::env::var("COLI_DRAFT_SAMPLED").ok().as_deref(), Some("1") | Some("true"))
 }
 
 /// How deep this sequence may speculate.
@@ -462,22 +670,44 @@ fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize, 
 }
 
 /// Fuse a prefill chunk into the same forward as the decode batch
-/// (`COLI_FUSE_PREFILL`). Default **off** — the historical two-forward tick.
+/// (`COLI_FUSE_PREFILL`). Default **on** (2026-08-13); `=0` restores the
+/// historical two-forward tick.
 ///
-/// On a tick with both, the engine runs `forward_prefill_seq` *and*
+/// On a tick with both, the unfused engine runs `forward_prefill_seq` *and*
 /// `forward_step_batched`: two disjoint forwards, each streaming its own
 /// routed-expert union off disk, ~11.3 GB per token apiece at GLM-5.2 shapes.
 /// The MoE lane is row-batch-union'd and does not care which sequence a row
-/// belongs to, so the two can share one set of expert reads.
+/// belongs to, so the two share one set of expert reads instead.
 ///
 /// **Output-neutral, and proven so rather than argued**:
 /// `a_fused_chunk_is_indistinguishable_from_two_separate_forwards` (model) and
-/// `fused_prefill_emits_the_same_tokens_as_the_two_forward_tick` (here). It is
-/// still opt-in because the win is a *byte* win that this workspace cannot
-/// measure — see `docs/validation-runbook.md`.
+/// `fused_prefill_emits_the_same_tokens_as_the_two_forward_tick` (here). The
+/// byte win that justified flipping the default is a union-share measurement
+/// (`COLI_UNION_STATS`); the serve-path A/B recipe is in
+/// `docs/validation-runbook.md`.
 fn fuse_prefill() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("COLI_FUSE_PREFILL").ok().as_deref(), Some("1") | Some("true")))
+    !matches!(std::env::var("COLI_FUSE_PREFILL").ok().as_deref(), Some("0") | Some("false"))
+}
+
+/// Ceiling on rows in one fused forward (`COLI_MAX_BATCH_ROWS`); `0`/unset =
+/// uncapped, the historical behaviour. A fused tick's row count is
+/// `Σ(1 + drafts)` over the decode batch plus the prefill chunk, and nothing
+/// bounded the total: a geometric prefill chunk riding a full speculative
+/// batch could assemble an arbitrarily large forward. The cap shrinks the
+/// fused chunk first (always leaving one token of prefill progress) and
+/// bounds next-tick draft depth so the decode block itself fits. Purely a
+/// scheduling bound — which rows run when — never which tokens come out.
+fn max_batch_rows() -> usize {
+    std::env::var("COLI_MAX_BATCH_ROWS").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+}
+
+/// Admission-queue depth cap (`COLI_QUEUE_DEPTH`); `0`/unset = unbounded, the
+/// historical behaviour. When set, a submit against a backlog this deep is
+/// refused ([`SubmitRefused::Full`] → HTTP 503) instead of queued forever —
+/// overload becomes visible backpressure rather than unbounded memory and a
+/// client timeout long after the fact.
+fn queue_depth_cap() -> usize {
+    std::env::var("COLI_QUEUE_DEPTH").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
 }
 
 /// Number of decode ticks per prefill tick when the adaptive window is on.
@@ -486,15 +716,11 @@ fn fuse_prefill() -> bool {
 /// trading admission latency for decode throughput when the workload is decode-
 /// heavy. Purely a scheduling knob — correctness-neutral.
 fn adaptive_window_ratio() -> u64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<u64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_ADAPTIVE_WINDOW")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(1)
-    })
+    std::env::var("COLI_ADAPTIVE_WINDOW")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
 }
 
 /// Resident KV budget in bytes (`COLI_KV_BUDGET_MB`); 0 = off, the historical
@@ -509,15 +735,11 @@ fn adaptive_window_ratio() -> u64 {
 /// every downstream KV optimization is worth exactly zero extra batch slots
 /// until this exists.
 fn kv_budget_bytes() -> usize {
-    use std::sync::OnceLock;
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("COLI_KV_BUDGET_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .map(|mb| mb.saturating_mul(1 << 20))
-            .unwrap_or(0)
-    })
+    std::env::var("COLI_KV_BUDGET_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1 << 20))
+        .unwrap_or(0)
 }
 
 /// Whether the engine may admit another sequence given the KV already resident.
@@ -632,50 +854,80 @@ struct SeqState {
     /// Pre-final-norm hidden at this sequence's last committed position: what
     /// the next draft continues from. Empty until the first verify produces it.
     hlast: Vec<f32>,
+    /// The fed-token log, row-aligned with `seq`: `toks[i]` is the token whose
+    /// feed produced KV row `i` (the prompt, then each committed decode/draft
+    /// token). Kept so a retiring sequence can hand `prompt + output` to the
+    /// prefix cache — a multi-turn client resends exactly that as the next
+    /// prompt's head, and without this entry it re-prefills the assistant turn
+    /// it just received. Invariant: `toks.len() == pos == seq.len()` at the
+    /// top of a decode step.
+    toks: Vec<i32>,
 }
 
 /// The engine loop: admit + prefill new requests, then decode all active
 /// sequences one batched step at a time until each hits a stop id, its token
 /// budget, or a dropped client.
 fn run(
-    model: Model,
-    rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
-    rx_high: mpsc::UnboundedReceiver<EngineRequest>,
-    max_batch: usize,
-    fuse: bool,
-    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
-) {
-    run_tuned(model, rx_normal, rx_high, max_batch, fuse, SpecOverride::default(), telemetry)
-}
-
-/// [`run`] with the speculation knobs overridable, for tests. Each `None` reads
-/// the corresponding environment variable.
-fn run_tuned(
     mut model: Model,
     mut rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
     mut rx_high: mpsc::UnboundedReceiver<EngineRequest>,
     max_batch: usize,
-    fuse: bool,
-    spec: SpecOverride,
-    telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
+    knobs: EngineKnobs,
+    shared: EngineShared,
 ) {
+    let EngineShared { telemetry, queued } = shared;
+    let fuse = knobs.fuse_prefill;
     let vocab = model.cfg.vocab as usize;
     let stop_ids = model.cfg.stop_ids.clone();
     let mut active: Vec<SeqState> = Vec::new();
     let mut pending: VecDeque<Prefilling> = VecDeque::new();
     let mut steps = 0usize;
+    // MTP acceptance accounting (see `EngineTelemetry::spec_proposed`).
+    let mut spec_proposed: u64 = 0;
+    let mut spec_accepted: u64 = 0;
+    let mut spec_conf_stops: u64 = 0;
     // Adaptive-batching state. `working_cap` is the current admission ceiling
     // (starts at `max_batch`, shrinks under SLA overrun, grows on slack). EWMA
     // over per-forward wall time drives the adjustment.
-    let sla_ms = batch_sla_ms();
-    // Resolved once: prefill chunking is a latency/work trade, not a per-tick decision.
-    let chunk_div = prefill_chunk_div();
-    let depth = spec.depth.unwrap_or_else(draft_depth);
-    let sampled_spec = spec.sampled.unwrap_or_else(draft_sampled);
-    let has_mtp = model.has_mtp();
-    let mut prefix = PrefixCache::new(prefix_cache_budget());
-    // Resolved once: the KV byte ceiling admission respects alongside the count.
-    let kv_budget = kv_budget_bytes();
+    let sla_ms = knobs.batch_sla_ms;
+    // Prefill chunking is a latency/work trade, not a per-tick decision.
+    let chunk_div = knobs.prefill_chunk_div;
+    let depth = knobs.draft_depth;
+    let sampled_spec = knobs.draft_sampled;
+    let conf_floor = knobs.spec_conf;
+    // Speculation additionally requires that rejecting a draft is a pure KV
+    // rewind. A recurrent arch's verify forward advances its GdnState in place
+    // and `truncate` cannot undo that, so drafts stay off there until the
+    // snapshot/restore rollback is wired into the accept path below — enabling
+    // them first would corrupt the state of every sequence that rejects one.
+    let has_mtp = model.has_mtp() && model.spec_reject_is_kv_only();
+    if model.has_mtp() && !model.spec_reject_is_kv_only() {
+        eprintln!(
+            "peregrine: [spec] MTP head present but speculation is off — this arch needs \
+             recurrent-state rollback on reject (not yet wired)"
+        );
+    }
+    // A GDN sequence's context is a point state, not per-position rows: a
+    // prefix hit or a disk checkpoint would need a state snapshot taken exactly
+    // at the boundary. Until that trade is measured, hybrid models skip both
+    // (Track C phase 2a) — budget 0 is the prefix cache's documented off state.
+    let cacheable = model.prefix_cachable();
+    let mut prefix = PrefixStore::new(
+        if cacheable { knobs.prefix_cache_budget } else { 0 },
+        if cacheable {
+            crate::kvstore::KvSessionStore::from_env(&model, PREFIX_CACHE_MIN_TOKENS)
+        } else {
+            None
+        },
+    );
+    // The KV byte ceiling admission respects alongside the count.
+    let kv_budget = knobs.kv_budget_bytes;
+    // The fused-forward row ceiling (0 = uncapped).
+    let max_rows = knobs.max_batch_rows;
+    // Decode ticks per prefill tick (COLI_ADAPTIVE_WINDOW). Hoisted with the
+    // rest: it used to be re-read every tick through its process-wide latch,
+    // which made it look per-tick-tunable when it never was.
+    let win = knobs.adaptive_window_ratio;
     let mut working_cap = max_batch;
     let mut ewma_decode_us: u64 = 0;
     // Small current-thread runtime just for the priority-aware blocking recv.
@@ -699,14 +951,14 @@ fn run_tuned(
         // because every admission grows the resident set.
         while active.len() + pending.len() < working_cap && kv_headroom(&active, &pending, kv_budget) {
             match rx_high.try_recv() {
-                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix),
+                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix, &queued),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
         while active.len() + pending.len() < working_cap && kv_headroom(&active, &pending, kv_budget) {
             match rx_normal.try_recv() {
-                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix),
+                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix, &queued),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break, // drain, then exit
             }
@@ -722,14 +974,14 @@ fn run_tuned(
                 // is handled as shutdown by `recv_priority` below.
                 match rx_high.try_recv() {
                     Ok(req) => {
-                        admit_pending(&model, &mut pending, req, &mut prefix);
+                        admit_pending(&model, &mut pending, req, &mut prefix, &queued);
                         break;
                     }
                     Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
                 }
                 match rx_normal.try_recv() {
                     Ok(req) => {
-                        admit_pending(&model, &mut pending, req, &mut prefix);
+                        admit_pending(&model, &mut pending, req, &mut prefix, &queued);
                         break;
                     }
                     Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
@@ -741,7 +993,7 @@ fn run_tuned(
             let req = recv_priority(idle_rt.as_ref(), &mut rx_high, &mut rx_normal);
             match req {
                 Some(req) => {
-                    admit_pending(&model, &mut pending, req, &mut prefix);
+                    admit_pending(&model, &mut pending, req, &mut prefix, &queued);
                     continue;
                 }
                 None => break,
@@ -754,7 +1006,6 @@ fn run_tuned(
         // Nth engine tick so decode gets more consecutive time before yielding.
         // If no decodes are active yet, always run prefill (else the engine stalls
         // waiting for a prefill that never fires).
-        let win = adaptive_window_ratio();
         let do_prefill = win == 1 || active.is_empty() || steps.is_multiple_of(win as usize);
         // Fusion needs something to fuse *with*: a live decode batch and a
         // pending prefill. Otherwise there is only one forward to run anyway, so
@@ -764,7 +1015,14 @@ fn run_tuned(
             let fusable = fuse && !active.is_empty() && !pending.is_empty();
             match fusable.then(|| pending.pop_front()).flatten() {
                 Some(p) => {
-                    let end = chunk_end(p.pos, p.prompt.len(), chunk_div);
+                    let mut end = chunk_end(p.pos, p.prompt.len(), chunk_div);
+                    // COLI_MAX_BATCH_ROWS: the fused chunk yields first, down
+                    // to one token so the prefill always makes progress.
+                    if max_rows > 0 {
+                        let dec_rows: usize = active.iter().map(|s| 1 + s.draft.len()).sum();
+                        let room = max_rows.saturating_sub(dec_rows).max(1);
+                        end = end.min(p.pos + room);
+                    }
                     fused = Some((p, end));
                 }
                 None => prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids, chunk_div, &mut prefix),
@@ -921,6 +1179,10 @@ fn run_tuned(
             } else {
                 (0, 0)
             };
+            if g > 0 {
+                spec_proposed += g as u64;
+                spec_accepted += k.min(g) as u64;
+            }
             // **`s.next_tok` was already emitted** — by the prefill that
             // promoted this sequence, or by the previous round. It is the token
             // being *fed* now, not one to send. What this round emits is
@@ -929,17 +1191,49 @@ fn run_tuned(
             //
             // With no drafts that is a single token from row 0, which is the
             // historical decode step exactly.
+            //
+            // RLM composition (COLI_RLM, structural no-op when unset): refine
+            // the *decision* row before it becomes `final_next`, mirroring the
+            // model-resident composition in `generate_speculative` — accept
+            // decisions always use the raw logits; only the post-acceptance
+            // contested row (or the sole row of a non-drafting step) refines;
+            // and a sampled speculative run is skipped, because refining after
+            // `accept_run_sampled`'s residual draw would break its
+            // distribution-preserving guarantee.
+            let mut refined_hidden: Option<Vec<f32>> = None;
             let final_next = if g > 0 {
                 // Already chosen by whichever accept rule ran: `accept_run`'s
                 // argmax for a greedy request, `accept_run_sampled`'s residual
                 // or bonus draw for a sampled one. Re-picking here would take a
                 // second sample from the same row and emit a token the accept
-                // rule never verified against.
-                spec_next
+                // rule never verified against. (An RLM pass on the contested
+                // row recomputes the argmax from *refined* logits — a different
+                // footing, not a second sample from the same one.)
+                if s.sampler.temp <= 0.0 {
+                    let rows = ForwardRows { logits: &logits, hidden: &hidden, vocab, d_hidden };
+                    match rlm_refine_row(&model, &s.seq, s.pos + k, &rows, base + k, 0.0) {
+                        Some((lg, h)) => {
+                            refined_hidden = Some(h);
+                            peregrine_model::argmax(&lg) as i32
+                        }
+                        None => spec_next,
+                    }
+                } else {
+                    spec_next
+                }
             } else {
                 let lo = base * vocab;
                 match logits.get(lo..lo + vocab) {
-                    Some(r) => s.sampler.pick(r, -1) as i32,
+                    Some(r) => {
+                        let rows = ForwardRows { logits: &logits, hidden: &hidden, vocab, d_hidden };
+                        match rlm_refine_row(&model, &s.seq, s.pos, &rows, base, s.sampler.temp) {
+                            Some((lg, h)) => {
+                                refined_hidden = Some(h);
+                                s.sampler.pick(&lg, -1) as i32
+                            }
+                            None => s.sampler.pick(r, -1) as i32,
+                        }
+                    }
                     None => s.next_tok,
                 }
             };
@@ -973,6 +1267,11 @@ fn run_tuned(
             // the client never received.
             s.pos += 1 + drafts_emitted;
             s.seq.truncate(s.pos);
+            // The fed-token log commits the same rows: the token fed this tick
+            // (the *old* `next_tok`, so this must precede the overwrite below)
+            // plus the accepted drafts, keeping `toks` row-aligned with `seq`.
+            s.toks.push(s.next_tok);
+            s.toks.extend_from_slice(&s.draft[..drafts_emitted]);
             // `final_next` has been emitted but not yet fed, which is exactly
             // the pending-token invariant. Only meaningful when the sequence
             // survives; a retiring one is dropped below.
@@ -984,10 +1283,30 @@ fn run_tuned(
             // An absent row means the forward returned less than it was asked
             // for — clear the hidden rather than default it, so the next tick
             // skips drafting instead of drafting from zeros.
-            s.hlast = match hidden.get(hrow..hrow + d_hidden) {
-                Some(h) => h.to_vec(),
-                None => Vec::new(),
+            //
+            // A refined hidden replaces the raw row (the next MTP draft then
+            // continues from the refined footing, as the model composition
+            // does), but only when the emitted run wasn't cut short — the
+            // refinement sits at the decision row, which is `hrow` exactly
+            // when `drafts_emitted == k` (a cut-short run retires below, so
+            // nothing downstream reads a mismatched hidden either way).
+            s.hlast = match refined_hidden {
+                Some(h) if drafts_emitted == k.min(g) => h,
+                _ => match hidden.get(hrow..hrow + d_hidden) {
+                    Some(h) => h.to_vec(),
+                    None => Vec::new(),
+                },
             };
+            // A retiring sequence's KV is about to drop; freeze prompt+output
+            // first. This is what turns a multi-turn conversation's next
+            // request — the same ids plus a new user turn — into a refcount
+            // bump instead of a full re-prefill of the assistant turn. The
+            // 64-token floor and the LRU budget in `insert` apply unchanged,
+            // and exact-id matching means a client whose retokenization
+            // differs simply degrades to the prompt-prefix match it gets today.
+            if !alive {
+                prefix.insert(&s.toks[..s.pos.min(s.toks.len())], &s.seq);
+            }
             keep.push(alive);
         }
         let mut idx = 0usize;
@@ -1006,9 +1325,18 @@ fn run_tuned(
         // for that sequence rather than dropping the client.
         if depth > 0 {
             let sampled = sampled_spec;
+            // COLI_MAX_BATCH_ROWS bounds next tick's decode block too: B
+            // sequences each drafting g assemble B*(1+g) rows before any
+            // fused chunk is added.
+            let depth_cap = if max_rows > 0 && !active.is_empty() {
+                (max_rows / active.len()).saturating_sub(1)
+            } else {
+                usize::MAX
+            };
             for s in active.iter_mut() {
                 let g =
-                    draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new), sampled);
+                    draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new), sampled)
+                        .min(depth_cap);
                 s.draft.clear();
                 s.draft_q.clear();
                 if g == 0 || s.hlast.is_empty() {
@@ -1019,15 +1347,23 @@ fn run_tuned(
                 // handing it a sampled draft would break `accept_run`'s
                 // sequence-identity with greedy decoding.
                 let drafted = if s.sampler.temp > 0.0 {
-                    model.mtp_draft_sampled(s.next_tok, g, &s.hlast, &mut s.sampler).map(|(d, q)| {
+                    model.mtp_draft_sampled(s.next_tok, g, &s.hlast, conf_floor, &mut s.sampler).map(|(d, q)| {
                         s.draft_q = q;
                         d
                     })
                 } else {
-                    model.mtp_draft(s.next_tok, g, &s.hlast)
+                    model.mtp_draft(s.next_tok, g, &s.hlast, conf_floor)
                 };
                 match drafted {
-                    Ok(d) => s.draft = d,
+                    Ok(d) => {
+                        // A draft shorter than requested under an active floor
+                        // is the gate firing — the number that says whether
+                        // 0.65 is pruning wasted verify rows or starving depth.
+                        if conf_floor > 0.0 && d.len() < g {
+                            spec_conf_stops += 1;
+                        }
+                        s.draft = d;
+                    }
                     // A partial `draft_q` from a failed draft must not survive:
                     // the next verify would score this tick's rows against it.
                     Err(e) => {
@@ -1067,18 +1403,61 @@ fn run_tuned(
             steps: steps as u64,
             ecache: model.ecache_stats(),
             prefetch_reads: model.ecache_prefetch_reads().unwrap_or(0),
+            spec_proposed,
+            spec_accepted,
+            spec_conf_stops,
+            rlm: model.rlm_stats(),
+            kvstore: prefix.disk.as_ref().map(|d| (d.saved, d.loaded, d.tokens_restored)),
+            io_slab_in_use: model.io_slab_in_use(),
         };
     }
     // Shutdown: report what the prefix cache absorbed. Silent when it is off, so
     // a default run's output is unchanged.
-    if prefix.enabled() {
+    if prefix.mem.enabled() {
         eprintln!(
             "[prefix-cache] hits={} tokens_reused={} entries={} resident={:.1} MiB",
-            prefix.hits,
-            prefix.tokens_saved,
-            prefix.entries.len(),
-            prefix.used as f64 / (1024.0 * 1024.0)
+            prefix.mem.hits,
+            prefix.mem.tokens_saved,
+            prefix.mem.entries.len(),
+            prefix.mem.used as f64 / (1024.0 * 1024.0)
         );
+    }
+    // Disk-persisted sessions, silent unless COLI_KV_STORE_DIR enabled them.
+    if let Some(d) = &prefix.disk {
+        // The write path is asynchronous (kvstore.rs); draining it first makes
+        // entries/resident reflect every accepted checkpoint, and dropped_busy
+        // says how many the depth-1 writer queue declined.
+        d.flush();
+        eprintln!(
+            "[kvstore] saved={} loaded={} tokens_restored={} entries={} resident={:.1} MiB dropped_busy={}",
+            d.saved,
+            d.loaded,
+            d.tokens_restored,
+            d.entry_count(),
+            d.resident_bytes() as f64 / (1024.0 * 1024.0),
+            d.dropped_busy
+        );
+    }
+    // Topic-routing profiles learn in-process; without this a long-running
+    // server relearns its workload mix every boot — the sidecar's other writer
+    // is the stdio engine's route-stats path, which this server never takes.
+    // Unconditional by design: the call is a documented no-op when
+    // COLI_TOPIC_ROUTING is off.
+    if let Err(e) = model.save_topic_profiles_here() {
+        peregrine_core::note_advisory_err("topic profiles persist", &e);
+    }
+    // Speculation accounting, silent when speculation never ran. The accept
+    // rate is what says whether COLI_DRAFT's depth pays for its verify rows.
+    if spec_proposed > 0 {
+        eprintln!(
+            "[spec] proposed={spec_proposed} accepted={spec_accepted} conf_stops={spec_conf_stops} accept_rate={:.1}%",
+            spec_accepted as f64 / spec_proposed as f64 * 100.0
+        );
+    }
+    // RLM refinement accounting, same shape ((0,0) prints nothing).
+    let (rlm_passes, rlm_tokens) = model.rlm_stats();
+    if rlm_passes > 0 {
+        eprintln!("[rlm] passes={rlm_passes} tokens_recursed={rlm_tokens}");
     }
     // Warm-tier and prefetch effectiveness. This has to happen *here* — the engine
     // thread owns the `Model`, so `main` cannot ask it anything after the server
@@ -1212,10 +1591,13 @@ fn run_tuned(
         // Whether that biases the tuner is a real question and not answered here.
         let unclassified = pf.saturating_sub(used + wasted);
         let yield_pct = if pf > 0 { 100.0 * used as f64 / pf as f64 } else { 0.0 };
+        // `stale_dropped` is *not* part of `issued`: those items never reached a
+        // read, so they are disk bandwidth the gate returned to the demand lane.
+        let sd = model.ecache_prefetch_stale_dropped().unwrap_or(0);
         eprintln!(
             "[prefetch] used={used} wasted={wasted} unclassified={unclassified} \
              accuracy={acc:.1}% (of {} classified) yield={yield_pct:.1}% (of {pf} issued) \
-             fadvise={fadv} verify_mismatch={vm}",
+             fadvise={fadv} verify_mismatch={vm} stale_dropped={sd}",
             used + wasted
         );
         // How much of the cache speculation is *holding* — the unclassified slabs
@@ -1303,7 +1685,28 @@ fn recv_priority(
 /// The most recent admission's workload class becomes the model's active class —
 /// a pragmatic "latest wins" policy for a mixed batch (per-sequence classes would
 /// need per-sequence prefetch policies; the breadth knob is batch-global today).
-fn admit_pending(model: &Model, pending: &mut VecDeque<Prefilling>, req: EngineRequest, prefix: &mut PrefixCache) {
+fn admit_pending(
+    model: &Model,
+    pending: &mut VecDeque<Prefilling>,
+    req: EngineRequest,
+    prefix: &mut PrefixStore,
+    queued: &std::sync::atomic::AtomicUsize,
+) {
+    // The request has left the channel: it no longer counts against
+    // `COLI_QUEUE_DEPTH`. Saturating (a plain `fetch_sub` would wrap) because
+    // tests drive this function directly with a counter no submit incremented.
+    let mut cur = queued.load(std::sync::atomic::Ordering::Relaxed);
+    while cur > 0 {
+        match queued.compare_exchange_weak(
+            cur,
+            cur - 1,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(now) => cur = now,
+        }
+    }
     if req.prompt.is_empty() || req.max_new == 0 {
         return; // nothing to generate; dropping req.out closes the stream cleanly
     }
@@ -1338,7 +1741,7 @@ fn prefill_step(
     vocab: usize,
     stop_ids: &[i32],
     chunk_div: usize,
-    prefix: &mut PrefixCache,
+    prefix: &mut PrefixStore,
 ) {
     let Some(mut p) = pending.pop_front() else {
         return;
@@ -1380,6 +1783,49 @@ fn chunk_end(pos: usize, prompt_len: usize, chunk_div: usize) -> usize {
 /// Split out of [`prefill_step`] so the fused tick, which produces these logits
 /// inside the *decode* forward, finishes a chunk by exactly the same rules. The
 /// two paths differing here is how a fusion silently changes served output.
+/// Borrowed row-indexed view of one batched forward's outputs (logits and
+/// pre-final-norm hidden, with their row strides).
+struct ForwardRows<'a> {
+    logits: &'a [f32],
+    hidden: &'a [f32],
+    vocab: usize,
+    d_hidden: usize,
+}
+
+/// RLM refinement of one decision row of a batched forward (COLI_RLM).
+///
+/// Copies the row's logits and pre-final-norm hidden only after the cheap
+/// enabled check, hands them to [`Model::rlm_refine_external`] (which loops
+/// the uncertainty policy over throwaway KV replays of `seq`'s causal prefix
+/// at `pos`), and returns the refined pair — `None` when RLM is off, the row
+/// is out of range, no pass triggered, or the replay failed (advisory, like a
+/// draft failure: refinement is a quality optimisation, never worth dropping
+/// a client over).
+fn rlm_refine_row(
+    model: &Model,
+    seq: &SeqKv,
+    pos: usize,
+    rows: &ForwardRows<'_>,
+    row: usize,
+    temp: f32,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    if !peregrine_model::rlm::rlm_enabled() {
+        return None;
+    }
+    let r = rows.logits.get(row * rows.vocab..(row + 1) * rows.vocab)?;
+    let hsrc = rows.hidden.get(row * rows.d_hidden..(row + 1) * rows.d_hidden)?;
+    let mut lg = r.to_vec();
+    let mut h = hsrc.to_vec();
+    match model.rlm_refine_external(seq, pos, &mut h, &mut lg, temp) {
+        Ok(true) => Some((lg, h)),
+        Ok(false) => None,
+        Err(e) => {
+            peregrine_core::note_advisory_err("rlm refine", &e);
+            None
+        }
+    }
+}
+
 fn finish_prefill_chunk(
     p: Prefilling,
     end: usize,
@@ -1387,7 +1833,7 @@ fn finish_prefill_chunk(
     pending: &mut VecDeque<Prefilling>,
     active: &mut Vec<SeqState>,
     out_cfg: OutputCfg,
-    prefix: &mut PrefixCache,
+    prefix: &mut PrefixStore,
 ) {
     let OutputCfg { vocab, stop_ids } = out_cfg;
     let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist, seq_id } = p;
@@ -1430,6 +1876,9 @@ fn finish_prefill_chunk(
         draft: Vec::new(),
         draft_q: Vec::new(),
         hlast: Vec::new(),
+        // The fed-token log starts as the prompt (row-aligned with `seq`,
+        // whose rows so far are exactly the prompt); `t0` joins it when fed.
+        toks: prompt,
     });
 }
 
@@ -1521,6 +1970,104 @@ mod tests {
     }
 
     #[test]
+    fn queue_cap_refuses_at_depth_and_recovers_on_drain() {
+        // The COLI_QUEUE_DEPTH contract, driven directly (the knob itself is a
+        // process-wide OnceLock, so the cap is injected here the same way the
+        // spec/fuse overrides are): at the cap a submit refuses Full — nothing
+        // wrong with the request — and draining makes room again.
+        let (tx_normal, _rx_n) = mpsc::unbounded_channel::<EngineRequest>();
+        let (tx_high, _rx_h) = mpsc::unbounded_channel::<EngineRequest>();
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = EngineHandle {
+            tx_normal,
+            tx_high,
+            telemetry: std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default())),
+            queued: queued.clone(),
+            queue_cap: 2,
+        };
+        let req = || {
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            (
+                EngineRequest {
+                    prompt: vec![1, 2, 3],
+                    max_new: 1,
+                    sampler: Sampler::new(0.0, 0.9, 1),
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                },
+                rx,
+            )
+        };
+        let (r1, _k1) = req();
+        let (r2, _k2) = req();
+        let (r3, _k3) = req();
+        assert!(handle.submit(r1).is_ok(), "under the cap admits");
+        assert!(handle.submit(r2).is_ok(), "at cap-1 admits");
+        assert!(matches!(handle.submit(r3), Err(SubmitRefused::Full)), "at the cap refuses Full");
+        // The engine draining one request makes room for exactly one more.
+        queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let (r4, _k4) = req();
+        let (r5, _k5) = req();
+        assert!(handle.submit(r4).is_ok(), "drain restores one admission");
+        assert!(matches!(handle.submit(r5), Err(SubmitRefused::Full)), "and only one");
+    }
+
+    #[test]
+    fn retiring_output_extends_the_prefix_cache_past_the_prompt() -> Result<(), Error> {
+        // The multi-turn shape: a client's next request resends prompt+output
+        // as its new prompt's head. Before the retire-time insert, the cache
+        // held prompt-only entries, so the assistant turn was re-prefilled
+        // every round trip. This drives the exact sequence the engine performs
+        // — prompt-only insert at prefill completion, fed-token log through
+        // decode, prompt+output insert at retire — and asserts the follow-up
+        // request matches past the original prompt, with the covered
+        // prompt-only entry dropped rather than accumulated.
+        let dir = tiny_dir("prefixgen")?;
+        let model = Model::load(&dir)?;
+        let vocab = model.cfg.vocab as usize;
+        let mut prefix = PrefixCache::new(1 << 20);
+
+        // A prompt over the 64-token floor, prefilled the way the engine does.
+        let prompt: Vec<i32> = (0..96).map(|i| (i * 5 % vocab.min(11)) as i32).collect();
+        let mut seq = SeqKv::new(&model.cfg);
+        let logits = model.forward_prefill_seq(&prompt, &mut seq, 0)?;
+        prefix.insert(&prompt, &seq); // finish_prefill_chunk's prompt-only entry
+        assert_eq!(prefix.entries.len(), 1, "prompt entry cached");
+
+        // Decode a few tokens, keeping the fed-token log the accept loop keeps.
+        let last = (prompt.len() - 1) * vocab;
+        let mut tok = argmax(&logits[last..last + vocab]) as i32;
+        let mut toks = prompt.clone();
+        let mut pos = prompt.len();
+        for _ in 0..4 {
+            let mut one: [&mut SeqKv; 1] = [&mut seq];
+            let lg = model.forward_step_batched(&[tok], &mut one, &[pos], None)?;
+            toks.push(tok);
+            pos += 1;
+            tok = argmax(&lg[..vocab]) as i32;
+        }
+        assert_eq!(toks.len(), seq.len(), "fed-token log stays row-aligned");
+
+        // Retire: insert prompt+output. The prompt-only entry is now covered.
+        prefix.insert(&toks, &seq);
+        assert_eq!(prefix.entries.len(), 1, "covered prompt-only entry dropped, not accumulated");
+        assert_eq!(prefix.entries[0].tokens, toks, "surviving entry is prompt+output");
+        let bytes_sum: usize = prefix.entries.iter().map(|e| e.bytes).sum();
+        assert_eq!(prefix.used, bytes_sum, "used-bytes accounting survives the cleanup");
+
+        // The next turn resends prompt+output plus new user tokens: the match
+        // must run past the original prompt — that is the whole point.
+        let mut next_turn = toks.clone();
+        next_turn.extend_from_slice(&[1, 2, 3]);
+        let (seeded, n) = prefix.lookup(&next_turn).ok_or(Error::Format("lookup must hit".into()))?;
+        assert_eq!(n, toks.len(), "match depth covers the generated tokens, not just the prompt");
+        assert!(n > prompt.len(), "deeper than any prompt-only entry could reach");
+        assert_eq!(seeded.len(), n, "seeded KV length equals the match");
+        Ok(())
+    }
+
+    #[test]
     fn a_retiring_sequence_does_not_renumber_the_streams_behind_it() -> Result<(), Error> {
         // Until 2026-08-08 the prefetch lane was keyed on a sequence's index in
         // `active`, which the decode loop compacts with `retain` every tick. When a
@@ -1532,7 +2079,7 @@ mod tests {
         let dir = tiny_dir("seqid")?;
         let model = Model::load(&dir)?;
         let mut pending: VecDeque<Prefilling> = VecDeque::new();
-        let mut prefix = PrefixCache::new(0);
+        let mut prefix = PrefixStore::new(0, None);
         let mut keepalive = Vec::new();
         for _ in 0..3 {
             let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
@@ -1549,6 +2096,7 @@ mod tests {
                     class: peregrine_model::TokenClass::Prose,
                 },
                 &mut prefix,
+                &std::sync::atomic::AtomicUsize::new(0),
             );
         }
         let ids: Vec<usize> = pending.iter().map(|p| p.seq_id).collect();
@@ -1572,6 +2120,7 @@ mod tests {
                 draft: Vec::new(),
                 draft_q: Vec::new(),
                 hlast: Vec::new(),
+                toks: p.prompt,
             })
             .collect();
         assert_eq!(active.iter().map(|s| s.seq_id).collect::<Vec<_>>(), ids, "promotion preserves the id");
@@ -1588,6 +2137,62 @@ mod tests {
         assert_eq!(active.iter().position(|s| s.seq_id == ids[2]), Some(1), "it slid to index 1");
         assert_eq!(active[1].seq_id, ids[2], "…and kept its lane across the retire");
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_engine_batches_and_matches_reference() -> Result<(), Error> {
+        // The Track C phase-2a end-to-end: the batch engine serves a hybrid
+        // (GDN + gated-GQA) model, three concurrent greedy requests each
+        // matching the standalone decode — with the prefix cache and disk KV
+        // sessions auto-disabled for the recurrent architecture.
+        let d = std::env::temp_dir().join(format!("peregrine_batch_hybrid_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        peregrine_model::testkit::build_tiny_hybrid_model(&d, 45)?;
+        let prompt = vec![3i32, 7, 1, 4];
+        let n = 6usize;
+        let want = {
+            let m = Model::load(&d)?;
+            assert!(!m.prefix_cachable(), "hybrid must opt out of prefix caching in 2a");
+            ref_decode(&m, &prompt, n)?
+        };
+        assert!(!want.is_empty(), "reference must produce tokens");
+
+        let (handle, join) = spawn(Model::load(&d)?, 8)?;
+        let mut rxs = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: prompt.clone(),
+                max_new: n,
+                sampler: Sampler::new(0.0, 0.9, 1),
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            rxs.push(rx);
+        }
+        let mut outs = Vec::new();
+        for mut rx in rxs {
+            let mut toks = Vec::new();
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Error(e) => return Err(Error::Format(e)),
+                }
+            }
+            outs.push(toks);
+        }
+        drop(handle);
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+        for (i, o) in outs.iter().enumerate() {
+            assert_eq!(o, &want, "hybrid batched request {i} must match the reference decode");
+        }
+        std::fs::remove_dir_all(&d)?;
         Ok(())
     }
 
@@ -2004,7 +2609,7 @@ mod tests {
             Ok(toks)
         };
 
-        let on = SpecOverride { depth: Some(4), sampled: Some(true) };
+        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None };
         let got = run_engine(on)?;
         assert!(!got.is_empty(), "sampled speculation generated nothing");
         assert!(got.len() <= n, "served {} tokens for max_new {n}", got.len());
@@ -2018,7 +2623,7 @@ mod tests {
         // And the knob is a knob: with it off, the same request takes the
         // historical one-row path, whose stream differs precisely because the
         // RNG is consumed differently.
-        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false) })?;
+        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None })?;
         assert!(!off.is_empty(), "the unspeculated path generated nothing");
         assert_ne!(
             off, got,
@@ -2026,6 +2631,53 @@ mod tests {
              identical streams mean no draft was ever taken and the test proves nothing"
         );
 
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The confidence floor's one hard promise: whatever `COLI_SPEC_CONF` is
+    /// set to, a greedy request serves exactly the tokens it would serve with
+    /// the floor off. The floor decides how *deep* a draft goes; `accept_run`
+    /// alone decides what is emitted, so any divergence here means the gate
+    /// leaked past depth into acceptance.
+    #[test]
+    fn the_confidence_floor_never_changes_a_greedy_stream() -> Result<(), Error> {
+        let dir = tiny_dir("spec_conf_engine")?;
+        let prompt = vec![1i32, 5, 9, 2];
+        let n = 8usize;
+
+        let run_engine = |spec: SpecOverride| -> Result<Vec<u32>, Error> {
+            let (handle, join) = spawn_spec(Model::load(&dir)?, 4, false, spec)?;
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: prompt.clone(),
+                max_new: n,
+                sampler: Sampler::new(0.0, 0.9, 1), // greedy: sequence-identity is the contract
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            drop(handle);
+            let mut toks = Vec::new();
+            let mut rx = rx;
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Error(e) => return Err(Error::Format(e)),
+                }
+            }
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok(toks)
+        };
+
+        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0) })?;
+        assert!(!base.is_empty(), "the baseline generated nothing");
+        for floor in [0.65f32, 0.999] {
+            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor) })?;
+            assert_eq!(gated, base, "a {floor} confidence floor changed a greedy stream");
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

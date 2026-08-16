@@ -1,0 +1,2 @@
+peregrine-requantize --dry-run: 118478 tensors (35840 would requantize to int3-g64) | 383.73 GB -> 355.25 GB (92.6% of source), about 72 shard(s) at 5.0 GB each
+both containers must fit at once: plan for 355.25 GB of free space.

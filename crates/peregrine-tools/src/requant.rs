@@ -233,6 +233,120 @@ impl HeatTier {
     }
 }
 
+/// Precision policy for the `.down_proj` expert projection, separate from
+/// gate/up.
+///
+/// The evidenced low-bit recipes for this model class (ds4/DwarfStar's shipped
+/// 2-bit containers) are *asymmetric*: gate/up take the harder quantization,
+/// down keeps more precision — down's output feeds the residual stream
+/// directly, where gate/up error is first laundered through the SwiGLU
+/// nonlinearity. Uniform int3-g64 here measured flip_rate 0.514 (todo.md §13);
+/// this knob exists to test the asymmetric point on that ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownPolicy {
+    /// Same scheme as gate/up (`Plan::target` / the tier) — the historical
+    /// behavior, and the fingerprint-compatible default.
+    Same,
+    /// Pass `.down_proj.weight` through byte-identical. The GLM-5.2 source is
+    /// already int4, so "keep" costs no conversion work and no quality — it
+    /// just forgoes ~⅓ of the expert-byte saving.
+    Keep,
+    /// Requantize down to its own scheme.
+    Target(Target),
+}
+
+impl DownPolicy {
+    pub fn parse(s: &str) -> Option<DownPolicy> {
+        match s {
+            "same" => Some(DownPolicy::Same),
+            "keep" => Some(DownPolicy::Keep),
+            _ => Target::parse(s).map(DownPolicy::Target),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            DownPolicy::Same => "same".into(),
+            DownPolicy::Keep => "keep".into(),
+            DownPolicy::Target(t) => t.label(),
+        }
+    }
+}
+
+/// Per-layer channel-importance vectors for calibrated rounding (ideas #7,
+/// 2026-08-15): `layers[l]` is the mean `|x|` per hidden channel at layer
+/// `l`'s MoE input, empty for dense layers, indexed like `HeatTable` (the MTP
+/// row last). Pooled per layer, not per expert — every expert in a layer sees
+/// the same pre-gating hidden distribution, which sidesteps the ~16
+/// samples/expert/layer a 512-position trace would give per-expert statistics.
+#[derive(Debug, Clone)]
+pub struct CalibWeights {
+    pub layers: Vec<Vec<f32>>,
+    /// FNV-1a-64 of the sidecar bytes. Part of the conversion's identity: two
+    /// containers rounded under different calibrations differ everywhere the
+    /// scale search moved, so mixing them in one directory is exactly the
+    /// interleaving failure the resume fingerprint exists to prevent.
+    pub fp: u64,
+}
+
+/// FNV-1a-64 over the sidecar bytes for [`CalibWeights::fp`] — an identity
+/// tag, not cryptography. Inline because the dependency posture says eight
+/// lines beat a shared crate.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+
+/// Load a calibration sidecar (`{"version":1, "stat":"mean_abs", "hidden":H,
+/// "positions":N, "layers":[[H floats]|[] ...]}`, written by the capture pass
+/// next to `route_stats.json`). Refuses rather than coerces: a wrong-width
+/// vector zipped against a weight row would weight the wrong channels — the
+/// one failure mode calibration must not have.
+pub fn load_calib(path: &Path) -> Result<CalibWeights, Error> {
+    let bytes = std::fs::read(path).ctx(|| format!("read {}", path.display()))?;
+    let fp = fnv1a64(&bytes);
+    let v: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| Error::Format(format!("{}: {e}", path.display())))?;
+    if v.get("version").and_then(|n| n.as_u64()) != Some(1) {
+        return Err(Error::Format(format!("{}: unsupported calibration version", path.display())));
+    }
+    if v.get("stat").and_then(|s| s.as_str()) != Some("mean_abs") {
+        return Err(Error::Format(format!("{}: unknown stat (this build reads mean_abs)", path.display())));
+    }
+    let hidden = v.get("hidden").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+    let arr = v
+        .get("layers")
+        .and_then(|l| l.as_array())
+        .ok_or_else(|| Error::Format(format!("{}: no `layers` array", path.display())))?;
+    let mut layers = Vec::with_capacity(arr.len());
+    for (l, entry) in arr.iter().enumerate() {
+        let row = entry
+            .as_array()
+            .ok_or_else(|| Error::Format(format!("{}: layer {l} is not an array", path.display())))?;
+        if !row.is_empty() && row.len() != hidden {
+            return Err(Error::Format(format!(
+                "{}: layer {l} has {} channels, header says hidden={hidden} — a mis-sized \
+                 vector would weight the wrong channels",
+                path.display(),
+                row.len()
+            )));
+        }
+        let vals: Vec<f32> = row.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect();
+        if vals.len() != row.len() {
+            return Err(Error::Format(format!("{}: layer {l} has non-numeric entries", path.display())));
+        }
+        layers.push(vals);
+    }
+    if layers.iter().all(|l| l.is_empty()) {
+        return Err(Error::Format(format!("{}: every layer is empty — nothing to calibrate with", path.display())));
+    }
+    Ok(CalibWeights { layers, fp })
+}
+
 /// What to convert and how.
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -246,11 +360,31 @@ pub struct Plan {
     pub include: String,
     /// Roll to a new output shard once it reaches this many bytes.
     pub shard_bytes: u64,
+    /// Precision policy for `.down_proj.weight`, separate from gate/up.
+    pub down: DownPolicy,
+    /// Pass the last N expert-bearing layer indices through untouched. The
+    /// window counts the MTP head row at index `n_layers` (same convention as
+    /// `HeatTable`), so `keep_last_layers=6` on GLM-5.2 keeps layers 73–78
+    /// including the experts that draft every speculative token.
+    pub keep_last_layers: usize,
+    /// Importance-weighted rounding (`--calib`). int3-g64 only; applies where
+    /// the tensor's input width matches the layer's stats vector — gate/up
+    /// (input = hidden) yes, down (input = moe_inter) no, dense layers no.
+    /// Same bytes on disk, different rounding objective.
+    pub calib: Option<CalibWeights>,
 }
 
 impl Default for Plan {
     fn default() -> Plan {
-        Plan { target: Target::Int2, tier: None, include: ".mlp.experts.".into(), shard_bytes: 5_000_000_000 }
+        Plan {
+            target: Target::Int2,
+            tier: None,
+            include: ".mlp.experts.".into(),
+            shard_bytes: 5_000_000_000,
+            down: DownPolicy::Same,
+            keep_last_layers: 0,
+            calib: None,
+        }
     }
 }
 
@@ -273,7 +407,20 @@ const PROGRESS_FILE: &str = ".requant-progress.json";
 /// half-finished directory interleaves two bit-widths in one container, which
 /// then loads without complaint and computes garbage.
 fn params_fingerprint(plan: &Plan) -> String {
-    format!("target={} include={} shard_bytes={}", plan.target.label(), plan.include, plan.shard_bytes)
+    let mut s =
+        format!("target={} include={} shard_bytes={}", plan.target.label(), plan.include, plan.shard_bytes);
+    // Appended only when non-default, so directories written before these knobs
+    // existed still match their recorded spelling and remain resumable.
+    if plan.down != DownPolicy::Same {
+        s.push_str(&format!(" down={}", plan.down.label()));
+    }
+    if plan.keep_last_layers > 0 {
+        s.push_str(&format!(" keep_last_layers={}", plan.keep_last_layers));
+    }
+    if let Some(c) = &plan.calib {
+        s.push_str(&format!(" calib={:016x}", c.fp));
+    }
+    s
 }
 
 /// How far a previous run got. Recorded only at shard boundaries, because a
@@ -423,6 +570,10 @@ impl ShardWriter {
 pub struct Report {
     pub tensors_total: usize,
     pub tensors_requantized: usize,
+    /// Of those, how many rounded under the calibration weights (`--calib`).
+    /// Zero either means no calibration or that nothing matched its widths —
+    /// the operator line prints it so a silently inert sidecar is visible.
+    pub tensors_calibrated: usize,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub shards: usize,
@@ -460,23 +611,37 @@ pub fn plan_sizes(indir: &Path, plan: &Plan) -> Result<Report, Error> {
         if t.name.ends_with(".qs") {
             continue;
         }
+        // Mirror `requantize`'s per-tensor choice exactly by asking the one
+        // shared `plan_target`. The predecessor of that function was inlined
+        // here and in the converter separately, and the two drifted: a tier
+        // overrides the uniform target per expert, and sizing every expert at
+        // `plan.target` ignored that. `--dry-run --tier-hot-frac` therefore
+        // reported the all-cold size whatever the fraction — identical output
+        // for every `--tier-hot-frac`, and a "plan for N GB of free space"
+        // line that under-states a tiered run by the whole difference between
+        // hot and cold for the experts kept hot.
         match (t.name.contains(&plan.include), expert_dims(&t.name, &cfg)) {
-            (true, Some((o, i))) => {
-                rep.tensors_requantized += 1;
-                // Mirror `requantize`'s per-expert choice exactly (see the
-                // `expert_coords` match there): a tier overrides the uniform
-                // target per expert, and sizing every expert at `plan.target`
-                // ignored that. `--dry-run --tier-hot-frac` therefore reported
-                // the all-cold size whatever the fraction — identical output for
-                // every `--tier-hot-frac`, and a "plan for N GB of free space"
-                // line that under-states a tiered run by the whole difference
-                // between hot and cold for the experts kept hot.
-                let target = match (&plan.tier, expert_coords(&t.name)) {
-                    (Some(tr), Some((layer, expert))) => tr.target_for(layer, expert),
-                    _ => plan.target,
-                };
-                rep.bytes_out += (target.payload_bytes(o, i) + target.scale_count(o, i) * 4) as u64;
-            }
+            (true, Some((o, i))) => match plan_target(plan, &t.name, &cfg) {
+                Some(target) => {
+                    rep.tensors_requantized += 1;
+                    // Same calibration predicate as the converter, so the
+                    // dry-run's calibrated count is the run's, exactly.
+                    if let (Some(cal), Target::Int3G64) = (&plan.calib, target) {
+                        let matched = expert_coords(&t.name)
+                            .and_then(|(layer, _)| cal.layers.get(layer))
+                            .is_some_and(|cw| cw.len() == i);
+                        if matched {
+                            rep.tensors_calibrated += 1;
+                        }
+                    }
+                    rep.bytes_out += (target.payload_bytes(o, i) + target.scale_count(o, i) * 4) as u64;
+                }
+                None => {
+                    rep.bytes_out += nbytes;
+                    let qs = format!("{}.qs", t.name);
+                    rep.bytes_out += st.uncompressed_nbytes(&qs).unwrap_or(0).max(0) as u64;
+                }
+            },
             _ => {
                 rep.bytes_out += nbytes;
                 let qs = format!("{}.qs", t.name);
@@ -509,10 +674,19 @@ pub fn requantize(indir: &Path, outdir: &Path, plan: &Plan) -> Result<Report, Er
             resume.tensors_done, resume.shards
         );
     }
-    let scheme = match &plan.tier {
+    let mut scheme = match &plan.tier {
         Some(t) => format!("heat-tiered hot={} cold={} hot_frac={}", t.hot.label(), t.cold.label(), t.hot_frac),
         None => plan.target.label(),
     };
+    if plan.down != DownPolicy::Same {
+        scheme.push_str(&format!(" down={}", plan.down.label()));
+    }
+    if plan.keep_last_layers > 0 {
+        scheme.push_str(&format!(" keep_last_layers={}", plan.keep_last_layers));
+    }
+    if let Some(c) = &plan.calib {
+        scheme.push_str(&format!(" calib={:016x}", c.fp));
+    }
     let mut w = ShardWriter::new(outdir, "out", plan.shard_bytes).with_metadata(vec![
         ("peregrine.requantize.scheme".into(), scheme),
         ("peregrine.requantize.include".into(), plan.include.clone()),
@@ -551,7 +725,15 @@ pub fn requantize(indir: &Path, outdir: &Path, plan: &Plan) -> Result<Report, Er
         // and so must this: guessing is how a container gets silently misdecoded.
         let two_d = expert_dims(name, &cfg);
 
-        if let (true, Some((o, i))) = (selected, two_d) {
+        // The tier/down/keep-last choice lives in `plan_target`, shared with
+        // `plan_sizes` so the forecast and the run cannot disagree. `None`
+        // (a kept tensor) falls through to the byte-identical pass-through arm
+        // below, `.qs` sibling included.
+        let target = match (selected, two_d) {
+            (true, Some(_)) => plan_target(plan, name, &cfg),
+            _ => None,
+        };
+        if let (Some(target), Some((o, i))) = (target, two_d) {
             let info = QtInfo::detect(&st, name, o as i64, i as i64);
             match QtView::row_bytes(info.fmt, i) {
                 Some(rb) => {
@@ -567,14 +749,24 @@ pub fn requantize(indir: &Path, outdir: &Path, plan: &Plan) -> Result<Report, Er
                     for r in 0..o {
                         view.dequant_row_into(r, &mut dense[r * i..(r + 1) * i]);
                     }
-                    // A tier overrides the uniform target per expert; anything
-                    // whose coordinates cannot be parsed falls back to the
-                    // uniform target rather than being silently mis-tiered.
-                    let target = match (&plan.tier, expert_coords(name)) {
-                        (Some(t), Some((layer, expert))) => t.target_for(layer, expert),
-                        _ => plan.target,
+                    // Calibrated rounding applies only where the layer has a
+                    // stats vector of the tensor's input width: gate/up (input
+                    // = hidden) qualify, down (input = moe_inter) and dense
+                    // layers fall through to the data-free path. Same bytes on
+                    // disk either way — only the rounding objective differs.
+                    let calib_row = match (&plan.calib, target) {
+                        (Some(cal), Target::Int3G64) => expert_coords(name)
+                            .and_then(|(layer, _)| cal.layers.get(layer))
+                            .filter(|cw| cw.len() == i),
+                        _ => None,
                     };
-                    let (nq, nsc) = target.quantize(&dense, o, i);
+                    let (nq, nsc) = match calib_row {
+                        Some(cw) => {
+                            rep.tensors_calibrated += 1;
+                            peregrine_core::pack::quant_i3_g64_weighted(&dense, o, i, cw)
+                        }
+                        None => target.quantize(&dense, o, i),
+                    };
                     rep.bytes_out += (nq.len() + nsc.len() * 4) as u64;
                     rep.tensors_requantized += 1;
                     let out_rb = (nq.len() / o.max(1)) as i64;
@@ -650,7 +842,22 @@ pub fn requantize(indir: &Path, outdir: &Path, plan: &Plan) -> Result<Report, Er
 /// routed projection shares those two widths, so one check covers the run and an
 /// operator learns before the hours are spent, not after.
 fn check_writable(plan: &Plan, cfg: &Cfg) -> Result<(), Error> {
-    let targets = [Some(plan.target), plan.tier.as_ref().map(|t| t.hot), plan.tier.as_ref().map(|t| t.cold)];
+    // Calibrated rounding exists only for int3-g64, and a tier would route
+    // some experts around it silently. Refuse up front rather than write a
+    // container that is only partially the thing its scheme stamp claims.
+    if plan.calib.is_some() && (plan.target != Target::Int3G64 || plan.tier.is_some()) {
+        return Err(Error::Format(
+            "--calib is implemented for --target int3-g64 only (and not with --tier-hot-frac): \
+             a calibrated container must be calibrated wherever the target applies, or the \
+             scheme stamp lies"
+                .into(),
+        ));
+    }
+    let down = match plan.down {
+        DownPolicy::Target(t) => Some(t),
+        _ => None,
+    };
+    let targets = [Some(plan.target), down, plan.tier.as_ref().map(|t| t.hot), plan.tier.as_ref().map(|t| t.cold)];
     if !targets.iter().flatten().any(|t| *t == Target::Int2G64) {
         return Ok(());
     }
@@ -669,6 +876,47 @@ fn check_writable(plan: &Plan, cfg: &Cfg) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+/// The per-tensor precision decision, shared by [`plan_sizes`] and
+/// [`requantize`]: `None` means pass the tensor through byte-identical,
+/// `Some(t)` means requantize to `t`. Only called for tensors that matched the
+/// include filter *and* resolved expert dims.
+///
+/// One function on purpose. The `--dry-run --tier-hot-frac` bug (see the
+/// comment in `plan_sizes`) came from the sizing and converting paths encoding
+/// this choice separately and drifting; every future policy goes here or it
+/// will eventually repeat that failure.
+///
+/// Precedence, most specific first:
+/// 1. `keep_last_layers` — the tail of the stack passes through untouched. The
+///    slot count is `n_layers + 1` because the MTP head sits at layer index
+///    `n_layers` and routes a full set of experts (the `HeatTable` convention);
+///    a window that forgot to count it would slide off the MTP experts that
+///    draft every speculative token.
+/// 2. `down` — `.down_proj.weight` follows its own policy (the asymmetric
+///    recipe: see [`DownPolicy`]).
+/// 3. The heat tier, then the uniform target — unchanged historical behavior.
+fn plan_target(plan: &Plan, name: &str, cfg: &Cfg) -> Option<Target> {
+    if plan.keep_last_layers > 0 {
+        if let Some((layer, _)) = expert_coords(name) {
+            let slots = cfg.n_layers as usize + 1;
+            if layer >= slots.saturating_sub(plan.keep_last_layers) {
+                return None;
+            }
+        }
+    }
+    if name.ends_with(".down_proj.weight") {
+        match plan.down {
+            DownPolicy::Keep => return None,
+            DownPolicy::Target(t) => return Some(t),
+            DownPolicy::Same => {}
+        }
+    }
+    Some(match (&plan.tier, expert_coords(name)) {
+        (Some(t), Some((layer, expert))) => t.target_for(layer, expert),
+        _ => plan.target,
+    })
 }
 
 /// Logical `[O, I]` of a routed-expert projection, from the config — the only
@@ -902,6 +1150,14 @@ mod tests {
             let msg = format!("{e}");
             assert!(msg.contains("different settings"), "explains what clashed: {msg}");
         }
+
+        // The asymmetric knobs are part of the identity too: mixing a
+        // `--down keep` continuation into a default-plan directory would
+        // interleave two recipes just as surely as a changed --target.
+        let asym = Plan { down: DownPolicy::Keep, ..plan.clone() };
+        assert!(requantize(&dir, &out, &asym).is_err(), "changing --down mid-directory must not proceed");
+        let tail = Plan { keep_last_layers: 1, ..plan.clone() };
+        assert!(requantize(&dir, &out, &tail).is_err(), "changing --keep-last-layers mid-directory must not proceed");
         std::fs::remove_dir_all(&dir)?;
         std::fs::remove_dir_all(&out)?;
         Ok(())
@@ -930,6 +1186,250 @@ mod tests {
         assert_eq!(predicted.bytes_out, actual.bytes_out, "predicted output bytes must be exact");
         std::fs::remove_dir_all(&dir)?;
         std::fs::remove_dir_all(&out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn keep_last_layers_passes_the_tail_through_byte_identically() -> Result<(), Error> {
+        // The tiny model carries experts on layers 1..=3 (0 is dense, 3 is the
+        // MTP head row). The window counts `n_layers + 1 = 4` slots, so N=2
+        // keeps layers 2 and 3 — crucially *including* the MTP row, whose
+        // experts draft every speculative token; a window that forgot to count
+        // it would keep layers 1–2 instead and quantize the drafts' experts.
+        let (dir, out) = fixture_dirs("keeplast")?;
+        peregrine_model::testkit::build_tiny_model(&dir)?;
+        let plan = Plan { target: Target::Int2, keep_last_layers: 2, ..Plan::default() };
+        let rep = requantize(&dir, &out, &plan)?;
+        assert!(rep.tensors_requantized > 0, "layer 1 must still convert");
+
+        let src = SafeTensors::open(&dir)?;
+        let dst = SafeTensors::open(&out)?;
+        let mut kept = 0usize;
+        for t in src.tensors() {
+            let Some((layer, _)) = expert_coords(&t.name) else { continue };
+            let n = src.uncompressed_nbytes(&t.name).unwrap_or(0).max(0) as usize;
+            let m = dst.uncompressed_nbytes(&t.name).unwrap_or(0).max(0) as usize;
+            if layer >= 2 {
+                assert_eq!(n, m, "{}: kept layer changed size, so it was rewritten", t.name);
+                let mut a = vec![0u8; n];
+                let mut b = vec![0u8; m];
+                src.read_raw(&t.name, &mut a)?;
+                dst.read_raw(&t.name, &mut b)?;
+                assert_eq!(a, b, "{}: kept layer must survive byte-for-byte", t.name);
+                kept += 1;
+            } else if t.name.ends_with(".weight") {
+                // int4 -> int2 halves the payload; the `.qs` siblings keep
+                // their per-row size either way, so only weights are compared.
+                assert!(m < n, "{}: converted layer must have shrunk", t.name);
+            }
+        }
+        assert!(kept > 0, "fixture must actually have tail-layer experts to protect");
+        std::fs::remove_dir_all(&dir)?;
+        std::fs::remove_dir_all(&out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn down_keep_leaves_down_proj_untouched_while_gate_up_shrink() -> Result<(), Error> {
+        let (dir, out) = fixture_dirs("downkeep")?;
+        peregrine_model::testkit::build_tiny_model(&dir)?;
+        let plan = Plan { target: Target::Int2, down: DownPolicy::Keep, ..Plan::default() };
+        let rep = requantize(&dir, &out, &plan)?;
+
+        let src = SafeTensors::open(&dir)?;
+        let dst = SafeTensors::open(&out)?;
+        let (mut kept_down, mut shrunk) = (0usize, 0usize);
+        for t in src.tensors() {
+            if expert_coords(&t.name).is_none() {
+                continue;
+            }
+            let n = src.uncompressed_nbytes(&t.name).unwrap_or(0).max(0) as usize;
+            let m = dst.uncompressed_nbytes(&t.name).unwrap_or(0).max(0) as usize;
+            if t.name.contains(".down_proj.") {
+                assert_eq!(n, m, "{}: down must not change size", t.name);
+                let mut a = vec![0u8; n];
+                let mut b = vec![0u8; m];
+                src.read_raw(&t.name, &mut a)?;
+                dst.read_raw(&t.name, &mut b)?;
+                assert_eq!(a, b, "{}: down must survive byte-for-byte", t.name);
+                kept_down += 1;
+            } else if t.name.ends_with(".weight") {
+                assert!(m < n, "{}: gate/up must shrink at int2", t.name);
+                shrunk += 1;
+            }
+        }
+        assert!(kept_down > 0 && shrunk > 0, "fixture must exercise both arms");
+        // The report reflects the split: only gate/up count as requantized.
+        assert_eq!(rep.tensors_requantized, shrunk, "kept down_proj must not be counted as requantized");
+        std::fs::remove_dir_all(&dir)?;
+        std::fs::remove_dir_all(&out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_sizes_stay_exact_for_the_asymmetric_plan() -> Result<(), Error> {
+        // `plan_sizes` and `requantize` consult one shared `plan_target`; this
+        // pins that the down/keep-last variants cannot drift between forecast
+        // and run the way the tier arm once did.
+        let (dir, out) = fixture_dirs("dryasym")?;
+        peregrine_model::testkit::build_tiny_model(&dir)?;
+        let plan =
+            Plan { target: Target::Int2, down: DownPolicy::Keep, keep_last_layers: 2, ..Plan::default() };
+        let predicted = plan_sizes(&dir, &plan)?;
+        let actual = requantize(&dir, &out, &plan)?;
+        assert_eq!(predicted.tensors_requantized, actual.tensors_requantized, "requantized count");
+        assert_eq!(predicted.bytes_out, actual.bytes_out, "asymmetric prediction must be exact");
+        std::fs::remove_dir_all(&dir)?;
+        std::fs::remove_dir_all(&out)?;
+        Ok(())
+    }
+
+    /// Calibration weights for the tiny model: dense layer 0 empty, layers
+    /// 1..=3 with one overwhelmingly salient channel — extreme on purpose, so
+    /// the scale search provably moves on 16-wide ragged groups.
+    fn tiny_calib(fp: u64) -> CalibWeights {
+        let skew: Vec<f32> = (0..16).map(|k| if k == 0 { 1e6 } else { 1e-3 }).collect();
+        CalibWeights { layers: vec![Vec::new(), skew.clone(), skew.clone(), skew], fp }
+    }
+
+    #[test]
+    fn calibrated_rounding_moves_gate_up_only_and_the_dry_run_stays_exact() -> Result<(), Error> {
+        let (dir, out_plain) = fixture_dirs("calib_plain")?;
+        let out_cal = dir.with_extension("calout");
+        if let Err(e) = std::fs::remove_dir_all(&out_cal) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "stale fixture: {e}");
+        }
+        peregrine_model::testkit::build_tiny_model(&dir)?;
+
+        let plain = Plan { target: Target::Int3G64, ..Plan::default() };
+        let cal = Plan { target: Target::Int3G64, calib: Some(tiny_calib(7)), ..Plan::default() };
+        let rep_plain = requantize(&dir, &out_plain, &plain)?;
+        let rep_cal = requantize(&dir, &out_cal, &cal)?;
+
+        // Same bytes, same tensor set — only the rounding objective differed.
+        assert_eq!(rep_plain.bytes_out, rep_cal.bytes_out, "the format must not change size");
+        assert_eq!(rep_plain.tensors_requantized, rep_cal.tensors_requantized);
+        assert_eq!(rep_plain.tensors_calibrated, 0);
+        // gate/up on expert layers 1..=3: 3 layers × 4 experts × 2 projections.
+        assert_eq!(rep_cal.tensors_calibrated, 24, "every gate/up got the weights, nothing else");
+
+        // The forecast counts calibrated tensors with the converter's own
+        // predicate — drift here is the tier bug all over again.
+        let predicted = plan_sizes(&dir, &cal)?;
+        assert_eq!(predicted.tensors_calibrated, rep_cal.tensors_calibrated);
+        assert_eq!(predicted.bytes_out, rep_cal.bytes_out);
+
+        let a = SafeTensors::open(&out_plain)?;
+        let b = SafeTensors::open(&out_cal)?;
+        let (mut down_same, mut gate_up_moved) = (0usize, 0usize);
+        for t in a.tensors() {
+            if expert_coords(&t.name).is_none() || !t.name.ends_with(".weight") {
+                continue;
+            }
+            let n = a.uncompressed_nbytes(&t.name).unwrap_or(0).max(0) as usize;
+            let mut xa = vec![0u8; n];
+            let mut xb = vec![0u8; n];
+            a.read_raw(&t.name, &mut xa)?;
+            b.read_raw(&t.name, &mut xb)?;
+            if t.name.contains(".down_proj.") {
+                // down's input width is moe_inter (8) ≠ hidden (16): the
+                // sidecar must not apply, so bytes match the data-free run.
+                assert_eq!(xa, xb, "{}: down must stay data-free under --calib", t.name);
+                down_same += 1;
+            } else if xa != xb {
+                gate_up_moved += 1;
+            }
+        }
+        assert!(down_same > 0, "fixture must have down_proj tensors to protect");
+        assert!(gate_up_moved > 0, "an extreme salient channel must move at least one gate/up rounding");
+        std::fs::remove_dir_all(&dir)?;
+        std::fs::remove_dir_all(&out_plain)?;
+        std::fs::remove_dir_all(&out_cal)?;
+        Ok(())
+    }
+
+    #[test]
+    fn calib_refuses_wrong_targets_and_a_changed_calibration_refuses_resume() -> Result<(), Error> {
+        let (dir, out) = fixture_dirs("calib_refuse")?;
+        peregrine_model::testkit::build_tiny_model(&dir)?;
+
+        // Not int3-g64 → loud plan-time error, not a silently uncalibrated run.
+        let wrong = Plan { target: Target::Int2, calib: Some(tiny_calib(1)), ..Plan::default() };
+        let msg = match requantize(&dir, &out, &wrong) {
+            Err(e) => e.to_string(),
+            Ok(_) => String::new(),
+        };
+        assert!(msg.contains("int3-g64 only"), "got: {msg}");
+
+        // A finished calibrated run must refuse a re-run under different
+        // calibration bytes — same interleaving hazard as a changed --target.
+        let cal_a = Plan { target: Target::Int3G64, calib: Some(tiny_calib(1)), ..Plan::default() };
+        requantize(&dir, &out, &cal_a)?;
+        let cal_b = Plan { target: Target::Int3G64, calib: Some(tiny_calib(2)), ..Plan::default() };
+        assert!(requantize(&dir, &out, &cal_b).is_err(), "a different calibration must not proceed");
+        let uncal = Plan { target: Target::Int3G64, ..Plan::default() };
+        assert!(requantize(&dir, &out, &uncal).is_err(), "dropping --calib must not proceed either");
+        std::fs::remove_dir_all(&dir)?;
+        std::fs::remove_dir_all(&out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_captured_sidecar_feeds_the_converter_end_to_end() -> Result<(), Error> {
+        // The full #7 pipeline on the tiny model: capture → sidecar →
+        // load_calib → calibrated conversion. The MTP row comes back empty
+        // from capture (it never drafts), so only the two real expert layers
+        // calibrate: 2 layers × 4 experts × gate+up = 16 tensors.
+        let (dir, out) = fixture_dirs("calib_e2e")?;
+        peregrine_model::testkit::build_tiny_model(&dir)?;
+        let sidecar = dir.join("calib_channels.json");
+        {
+            let mut m = peregrine_model::Model::load(&dir)?;
+            m.enable_calib_capture(sidecar.clone());
+            m.teacher_forcing(&[1, 5, 9, 2, 7, 3])?;
+            m.write_calib_sidecar()?;
+        }
+        let cal = load_calib(&sidecar)?;
+        assert_eq!(cal.layers.len(), 4, "3 layers + the MTP row");
+        assert!(cal.layers[0].is_empty() && cal.layers[3].is_empty());
+        assert_eq!(cal.layers[1].len(), 16);
+
+        let plan = Plan { target: Target::Int3G64, calib: Some(cal), ..Plan::default() };
+        let predicted = plan_sizes(&dir, &plan)?;
+        let rep = requantize(&dir, &out, &plan)?;
+        assert_eq!(rep.tensors_calibrated, 16, "layers 1–2 calibrate; dense and MTP fall back");
+        assert_eq!(predicted.tensors_calibrated, rep.tensors_calibrated, "forecast matches the run");
+        peregrine_core::config::Cfg::load(&out)?;
+        std::fs::remove_dir_all(&dir)?;
+        std::fs::remove_dir_all(&out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_calib_accepts_the_sidecar_shape_and_refuses_mis_sized_layers() -> Result<(), Error> {
+        let dir = std::env::temp_dir().join(format!("peregrine_rq_calibjson_{}", std::process::id()));
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "stale fixture: {e}");
+        }
+        std::fs::create_dir_all(&dir)?;
+        let p = dir.join("calib_channels.json");
+
+        std::fs::write(
+            &p,
+            r#"{"version":1,"stat":"mean_abs","hidden":4,"positions":128,"layers":[[],[0.5,1.5,2.0,0.25],[1.0,1.0,1.0,1.0]]}"#,
+        )?;
+        let c = load_calib(&p)?;
+        assert_eq!(c.layers.len(), 3);
+        assert!(c.layers[0].is_empty() && c.layers[1].len() == 4);
+        assert_ne!(c.fp, 0, "the sidecar bytes fingerprint the conversion identity");
+
+        std::fs::write(&p, r#"{"version":2,"stat":"mean_abs","hidden":4,"layers":[[1,1,1,1]]}"#)?;
+        assert!(load_calib(&p).is_err(), "unknown version must be refused");
+        std::fs::write(&p, r#"{"version":1,"stat":"mean_abs","hidden":4,"layers":[[1,1]]}"#)?;
+        assert!(load_calib(&p).is_err(), "a mis-sized layer would weight the wrong channels");
+        std::fs::write(&p, r#"{"version":1,"stat":"mean_abs","hidden":4,"layers":[[],[]]}"#)?;
+        assert!(load_calib(&p).is_err(), "an all-empty sidecar calibrates nothing");
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

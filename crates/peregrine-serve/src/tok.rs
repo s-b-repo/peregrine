@@ -8,11 +8,14 @@
 //! The gigatoken instance is process-persistent behind a mutex, so its
 //! pretoken memo cache warms **across requests** — a repeated chat-template
 //! prefix encodes from cache. Encode is one short critical section per
-//! request; decode takes the same lock briefly (streaming decodes are one
-//! call per emitted token over a short id slice).
+//! request. Streaming decode does NOT go through that mutex: each stream
+//! takes a [`DecodeHandle`] (an `Arc` view of the immutable vocab) once and
+//! decodes at token rate with no shared state — N concurrent streams would
+//! otherwise contend on the encode lock at token frequency for what is a
+//! read of an immutable table.
 
 use peregrine_core::{Context, Error};
-use peregrine_token::GigaTokenizer;
+use peregrine_token::{DecodeHandle, GigaTokenizer};
 
 /// The process-wide tokenizer. `Mutex` because encode is `&mut` (the memo
 /// cache learns); kept for the process so the cache persists across requests.
@@ -51,12 +54,15 @@ impl TokenBackend {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Decode token ids to their raw bytes, without the lossy UTF-8 conversion.
-    /// Token boundaries do not respect character boundaries, so a streaming
-    /// caller must join the bytes itself before deciding what is a complete
-    /// character.
-    pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
-        self.giga.lock().decode(ids)
+    /// A lock-free per-token decode view for one stream: one mutex
+    /// acquisition here, then [`DecodeHandle::token_bytes`] at token rate
+    /// with no lock and no allocation. Token boundaries do not respect
+    /// character boundaries, so streaming callers must join bytes through
+    /// [`IncrementalDecoder`]. Out-of-vocab ids read as `None` (same lenient
+    /// contract as [`Self::decode`]'s skip — a padded `lm_head` can sample
+    /// past the vocab and must not kill the stream).
+    pub fn decode_handle(&self) -> DecodeHandle {
+        self.giga.lock().decode_handle()
     }
 
     /// The active tokenizer name (for logs / health output).

@@ -627,3 +627,148 @@ printf 'GEN 64 1 2 3\nQUIT\n' | COLI_PREDICT_EVAL=1 COLI_PREDICT_EVAL_N=16 pereg
 `COLI_PREDICT_EVAL_N=16` makes it comparable with the WASTE recall@16 table; the
 default is the model's topk (8 on GLM-5.2). Getting the number from `bench` or from
 the server needs a hook in `forward_rows_inner`, not a gate change.
+
+## Benchmark pass — 2026-08-10 (serve-path batch knee, recorded 2026-08-13)
+
+The freshest aggregate numbers come from the HTTP serve path
+(`scripts/bench-serve-batch.sh`, `COLI_ECACHE_GB=8 COLI_FUSE_PREFILL=1
+COLI_IO_BATCH=8 COLI_KV_BUDGET_MB=4096`, `max_tokens=32`, git `18c14e0`), and
+they went unrecorded here for three days:
+
+| B | tokens | wall | aggregate | streams ok |
+|---:|---:|---:|---:|---|
+| 16 | 512 | 6017.0 s | **0.085 tok/s** | 16/16 |
+| 32 | 832 | 10800.2 s (guillotine) | 0.077 | 26/32 — **arm failed** |
+| 48 | 0 | 7627.8 s | — | **failed** |
+| 64 | 288 | 10800.2 s (guillotine) | 0.027 | 9/64 — **failed** |
+
+**0.085 tok/s at B=16 is the freshest serve-path aggregate**, and the batch
+knee sits at or below B=32 — the B≥32 arms die on the 3600 s per-stream
+guillotine before finishing. The headline-table numbers above come from the
+stdio bench path under different conditions; the two are not comparable
+row-for-row. An earlier same-file run at git `2a262c1` read 0.07 at B=16.
+
+## Tokenizer pass — 2026-08-13
+
+`--bench-tokenizer` rows are now **best-of-3** per row (single passes on this
+box swing more than the effects under test). The vendored-engine speed pass
+(scratch hoist, batch handout, lock-free stream decode) measured **+19 %**
+line, **+8 %** whole, **+15 %** warm-parallel on the GLM vocab, ids
+byte-identical; the `COLI_TOK_MERGE_SIMD=avx2` arm is a wash (±1 %), so the
+scalar default stands with a local number behind it. Full table and method:
+[tokenizer.md → 2026-08-13 speed pass](tokenizer.md#2026-08-13-speed-pass).
+
+## Benchmark pass — 2026-08-14 (overnight chain, `scripts/overnight-2026-08-13.sh`)
+
+Four measurements, three verdicts, one still in flight:
+
+**int3-g64 quality gate: FAILS — `flip_rate = 0.513672` (263/512).** Conversion
+383.73 → 332.19 GB (67 shards, 3h12m onto the md0 stripe), then teacher forcing
+on the committed prose corpus, same rules as the min-share and int2 gates. The
+byte saving was real — the candidate arm's working set read 9.35 GB/token vs
+int4's 10.85 — but half the top-1 predictions moved. With int2 at 1.000 and
+min-share at 0.21–0.28, **every sub-int4 round-to-nearest rung is now a
+measured negative**; below 4 bits means vector quantization / incoherence
+processing, not a converter flag. Logs: `bench-data/2026-08-13-int3g64/`.
+
+**Predict-eval scoreboard (first ever run):** 4 725 layer transitions, width 16:
+
+| arm | recall | precision |
+|---|---:|---:|
+| router-lookahead | **92.5 %** | **46.3 %** |
+| PhaseAware predictor | 58.1 % | 29.3 % |
+| prev-token baseline | 38.9 % | 38.3 % |
+
+The router look-ahead dominates the statistical stack on both axes — this
+closed todo §3b (`PhaseTracker` deleted) and answers the 2026-08-03 open
+question against §1's statistical predictors. Log:
+`bench-data/2026-08-13-predict-eval/`.
+
+**Serve defaults A/B at B=16 (REPEATS=1, in flight):** the defaults-on arm read
+**0.07 tok/s** (512 tok / 7310.8 s, 16/16 streams). Not comparable to the
+2026-08-10 sweep's 0.085 row-for-row (different git, different knob set — that
+run had no prefix cache and KV budget 4096); the paired defaults-off arm is the
+comparison and was still running when this was written. Its number belongs
+beside this line when it lands: `bench-data/2026-08-13-defaults-ab/`.
+
+**Skipbound (runbook §8): half a result.** `dump-routes` wrote a 256-forward
+trace and `peregrine-skipbound` bounded 19 200 experts and wrote
+`expert_bounds.json` into the model dir — but the trace replay reported
+`no usable frames`, so the "how many reads would bounds skip" number did not
+come out. The bounds artifact is real; the trace-format mismatch between
+`dump-routes` output and skipbound's reader is an open (small) defect.
+(Fixed 2026-08-15: the reader now parses dump-routes' real nested shape —
+see the 2026-08-15 pass below; the skip-fraction number itself is queue job
+97 on the existing artifacts.)
+
+## Benchmark pass — 2026-08-15 (ds4-port chain, `scripts/overnight-2026-08-15.sh`)
+
+Two final verdicts, one broken arm root-caused, two positive screens awaiting
+their REPEATS=3 confirmations (queue jobs 10/20 — fold their numbers in here
+when they land).
+
+**Asymmetric int3-g64 quality gate: FAILS — `flip_rate = 0.447266` (229/512).**
+The ds4/DwarfStar recipe — gate/up to int3-g64, `down_proj` kept byte-identical
+int4, last 6 expert layer indices (MTP row included) untouched — converted
+383.73 → 355.25 GB in one idle-priority pass and beat the uniform rung's 0.514,
+but not remotely enough: 45 % of top-1 predictions still move against the int4
+source on the committed corpus. The byte saving was real and measured live
+(the gate's own working-set line read **10.02 GB/token vs int4's 10.85**,
+the predicted −7.4 %). With uniform int2-g64 at 1.000, uniform int3-g64 at
+0.514, and the asymmetric/hybrid point at 0.447, **the data-free
+round-to-nearest ladder is now closed at every measured point, symmetric or
+not**. What remains genuinely open below 4 bits is *calibrated* rounding
+(importance-weighted scale search, ideas #7) — code-complete as of this pass
+(`quant_i3_g64_weighted`, `--calib`, `peregrine calib-capture`), sharing a
+future overnight slot with the `--keep-last-layers 12` contingency. Artifact:
+`/srv/modelstripe/GLM-5.2-i3g64-asym` (355 GB, deletion is the user's call);
+logs `bench-data/2026-08-15-i3g64-asym/`.
+
+**Disk-persisted KV sessions (COLI_KV_STORE_DIR) restart smoke: PASS.** Same
+long-prompt request before and after a full server restart: **cold 2620.5 s →
+warm 391.9 s (6.7×)**, with 832 prompt positions restored from a 142.6 MiB
+checkpoint (`tokens_restored=832` in the warm boot's `[kvstore]` line) and the
+served output **byte-identical** across the restart. This is the first feature
+in the repo that cuts *prefill* bytes across process lifetimes — each restored
+token is ~10.85 GB of expert reads not streamed, bought for ~175 KiB of
+checkpoint read back. Logs: `bench-data/2026-08-15-kvstore/`.
+
+**`COLI_ECACHE_GB=auto` arm: BROKE, root-caused, fixed.** The auto budget took
+80 % of *host* MemAvailable (43.4 GB) inside the harness's 34G MemoryMax scope
+— the cgroup probe read the root's `max` and never saw the transient scope's
+limit — planning a 54.4 GB peak that the kernel ended at 0/16 streams. Fixed
+in 6704288 (walk `/proc/self/cgroup` leaf-to-root for the tightest v2 limit);
+the measurement itself is still owed: queue job 93 reruns the arm on the fixed
+binary. The knob's *screen* is therefore still pending, not negative — the arm
+never ran.
+
+**Confirmations (REPEATS=3, landed 2026-08-16 — the screens above graduated):**
+
+**`COLI_SPEC_CONF=0.65` with `COLI_DRAFT=5`: CONFIRMED — 0.060 → 0.082
+median tok/s (+37 %) at B=16**, reps [0.06, 0.06, 0.06] vs [0.08, 0.08, 0.08]
+— every floored rep beat every unfloored one. The mechanism confirmed with the
+number: the floored arm read **289 059 disk expert-reads vs 369 955 (−22 %)**
+for the same 512 tokens — tok/s bought by *fewer bytes*, the honest direction.
+The draft-depth economics that made `COLI_DRAFT=4` a 1.57× regression invert
+once low-confidence drafts stop paying for verify rows. **What this does NOT
+yet license: a default flip.** Both arms drafted at depth 5; the standing
+no-speculation baseline sits near 0.072–0.076 in the adjacent A/Bs, so
+draft5+floor beats no-draft only cross-experiment (+~14 %, uncontrolled). The
+controlled draft0-vs-floored-depth sweep is queue job 96 — that verdict, not
+this one, decides whether speculation turns on by default. Logs:
+`bench-data/2026-08-15-queue/confirm-specconf-b16/`.
+
+**`COLI_PREFETCH_STALE_DROP=1`: CONFIRMED — 0.072 → 0.077 median (+6.9 %) at
+B=16** (reps [0.07, 0.07, 0.08] vs [0.09, 0.07, 0.08], noisier than the
+spec-conf pair but the medians clear the ±3 % band). Counters say why it is a
+real lever and not a cache trade: speculative `prefetch_reads` collapsed
+**45 188 → 14 258 (−68 %)** and total `disk_reads` *fell* 2.2 % — the gate
+returns wasted speculative bandwidth to demand reads, exactly the 98.6 %-waste
+diagnosis that motivated it. Logs:
+`bench-data/2026-08-15-queue/confirm-stale-drop-b16/`.
+
+**kvstore restart smoke, re-run on the async-writer binary (job 90): PASS
+again** — cold 2504.6 s → warm 389.0 s (6.4×), output byte-identical,
+`dropped_busy=0` (the depth-1 writer queue never cost a checkpoint in this
+workload). The 08-15 synchronous-path result reproduces on the shipped
+implementation. Logs: `bench-data/2026-08-15-queue/kvstore-smoke-async/`.

@@ -11,6 +11,7 @@
 //! the sequential path. This is the CPU∥SSD design; the GPU lane composes the
 //! same way (a third producer feeding the same reduce).
 
+use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -58,6 +59,13 @@ pub struct ForwardCtx<'a> {
     /// speculative-draft forwards (so drafts don't pollute the main-stream
     /// prediction) and when prefetch is off.
     pub route_log: Option<&'a Mutex<RouteHistory>>,
+    /// Calibration capture (`COLI_CALIB_CAPTURE`, ideas #7): each sparse
+    /// layer's MoE-input rows fold into per-channel `Σ|x|` right before the
+    /// router runs. `None` in serving (the env is only set on capture runs)
+    /// and on draft forwards — drafts replay positions the main stream
+    /// already accumulated, so counting them would double-weight whatever the
+    /// drafter happened to explore.
+    pub calib: Option<&'a Mutex<crate::model::CalibAccum>>,
     /// Per-**row** routing history for batched decode: `route_log_multi[r]` receives
     /// row `r`'s own routed set, so each concurrent stream predicts and prefetches
     /// from its *own* routing rather than the weak cross-sequence union. `None` on the
@@ -84,6 +92,16 @@ pub struct ForwardCtx<'a> {
     /// it between forwards so the `BubbleTuner` sees per-forward deltas.
     /// `None` disables the (very cheap) bracketing.
     pub timings: Option<&'a LaneTimingsAccum>,
+    /// Deferred-spill log (`COLI_GPU_SPILL`): a [`crate::lane::Placement::GpuSpill`]
+    /// verdict records its `(layer, expert)` here — the expert still computes on
+    /// the CPU lane *this* forward — and [`crate::Model::reheat`] drains the log
+    /// between forwards, boosting those pairs in the heat snapshot so the next
+    /// residency generation actually uploads what the balancer kept asking for.
+    /// Acting between forwards is what keeps this out of the mid-forward
+    /// `&mut GpuTier` problem the `GpuSpill` doc describes, at the cost of the
+    /// spill paying off next generation instead of this token. `None` = the
+    /// verdict stays advisory (the historical behavior).
+    pub spill: Option<&'a Mutex<Vec<(usize, usize)>>>,
     /// Optional adaptive CPU/GPU lane balancer. When `Some` (i.e. bias is
     /// non-`Balanced` and `COLI_LANE_BALANCE=1`), the scheduler downgrades cold
     /// GPU-resident experts to the CPU lane when the GPU is the bottleneck.
@@ -111,6 +129,18 @@ pub struct ForwardCtx<'a> {
     /// [`tplan`], which is what every path did before the index existed —
     /// same bytes either way.
     pub expert_index: Option<&'a ExpertIndex>,
+    /// fd → device-ordinal table for **device-pure io claims**
+    /// (`COLI_IO_DEVICE_SCHED`, read at model build — not OnceLock-latched).
+    /// When `Some` and more than one ring exists, the claim order is
+    /// partitioned by device so no deep submit mixes devices: a mixed batch
+    /// reaps behind the slowest device (`submit_and_wait` completes the whole
+    /// claim), which is the suspected mechanism behind 0.86 GB/s delivered
+    /// against a ~1.42 GB/s predicted aggregate on the 3-device r4 split.
+    /// Ordinals are opaque group keys (the Seam 1 contract in the 2026-08-15
+    /// coordination file); fds absent from the table group under `u8::MAX`.
+    /// `None` = the historical device-blind single cursor. Bit-identical either
+    /// way — only claim/submission order changes; the reduce keys on `pos`.
+    pub fd_devices: Option<&'a HashMap<RawFd, u8>>,
 }
 
 /// Per-layer co-activation ordering hints, rebuilt periodically by the model
@@ -798,6 +828,61 @@ pub fn experts_per_batch() -> usize {
     })
 }
 
+/// Partition plan indices into device-pure claim groups: one `Vec<usize>` per
+/// device ordinal, ascending, each preserving the incoming plan order (which the
+/// caller already sorted for contiguous offsets). Fds absent from the table land
+/// in a trailing `u8::MAX` group rather than poisoning a real device's claims.
+/// Pure so it unit-tests without mounts or env.
+fn device_claim_groups(
+    fds: impl Iterator<Item = RawFd>,
+    table: &HashMap<RawFd, u8>,
+) -> Vec<Vec<usize>> {
+    let mut by_dev: std::collections::BTreeMap<u8, Vec<usize>> = std::collections::BTreeMap::new();
+    for (idx, fd) in fds.enumerate() {
+        by_dev.entry(table.get(&fd).copied().unwrap_or(u8::MAX)).or_default().push(idx);
+    }
+    by_dev.into_values().collect()
+}
+
+/// Home-group assignment for the io rings: rings are spread across claim groups
+/// proportionally to group size (largest remainder), and every non-empty group
+/// gets at least one ring while rings remain — a device with little work must
+/// not be orphaned, or its reads wait for a stealing ring to go dry elsewhere.
+/// Returns `homes[ring] = group`. Pure for the same testability reason.
+fn ring_homes(group_sizes: &[usize], n_rings: usize) -> Vec<usize> {
+    let total: usize = group_sizes.iter().sum();
+    if total == 0 || group_sizes.is_empty() {
+        return vec![0; n_rings];
+    }
+    // Ideal share per group, floored; then hand leftover rings to the largest
+    // remainders, seeding empty-handed non-empty groups first.
+    let mut share: Vec<usize> =
+        group_sizes.iter().map(|&s| n_rings * s / total).collect();
+    let mut assigned: usize = share.iter().sum();
+    let mut order: Vec<usize> = (0..group_sizes.len()).collect();
+    order.sort_by_key(|&g| {
+        // Zero-share non-empty groups first, then by remainder, descending.
+        let starved = share[g] == 0 && group_sizes[g] > 0;
+        let rem = n_rings * group_sizes[g] % total;
+        (std::cmp::Reverse(starved as usize), std::cmp::Reverse(rem), g)
+    });
+    for &g in order.iter().cycle() {
+        if assigned >= n_rings {
+            break;
+        }
+        if group_sizes[g] > 0 {
+            share[g] += 1;
+            assigned += 1;
+        }
+    }
+    let mut homes = Vec::with_capacity(n_rings);
+    for (g, &n) in share.iter().enumerate() {
+        homes.extend(std::iter::repeat_n(g, n));
+    }
+    homes.resize(n_rings, homes.last().copied().unwrap_or(0));
+    homes
+}
+
 /// Whether to fire `POSIX_FADV_WILLNEED` for the main streamed-expert regions
 /// just before the batched read (buffered mode only — the O_DIRECT path bypasses
 /// the page cache, so the hint would be ignored). Default on when buffered;
@@ -1279,13 +1364,23 @@ pub fn moe_forward_concurrent(
         let route_to_gpu = match (ctx.balancer, ctx.heat_counts) {
             (Some(bal), Some(counts)) => {
                 let heat = counts.get(layer * n_experts_layer + e).copied().unwrap_or(0);
-                // Exhaustive on purpose: `GpuSpill` would need a mid-forward
-                // upload path that does not exist, so it resolves to the CPU
-                // lane. Spelling it out means adding a real spill is a compile
-                // error here rather than a verdict that silently does nothing.
+                // Exhaustive on purpose: a *mid-forward* upload path still does
+                // not exist, so `GpuSpill` resolves to the CPU lane this
+                // forward. What changed (2026-08-13): the verdict is no longer
+                // discarded — with `COLI_GPU_SPILL` it records into `ctx.spill`
+                // and `Model::reheat` uploads the expert for the *next*
+                // generation. Spelling the variant out keeps a future real
+                // mid-forward spill a compile error here rather than a verdict
+                // that silently does nothing.
                 match bal.choose(gpu_resident, heat) {
                     crate::lane::Placement::Gpu => true,
-                    crate::lane::Placement::Cpu | crate::lane::Placement::GpuSpill => false,
+                    crate::lane::Placement::Cpu => false,
+                    crate::lane::Placement::GpuSpill => {
+                        if let Some(log) = ctx.spill {
+                            log.lock().push((layer, e));
+                        }
+                        false
+                    }
                 }
             }
             _ => gpu_resident,
@@ -1365,15 +1460,44 @@ pub fn moe_forward_concurrent(
     let fused_reduce = gpu.is_some() && !gplans.is_empty() && fused_reduce_enabled();
 
     let completed = AtomicUsize::new(0);
-    // Shared cursor the I/O rings atomically claim expert-batches from (lock-free
-    // work-stealing): each ring `fetch_add`s a batch, so no expert is read twice and
-    // the rings never idle while work remains.
-    let io_work = AtomicUsize::new(0);
+    // Claim order for the I/O rings. Device-pure when the fd→device table is
+    // present (`COLI_IO_DEVICE_SCHED`) and more than one ring exists: one group
+    // of plan indices per device ordinal, so a claim window — and therefore each
+    // deep submit — never mixes devices and never reaps behind a slower one.
+    // Otherwise a single group spanning all plans, which reproduces the
+    // historical shared-cursor behavior claim-for-claim. Each group keeps its
+    // own lock-free cursor; rings claim from their home group first and steal
+    // device-pure windows from the others when it runs dry, so no expert is
+    // read twice and no ring idles while any device still has work.
+    let claim_groups: Vec<Vec<usize>> = match ctx.fd_devices {
+        Some(table) if reactors.len() > 1 => device_claim_groups(
+            plans.iter().map(|p| p.entry.w_run.map_or(p.entry.plans[0].w_fd, |r| r.fd)),
+            table,
+        ),
+        _ => vec![(0..plans.len()).collect()],
+    };
+    let group_cursors: Vec<AtomicUsize> =
+        claim_groups.iter().map(|_| AtomicUsize::new(0)).collect();
+    // Home-ring assignment and per-group claim sizes, hoisted out of the thread
+    // scope: scoped spawns may only borrow what outlives the scope itself.
+    let n_rings = reactors.len().max(1);
+    let group_sizes: Vec<usize> = claim_groups.iter().map(|g| g.len()).collect();
+    let homes = ring_homes(&group_sizes, n_rings);
+    let rings_in: Vec<usize> = (0..claim_groups.len())
+        .map(|g| homes.iter().filter(|&&h| h == g).count())
+        .collect();
+    let batches: Vec<usize> = group_sizes
+        .iter()
+        .zip(&rings_in)
+        .map(|(&glen, &r)| experts_per_batch().min(glen.div_ceil(r.max(1))).max(1))
+        .collect();
+    let claim_groups_ref = &claim_groups;
+    let group_cursors_ref = &group_cursors;
+    let batches_ref = &batches;
     let plans_ref = &plans;
     let gplans_ref = &gplans;
     let x_ref = x;
     let completed_ref = &completed;
-    let io_work_ref = &io_work;
     // Per-lane wall-time accumulator (or `None` for the no-tracking path). Copied
     // into each scoped thread so the atomic bumps in the accumulator's four counters
     // are the only synchronization the timing incurs.
@@ -1401,12 +1525,13 @@ pub fn moe_forward_concurrent(
     let t_lane = std::time::Instant::now();
     let results: Result<LaneResults, Error> = std::thread::scope(|scope| {
         // ---- I/O lanes: N io_uring rings in PARALLEL, lock-free (atomic) work-stealing ----
-        // One thread per ring. Each atomically claims a batch of experts off `io_work`,
+        // One thread per ring. Each atomically claims a batch of experts off its
+        // home group's cursor (falling back to stealing from other groups),
         // serves warm-tier hits immediately, and streams the misses through *its own*
         // ring in one deep submit — so N reads run concurrently (which also parallelizes
         // dm-crypt decryption on encrypted volumes). The `pos`-ordered reduce is
         // order-independent, so which ring reads which expert never changes the output.
-        let n_plans = plans_ref.len();
+        //
         // Claim size, sized so **every ring gets work**.
         //
         // `experts_per_batch()` (`COLI_IO_BATCH`, default 16) is a submit-depth
@@ -1422,23 +1547,42 @@ pub fn moe_forward_concurrent(
         // decode gets ceil(8/4) = 2 and all four rings run; prefill gets
         // ceil(69/4) = 18, clamped back to 16, so its deep submits are unchanged.
         // Measured on GLM-5.2: decode 21.8 -> 14.8 s/tok, ttft 157 -> 116 s, io
-        // duty 24% -> 90%.
-        let n_rings = reactors.len().max(1);
-        let batch = experts_per_batch().min(n_plans.div_ceil(n_rings)).max(1);
-        for ring in reactors.iter() {
+        // duty 24% -> 90%. Under device-pure groups the same arithmetic runs
+        // per group against the rings homed on it, for the same reason (the
+        // group/home/batch tables are hoisted above the scope for lifetimes).
+        for (ri, ring) in reactors.iter().enumerate() {
             let job_tx = job_tx.clone();
             let res_tx = res_tx.clone();
+            let home = homes.get(ri).copied().unwrap_or(0);
             scope.spawn(move || {
                 loop {
-                    let start = io_work_ref.fetch_add(batch, Ordering::Relaxed);
-                    if start >= n_plans {
-                        break; // no work left for this ring
+                    // Home group first; on dry, steal a device-pure window from
+                    // the remaining groups so no ring idles while any device
+                    // still has work.
+                    let mut claim: Option<(usize, usize, usize)> = None;
+                    for gi in std::iter::once(home)
+                        .chain((0..claim_groups_ref.len()).filter(|&g| g != home))
+                    {
+                        let glen = claim_groups_ref[gi].len();
+                        if glen == 0 {
+                            continue;
+                        }
+                        let start = group_cursors_ref[gi].fetch_add(batches_ref[gi], Ordering::Relaxed);
+                        if start >= glen {
+                            continue; // this group is dry
+                        }
+                        claim = Some((gi, start, (start + batches_ref[gi]).min(glen)));
+                        break;
                     }
-                    let end = (start + batch).min(n_plans);
+                    let Some((gi, start, end)) = claim else {
+                        break; // every group dry: no work left for this ring
+                    };
+                    let idxs = &claim_groups_ref[gi][start..end];
                     // split the claimed range into warm-tier hits (dispatch now) and
                     // misses (one deep async submit on this ring)
                     let mut miss: Vec<usize> = Vec::new();
-                    for (idx, plan) in plans_ref.iter().enumerate().take(end).skip(start) {
+                    for &idx in idxs {
+                        let plan = &plans_ref[idx];
                         let key = (layer as u32, plan.expert as u32);
                         // Filter first: on "definitely absent" skip the mutex
                         // entirely and go straight to disk. Races are byte-safe
@@ -1495,15 +1639,18 @@ pub fn moe_forward_concurrent(
                         // forwarding — accepted semantics shift vs the wave.
                         let mut r = ring.lock(); // this ring, uncontended (owned by this thread)
                         if !use_direct && fadvise_main_enabled() {
-                            // Hint the NEXT claim window while this one streams
-                            // — genuinely ahead of its reads, unlike the wave
-                            // path's same-wave hint. Best-effort: the window may
-                            // be claimed by another ring, which only means the
-                            // readahead lands in the page cache it shares.
-                            let ahead_end = (end + batch).min(n_plans);
+                            // Hint the NEXT claim window of this group while
+                            // this one streams — genuinely ahead of its reads,
+                            // unlike the wave path's same-wave hint. Best-effort:
+                            // the window may be claimed by another ring, which
+                            // only means the readahead lands in the page cache
+                            // it shares. Same-group by construction, so the hint
+                            // stays on this claim's device.
+                            let ahead_end =
+                                (end + batches_ref[gi]).min(claim_groups_ref[gi].len());
                             let mut ahead: Vec<(RawFd, u64, usize)> = Vec::new();
-                            for p in &plans_ref[end..ahead_end] {
-                                ahead.extend_from_slice(&expert_regions(&p.entry, false));
+                            for &ai in &claim_groups_ref[gi][end..ahead_end] {
+                                ahead.extend_from_slice(&expert_regions(&plans_ref[ai].entry, false));
                             }
                             if !ahead.is_empty() {
                                 r.queue_willneed(&ahead);
@@ -2030,6 +2177,146 @@ mod tests {
     use crate::weight::QuantFmt;
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
+
+    /// Device-pure partition: every plan index lands in exactly one group, groups
+    /// come out in ascending-ordinal order preserving in-group plan order, and an
+    /// fd the table has never seen is quarantined in the trailing `u8::MAX` group
+    /// rather than polluting a real device's claim windows.
+    #[test]
+    fn device_claim_groups_partition_by_ordinal_and_quarantine_unknown_fds() {
+        let table: HashMap<RawFd, u8> = [(10, 0u8), (11, 1u8), (12, 0u8)].into_iter().collect();
+        // Plans interleaved across devices, one fd (99) unknown.
+        let fds = [10, 11, 12, 99, 11, 10];
+        let groups = device_claim_groups(fds.iter().copied(), &table);
+        assert_eq!(groups, vec![vec![0, 2, 5], vec![1, 4], vec![3]]);
+        let mut all: Vec<usize> = groups.concat();
+        all.sort_unstable();
+        assert_eq!(all, (0..fds.len()).collect::<Vec<_>>());
+    }
+
+    /// The blind path's contract, restated for the grouped machinery: a table
+    /// mapping every fd to one ordinal yields a single group in plan order —
+    /// claim windows are then identical to the historical shared cursor.
+    #[test]
+    fn device_claim_groups_single_device_is_the_identity_order() {
+        let table: HashMap<RawFd, u8> = [(7, 3u8)].into_iter().collect();
+        let groups = device_claim_groups([7, 7, 7, 7].into_iter(), &table);
+        assert_eq!(groups, vec![vec![0, 1, 2, 3]]);
+    }
+
+    /// The whole correctness argument for device-pure claims, asserted end to
+    /// end: the same forward, once through the blind cursor and once through a
+    /// forced two-group split (shard fds alternately assigned ordinals 0/1 —
+    /// the tiny model lives on one real device, so the split is synthetic on
+    /// purpose), produces **bit-identical** output. Only claim/submission order
+    /// may change; the `pos`-keyed reduce erases it.
+    #[test]
+    fn device_pure_claims_are_bit_identical_to_the_blind_cursor() -> Result<(), Error> {
+        use peregrine_core::Cfg;
+
+        let dir = std::env::temp_dir()
+            .join(format!("peregrine_devsched_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
+        }
+        crate::testkit::build_tiny_model_seeded(&dir, 0xD5C4ED)?;
+        let cfg = Cfg::load(&dir)?;
+        let st = SafeTensors::open(&dir)?;
+
+        // Two rings: grouping only engages with more than one, and two claim
+        // groups against two rings exercises homes + stealing both.
+        let reactors = match (Reactor::new(32), Reactor::new(32)) {
+            (Ok(a), Ok(b)) => vec![Mutex::new(a), Mutex::new(b)],
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
+                return Ok(());
+            }
+        };
+        let table: HashMap<RawFd, u8> = st
+            .fd_devices()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (fd, _))| (fd, (i % 2) as u8))
+            .collect();
+        assert!(
+            table.values().any(|&d| d == 1),
+            "fixture must span two synthetic ordinals for the test to bite"
+        );
+
+        let (hidden, e_n) = (cfg.hidden as usize, cfg.n_experts as usize);
+        let s_n = 3usize;
+        let layer = cfg.first_dense as usize;
+        // Deterministic inputs, no rand dependency: a small LCG.
+        let mut state = 0x00C0_FFEEu64;
+        let mut f = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        let x: Vec<f32> = (0..s_n * hidden).map(|_| f()).collect();
+        let router_w: Vec<f32> = (0..e_n * hidden).map(|_| f()).collect();
+        let router_bias: Vec<f32> = (0..e_n).map(|_| f() * 0.1).collect();
+
+        let ctx_of = |fd_devices| ForwardCtx {
+            st: &st,
+            absorb: false,
+            dsa: false,
+            reactors: &reactors,
+            gpu: None,
+            workers: 2,
+            cfg: &cfg,
+            stream_experts: true,
+            ecache: None,
+            route_log: None,
+            calib: None,
+            route_log_multi: None,
+            direct: false,
+            heat: None,
+            spill: None,
+            timings: None,
+            balancer: None,
+            heat_counts: None,
+            layout_schedule: None,
+            affinity: None,
+            expert_index: None,
+            fd_devices,
+        };
+        let blind =
+            moe_forward_concurrent(&ctx_of(None), layer, &x, &router_w, &router_bias, None, s_n)?;
+        let grouped = moe_forward_concurrent(
+            &ctx_of(Some(&table)),
+            layer,
+            &x,
+            &router_w,
+            &router_bias,
+            None,
+            s_n,
+        )?;
+        assert_eq!(blind.len(), grouped.len());
+        for (i, (a, b)) in blind.iter().zip(&grouped).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "diverged at f32 index {i}");
+        }
+        std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// Ring homes are proportional to group size, and a non-empty group is never
+    /// orphaned while rings remain — a device with little work must not wait for
+    /// a stealing ring to run dry elsewhere before its reads start.
+    #[test]
+    fn ring_homes_are_proportional_and_never_orphan_a_nonempty_group() {
+        assert_eq!(ring_homes(&[80, 20], 4), vec![0, 0, 0, 1]);
+        // Fewer rings than groups: valid homes, one per ring, no panic; the
+        // unhomed group is reached via stealing.
+        let homes = ring_homes(&[10, 10, 10], 2);
+        assert_eq!(homes.len(), 2);
+        assert!(homes.iter().all(|&h| h < 3));
+        // Empty groups draw nothing.
+        assert_eq!(ring_homes(&[0, 5], 2), vec![1, 1]);
+        // Degenerate inputs hold the shape contract.
+        assert_eq!(ring_homes(&[], 3), vec![0, 0, 0]);
+        assert_eq!(ring_homes(&[0, 0], 2), vec![0, 0]);
+    }
 
     /// A fresh tiny-model checkpoint on disk. Mirrors `model.rs`'s `tmp_model_dir`:
     /// this crate has no `tempfile` dependency, and the tests are per-process.

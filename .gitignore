@@ -52,3 +52,9 @@ Thumbs.db
 # Python bytecode (scripts/ carries runstat.py + audit-reachability.py)
 __pycache__/
 *.pyc
+
+# Claude Code agent worktrees are local build areas, never content
+.claude/worktrees/
+
+# KV-cache checkpoints are runtime artifacts, never source
+*.pgkv

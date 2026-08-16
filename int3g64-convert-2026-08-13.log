@@ -1,0 +1,2 @@
+peregrine-requantize: /home/cortix/models/GLM-5.2 -> /srv/modelstripe/GLM-5.2-int3g64 | target int3-g64 | include '.mlp.experts.'
+peregrine-requantize: 118478 tensors (58368 requantized) -> 67 shards | 383.73 GB -> 332.19 GB (86.6% of source)

@@ -70,6 +70,50 @@ impl Bounds {
             "experts": rows,
         })
     }
+
+    /// The inverse of [`Self::to_json`], so a sidecar the tool already wrote
+    /// can be measured against a trace **without re-reading the container** —
+    /// `compute_bounds` is a pass over every routed expert (~hundreds of GB),
+    /// which is a steep toll for an analysis whose other input is a JSON trace.
+    /// Rows with missing or non-numeric fields are refused, not skipped: a
+    /// silently thinner sidecar would make every absent expert read as
+    /// "unbounded" and quietly shrink the denominator of the one fraction this
+    /// tool exists to report.
+    pub fn from_json(v: &serde_json::Value) -> Result<Bounds, Error> {
+        let version = v.get("version").and_then(|n| n.as_u64());
+        if version != Some(1) {
+            return Err(Error::Format(format!("bounds sidecar: unsupported version {version:?}")));
+        }
+        let rows = v
+            .get("experts")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| Error::Format("bounds sidecar: no `experts` array".into()))?;
+        let mut b = Bounds::default();
+        for (i, row) in rows.iter().enumerate() {
+            let (Some(l), Some(e), Some(c)) = (
+                row.get("layer").and_then(|x| x.as_u64()),
+                row.get("expert").and_then(|x| x.as_u64()),
+                row.get("c").and_then(|x| x.as_f64()),
+            ) else {
+                return Err(Error::Format(format!("bounds sidecar: malformed row {i}: {row}")));
+            };
+            b.c.insert((l as usize, e as usize), c);
+        }
+        if b.c.is_empty() {
+            return Err(Error::Format("bounds sidecar: zero experts — measuring against it would report every position unbounded".into()));
+        }
+        Ok(b)
+    }
+}
+
+/// Read a bounds sidecar (the file `peregrine-skipbound` writes by default as
+/// `<model-dir>/expert_bounds.json`).
+pub fn load_bounds(path: &std::path::Path) -> Result<Bounds, Error> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| Error::Format(format!("read bounds {}: {e}", path.display())))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::Format(format!("parse bounds {}: {e}", path.display())))?;
+    Bounds::from_json(&v)
 }
 
 /// Frobenius norm of one quantized weight, read row by row.
@@ -287,7 +331,24 @@ pub fn measure(bounds: &Bounds, frames: &[Frame]) -> Tightness {
     t
 }
 
-/// Parse the trace shape `peregrine dump-routes` writes.
+/// Parse a routing trace. Two shapes are accepted:
+///
+/// - **What `peregrine dump-routes` actually writes** —
+///   `Model::dump_routes_to` serializes `Vec<Vec<Vec<i32>>>`: a bare array of
+///   *positions*, each an array indexed by layer of routed-expert-id arrays
+///   (dense / unrouted layers empty). This reader originally did not parse it:
+///   it looked only for `{"layer": ..}` objects, silently `continue`d past
+///   every nested row, and reported "no usable frames" against real traces —
+///   which is exactly how the 2026-08-13 run lost its "reads skipped by
+///   bounds" number (`bench-data/2026-08-13-int3g64/skipbound.log`).
+/// - The object form `{"frames": [{"layer": N, "experts": [..],
+///   "weights": [..]}]}` (or a bare array of those objects) — hand-written
+///   fixtures and any future weight-carrying producer.
+///
+/// The nested shape carries no gate weights; [`measure`] defaults an absent
+/// weight to `1.0`, so the `g·C` column still ranks by the Frobenius bound
+/// while the gate-only column is degenerate for such traces — a property of
+/// the trace, reported rather than silently wrong.
 pub fn load_frames(path: &std::path::Path) -> Result<Vec<Frame>, Error> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| Error::Format(format!("read trace {}: {e}", path.display())))?;
@@ -302,6 +363,19 @@ pub fn load_frames(path: &std::path::Path) -> Result<Vec<Frame>, Error> {
     };
     let mut out = Vec::with_capacity(arr.len());
     for f in &arr {
+        // dump-routes nested form: this element is one position's per-layer
+        // routed sets. Layer index is the array position; empty layers (dense,
+        // or not yet routed) contribute no frame.
+        if let Some(pos_layers) = f.as_array() {
+            for (layer, ids) in pos_layers.iter().enumerate() {
+                let Some(ids) = ids.as_array() else { continue };
+                let ids: Vec<i32> = ids.iter().filter_map(|e| e.as_i64()).map(|e| e as i32).collect();
+                if !ids.is_empty() {
+                    out.push((layer, ids, Vec::new()));
+                }
+            }
+            continue;
+        }
         let Some(layer) = f.get("layer").and_then(|l| l.as_u64()) else { continue };
         let Some(experts) = f.get("experts").and_then(|e| e.as_array()) else { continue };
         let ids: Vec<i32> = experts.iter().filter_map(|e| e.as_i64()).map(|e| e as i32).collect();
@@ -327,6 +401,84 @@ mod tests {
             b.c.insert((l, e), c);
         }
         b
+    }
+
+    #[test]
+    fn a_sidecar_round_trips_and_malformed_rows_are_refused_not_skipped() -> Result<(), Error> {
+        // from_json is what lets a trace analysis skip the container pass, so
+        // it must reproduce exactly what to_json wrote…
+        let b = bounds_of(&[(0, 0, 1.5), (0, 3, 0.25), (7, 200, 1e-6)]);
+        let back = Bounds::from_json(&b.to_json())?;
+        assert_eq!(back.c, b.c, "sidecar round-trip must be exact");
+        // …and refuse rather than thin out: a dropped row would read as
+        // "unbounded" downstream and shrink the measured denominator silently.
+        let mut v = b.to_json();
+        if let Some(rows) = v.get_mut("experts").and_then(|e| e.as_array_mut()) {
+            rows.push(serde_json::json!({ "layer": 1, "expert": "not-a-number", "c": 0.5 }));
+        }
+        assert!(Bounds::from_json(&v).is_err(), "a malformed row must fail the load");
+        // Version and emptiness are hard errors too.
+        assert!(Bounds::from_json(&serde_json::json!({"version": 2, "experts": []})).is_err());
+        assert!(Bounds::from_json(&serde_json::json!({"version": 1, "experts": []})).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn load_frames_reads_the_shape_dump_routes_actually_writes() -> Result<(), Error> {
+        // The 2026-08-13 defect in miniature: a positions × layers × ids array
+        // (dump-routes' real output) used to yield "no usable frames". Layer
+        // index comes from array position; empty (dense) layers emit nothing.
+        let dir = std::env::temp_dir().join(format!("peregrine_sb_shape_{}", std::process::id()));
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "stale fixture: {e}");
+        }
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("routes.json");
+        std::fs::write(&path, r#"[[[],[1,2],[3]],[[],[],[4,5]]]"#)?;
+        let frames = load_frames(&path)?;
+        assert_eq!(
+            frames,
+            vec![
+                (1usize, vec![1, 2], Vec::<f32>::new()),
+                (2, vec![3], Vec::new()),
+                (2, vec![4, 5], Vec::new()),
+            ],
+            "layer = array index, empty layers skipped, no weights in this shape"
+        );
+        // The object form keeps working alongside it.
+        std::fs::write(&path, r#"{"frames":[{"layer":0,"experts":[7],"weights":[0.5]}]}"#)?;
+        let frames = load_frames(&path)?;
+        assert_eq!(frames, vec![(0usize, vec![7], vec![0.5])]);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_real_dump_routes_trace_round_trips_into_measurable_frames() -> Result<(), Error> {
+        // The acceptance for the fix: dump-routes on the synthetic tiny model
+        // (no real-model disk read anywhere), feed the file to this reader,
+        // and the measurement pipeline must see frames — the exact end-to-end
+        // path that silently produced nothing on 2026-08-13.
+        let dir = std::env::temp_dir().join(format!("peregrine_sb_rt_{}", std::process::id()));
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "stale fixture: {e}");
+        }
+        peregrine_model::testkit::build_tiny_model(&dir)?;
+        // Streaming + a small forced cache: `dump_routes` requires the routing
+        // history, which only a streaming model builds.
+        let mut m = peregrine_model::Model::load_streaming_ecache(&dir, true, 1 << 20)?;
+        let corpus: Vec<i32> = (0..12).map(|k| (k * 5 + 1) % 32).collect();
+        let trace_path = dir.join("routes.json");
+        let n = m.dump_routes_to(&corpus, &trace_path)?;
+        assert_eq!(n, corpus.len(), "one frame per forward");
+
+        let frames = load_frames(&trace_path)?;
+        assert!(!frames.is_empty(), "the reader must parse its own producer's output");
+        let bounds = compute_bounds(&dir)?;
+        let t = measure(&bounds, &frames);
+        assert!(t.routed > 0, "bounded routed experts must be examined, got {t:?}");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]

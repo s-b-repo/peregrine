@@ -108,6 +108,95 @@ forward verifies γ+1 rows and its routed union grows faster than acceptance rep
 Output is sequence-identical at temperature 0, as documented; it is simply slower.
 The advice may still hold where experts are **resident** rather than streamed.
 
+### The 2026-08-15 ds4-port wave — statuses as measured (updated 08-16)
+
+Four knobs ported from antirez's ds4/DwarfStar engine, every one **off by
+default**. First verdicts are in (`bench-data/2026-08-15-*/`, and the
+2026-08-15 pass in [benchmarks.md](benchmarks.md)); each entry below carries
+its own status so nobody mistakes "documented" for "measured":
+
+- **Asymmetric expert requantization — MEASURED, FAILS its gate.**
+  `--down keep --keep-last-layers 6 --target int3-g64` converted
+  383.73 → 355.25 GB and delivered the predicted bytes (working set measured
+  live at 10.02 GB/token vs int4's 10.85), but `flip_rate = 0.447` — better
+  than uniform's 0.514, nowhere near licensable. The data-free RTN ladder is
+  now closed at every measured point, uniform or asymmetric (todo.md §13).
+  The open question moved to **calibrated rounding**: `--calib` +
+  `peregrine calib-capture` (ideas #7) are code-complete — but the two-rung
+  measurement night was SHELVED 2026-08-16 by product decision (Qwen
+  resident serving took priority; partial GPU offload is that track's
+  VRAM-fit route). The tools remain the instrument of record if revisited.
+- **`COLI_SPEC_CONF`** (default 0, off) — stop an MTP draft early when the
+  head's top-token probability drops under the floor. Depth-only: `accept_run`
+  is untouched, so greedy output is bit-identical by construction (test:
+  `the_confidence_floor_never_changes_a_greedy_stream`). **CONFIRMED,
+  REPEATS=3 (2026-08-16): 0.060 → 0.082 median tok/s (+37 %) at B=16 with
+  `COLI_DRAFT=5` + floor 0.65, and −22 % disk reads for the same tokens** —
+  the `COLI_DRAFT=4` rejection above inverts once low-confidence drafts stop
+  paying for verify rows, and the win is bytes-shaped, not cache-shaped.
+  Defaults still unchanged on purpose: both confirmed arms drafted at depth 5,
+  so this licenses "if you speculate, floor it", not "speculate by default" —
+  the controlled draft0-vs-floored sweep (queue job 96) decides the latter.
+- **`COLI_ECACHE_GB=auto`** (+ `COLI_ECACHE_AUTO_FRAC`, default 0.80) — ds4's
+  budget rule: a fraction of post-load `MemAvailable`, still capped by the
+  transient reserve + 1 GiB safety. Numeric spellings unchanged. **First arm
+  BROKE (not a negative — it never ran):** auto sized against *host*
+  MemAvailable inside the harness's 34G cgroup scope and got OOM-killed at
+  0/16 streams; fixed in 6704288 (leaf-to-root cgroup-v2 walk). Rerun is
+  queue job 93.
+- **`COLI_KV_STORE_DIR`** (+ `COLI_KV_STORE_MB` cap, default 16384;
+  `COLI_KV_STORE_TRIM`, default 32) — disk-persisted KV sessions: completed
+  prefixes ≥ 256 tokens checkpoint to disk and a restarted server restores
+  them instead of re-prefilling. **SMOKE-PROVEN: cold 2620.5 s → warm
+  391.9 s (6.7×)** on an 832-token restore from a 142.6 MiB checkpoint,
+  output byte-identical across the restart — and re-proven on the shipped
+  async-writer binary (job 90: 2504.6 → 389.0 s, `dropped_busy=0`). Fingerprint + checksum +
+  full-token compare gate every load; a bad file means a cold prefill, never
+  a wrong token. Note the checkpoint files contain the session's token ids in
+  the clear — point the knob at storage with the same privacy expectations as
+  the server log.
+
+### `COLI_TOPIC_ROUTING` — pending measurement (2026-08-15/16, same rule)
+
+- **`COLI_TOPIC_ROUTING=1`** (default 0, off; `COLI_TOPIC_HALFLIFE`, default
+  512 forwards, `0` = static all-time counters) — per-`TokenClass` expert-usage
+  profiles that break the warm-cache evictor's ties by the **active topic's**
+  routing frequency instead of the global heat distribution (which, on a
+  CPU-only box, does not otherwise exist). A coding request keeps coding-hot
+  experts resident through an interleaved prose request. The adaptive half
+  ages each profile at a volatility-driven rate: the decay interval scales
+  with the routing-entropy EWMA (stable routing → durable residency set,
+  volatile routing → interval drops to base/16 so the profile re-forms within
+  a few halvings). Correctness-neutral by construction — only the low-bits
+  tiebreak of an eviction priority changes, never a predicted set or any
+  get/insert — and profiles persist to a `topic_profiles.json` sidecar.
+  Measurement: queue job 99, three arms (off / static / adaptive) at B=16.
+  Off by default until it reports.
+
+### `COLI_PREFETCH_STALE_DROP` — confirmed, default ON (2026-08-16)
+
+- **`COLI_PREFETCH_STALE_DROP`** (default ON since d3b47c5, `=0` to disable; window via
+  `COLI_PREFETCH_STALE_SLACK`, default 1 layer-step) — drop a queued
+  speculative warm *before its disk read* once the forward sweep has moved
+  past the layer window it was emitted for. **CONFIRMED, REPEATS=3
+  (2026-08-16): 0.072 → 0.077 median (+6.9 %) at B=16**, with the counters
+  showing the honest mechanism — speculative reads −68 %, total disk reads
+  −2.2 % — wasted speculative bandwidth returned to demand reads rather than
+  a cache trade. **Default flipped ON the same day (d3b47c5)**, with `=0` as
+  the escape hatch and both resolver sides under test. The 2026-08-13 defaults run is
+  the motivating measurement: at B=16 the rings sit at 93 % duty, the
+  unbounded prefetch queue backlogs, and **40 352 of 41 159 speculative reads
+  (98.6 %) were classified wasted — ~12.6 % of all disk reads** on a run whose
+  wall clock is its disk time (`[lane] io 71 %`, moe wall ≈ io time). A late
+  speculation is a demand read's bandwidth spent on a token that already
+  happened. The gate is advisory-lane-only (it can drop a read, never add
+  one, so output is untouched by construction), and the `[prefetch]` line now
+  reports `stale_dropped=` so the A/B can see both the reads not spent and
+  whatever survives as `used`. At B=1, where the disk has real idle windows
+  and the look-ahead measurably wins, a timely queue means the gate should be
+  a near-no-op — that prediction is part of what the A/B checks. Bulk warms
+  (`tiers.json` seed, expert replicas) are exempt by construction.
+
 ### Unavailable here: `COLI_IO_RINGS=8`
 
 Streaming buffers scale with ring count — 11.5 GB at 4 rings, **21.1 GB at 8** — and
