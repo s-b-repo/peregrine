@@ -79,6 +79,42 @@ fn self_agreement_reads_zero_and_planted_flips_read_exactly() -> Result<(), pere
     Ok(())
 }
 
+/// The paired-analysis dump: the positions it names must be exactly the
+/// positions that disagree — that is the whole basis of a McNemar comparison
+/// between two arms, and an off-by-one or a truncated list would silently
+/// weaken every conclusion drawn from it.
+#[test]
+fn dump_flips_names_exactly_the_disagreeing_positions() -> Result<(), peregrine_core::Error> {
+    let dir = tiny_hybrid("dumpflips")?;
+    let tokens: Vec<i32> = vec![1, 5, 9, 2, 7, 4, 8, 3];
+    let mut wrong = self_dump(&dir, &tokens)?;
+    // Plant disagreements at known positions.
+    let planted = [2usize, 6];
+    for &i in &planted {
+        wrong[i] = (wrong[i] + 1) % 32;
+    }
+    let dump = dir.join("ref.json");
+    std::fs::write(&dump, serde_json::json!({ "tokens": tokens, "argmax": wrong }).to_string())?;
+    let flips_path = dir.join("flips.json");
+    let out = bin()
+        .args(["flip-rate", dir.to_str().unwrap_or("."), "--reference-json"])
+        .arg(&dump)
+        .arg("--dump-flips")
+        .arg(&flips_path)
+        .output()?;
+    assert!(out.status.success(), "gate must succeed: {}", String::from_utf8_lossy(&out.stderr));
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&flips_path)?)
+        .map_err(|e| peregrine_core::Error::Format(format!("flips json: {e}")))?;
+    let got: Vec<usize> = doc["flips"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+        .unwrap_or_default();
+    assert_eq!(got, planted.to_vec(), "dumped positions must be exactly the planted disagreements");
+    assert_eq!(doc["positions"].as_u64(), Some(tokens.len() as u64));
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
 #[test]
 fn the_mode_refuses_ambiguous_argument_combinations() -> Result<(), peregrine_core::Error> {
     let dir = tiny_hybrid("refuse")?;

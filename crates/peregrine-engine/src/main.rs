@@ -382,7 +382,7 @@ fn run() -> Result<(), Error> {
         Some("flip-rate") => {
             let usage = || {
                 Error::Format(
-                    "usage: peregrine flip-rate <source-dir> <candidate-dir> [--text FILE] [--tokens N] [--candidate-env KEY=VAL]...".into(),
+                    "usage: peregrine flip-rate <source-dir> <candidate-dir|--reference-json FILE> [--text FILE] [--tokens N] [--dump-flips FILE] [--candidate-env KEY=VAL]...".into(),
                 )
             };
             let src = args.get(2).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
@@ -480,6 +480,33 @@ fn run() -> Result<(), Error> {
             println!("flip_rate   {rate:.6}");
             println!("source      {src}");
             println!("candidate   {cand_label}");
+            // Paired analysis support: which POSITIONS flipped, not just how
+            // many. Two arms over the same corpus and reference are paired
+            // observations, so McNemar over the discordant positions is far
+            // stronger at this n than comparing two rates — at 128 positions a
+            // rate difference of a few points is inside the binomial noise
+            // while a systematic subset of flips disappearing is not. It also
+            // separates "the same flips survived" (systematic, worth chasing)
+            // from "different flips appeared" (noise).
+            if let Some(path) = flag_value(&args, "--dump-flips") {
+                let flips: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+                let doc = serde_json::json!({
+                    "positions": a.len(),
+                    "flips": flips,
+                    "candidate": cand_label,
+                    "source": src,
+                });
+                match serde_json::to_vec(&doc) {
+                    Ok(bytes) => {
+                        if let Err(e) = std::fs::write(&path, bytes) {
+                            // The verdict is already on stdout; losing the dump
+                            // costs the paired analysis, not the measurement.
+                            eprintln!("peregrine: flip-rate: could not write {path}: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("peregrine: flip-rate: could not serialize flips: {e}"),
+                }
+            }
             // Top-k containment, only when a reference dump carried top-k rows:
             // of the positions where argmax flipped, how many landed inside the
             // reference's own top-k (near-ties) vs outside it (real departures).

@@ -68,6 +68,21 @@ pub struct QtWeight {
     gs: usize,
 }
 
+/// `COLI_ACT_F32=1`: compute quantized matmuls against **f32** activations
+/// instead of the int8 ones `qrow_i8` produces ([`QtWeight::apply_vec_f32_act`]).
+///
+/// A `OnceLock` here rather than a build-time read, against this repo's usual
+/// preference, and the reason is specific: this is a measurement knob with no
+/// config plumbed to the matmul hot path, and the one harness that A/Bs it —
+/// `peregrine flip-rate` — already runs each arm in its own **process**
+/// (`--candidate-env`, built precisely because latched knobs cannot be
+/// toggled in-process). So the latch cannot produce the vacuous same-arm
+/// comparison it produces for serving knobs.
+fn act_f32() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("COLI_ACT_F32").as_deref(), Ok("1") | Ok("true")))
+}
+
 impl QtWeight {
     /// Build from already-quantized per-row data (also the test constructor).
     /// For grouped-int4 use [`Self::new_grouped`].
@@ -245,6 +260,12 @@ impl QtWeight {
     /// when nested (e.g. an expert matmul inside a parallel MoE), so no
     /// oversubscription. This parallelizes every projection, lm_head, and expert.
     pub fn apply_vec(&self, x: &[f32], s_n: usize) -> Vec<f32> {
+        // Measurement-only escape from activation quantization (`COLI_ACT_F32=1`).
+        // Never a serving path — it dequantizes a weight row per output and dots
+        // in f32, which is correct and slow. See [`Self::apply_vec_f32_act`].
+        if act_f32() {
+            return self.apply_vec_f32_act(x, s_n);
+        }
         let mut y = vec![0f32; s_n * self.o];
         // DECODE (`s_n == 1`) splits the OUTPUT rows, not the batch rows.
         //
@@ -292,6 +313,45 @@ impl QtWeight {
         });
         if let (Some(used_par), Some(t0)) = (probing, t0) {
             shape_dispatch_post(self.fmt, self.o, self.i, used_par, t0.elapsed().as_nanos() as u64);
+        }
+        y
+    }
+
+    /// The same matmul with **no activation quantization**: weights dequantized
+    /// exactly, activations left in f32.
+    ///
+    /// Exists to answer a question the engine could not otherwise ask about
+    /// itself. Every quantized matmul here computes int4/int8 weights against
+    /// **int8 activations** (`qrow_i8`), so a container's served error has two
+    /// sources — the weights it stores and the activations the kernel quantizes
+    /// on the fly — and every quantization gate this repo has ever run measured
+    /// their sum while attributing it to the weights alone. Flipping this knob
+    /// holds the weights fixed and removes the activation term, so the two
+    /// become separable: the difference between a gate run with it and without
+    /// it *is* the activation contribution.
+    ///
+    /// Measured motivation: on one MLP shape the device's fp16-activation path
+    /// sat 29x closer to an f32 truth than this crate's int8-activation path
+    /// (1.09e-4 vs 3.18e-3 RMS), which is large enough to move a flip rate on
+    /// its own and therefore large enough to have been silently inflating them.
+    ///
+    /// Deliberately unoptimized — a reference, not a kernel. It allocates a row
+    /// buffer per output row and does f32 dots with no SIMD path; at GLM/Qwen
+    /// widths expect it to be far slower than [`Self::apply_vec`]. That is the
+    /// correct trade for a measurement instrument: a fast one would have to
+    /// reintroduce the very approximations it exists to remove.
+    fn apply_vec_f32_act(&self, x: &[f32], s_n: usize) -> Vec<f32> {
+        let mut y = vec![0f32; s_n * self.o];
+        let mut row = vec![0f32; self.i];
+        for o in 0..self.o {
+            self.dequant_row_into(o, &mut row);
+            for s in 0..s_n {
+                let xr = &x[s * self.i..(s + 1) * self.i];
+                // Same accumulation order as the reference dots elsewhere in
+                // this file, so the only difference from `apply_vec` is the
+                // activation precision — which is the whole point.
+                y[s * self.o + o] = row.iter().zip(xr).map(|(w, v)| w * v).sum();
+            }
         }
         y
     }
@@ -465,6 +525,53 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+
+    /// The f32-activation instrument must differ from the production path ONLY
+    /// in activation precision — same weights, same shapes, same outputs to
+    /// within the quantization error it removes. A bug that made it compute a
+    /// different matmul entirely would make every attribution drawn from it
+    /// wrong, so this pins it against a hand-rolled reference over the same
+    /// dequantized weights (which is what it should equal exactly).
+    #[test]
+    fn the_f32_activation_path_computes_the_same_matmul_without_quantizing_x() {
+        let (o, i, s_n) = (12usize, 32usize, 2usize);
+        let mut seed = 0xACC0u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        let w: Vec<f32> = (0..o * i).map(|_| rnd()).collect();
+        let qt = super::test_support::quant_i4(&w, o, i);
+        let x: Vec<f32> = (0..s_n * i).map(|_| rnd()).collect();
+
+        // Reference: dequantized weights, f32 activations, plain dots.
+        let mut row = vec![0f32; i];
+        let mut want = vec![0f32; s_n * o];
+        for oo in 0..o {
+            qt.dequant_row_into(oo, &mut row);
+            for s in 0..s_n {
+                want[s * o + oo] =
+                    row.iter().zip(&x[s * i..(s + 1) * i]).map(|(a, b)| a * b).sum();
+            }
+        }
+        let got = qt.apply_vec_f32_act(&x, s_n);
+        assert!(
+            got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the instrument must be exactly the dequantized-weight f32 matmul"
+        );
+
+        // And it must be measurably CLOSER to that reference than the
+        // production int8-activation path — the property the attribution rests
+        // on. (Not merely different: closer.)
+        let prod = qt.apply_vec(&x, s_n);
+        let err = |v: &[f32]| v.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(
+            err(&got) <= err(&prod),
+            "instrument err {:.3e} must not exceed production err {:.3e}",
+            err(&got),
+            err(&prod)
+        );
+    }
     use super::test_support::*;
     use super::QtWeight;
     use peregrine_kernels::{matmul_f32, ActScratch};
