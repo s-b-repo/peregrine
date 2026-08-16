@@ -2346,6 +2346,13 @@ fn layer_prefix(cfg: &Cfg, i: usize) -> String {
     }
 }
 
+/// Whether the container carries any routed-expert tensors at all. A model
+/// without them (dense Qwen3, the Qwen3.5 hybrid, a hypothetical all-dense
+/// GLM) has nothing the streaming lane could ever read.
+fn has_routed_experts(st: &SafeTensors) -> bool {
+    st.tensors().iter().any(|t| t.name.contains(".mlp.experts."))
+}
+
 fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Result<LayerW, Error> {
     let d = cfg.hidden as usize;
     let h = cfg.n_heads as usize;
@@ -2807,6 +2814,20 @@ impl Model {
         } else {
             stream_experts
         };
+        // A container with no routed-expert tensors has nothing to stream, and
+        // honoring a streaming request anyway builds rings, transient reserves
+        // and a warm cache for a lane that will never read a byte — measured on
+        // the first resident Qwen boot as a 10.2 GB stream reserve in the [ram]
+        // projection of a model that fits whole in RAM (serve hard-requests
+        // streaming, which is also why COLI_STREAM=0 appeared to be ignored).
+        // Same shape as the compressed override above: the container's own
+        // contents outrank the caller's flag, and the override says so out loud.
+        let stream_experts = if stream_experts && !has_routed_experts(&st) {
+            eprintln!("[peregrine] no routed-expert tensors — forcing resident mode (nothing to stream)");
+            false
+        } else {
+            stream_experts
+        };
 
         // Preflight: can this machine hold what is about to be loaded? Every byte
         // needed is already in the headers, so the verdict costs no extra I/O and
@@ -2866,6 +2887,20 @@ impl Model {
         // streaming knows why it was overridden.
         let stream_experts = if stream_experts && st.has_compressed_tensors() {
             eprintln!("[peregrine] compressed checkpoint detected — disabling expert streaming (compressed reads decompress on read)");
+            false
+        } else {
+            stream_experts
+        };
+        // A container with no routed-expert tensors has nothing to stream, and
+        // honoring a streaming request anyway builds rings, transient reserves
+        // and a warm cache for a lane that will never read a byte — measured on
+        // the first resident Qwen boot as a 10.2 GB stream reserve in the [ram]
+        // projection of a model that fits whole in RAM (serve hard-requests
+        // streaming, which is also why COLI_STREAM=0 appeared to be ignored).
+        // Same shape as the compressed override above: the container's own
+        // contents outrank the caller's flag, and the override says so out loud.
+        let stream_experts = if stream_experts && !has_routed_experts(&st) {
+            eprintln!("[peregrine] no routed-expert tensors — forcing resident mode (nothing to stream)");
             false
         } else {
             stream_experts
@@ -5869,6 +5904,33 @@ mod tests {
         crate::testkit::build_tiny_qwen_model(&d, 42)?;
         prefill_step_identity_and_generate(&d)?;
         std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_container_without_experts_refuses_to_stream() -> Result<(), peregrine_core::Error> {
+        // serve hard-requests streaming for every model; a container with no
+        // routed-expert tensors must land resident anyway — no ecache, no
+        // rings, no 10.2 GB stream reserve — and still decode.
+        let d = std::env::temp_dir().join(format!("peregrine_noexp_stream_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_hybrid_model(&d, 47)?;
+        let mut m = Model::load_streaming_ecache(&d, true, 8 << 20)?; // caller asks; container declines
+        assert!(
+            m.ecache_prefetch_reads().is_none(),
+            "no streaming apparatus may be built for a container with nothing to stream"
+        );
+        let logits = m.forward_step(&[1, 5, 9], 0)?;
+        assert_eq!(logits.len(), 3 * m.cfg.vocab as usize, "resident decode still works");
+        // ...while a GLM container under the identical call keeps its cache —
+        // the override is evidence-gated, not arch-gated.
+        let g = tmp_model_dir("noexp_glm_ctrl")?;
+        let mg = Model::load_streaming_ecache(&g, true, 8 << 20)?;
+        assert!(mg.ecache_prefetch_reads().is_some(), "a MoE container must still stream");
+        std::fs::remove_dir_all(&d)?;
+        std::fs::remove_dir_all(&g)?;
         Ok(())
     }
 
