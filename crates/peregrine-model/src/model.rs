@@ -6334,6 +6334,85 @@ mod tests {
     /// count assertion: if residency were zero the comparison would be
     /// CPU-vs-CPU, so the test demands at least one resident layer before it
     /// believes the agreement means anything.
+    /// Reproduces the serving failure's REGIME: a hybrid model with only a few
+    /// attention-side projections resident and the budget exhausted mid-set —
+    /// the case a test with headroom never reaches, and the one where a
+    /// placement bug (a weight holding another's handle, or a declined upload
+    /// leaving a stale one) would show as correct arithmetic on the wrong
+    /// matrix. Tokens must not change.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_partially_resident_hybrid_decodes_identically() -> Result<(), peregrine_core::Error> {
+        if peregrine_cuda::init(&[0]) < 1 {
+            return Ok(());
+        }
+        let d = std::env::temp_dir().join(format!("peregrine_partial_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        // 256-wide: past the width where the device entry declines, so the
+        // comparison below is against a device that actually computed.
+        crate::testkit::build_sized_hybrid_model(
+            &d,
+            71,
+            crate::testkit::sized_hybrid_cfg_json(256, 512, 64, 64),
+        )?;
+        let toks = [1, 5, 9, 2, 7];
+
+        // Prefill, then ONE decode step — the device path is s_n == 1 only, so a
+        // prefill-only comparison exercises nothing (silently vacuous until the
+        // bit-identity check below caught it).
+        let mut cpu = Model::load(&d)?;
+        cpu.forward_step(&toks, 0)?;
+        let want = cpu.forward_step(&[3], toks.len())?;
+
+        // Upload only the FIRST FEW projections, then stop — the mid-set
+        // exhaustion the serving run hit at 0.02 GB of 12.19.
+        let mut gpu = Model::load(&d)?;
+        let mut placed = 0usize;
+        for l in gpu.layers.iter_mut() {
+            for w in l.attn_weights_mut() {
+                if placed >= 3 {
+                    break;
+                }
+                if w.upload_to_device(0, 1 << 20)? {
+                    placed += 1;
+                }
+            }
+        }
+        assert!(placed > 0, "the test must actually place weights or it proves nothing");
+        gpu.forward_step(&toks, 0)?;
+        let got = gpu.forward_step(&[3], toks.len())?;
+        // Vacuity check, and it is not paranoia: an upload can succeed while the
+        // device entry DECLINES the shape at compute time and falls back (it
+        // validates first — see the matvec shape sweep). The device path is
+        // numerically different from the CPU one, so bit-identical logits mean
+        // it never ran and this test asserted nothing.
+        assert!(
+            got.iter().zip(&want).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "logits are bit-identical to the CPU path: the device never computed, so this test is vacuous \
+             (placed {placed} weights at these fixture dims)"
+        );
+
+        let vocab = gpu.cfg.vocab as usize;
+        for srow in 0..1 {
+            let arg = |v: &[f32]| {
+                v[srow * vocab..(srow + 1) * vocab]
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b })
+                    .0
+            };
+            assert_eq!(
+                arg(&got),
+                arg(&want),
+                "row {srow}: partial residency ({placed} weights) must not change the token"
+            );
+        }
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn gpu_resident_layers_decode_like_cpu_layers() -> Result<(), peregrine_core::Error> {

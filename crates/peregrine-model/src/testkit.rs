@@ -211,6 +211,34 @@ pub fn build_sized_qwen_model(dir: &Path, seed: u64, cfg_json: serde_json::Value
     build_tiny_gqa_family(dir, seed, cfg_json)
 }
 
+/// A hybrid config at caller-chosen width. The 16-wide [`tiny_hybrid_cfg_json`]
+/// exercises every code path structurally, but it is below the width at which
+/// the device GEMV entry engages — so a GPU test built on it passes without the
+/// device ever computing. Tests that must actually reach the kernel use this.
+pub fn sized_hybrid_cfg_json(hidden: i64, inter: i64, head_dim: i64, lin_dim: i64) -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "vocab_size": 32, "hidden_size": hidden, "intermediate_size": inter,
+            "num_hidden_layers": 3, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": head_dim,
+            "layer_types": ["linear_attention", "linear_attention", "full_attention"],
+            "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+            "linear_key_head_dim": lin_dim, "linear_value_head_dim": lin_dim,
+            "linear_conv_kernel_dim": 4, "attn_output_gate": true,
+            "partial_rotary_factor": 0.25,
+            "rope_parameters": {"rope_theta": 10000000.0, "partial_rotary_factor": 0.25},
+            "rms_norm_eps": 1e-6, "eos_token_id": 0
+        }
+    })
+}
+
+/// [`sized_hybrid_cfg_json`] written to disk as a loadable model.
+pub fn build_sized_hybrid_model(dir: &Path, seed: u64, cfg_json: serde_json::Value) -> Result<(), Error> {
+    build_tiny_gqa_family(dir, seed, cfg_json)
+}
+
 /// Write a tiny random dense-GQA (classic Qwen3) model into `dir`.
 pub fn build_tiny_qwen_model(dir: &Path, seed: u64) -> Result<(), Error> {
     build_tiny_gqa_family(dir, seed, tiny_qwen_cfg_json())
