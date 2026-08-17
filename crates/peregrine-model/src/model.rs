@@ -6334,6 +6334,69 @@ mod tests {
     /// count assertion: if residency were zero the comparison would be
     /// CPU-vs-CPU, so the test demands at least one resident layer before it
     /// believes the agreement means anything.
+    /// The configuration nobody has ever run: the **MoE** expert tier
+    /// (`COLI_GPU`) built against a container with NO routed experts.
+    ///
+    /// `has_routed_experts` was wired to force streaming off and never
+    /// consulted before building this tier, so a dense container with
+    /// `COLI_GPU=1` reaches expert-residency code whose every assumption —
+    /// that `mlp.experts.N.*` tensors exist, that some layer is sparse — is
+    /// false. Whatever it does, it must not be silent corruption: either it
+    /// declines to build, or it builds empty and the model still decodes
+    /// exactly as it does without it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_expert_tier_on_a_container_with_no_experts_is_harmless() -> Result<(), peregrine_core::Error> {
+        if peregrine_cuda::init(&[0]) < 1 {
+            return Ok(());
+        }
+        let d = std::env::temp_dir().join(format!("peregrine_moe_dense_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_sized_hybrid_model(
+            &d,
+            72,
+            crate::testkit::sized_hybrid_cfg_json(256, 512, 64, 64),
+        )?;
+        let mut baseline = Model::load(&d)?;
+        baseline.forward_step(&[1, 5, 9, 2, 7], 0)?;
+        let want = baseline.forward_step(&[3], 5)?;
+
+        // Build the expert tier directly against this container, the way
+        // `COLI_GPU=1` would.
+        let st = peregrine_core::SafeTensors::open(&d)?;
+        let cfg = peregrine_core::Cfg::load(&d)?;
+        let counts = vec![0u32; (cfg.n_layers as usize + 1) * cfg.n_experts as usize];
+        // Declining is a fine answer — and the reason is reported rather than
+        // dropped, so a future failure mode shows up as text instead of a
+        // silently-skipped assertion.
+        let tier = match crate::gpu::GpuTier::build(&st, &cfg, 1 << 20, &counts) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("expert tier declined a zero-expert container: {e}");
+                None
+            }
+        };
+        match tier {
+            None => {}
+            Some(t) => {
+                assert_eq!(t.len(), 0, "a container with no experts must not place any");
+                // And a model carrying it must decode identically.
+                let mut m = Model::load(&d)?;
+                m.gpu = Some(t);
+                m.forward_step(&[1, 5, 9, 2, 7], 0)?;
+                let got = m.forward_step(&[3], 5)?;
+                assert!(
+                    got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "an empty expert tier must not change a single logit"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
     /// Reproduces the serving failure's REGIME: a hybrid model with only a few
     /// attention-side projections resident and the budget exhausted mid-set —
     /// the case a test with headroom never reaches, and the one where a
