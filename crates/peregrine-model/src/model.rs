@@ -3172,9 +3172,23 @@ impl Model {
         // is what it refuses to spend, for activations and the context.
         let gpu_dense = if std::env::var("COLI_GPU_DENSE").is_ok() && !has_routed_experts(&st) {
             let headroom = env_usize("COLI_GPU_DENSE_HEADROOM_MB", 1024) * (1 << 20);
+            // `COLI_GPU_DENSE_LAYERS=N` pins the resident count instead of
+            // taking whatever fits. It exists because placement is not output-
+            // neutral: the device path is far more accurate than the CPU one
+            // (measured rms 1.1e-7 vs 3.0e-3 at decode), so WHICH layers are
+            // resident changes the tokens produced. Fitting to free VRAM makes
+            // that depend on whatever else holds the card, so two boots of one
+            // container can differ — fine for serving, where the better path
+            // wins and the log below says what ran, but not for a measurement
+            // arm, where the comparison must be repeatable. Pin it for gates,
+            // leave it unset for serving.
+            let pinned = std::env::var("COLI_GPU_DENSE_LAYERS").ok().and_then(|v| v.trim().parse::<usize>().ok());
             let mut tier = crate::gpu::GpuDenseTier::new(0);
             let mut refused = None;
             for (li, l) in layers.iter().enumerate() {
+                if pinned.is_some_and(|n| li >= n) {
+                    break;
+                }
                 let Some(mlp) = l.dense.as_ref() else { continue };
                 match tier.try_add(li, &mlp.gate, &mlp.up, &mlp.down, headroom) {
                     // Budget exhausted: stop probing. Later layers are no
@@ -3194,11 +3208,18 @@ impl Model {
             }
             let (n, bytes, skipped) = tier.stats();
             if n > 0 {
+                // Printed unconditionally, and it is not decoration: the
+                // resident set determines which layers took the more accurate
+                // device path, so this line is what makes a differing output
+                // between two runs explainable instead of mysterious. Anything
+                // recording a result from this process — a gate, a bench arm —
+                // should record it alongside the number.
                 eprintln!(
-                    "peregrine: [gpu-dense] {n} of {} MLP layers resident, {:.2} GB VRAM{}",
+                    "peregrine: [gpu-dense] {n} of {} MLP layers resident, {:.2} GB VRAM{}{}",
                     layers.len(),
                     bytes as f64 / 1e9,
-                    if skipped > 0 { format!(" ({skipped}+ skipped: VRAM budget)") } else { String::new() }
+                    if skipped > 0 { format!(", {skipped}+ skipped (VRAM budget)") } else { String::new() },
+                    if pinned.is_some() { " [pinned]" } else { " [fit-to-free-VRAM: not reproducible across boots]" }
                 );
                 Some(tier)
             } else {
