@@ -156,6 +156,15 @@ primary metric, B regime, REPEATS) / **Prereqs** / **Risk**.
    Prereqs: a domain corpus + a serve pass to trace it (queue slot). Verdict-
    risk: (a) low, composes with Track A; (b) high, expect flip-gate failure
    beyond the true never-routed tail. Rank (a) high, (b) low.
+   STATUS: form (a) BUILT — COLI_TOPIC_ROUTING (topic.rs, commit 4ccb2bd) is
+   per-TokenClass residency steering, now with **dynamic adaptive aging**
+   (COLI_TOPIC_HALFLIFE, later commit): profiles decay at a rate scaled by the
+   routing-entropy EWMA, so they track recent routing and re-form on a topic
+   shift instead of anchoring to all-time counts. A/B = queue job 99, three
+   arms (off / static / adaptive) to price steering and aging separately.
+   Follow-on (unbuilt): close the loop — adapt the tiebreak *strength* from
+   measured cache-hit feedback (the PrefetchTuner.observe idiom), so the
+   influence of the topic signal itself is learned, not fixed.
 
 External-survey notes (20:30, so nobody re-derives these):
 - HOBBIT's skip-vs-replace curve (PPL +6.6% skip vs +1.9% replace at 40%)
@@ -233,6 +242,29 @@ read 2026-08-15 during the port.
    sampled requests — same output-neutrality class as `COLI_DRAFT_SAMPLED`,
    so it could only ever be per-request opt-in. Rank low; recorded so the
    idea's cost is not rediscovered.
+
+5. **Grouped int4 for imported containers** [added 2026-08-17]. **NOT a tok/s
+   lever — a FIDELITY lever, listed here because this is the shared backlog.**
+   It costs a little throughput (more scale bytes to move), so it competes for
+   attention with the levers above rather than adding to them. Mechanism:
+   peregrine's per-row int4 gives one f32 scale to a whole 5120-wide row, which
+   measures **17–20 % relative error against the bf16 originals** (gate_proj
+   0.167, down_proj 0.196, q_proj 0.164, o_proj 0.183, in_proj_qkv 0.168) —
+   the dominant term in the Qwen container's 0.2422 cross-engine flip rate
+   (2026-08-17 parity pass in benchmarks.md; activation precision was measured
+   and refuted as the cause, McNemar p = 0.774). Expected size: **−29 % weight
+   error at g128, −35 % at g64**, i.e. 0.167 → 0.119 / 0.109. Cost: scales add
+   **0.53 GB (g128) or 1.07 GB (g64)** to the 8.1 GiB MLP set, so 8.6–9.2 GiB
+   against ~11 GiB usable — affordable. Prereqs, and this is the real work:
+   `gpu.rs` uploads raw only for per-row int4 (fmt 2) and dequantizes anything
+   else to f32 at 8×, and the w4 GEMV/matvec kernels are per-row only — so a
+   grouped arm needs per-group scale indexing inside the same reduction plus an
+   upload path. Sequence it AFTER the GPU tier generalization, since the tier
+   has to cover enough of the model for the fidelity difference to be worth
+   anything. Measurement: re-import with `--target int4-g128`, then the same
+   parity gate + paired flip comparison — the instrument already exists.
+   Risk: none to correctness; the container format is self-describing and
+   `QtInfo::detect` resolves grouped from the scale cardinality.
 
 **Closed as not-applicable here (so nobody re-evaluates):** DSpark auxiliary
 draft model (DeepSeek-only checkpoint; GLM-5.2's int8 MTP head already fills

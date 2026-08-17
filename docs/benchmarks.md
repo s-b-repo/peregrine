@@ -772,3 +772,81 @@ again** — cold 2504.6 s → warm 389.0 s (6.4×), output byte-identical,
 `dropped_busy=0` (the depth-1 writer queue never cost a checkpoint in this
 workload). The 08-15 synchronous-path result reproduces on the shipped
 implementation. Logs: `bench-data/2026-08-15-queue/kvstore-smoke-async/`.
+
+## Parity pass — 2026-08-17 (Qwen3.8-27B int4 container vs HF bf16)
+
+The first cross-engine parity measurement in this repo: an imported int4
+container teacher-forced against the original checkpoint's own bf16 argmax
+(`peregrine flip-rate --reference-json`, reference from
+`scripts/qwen-parity-reference.py`). It produced one licensing number, one
+refuted hypothesis, and a correction to how flip rates are read.
+
+**The gate: `flip_rate = 0.2422`, with 30 of 31 flips inside the reference's
+own top-8.** 128 positions of the committed prose corpus. The reference is
+healthy and aligned — 59 % of its argmaxes equal the actual next token, 88 %
+of true next tokens are in its top-8, no off-by-one signature.
+
+**Do not read this against the ≤0.05 quantization bar — that bar does not
+describe a cross-engine gate.** It was calibrated on container-vs-container
+runs (int4 source vs int3 candidate) where *both* sides carried int4-level
+error in the same engine and it cancelled. Here only one side is quantized and
+the two sides are different implementations, so the floor is structurally
+higher and cannot be subtracted (peregrine cannot load bf16, so no same-engine
+reference exists). Judge it by the discriminator and by output: near-ties
+dominate, and the served model answers questions correctly.
+
+**Refuted: activation quantization is not the cause.** peregrine's CPU path is
+w4a8 — it quantizes activations to int8 — while the device path and HF keep
+higher precision, and one MLP shape measured 29× closer to f32 truth on the
+device. That made activation precision the obvious suspect. A measurement-only
+f32-activation path (`COLI_ACT_F32=1`, every matmul: all 64 MLPs, all attention
+projections, lm_head) settled it, same container and reference, single
+variable:
+
+| arm | flips | rate | in ref top-8 |
+|---|---:|---:|---:|
+| int8 activations (production) | 33/128 | 0.2578 | 31/33 |
+| f32 activations (measurement) | 31/128 | 0.2422 | 30/31 |
+
+Paired over the same positions: **26 flips survive exact f32 activations**, 7
+fixed, 5 introduced — McNemar exact **p = 0.774** on 12 discordant pairs. Two
+net flips of 33. The 29× MLP error is real but does not propagate to top-1 at
+this scale. (Pairing matters: at n=128 the rate difference alone is inside the
+±3.9 pp binomial noise, while the paired test is decisive.)
+
+**The actual cause: per-row int4 weight quantization.** Measured directly
+against the bf16 originals (384-row samples, `amax/7`, ties-to-even):
+
+| tensor | per-row (shipped) | g128 | g64 | g32 |
+|---|---:|---:|---:|---:|
+| `layers.0.mlp.gate_proj` | 0.1667 | 0.1191 | 0.1089 | 0.0978 |
+| `layers.0.mlp.down_proj` | 0.1964 | 0.1203 | 0.1096 | 0.0983 |
+| `layers.3.self_attn.q_proj` | 0.1635 | 0.1182 | 0.1083 | 0.0974 |
+| `layers.3.self_attn.o_proj` | 0.1828 | 0.1216 | 0.1106 | 0.0990 |
+| `layers.0.linear_attn.in_proj_qkv` | 0.1684 | 0.1193 | 0.1091 | 0.0980 |
+
+One f32 scale for a whole 5120-wide row costs **17–20 % relative error**. That
+is the dominant term, it is a format property rather than a defect, and it
+explains a pervasive, unbiased, near-tie-heavy flip distribution exactly.
+Decomposition: **A − B = 0.0156** is the CPU path's activation penalty;
+**B = 0.2422** is the container's best-case fidelity in this engine.
+
+**Container verdict: licensed** as a faithful int4 rendering, with int4's
+fidelity cost stated. Import fidelity was verified separately (dequantized
+weights vs bf16 originals, correlation 0.986 — clean int4 noise).
+
+**Two engine bugs this pass found and closed** (both engine-side, container
+unaffected): the q/gate projection is per-head *interleaved*, and a flat read
+scrambled all 16 attention layers; and `Qwen3NextRMSNorm` is zero-centered
+(`x̂·(1+w)`, zero-init weights), so a plain-norm multiply collapsed
+activations. Before the fixes the gate read 1.000 with **zero** flips in top-8
+— systematic garbage, which is what a semantics bug looks like next to the
+noise-shaped 0.24 above. A third fault was data, not code: two weight shards
+were size-complete but zero-filled, an aria2c preallocation that survived a
+rename-by-size check.
+
+**Open lever, not taken:** grouped int4 would cut weight error ~29 % (g128) to
+~35 % (g64), costing 0.53–1.07 GB of extra scales. It conflicts with the GPU
+path, which uploads raw only for per-row int4 (fmt 2) and dequantizes anything
+else to f32 at 8×; both a grouped GEMV arm and `gpu.rs`'s upload path would
+need it. A kernel-support question, not a capacity one.
