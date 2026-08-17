@@ -799,6 +799,46 @@ async fn chat_completions(
     }
 }
 
+/// What the model is actually being asked: the rendered prompt string and the
+/// exact ids it tokenizes to, for the same `messages` a completion would take.
+///
+/// Exists because two sessions independently lost hours to "what tokens are
+/// these" during one debugging pass — the answer required rendering the
+/// checkpoint's chat template through a reference tokenizer by hand, and it
+/// turned out to be the whole explanation (the template opens a `<think>`
+/// block this server's filter then drops). A server that can generate tokens
+/// but cannot show them makes that class of question archaeology.
+///
+/// Authenticated like every other `/v1/*` route, and deliberately echoes the
+/// prompt VERBATIM including control markup — that is the point: the bug being
+/// hunted is usually in the markup.
+async fn debug_tokenize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ChatRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_auth(&state, &headers)?;
+    let prompt = build_prompt(&req.messages, active_tools(&req), state.inner.chatml_prompt);
+    let tokenizer = state.inner.tokenizer.clone();
+    let p2 = prompt.clone();
+    let ids = tk(tokio::task::spawn_blocking(move || tokenizer.encode(&p2))
+        .await
+        .map_err(|e| ApiError::internal(format!("encode task: {e}")))?)?;
+    // Per-id decode alongside the ids: an id that renders to nothing is the
+    // signature that matters, and only the pairing makes it visible.
+    let vocab = state.inner.tokenizer.decode_handle();
+    let pieces: Vec<String> = ids
+        .iter()
+        .map(|&t| String::from_utf8_lossy(vocab.token_bytes(t).unwrap_or(&[])).into_owned())
+        .collect();
+    Ok(Json(serde_json::json!({
+        "prompt": prompt,
+        "ids": ids,
+        "pieces": pieces,
+        "n_tokens": ids.len(),
+    })))
+}
+
 /// The OpenAI `chat.completion` body. Shared by the generated and memoized paths so
 /// a replayed response cannot drift in shape from a fresh one.
 fn json_completion(
@@ -1215,6 +1255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/debug/tokenize", post(debug_tokenize))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
