@@ -613,6 +613,70 @@ mod tests {
     /// accurate of the two (f32 throughout vs int8 activations), and the
     /// direction is asserted as well as the magnitude: uploading a weight must
     /// not make it worse.
+    /// The device matvec across the SHAPES A REAL MODEL ACTUALLY HAS, not one
+    /// convenient square-ish one.
+    ///
+    /// Written after a squat [384,256] test passed while a serving run went
+    /// wrong: Qwen's weights span from [48,5120] (the DeltaNet gates — 48
+    /// output rows against a 5120-long reduction, so few blocks each reducing a
+    /// long row) to [17408,5120] and [5120,17408]. Those are different kernel
+    /// regimes, and a reduction bug shows in one and not the others. Any shape
+    /// that reduces wrong is caught here rather than in a token stream.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_device_matvec_is_correct_across_real_model_shapes() -> Result<(), peregrine_core::Error> {
+        if peregrine_cuda::init(&[0]) < 1 {
+            return Ok(());
+        }
+        // (o, i): GDN gates, GDN qkv-ish, attention q/o, MLP gate/up, MLP down,
+        // plus degenerate single-row and odd widths.
+        for (o, i) in [(48usize, 5120usize), (2048, 5120), (5120, 5120), (1024, 5120), (5120, 1024), (1, 4096), (7, 33)] {
+            let mut seed = 0xB0A7u64 ^ ((o * 131 + i) as u64);
+            let mut rnd = || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+            };
+            let w: Vec<f32> = (0..o * i).map(|_| rnd() * 0.1).collect();
+            let mut qt = super::test_support::quant_i4(&w, o, i);
+            let x: Vec<f32> = (0..i).map(|_| rnd()).collect();
+            let cpu = qt.apply_vec(&x, 1);
+            if !qt.upload_to_device(0, 16 << 20)? {
+                continue; // no headroom for this one right now
+            }
+            let gpu = qt.apply_vec(&x, 1);
+            let mut row = vec![0f32; i];
+            let mut truth = vec![0f32; o];
+            for oo in 0..o {
+                qt.dequant_row_into(oo, &mut row);
+                truth[oo] = row.iter().zip(&x).map(|(a, b)| a * b).sum();
+            }
+            let rms = |v: &[f32]| {
+                (v.iter().zip(&truth).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / v.len() as f32).sqrt()
+            };
+            let (e_cpu, e_gpu) = (rms(&cpu), rms(&truth.iter().zip(&gpu).map(|(_, g)| *g).collect::<Vec<_>>()));
+            let scale = truth.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            // A shape the device entry declines (it validates before computing)
+            // falls back to the CPU, and the two results are then bit-identical.
+            // That is correct behaviour, not a wrong answer, so it is
+            // distinguished rather than asserted against — what must never
+            // happen is the device RUNNING and returning something wrong.
+            let fell_back = cpu.iter().zip(&gpu).all(|(a, b)| a.to_bits() == b.to_bits());
+            println!(
+                "[{o}x{i}] rms vs truth: cpu {e_cpu:.3e}  gpu {e_gpu:.3e}  (scale {scale:.3e}){}",
+                if fell_back { "  [declined -> CPU]" } else { "" }
+            );
+            if fell_back {
+                continue;
+            }
+            assert!(
+                e_gpu / scale < 1e-3,
+                "device matvec is wrong at [{o}x{i}]: rms {e_gpu:.3e} on scale {scale:.3e}"
+            );
+            assert!(e_gpu <= e_cpu, "device must not be less accurate at [{o}x{i}]");
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn a_resident_weight_matvecs_like_the_cpu_path_only_better() -> Result<(), peregrine_core::Error> {

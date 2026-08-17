@@ -2745,6 +2745,16 @@ fn forward_layer(
         // the CPU path. Which one a layer takes is fixed for the whole run (see
         // `GpuDenseTier`), so this is a placement decision, not a race. A device
         // failure mid-run is an advisory and a fallback, never a lost request.
+        //
+        // **Why the MLP keeps a fused tier while every other weight goes through
+        // `QtWeight`'s own device handle.** That asymmetry is deliberate and
+        // reads as an inconsistency without the reason. The fused kernel does
+        // gate, up and down in one call with the intermediates held in VRAM;
+        // three per-weight matvecs would download a `moe_inter`-wide
+        // intermediate and upload it again, twice per layer per token (17408
+        // floats each way at Qwen's shape). Generalizing here would cost more
+        // than it generalized. The rule is: fused where a fused kernel exists,
+        // per-weight everywhere else.
         match ctx.gpu_dense.and_then(|t| t.mlp(li, &nrm2, s_n, d)) {
             Some(Ok(y)) => y,
             Some(Err(e)) => {
@@ -2849,6 +2859,16 @@ fn forward_layer_batched(
         // the CPU path. Which one a layer takes is fixed for the whole run (see
         // `GpuDenseTier`), so this is a placement decision, not a race. A device
         // failure mid-run is an advisory and a fallback, never a lost request.
+        //
+        // **Why the MLP keeps a fused tier while every other weight goes through
+        // `QtWeight`'s own device handle.** That asymmetry is deliberate and
+        // reads as an inconsistency without the reason. The fused kernel does
+        // gate, up and down in one call with the intermediates held in VRAM;
+        // three per-weight matvecs would download a `moe_inter`-wide
+        // intermediate and upload it again, twice per layer per token (17408
+        // floats each way at Qwen's shape). Generalizing here would cost more
+        // than it generalized. The rule is: fused where a fused kernel exists,
+        // per-weight everywhere else.
         match ctx.gpu_dense.and_then(|t| t.mlp(li, &nrm2, s_n, d)) {
             Some(Ok(y)) => y,
             Some(Err(e)) => {
@@ -3237,9 +3257,18 @@ impl Model {
             let mut proj_n = 0usize;
             let mut proj_bytes = 0usize;
             let mut matmul_total = 0usize;
-            for l in layers.iter_mut() {
+            for (li, l) in layers.iter_mut().enumerate() {
+                // The pin bounds BOTH groups. It bounded only the fused MLPs
+                // until 2026-08-17, so `COLI_GPU_DENSE_LAYERS=0` — the natural
+                // way to ask for "the tier, placing nothing" — still uploaded
+                // every projection that fit, which is the opposite of what the
+                // knob says and makes it useless as a bisection tool.
+                let past_pin = pinned.is_some_and(|n| li >= n);
                 for w in l.attn_weights_mut() {
                     matmul_total += w.packed_bytes();
+                    if past_pin {
+                        continue;
+                    }
                     match w.upload_to_device(0, headroom) {
                         Ok(true) => {
                             proj_n += 1;
@@ -6314,6 +6343,148 @@ mod tests {
     /// count assertion: if residency were zero the comparison would be
     /// CPU-vs-CPU, so the test demands at least one resident layer before it
     /// believes the agreement means anything.
+    /// The configuration nobody has ever run: the **MoE** expert tier
+    /// (`COLI_GPU`) built against a container with NO routed experts.
+    ///
+    /// `has_routed_experts` was wired to force streaming off and never
+    /// consulted before building this tier, so a dense container with
+    /// `COLI_GPU=1` reaches expert-residency code whose every assumption —
+    /// that `mlp.experts.N.*` tensors exist, that some layer is sparse — is
+    /// false. Whatever it does, it must not be silent corruption: either it
+    /// declines to build, or it builds empty and the model still decodes
+    /// exactly as it does without it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_expert_tier_on_a_container_with_no_experts_is_harmless() -> Result<(), peregrine_core::Error> {
+        if peregrine_cuda::init(&[0]) < 1 {
+            return Ok(());
+        }
+        let d = std::env::temp_dir().join(format!("peregrine_moe_dense_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_sized_hybrid_model(
+            &d,
+            72,
+            crate::testkit::sized_hybrid_cfg_json(256, 512, 64, 64),
+        )?;
+        let mut baseline = Model::load(&d)?;
+        baseline.forward_step(&[1, 5, 9, 2, 7], 0)?;
+        let want = baseline.forward_step(&[3], 5)?;
+
+        // Build the expert tier directly against this container, the way
+        // `COLI_GPU=1` would.
+        let st = peregrine_core::SafeTensors::open(&d)?;
+        let cfg = peregrine_core::Cfg::load(&d)?;
+        let counts = vec![0u32; (cfg.n_layers as usize + 1) * cfg.n_experts as usize];
+        // Declining is a fine answer — and the reason is reported rather than
+        // dropped, so a future failure mode shows up as text instead of a
+        // silently-skipped assertion.
+        let tier = match crate::gpu::GpuTier::build(&st, &cfg, 1 << 20, &counts) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("expert tier declined a zero-expert container: {e}");
+                None
+            }
+        };
+        match tier {
+            None => {}
+            Some(t) => {
+                assert_eq!(t.len(), 0, "a container with no experts must not place any");
+                // And a model carrying it must decode identically.
+                let mut m = Model::load(&d)?;
+                m.gpu = Some(t);
+                m.forward_step(&[1, 5, 9, 2, 7], 0)?;
+                let got = m.forward_step(&[3], 5)?;
+                assert!(
+                    got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "an empty expert tier must not change a single logit"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    /// Reproduces the serving failure's REGIME: a hybrid model with only a few
+    /// attention-side projections resident and the budget exhausted mid-set —
+    /// the case a test with headroom never reaches, and the one where a
+    /// placement bug (a weight holding another's handle, or a declined upload
+    /// leaving a stale one) would show as correct arithmetic on the wrong
+    /// matrix. Tokens must not change.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_partially_resident_hybrid_decodes_identically() -> Result<(), peregrine_core::Error> {
+        if peregrine_cuda::init(&[0]) < 1 {
+            return Ok(());
+        }
+        let d = std::env::temp_dir().join(format!("peregrine_partial_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        // 256-wide: past the width where the device entry declines, so the
+        // comparison below is against a device that actually computed.
+        crate::testkit::build_sized_hybrid_model(
+            &d,
+            71,
+            crate::testkit::sized_hybrid_cfg_json(256, 512, 64, 64),
+        )?;
+        let toks = [1, 5, 9, 2, 7];
+
+        // Prefill, then ONE decode step — the device path is s_n == 1 only, so a
+        // prefill-only comparison exercises nothing (silently vacuous until the
+        // bit-identity check below caught it).
+        let mut cpu = Model::load(&d)?;
+        cpu.forward_step(&toks, 0)?;
+        let want = cpu.forward_step(&[3], toks.len())?;
+
+        // Upload only the FIRST FEW projections, then stop — the mid-set
+        // exhaustion the serving run hit at 0.02 GB of 12.19.
+        let mut gpu = Model::load(&d)?;
+        let mut placed = 0usize;
+        for l in gpu.layers.iter_mut() {
+            for w in l.attn_weights_mut() {
+                if placed >= 3 {
+                    break;
+                }
+                if w.upload_to_device(0, 1 << 20)? {
+                    placed += 1;
+                }
+            }
+        }
+        assert!(placed > 0, "the test must actually place weights or it proves nothing");
+        gpu.forward_step(&toks, 0)?;
+        let got = gpu.forward_step(&[3], toks.len())?;
+        // Vacuity check, and it is not paranoia: an upload can succeed while the
+        // device entry DECLINES the shape at compute time and falls back (it
+        // validates first — see the matvec shape sweep). The device path is
+        // numerically different from the CPU one, so bit-identical logits mean
+        // it never ran and this test asserted nothing.
+        assert!(
+            got.iter().zip(&want).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "logits are bit-identical to the CPU path: the device never computed, so this test is vacuous \
+             (placed {placed} weights at these fixture dims)"
+        );
+
+        let vocab = gpu.cfg.vocab as usize;
+        for srow in 0..1 {
+            let arg = |v: &[f32]| {
+                v[srow * vocab..(srow + 1) * vocab]
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b })
+                    .0
+            };
+            assert_eq!(
+                arg(&got),
+                arg(&want),
+                "row {srow}: partial residency ({placed} weights) must not change the token"
+            );
+        }
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn gpu_resident_layers_decode_like_cpu_layers() -> Result<(), peregrine_core::Error> {
