@@ -625,6 +625,8 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn the_device_matvec_is_correct_across_real_model_shapes() -> Result<(), peregrine_core::Error> {
+        // Shares the one device with every other GPU test in the crate.
+        let _g = crate::gpu_test_lock::gpu_guard();
         if peregrine_cuda::init(&[0]) < 1 {
             return Ok(());
         }
@@ -680,6 +682,8 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn a_resident_weight_matvecs_like_the_cpu_path_only_better() -> Result<(), peregrine_core::Error> {
+        // Shares the one device with every other GPU test in the crate.
+        let _g = crate::gpu_test_lock::gpu_guard();
         if peregrine_cuda::init(&[0]) < 1 {
             return Ok(());
         }
