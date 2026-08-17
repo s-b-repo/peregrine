@@ -278,6 +278,39 @@ Together with [K]: a timing harness cannot see a kernel that is fast and wrong; 
 correctness harness cannot see a kernel that never ran. A device test needs both
 guards.
 
+### [K3] Empty output is not evidence of broken decode
+
+**A response filter that drops a region makes an empty completion a *legitimate*
+render.** `OutputFilter` removes `<think>…</think>` by design (reasoning is
+dropped, not shown), so a request whose token budget expires before the closing
+tag renders every generated token invisible: `completion_tokens == max_tokens`,
+zero SSE content deltas, `content: ""`, `finish_reason: stop`. Nothing is broken.
+The model reasoned, the filter ate it, the budget ran out mid-thought.
+
+This cost most of a night in 2026-08-17, and the expensive part was not finding
+the filter — it was that the symptom is **content-dependent**, so it looks like
+whatever else changed. Two prompts of *identical* token length landed on opposite
+sides (one answered fast, one reasoned longer), and enabling the GPU flipped
+prompts across the line because slightly different numerics change the reasoning
+*trajectory*. That produced a clean, reproducible, and completely wrong
+attribution to the GPU placement path — a three-arm partition where every arm's
+result was real and the conclusion was not.
+
+**The corollary is the practical part:** when a filter can eat the output, the
+fastest discriminator is not more instrumentation, it is *a prompt whose answer
+the filter cannot swallow*. Vary the input before you bisect the code.
+
+And the general form, which is the rule the whole [K] family serves: **a
+differential experiment is only as good as the axis you vary, and the axis worth
+varying is the one you are most confident does not matter.** The confound here
+sat in the axis held fixed — one prompt, reused all night for "verification",
+which is also what hid the bug in the first place.
+
+`POST /v1/debug/tokenize` exists for this: it returns the rendered prompt
+verbatim (control markup included), the exact ids, and each id's rendered piece.
+The pairing is what earns its keep — an id that renders to nothing is invisible
+in a list of ids and obvious beside its piece.
+
 ## What is intentionally NOT flagged
 
 The upstream rustsploit catalogue runs to 125+ patterns across A–Q. Most of its
