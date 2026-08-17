@@ -2745,6 +2745,16 @@ fn forward_layer(
         // the CPU path. Which one a layer takes is fixed for the whole run (see
         // `GpuDenseTier`), so this is a placement decision, not a race. A device
         // failure mid-run is an advisory and a fallback, never a lost request.
+        //
+        // **Why the MLP keeps a fused tier while every other weight goes through
+        // `QtWeight`'s own device handle.** That asymmetry is deliberate and
+        // reads as an inconsistency without the reason. The fused kernel does
+        // gate, up and down in one call with the intermediates held in VRAM;
+        // three per-weight matvecs would download a `moe_inter`-wide
+        // intermediate and upload it again, twice per layer per token (17408
+        // floats each way at Qwen's shape). Generalizing here would cost more
+        // than it generalized. The rule is: fused where a fused kernel exists,
+        // per-weight everywhere else.
         match ctx.gpu_dense.and_then(|t| t.mlp(li, &nrm2, s_n, d)) {
             Some(Ok(y)) => y,
             Some(Err(e)) => {
@@ -2849,6 +2859,16 @@ fn forward_layer_batched(
         // the CPU path. Which one a layer takes is fixed for the whole run (see
         // `GpuDenseTier`), so this is a placement decision, not a race. A device
         // failure mid-run is an advisory and a fallback, never a lost request.
+        //
+        // **Why the MLP keeps a fused tier while every other weight goes through
+        // `QtWeight`'s own device handle.** That asymmetry is deliberate and
+        // reads as an inconsistency without the reason. The fused kernel does
+        // gate, up and down in one call with the intermediates held in VRAM;
+        // three per-weight matvecs would download a `moe_inter`-wide
+        // intermediate and upload it again, twice per layer per token (17408
+        // floats each way at Qwen's shape). Generalizing here would cost more
+        // than it generalized. The rule is: fused where a fused kernel exists,
+        // per-weight everywhere else.
         match ctx.gpu_dense.and_then(|t| t.mlp(li, &nrm2, s_n, d)) {
             Some(Ok(y)) => y,
             Some(Err(e)) => {
