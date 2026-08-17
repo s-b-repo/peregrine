@@ -1005,6 +1005,34 @@ extern "C" int coli_cuda_dense_mlp_gemv(ColiCudaTensor *gate, ColiCudaTensor *up
     return 1;
 }
 
+/* One int4 weight applied to one activation row: `y[O] = W[O,I] . x[I]`.
+ *
+ * The MLP entry above is three of these plus a silu-multiply; this is the same
+ * GEMV for a single weight, which is what a dense layer's attention and GDN
+ * projections (and lm_head) need — together those are the other ~33% of the
+ * per-token weight bytes that the MLP triple does not cover. */
+extern "C" int coli_cuda_w4_matvec(ColiCudaTensor *w, float *y, const float *x) {
+    if(!w||!x||!y||w->fmt!=2)return 0;
+    DeviceContext *ctx=find_ctx(w->device);if(!select_ctx(ctx))return 0;
+    const int I=w->I,O=w->O;
+    if(I<2||O<1||(I&1))return 0;                  /* packed nibbles need an even width */
+    size_t xb=(size_t)I*sizeof(float),yb=(size_t)O*sizeof(float);
+    if(!reserve(ctx,&ctx->x,&ctx->x_cap,xb)||!reserve(ctx,&ctx->y,&ctx->y_cap,yb)||
+       !reserve_pinned(ctx,&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(ctx,&ctx->host_y,&ctx->host_y_cap,yb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "w4 matvec input upload"))return 0;
+    w4_gemv_rows<<<(unsigned)O,256,0,ctx->stream>>>(ctx->y,ctx->x,
+        (const uint8_t*)w->weights,w->scales,I);
+    if(!cuda_ok(cudaGetLastError(),"w4 matvec launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,yb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "w4 matvec output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"w4 matvec synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,yb);
+    return 1;
+}
+
 /* Which kernel arm a call takes. Also the first component of the graph key: two
  * calls of the same shape on different arms are different launch sequences. */
 enum { ARM_TC_INT4 = 0, ARM_W4A16 = 1, ARM_W4_PACKED = 2, ARM_GENERIC = 3 };

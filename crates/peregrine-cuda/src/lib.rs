@@ -69,6 +69,7 @@ mod ffi {
             y: *mut f32,
             x: *const f32,
         ) -> c_int;
+        pub fn coli_cuda_w4_matvec(w: *mut ColiCudaTensor, y: *mut f32, x: *const f32) -> c_int;
         pub fn coli_cuda_expert_group(
             gates: *const *mut ColiCudaTensor,
             ups: *const *mut ColiCudaTensor,
@@ -421,6 +422,25 @@ fn upload_tensor(device: i32, w: &[f32], i: usize, o: usize) -> Result<*mut ffi:
 
 /// Upload one **per-row int4** (`fmt=2`) tensor `[o, i]`: `o*ceil(i/2)` packed
 /// nibble bytes plus `o` row scales.
+///
+/// # The host and device disagree about what a nibble means
+///
+/// The bytes go over verbatim, but the two sides decode them differently:
+///
+/// - **Host** (`QtWeight::dequant_row_into`, `dot_i4i8_avx2`, every CPU kernel):
+///   **bias-8**. The nibble is unsigned `0..15` and the value is `nibble - 8`.
+/// - **Device** (`w4a16_matmul_t`, `w4_gemv_rows`, every `.cu` kernel):
+///   **two's-complement**. The nibble is a signed 4-bit field and the value is
+///   `a & 8 ? a - 16 : a`.
+///
+/// Both map `0..15` onto `-8..7`, but they are DIFFERENT permutations of it, so
+/// reading device bytes with the host rule (or vice versa) yields plausible
+/// garbage rather than an error. That has now cost two debugging sessions — a
+/// gate-layout bug and a GEMV kernel that benchmarked 3x faster while computing
+/// nonsense (rms 4.2e-1 against an f32 truth the CPU path hits at 3.0e-3).
+/// Neither was caught by a timing harness; both were caught by an
+/// accuracy-versus-truth assertion. **A new device kernel must follow the
+/// device rule, and must ship with a test that compares against f32 truth.**
 #[cfg(feature = "cuda")]
 fn upload_tensor_i4(device: i32, w: &[u8], scales: &[f32], i: usize, o: usize) -> Result<*mut ffi::ColiCudaTensor, Error> {
     let mut t: *mut ffi::ColiCudaTensor = std::ptr::null_mut();
@@ -480,6 +500,70 @@ pub fn expert_group(experts: &[&GpuExpert], rows: &[i32], x: &[f32], hidden: usi
 /// the shape triple and returns failure rather than computing something else.
 /// A failure here is reported, never fatal: the caller falls back to the CPU
 /// MLP for that layer, which is the same result by a slower road.
+/// One **per-row int4** weight resident on the device: the single-matrix analogue
+/// of [`GpuExpert`], for the projections a dense layer applies one at a time
+/// (attention `q/k/v/o`, GDN `in_proj_*`/`out_proj`, `lm_head`). Together those
+/// are the per-token weight bytes the MLP triple does not cover.
+#[cfg(feature = "cuda")]
+pub struct GpuMatrix {
+    t: *mut ffi::ColiCudaTensor,
+    o: usize,
+    i: usize,
+}
+
+// SAFETY: as for `GpuExpert` — an opaque device handle, never dereferenced on the
+// host, read-only in the compute entry.
+#[cfg(feature = "cuda")]
+unsafe impl Send for GpuMatrix {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for GpuMatrix {}
+
+#[cfg(feature = "cuda")]
+impl GpuMatrix {
+    /// Upload a per-row int4 weight `[o, i]`: `o*ceil(i/2)` packed bytes plus `o`
+    /// row scales — the same encoding [`GpuExpert::upload_int4`] takes, and the
+    /// same host/device nibble asymmetry applies (see `upload_tensor_i4`).
+    pub fn upload_int4(device: i32, packed: &[u8], scales: &[f32], o: usize, i: usize) -> Result<GpuMatrix, Error> {
+        if packed.len() != o * i.div_ceil(2) || scales.len() != o {
+            return Err(Error::Format(format!(
+                "gpu matrix upload: {} bytes / {} scales for [{o},{i}]",
+                packed.len(),
+                scales.len()
+            )));
+        }
+        Ok(GpuMatrix { t: upload_tensor_i4(device, packed, scales, i, o)?, o, i })
+    }
+
+    /// Device bytes this matrix holds — what a VRAM budget is spent in.
+    pub fn bytes(&self) -> usize {
+        self.o * self.i.div_ceil(2) + self.o * std::mem::size_of::<f32>()
+    }
+
+    /// `y[o] = W · x[i]` for a single activation row, in GEMV form (see
+    /// [`dense_mlp_w4a16`] for why decode does not want WMMA here).
+    pub fn matvec(&self, x: &[f32]) -> Result<Vec<f32>, Error> {
+        if x.len() != self.i {
+            return Err(Error::Format(format!("w4 matvec: x is {} floats, expected {}", x.len(), self.i)));
+        }
+        let mut y = vec![0f32; self.o];
+        // SAFETY: `self.t` is a live device tensor owned by this `GpuMatrix`
+        // (freed only in `Drop`); `x`/`y` are host buffers of exactly the lengths
+        // the C entry reads and writes, checked above.
+        let ok = unsafe { ffi::coli_cuda_w4_matvec(self.t, y.as_mut_ptr(), x.as_ptr()) };
+        if ok == 0 {
+            return Err(Error::Format("w4 matvec: device call failed (format/shape/launch)".into()));
+        }
+        Ok(y)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for GpuMatrix {
+    fn drop(&mut self) {
+        free_tensor(self.t);
+    }
+}
+
 /// Decode (`s_n == 1`) takes the GEMV entry instead: a WMMA fragment is 16 rows
 /// wide, so at one activation row the `w4a16` kernel computes 15 idle rows for
 /// every real one — measured at 3.85 ms on Qwen's 17408×5120 SwiGLU against a
@@ -1015,6 +1099,53 @@ mod gpu_tests {
             worst / scale < 5e-3,
             "device dense MLP must match the CPU SwiGLU (worst {worst:.3e}, scale {scale:.3e})"
         );
+        Ok(())
+    }
+
+    /// The single-weight GEMV — the form the attention/GDN projections and
+    /// `lm_head` need — must compute the same matvec the CPU does.
+    ///
+    /// This test exists because its kernel is the one that shipped WRONG once:
+    /// the first `w4_gemv_rows` decoded nibbles with the HOST's bias-8 rule while
+    /// the device holds two's-complement (`upload` re-encodes, see
+    /// `upload_tensor_i4`). It benchmarked 3x faster than the kernel it replaced
+    /// and computed nonsense, and no timing harness could tell. A GEMV against
+    /// a dequantized CPU reference catches exactly that.
+    #[test]
+    fn the_device_matvec_agrees_with_the_cpu_matvec() -> Result<(), Error> {
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        // A non-square shape, so a transposed index would not accidentally pass.
+        let (o, i) = (384usize, 256usize);
+        let mut r = Lcg(0xA11CE);
+        let wf: Vec<f32> = (0..o * i).map(|_| r.f() * 0.1).collect();
+        let (wq, ws) = quant_i4(&wf, o, i);
+        let m = GpuMatrix::upload_int4(0, &wq, &ws, o, i)?;
+        let x: Vec<f32> = (0..i).map(|_| r.f()).collect();
+        let got = m.matvec(&x)?;
+        assert_eq!(got.len(), o);
+
+        // Reference over the DEQUANTIZED host weights (bias-8, the host rule),
+        // so this compares kernels rather than quantizers.
+        let mut want = vec![0f32; o];
+        for oo in 0..o {
+            let mut acc = 0f32;
+            for ii in 0..i {
+                let byte = wq[oo * i.div_ceil(2) + ii / 2];
+                let nib = if ii % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                acc += (nib as f32 - 8.0) * ws[oo] * x[ii];
+            }
+            want[oo] = acc;
+        }
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = got.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        println!("w4 matvec gpu-vs-cpu: worst abs {worst:.3e} on scale {scale:.3e}");
+        assert!(worst / scale < 5e-3, "device matvec must match the CPU matvec (worst {worst:.3e}, scale {scale:.3e})");
+        // `bytes()` is what a VRAM budget is spent in, so it must not drift from
+        // the upload's own length checks.
+        assert_eq!(m.bytes(), o * i.div_ceil(2) + o * 4);
         Ok(())
     }
 
