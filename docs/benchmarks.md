@@ -810,7 +810,10 @@ variable:
 
 Paired over the same positions: **26 flips survive exact f32 activations**, 7
 fixed, 5 introduced — McNemar exact **p = 0.774** on 12 discordant pairs. Two
-net flips of 33. The 29× MLP error is real but does not propagate to top-1 at
+net flips of 33 — activation quantization accounts for **~6 % of observed
+flips, measured rather than assumed**, which is the point: the 29× figure was
+a claim about *magnitude*, and it was allowed to imply a claim about
+*consequence* until this experiment separated them. The 29× MLP error is real but does not propagate to top-1 at
 this scale. (Pairing matters: at n=128 the rate difference alone is inside the
 ±3.9 pp binomial noise, while the paired test is decisive.)
 
@@ -850,3 +853,10 @@ rename-by-size check.
 path, which uploads raw only for per-row int4 (fmt 2) and dequantizes anything
 else to f32 at 8×; both a grouped GEMV arm and `gpu.rs`'s upload path would
 need it. A kernel-support question, not a capacity one.
+
+**If that is ever done, none of the flip numbers on this page transfer.**
+Grouped scales change the container format, so 0.514, 0.447 and the 0.2422
+above are all measurements of *per-row* containers. A future g128 gate must be
+compared against a per-row gate re-run on the same corpus and reference, never
+against these — the same class of mistake as reading a cross-engine rate
+against a same-engine bar.

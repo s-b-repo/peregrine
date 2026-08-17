@@ -264,7 +264,12 @@ read 2026-08-15 during the port.
    anything. Measurement: re-import with `--target int4-g128`, then the same
    parity gate + paired flip comparison — the instrument already exists.
    Risk: none to correctness; the container format is self-describing and
-   `QtInfo::detect` resolves grouped from the scale cardinality.
+   `QtInfo::detect` resolves grouped from the scale cardinality. **But it
+   breaks comparability: grouped scales change the format, so every existing
+   gate number (0.514, 0.447, 0.2422) is a per-row measurement and none of
+   them transfer.** A g128 verdict needs a per-row gate re-run on the same
+   corpus and reference to sit beside it — budget that second run into the
+   experiment rather than comparing against the numbers already on record.
 
 **Closed as not-applicable here (so nobody re-evaluates):** DSpark auxiliary
 draft model (DeepSeek-only checkpoint; GLM-5.2's int8 MTP head already fills
