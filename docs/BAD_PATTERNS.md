@@ -250,6 +250,34 @@ Not a gate — "is there a test for this kernel" is a judgement, not a regex. Th
 signal is a `.cu` entry point whose only Rust-side exercise is a benchmark or an
 example.
 
+### [K2] …and it must prove the device actually ran
+
+The companion failure, found the same week and strictly worse than a failing
+test: **a green test that certifies a path it never executed.** One device test
+passed twice while proving nothing —
+
+- on a 16-wide fixture, because the C entry *validates the shape and declines*,
+  so the upload succeeded, the kernel never launched, and the CPU fallback
+  produced the (correct) answer the assertion then checked;
+- at 256-wide, because the test drove `forward_step` over a 5-token prompt —
+  which is **prefill** (`s_n = 5`), and the device dispatch is `s_n == 1` only,
+  so decode was never reached.
+
+Both are the same shape: the fallback is *correct*, so every assertion about
+correctness passes, and the test reports success for a kernel that did not run.
+A benchmark cannot see this either — the fallback is merely slower.
+
+The fix is a **witness that the device ran**, not more correctness assertions.
+The cheap one is to assert the device result *differs* from the CPU path: these
+kernels are deliberately more accurate (f32 throughout vs the CPU's int8
+activations), so bit-identical output is proof of a fallback, and the test fails
+on it. Size fixtures past the entry's own validation, and drive the shape the
+dispatch actually takes.
+
+Together with [K]: a timing harness cannot see a kernel that is fast and wrong; a
+correctness harness cannot see a kernel that never ran. A device test needs both
+guards.
+
 ## What is intentionally NOT flagged
 
 The upstream rustsploit catalogue runs to 125+ patterns across A–Q. Most of its
