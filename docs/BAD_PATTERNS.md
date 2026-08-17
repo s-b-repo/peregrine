@@ -220,6 +220,36 @@ does clippy: `pub` items are reachable by definition from outside the crate, so
 `dead_code` stays quiet. The audit's other sections are all "this line is
 dangerous"; this one is "this line never runs."
 
+## [K] A device kernel without an accuracy test — informational, and grep cannot see it either
+
+**A new GPU kernel ships with a test that compares it against a CPU or f32
+reference. A timing harness is not evidence of correctness, because it
+structurally cannot see a fast wrong answer.**
+
+This is a rule with two scars behind it, both from 2026-08-16, both in the same
+seam, from opposite directions:
+
+- A gated-attention layout bug: the host packs `[query | gate]` per head
+  interleaved, the port read it as flat halves.
+- A decode GEMV kernel that **benchmarked 3× faster than the kernel it replaced
+  while computing nonsense** (rms 4.2e-1 against an f32 truth the CPU path hits
+  at 3.0e-3). Cause: host int4 is **bias-8** (`nibble - 8`), device int4 is
+  **two's-complement** (`a & 8 ? a - 16 : a`) because `coli_cuda_tensor_upload`
+  runs `offset_to_signed_s4` on the way over. Both map `0..15` onto `-8..7`, by
+  different permutations — so reading one with the other's rule yields plausible
+  garbage rather than an error or a crash.
+
+The benchmark was perfectly happy in both cases. What caught the second one, on
+its first run, was an assertion of RMS-versus-f32-truth added to the same commit
+as the kernel. That is the whole rule: **the accuracy test is not optional
+polish, it is the only defence against a kernel that is fast and wrong**, and
+the encoding asymmetry that produces those is documented at the seam
+(`upload_tensor_i4` in `peregrine-cuda`).
+
+Not a gate — "is there a test for this kernel" is a judgement, not a regex. The
+signal is a `.cu` entry point whose only Rust-side exercise is a benchmark or an
+example.
+
 ## What is intentionally NOT flagged
 
 The upstream rustsploit catalogue runs to 125+ patterns across A–Q. Most of its
