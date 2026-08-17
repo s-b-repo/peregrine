@@ -3186,7 +3186,13 @@ impl Model {
         // rest on the CPU, so partial residency is a working configuration
         // rather than a failure. `COLI_GPU_DENSE_HEADROOM_MB` (default 1024)
         // is what it refuses to spend, for activations and the context.
-        let gpu_dense = if std::env::var("COLI_GPU_DENSE").is_ok() && !has_routed_experts(&st) {
+        // Gated on the VALUE, not on the variable merely being set: `=0` has to
+        // mean off, or the A/B that the pinned-layer knob exists to make
+        // reproducible cannot have an off arm. (It read `is_ok()`, so
+        // `COLI_GPU_DENSE=0` enabled the tier — found while trying to isolate a
+        // regression by turning it off, which is exactly when it matters.)
+        let dense_requested = matches!(std::env::var("COLI_GPU_DENSE").as_deref(), Ok("1") | Ok("true"));
+        let gpu_dense = if dense_requested && !has_routed_experts(&st) {
             let headroom = env_usize("COLI_GPU_DENSE_HEADROOM_MB", 1024) * (1 << 20);
             // `COLI_GPU_DENSE_LAYERS=N` pins the resident count instead of
             // taking whatever fits. It exists because placement is not output-
