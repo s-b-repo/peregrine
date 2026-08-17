@@ -78,6 +78,22 @@ enum LayerAttn {
 }
 
 impl LayerW {
+    /// Every attention-side weight matrix, mutably — the projections that are
+    /// plain matmuls and therefore uploadable one at a time.
+    ///
+    /// Deliberately EXCLUDES the MLP: its three matrices go to the device as a
+    /// fused triple ([`crate::gpu::GpuDenseTier`]) so gate/up/down intermediates
+    /// stay in VRAM. Uploading them individually would be a regression, not a
+    /// generalization — each layer would round-trip a 17408-wide intermediate
+    /// through the host twice.
+    fn attn_weights_mut(&mut self) -> Vec<&mut QtWeight> {
+        match &mut self.attn {
+            LayerAttn::Mla { q_a, q_b, kv_a, kv_b, o, .. } => vec![q_a, q_b, kv_a, kv_b, o],
+            LayerAttn::Gqa { wq, wk, wv, o, .. } => vec![wq, wk, wv, o],
+            LayerAttn::Gdn { in_qkv, in_z, in_a, in_b, out, .. } => vec![in_qkv, in_z, in_a, in_b, out],
+        }
+    }
+
     /// The MLA weight view. Callers on MLA-only paths (the GLM forward, MTP,
     /// absorb) reach attention through this; a non-MLA layer here is a wiring
     /// bug reported as an error, never a panic.
@@ -3206,18 +3222,54 @@ impl Model {
             if let Some(e) = refused {
                 peregrine_io::note_advisory_err("gpu dense tier (CPU MLP path)", &e);
             }
+            // Then the attention-side projections, which are plain matmuls and
+            // upload one at a time. Order between the two groups does not
+            // affect throughput — every weight is read exactly once per token,
+            // so the time saved tracks BYTES resident, not which bytes — but
+            // MLPs go first because their fused kernel is the bigger per-byte
+            // win and because they dominate the budget (66.7% of the stream).
+            let mut proj_n = 0usize;
+            let mut proj_bytes = 0usize;
+            let mut matmul_total = 0usize;
+            for l in layers.iter_mut() {
+                for w in l.attn_weights_mut() {
+                    matmul_total += w.packed_bytes();
+                    match w.upload_to_device(0, headroom) {
+                        Ok(true) => {
+                            proj_n += 1;
+                            proj_bytes += w.device_bytes();
+                        }
+                        // Budget exhausted or a format that would cost 8x as
+                        // f32: either way the CPU path serves it correctly.
+                        Ok(false) => {}
+                        Err(e) => peregrine_io::note_advisory_err("gpu projection upload (CPU path)", &e),
+                    }
+                }
+                if let Some(m) = l.dense.as_ref() {
+                    matmul_total += m.gate.packed_bytes() + m.up.packed_bytes() + m.down.packed_bytes();
+                }
+            }
             let (n, bytes, skipped) = tier.stats();
-            if n > 0 {
+            if n > 0 || proj_n > 0 {
                 // Printed unconditionally, and it is not decoration: the
                 // resident set determines which layers took the more accurate
                 // device path, so this line is what makes a differing output
                 // between two runs explainable instead of mysterious. Anything
                 // recording a result from this process — a gate, a bench arm —
                 // should record it alongside the number.
+                // Reported in BYTES against the model's total matmul weight,
+                // because residency stopped being layer-shaped the moment
+                // individual projections could land: "47/64 layers" says
+                // nothing once q/k/v/o and the GDN projections are in the mix,
+                // while the byte fraction is exactly what an operator needs —
+                // how much of the model is on the fast, more-accurate path.
+                let resident = bytes + proj_bytes;
                 eprintln!(
-                    "peregrine: [gpu-dense] {n} of {} MLP layers resident, {:.2} GB VRAM{}{}",
-                    layers.len(),
-                    bytes as f64 / 1e9,
+                    "peregrine: [gpu-dense] {:.2} of {:.2} GB matmul weights resident ({:.0}%) — \
+                     {n} fused MLPs + {proj_n} projections{}{}",
+                    resident as f64 / 1e9,
+                    matmul_total as f64 / 1e9,
+                    if matmul_total > 0 { resident as f64 / matmul_total as f64 * 100.0 } else { 0.0 },
                     if skipped > 0 { format!(", {skipped}+ skipped (VRAM budget)") } else { String::new() },
                     if pinned.is_some() { " [pinned]" } else { " [fit-to-free-VRAM: not reproducible across boots]" }
                 );
