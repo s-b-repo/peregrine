@@ -476,10 +476,17 @@ mod tests {
         let mut st_cpu = GdnState::new(&c);
         let cpu = gdn_forward(&w.view(), &x, 1, &mut st_cpu, &c)?;
 
-        // Exactly the two gates, exactly as a nearly-full card would place them.
+        // The set a real budget actually places: the LARGE projections. The
+        // gates are 123 KB each and the big three are ~58 MB, so a budget that
+        // dies mid-set keeps whichever it reached first — and a test that
+        // placed only the gates covered the two weights the real run SKIPPED.
+        let up_qkv = w.in_qkv.upload_to_device(0, 1 << 20)?;
+        let up_z = w.in_z.upload_to_device(0, 1 << 20)?;
+        let up_out = w.out.upload_to_device(0, 1 << 20)?;
         let a_up = w.in_a.upload_to_device(0, 1 << 20)?;
         let b_up = w.in_b.upload_to_device(0, 1 << 20)?;
-        if !(a_up && b_up) {
+        println!("placed: qkv={up_qkv} z={up_z} out={up_out} a={a_up} b={b_up}");
+        if !(up_qkv || up_z || up_out) {
             return Ok(()); // no headroom right now
         }
         let mut st_gpu = GdnState::new(&c);

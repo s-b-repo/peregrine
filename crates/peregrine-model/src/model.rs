@@ -86,11 +86,15 @@ impl LayerW {
     /// stay in VRAM. Uploading them individually would be a regression, not a
     /// generalization — each layer would round-trip a 17408-wide intermediate
     /// through the host twice.
-    fn attn_weights_mut(&mut self) -> Vec<&mut QtWeight> {
+    fn attn_weights_mut(&mut self) -> Vec<(&'static str, &mut QtWeight)> {
         match &mut self.attn {
-            LayerAttn::Mla { q_a, q_b, kv_a, kv_b, o, .. } => vec![q_a, q_b, kv_a, kv_b, o],
-            LayerAttn::Gqa { wq, wk, wv, o, .. } => vec![wq, wk, wv, o],
-            LayerAttn::Gdn { in_qkv, in_z, in_a, in_b, out, .. } => vec![in_qkv, in_z, in_a, in_b, out],
+            LayerAttn::Mla { q_a, q_b, kv_a, kv_b, o, .. } => {
+                vec![("q_a", q_a), ("q_b", q_b), ("kv_a", kv_a), ("kv_b", kv_b), ("o", o)]
+            }
+            LayerAttn::Gqa { wq, wk, wv, o, .. } => vec![("q", wq), ("k", wk), ("v", wv), ("o", o)],
+            LayerAttn::Gdn { in_qkv, in_z, in_a, in_b, out, .. } => {
+                vec![("in_qkv", in_qkv), ("in_z", in_z), ("in_a", in_a), ("in_b", in_b), ("out", out)]
+            }
         }
     }
 
@@ -3257,6 +3261,8 @@ impl Model {
             let mut proj_n = 0usize;
             let mut proj_bytes = 0usize;
             let mut matmul_total = 0usize;
+            let mut placed_names: Vec<String> = Vec::new();
+            let mut skipped_names: Vec<String> = Vec::new();
             for (li, l) in layers.iter_mut().enumerate() {
                 // The pin bounds BOTH groups. It bounded only the fused MLPs
                 // until 2026-08-17, so `COLI_GPU_DENSE_LAYERS=0` — the natural
@@ -3264,7 +3270,7 @@ impl Model {
                 // every projection that fit, which is the opposite of what the
                 // knob says and makes it useless as a bisection tool.
                 let past_pin = pinned.is_some_and(|n| li >= n);
-                for w in l.attn_weights_mut() {
+                for (name, w) in l.attn_weights_mut() {
                     matmul_total += w.packed_bytes();
                     if past_pin {
                         continue;
@@ -3273,11 +3279,18 @@ impl Model {
                         Ok(true) => {
                             proj_n += 1;
                             proj_bytes += w.device_bytes();
+                            placed_names.push(format!("{li}.{name}"));
                         }
                         // Budget exhausted or a format that would cost 8x as
                         // f32: either way the CPU path serves it correctly.
-                        Ok(false) => {}
-                        Err(e) => peregrine_io::note_advisory_err("gpu projection upload (CPU path)", &e),
+                        // Recorded by name because WHICH weights landed is the
+                        // question a partial placement raises, and a count
+                        // cannot answer it.
+                        Ok(false) => skipped_names.push(format!("{li}.{name}")),
+                        Err(e) => {
+                            skipped_names.push(format!("{li}.{name}(err)"));
+                            peregrine_io::note_advisory_err("gpu projection upload (CPU path)", &e);
+                        }
                     }
                 }
                 if let Some(m) = l.dense.as_ref() {
@@ -3308,6 +3321,26 @@ impl Model {
                     if skipped > 0 { format!(", {skipped}+ skipped (VRAM budget)") } else { String::new() },
                     if pinned.is_some() { " [pinned]" } else { " [fit-to-free-VRAM: not reproducible across boots]" }
                 );
+                // Names, not just counts: a PARTIAL placement's failure mode
+                // depends on which weights landed, and every count-only log
+                // this tier has emitted so far left that unanswerable. Capped
+                // so a 64-layer full placement does not flood the boot log.
+                if !placed_names.is_empty() {
+                    let head: Vec<&str> = placed_names.iter().take(12).map(String::as_str).collect();
+                    eprintln!(
+                        "peregrine: [gpu-dense] placed: {}{}",
+                        head.join(" "),
+                        if placed_names.len() > 12 { format!(" (+{} more)", placed_names.len() - 12) } else { String::new() }
+                    );
+                }
+                if !skipped_names.is_empty() {
+                    let head: Vec<&str> = skipped_names.iter().take(12).map(String::as_str).collect();
+                    eprintln!(
+                        "peregrine: [gpu-dense] skipped: {}{}",
+                        head.join(" "),
+                        if skipped_names.len() > 12 { format!(" (+{} more)", skipped_names.len() - 12) } else { String::new() }
+                    );
+                }
                 Some(tier)
             } else {
                 None
@@ -6443,7 +6476,7 @@ mod tests {
         let mut gpu = Model::load(&d)?;
         let mut placed = 0usize;
         for l in gpu.layers.iter_mut() {
-            for w in l.attn_weights_mut() {
+            for (_name, w) in l.attn_weights_mut() {
                 if placed >= 3 {
                     break;
                 }

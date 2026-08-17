@@ -613,6 +613,73 @@ mod tests {
     /// accurate of the two (f32 throughout vs int8 activations), and the
     /// direction is asserted as well as the magnitude: uploading a weight must
     /// not make it worse.
+    /// What a FAILED upload does to the weights already resident.
+    ///
+    /// The regime an open serving failure isolates to: a budget that dies
+    /// mid-set. Every passing test so far placed a COMPLETE set with headroom;
+    /// this places until the device refuses, then asks whether a weight
+    /// uploaded BEFORE the refusal still computes correctly. If a failed
+    /// allocation leaves the CUDA context in a sticky error state, subsequent
+    /// launches can fail silently and return whatever was in the scratch
+    /// buffer — correct-looking arithmetic on garbage, which is exactly the
+    /// "argmax lands in the undefined tail of the vocab" signature.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_failed_upload_does_not_poison_the_weights_already_resident() -> Result<(), peregrine_core::Error> {
+        if peregrine_cuda::init(&[0]) < 1 {
+            return Ok(());
+        }
+        let _g = crate::gpu_test_lock::gpu_guard();
+        let (o, i) = (2048usize, 5120usize);
+        let mut seed = 0xFA17u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        let w: Vec<f32> = (0..o * i).map(|_| rnd() * 0.1).collect();
+        let mut good = super::test_support::quant_i4(&w, o, i);
+        let x: Vec<f32> = (0..i).map(|_| rnd()).collect();
+        if !good.upload_to_device(0, 1 << 20)? {
+            return Ok(()); // no headroom to establish a baseline
+        }
+        let before = good.apply_vec(&x, 1);
+
+        // Now drive the device to refusal: upload copies with a headroom demand
+        // of zero until one is declined or errors.
+        let mut hogs: Vec<QtWeight> = Vec::new();
+        let mut refused = false;
+        for _ in 0..64 {
+            let mut h = super::test_support::quant_i4(&w, o, i);
+            match h.upload_to_device(0, 0) {
+                Ok(true) => hogs.push(h),
+                Ok(false) => {
+                    refused = true;
+                    break;
+                }
+                Err(e) => {
+                    // The hard-failure arm: reported, because whether the
+                    // device REFUSED or FAILED is exactly the distinction this
+                    // test exists to probe.
+                    println!("device refused an upload with an error: {e}");
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        if !refused {
+            return Ok(()); // card too roomy to reach the regime today
+        }
+        // The weight that was resident BEFORE the refusal must still compute
+        // what it computed before it.
+        let after = good.apply_vec(&x, 1);
+        assert!(
+            before.iter().zip(&after).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "a resident weight changed its answer after a later upload was refused — \
+             the device is returning stale or uninitialized memory rather than failing"
+        );
+        Ok(())
+    }
+
     /// The device matvec across the SHAPES A REAL MODEL ACTUALLY HAS, not one
     /// convenient square-ish one.
     ///

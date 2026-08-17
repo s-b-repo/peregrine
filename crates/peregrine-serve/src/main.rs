@@ -317,6 +317,25 @@ fn build_prompt_chatml(messages: &[ChatMessage], tools: &[tools::ToolDef]) -> St
         s.push_str("<|im_end|>\n");
     }
     s.push_str("<|im_start|>assistant\n");
+    // Pre-close the reasoning block — what the shipped chat_template.jinja
+    // emits for `enable_thinking=false`.
+    //
+    // Without it the model opens `<think>` itself (Qwen3.5 is trained to) and
+    // reasons, and this server's OutputFilter DROPS `<think>…</think>` by
+    // design. A request whose budget runs out before `</think>` then returns
+    // completion_tokens == max_tokens with an EMPTY string and no content
+    // deltas: the model worked, every token was reasoning, the filter
+    // discarded all of it. That is why the failure was content-dependent
+    // rather than length-dependent — it tracks how long the model reasons, not
+    // how long the prompt is — and why "/no_think" in the user text did
+    // nothing, since the model's own opening tag is not the user's to suppress.
+    //
+    // `COLI_QWEN_THINK=1` restores reasoning for callers who want it and will
+    // budget for it: with the filter dropping the block, a small max_tokens
+    // spends the whole budget on text nobody sees.
+    if !matches!(std::env::var("COLI_QWEN_THINK").as_deref(), Ok("1") | Ok("true")) {
+        s.push_str("<think>\n\n</think>\n\n");
+    }
     s
 }
 
@@ -1308,16 +1327,40 @@ mod tests {
     }
 
     #[test]
+    fn chatml_preclosed_reasoning_so_the_filter_has_something_to_emit() -> Result<(), serde_json::Error> {
+        let m = msgs(json!([{"role": "user", "content": "Hi"}]))?;
+        let p = build_prompt(&m, &[], true);
+        assert!(
+            p.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "the reasoning block must arrive pre-closed; got {p:?}"
+        );
+        // What the filter does with each shape, which is why the default is
+        // what it is: ordinary text reaches the client, an unclosed reasoning
+        // block is swallowed whole.
+        let mut f = tools::OutputFilter::with_tools(&[]);
+        assert_eq!(f.push("Paris is the capital."), "Paris is the capital.");
+        let mut f2 = tools::OutputFilter::with_tools(&[]);
+        assert!(
+            f2.push("<think>reasoning that never closes").is_empty(),
+            "unclosed reasoning is dropped — the empty-response failure this default avoids"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn chatml_dialect_renders_qwen_markup_not_glm() -> Result<(), serde_json::Error> {
         let m = msgs(json!([
             {"role": "system", "content": "be terse"},
             {"role": "user", "content": "hi"}
         ]))?;
         let p = build_prompt(&m, &[], true);
-        // ChatML markup, ending on an open assistant turn to generate into.
+        // ChatML markup, ending on an assistant turn with the reasoning block
+        // already closed (see `chatml_preclosed_reasoning_so_the_filter_has_
+        // something_to_emit` for why that closure is load-bearing rather than
+        // cosmetic).
         assert!(p.contains("<|im_start|>system\nbe terse<|im_end|>\n"), "system turn:\n{p}");
         assert!(p.contains("<|im_start|>user\nhi<|im_end|>\n"), "user turn:\n{p}");
-        assert!(p.ends_with("<|im_start|>assistant\n"), "open assistant turn:\n{p}");
+        assert!(p.contains("<|im_start|>assistant\n"), "assistant turn:\n{p}");
         // Never GLM's control tokens — feeding those to Qwen is the bug this fixes.
         assert!(!p.contains("[gMASK]") && !p.contains("<sop>") && !p.contains("<|user|>"), "no GLM markup:\n{p}");
         Ok(())
