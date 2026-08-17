@@ -3257,9 +3257,18 @@ impl Model {
             let mut proj_n = 0usize;
             let mut proj_bytes = 0usize;
             let mut matmul_total = 0usize;
-            for l in layers.iter_mut() {
+            for (li, l) in layers.iter_mut().enumerate() {
+                // The pin bounds BOTH groups. It bounded only the fused MLPs
+                // until 2026-08-17, so `COLI_GPU_DENSE_LAYERS=0` — the natural
+                // way to ask for "the tier, placing nothing" — still uploaded
+                // every projection that fit, which is the opposite of what the
+                // knob says and makes it useless as a bisection tool.
+                let past_pin = pinned.is_some_and(|n| li >= n);
                 for w in l.attn_weights_mut() {
                     matmul_total += w.packed_bytes();
+                    if past_pin {
+                        continue;
+                    }
                     match w.upload_to_device(0, headroom) {
                         Ok(true) => {
                             proj_n += 1;

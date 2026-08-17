@@ -436,6 +436,72 @@ mod tests {
         }
     }
 
+    /// The regime an open serving failure points at: a GDN layer at REAL
+    /// widths with only its two smallest weights — `in_proj_a` and
+    /// `in_proj_b`, [48, 5120] each — VRAM-resident, because at a nearly-full
+    /// card those are the first to fit. They feed the recurrence's decay and
+    /// beta rather than an ordinary activation, so a wrong value there
+    /// degenerates the stream instead of blurring it.
+    ///
+    /// Real widths deliberately: the toy fixture's `in_proj_a` is [4, 256],
+    /// which is a different kernel regime and would not reproduce a bug that
+    /// depends on the real one.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_gdn_layer_with_resident_gates_computes_identically() -> Result<(), peregrine_core::Error> {
+        if peregrine_cuda::init(&[0]) < 1 {
+            return Ok(());
+        }
+        let c = Cfg::from_json(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "vocab_size": 32, "hidden_size": 5120, "intermediate_size": 64,
+                "num_hidden_layers": 1, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "head_dim": 64,
+                "layer_types": ["linear_attention"],
+                "linear_num_key_heads": 16, "linear_num_value_heads": 48,
+                "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4, "attn_output_gate": true,
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": {"rope_theta": 10000000.0, "partial_rotary_factor": 0.25},
+                "rms_norm_eps": 1e-6, "eos_token_id": 0
+            }
+        }))?;
+        let mut w = make_weights(&c, 91);
+        let d = c.hidden as usize;
+        let mut r = Lcg(37);
+        let x: Vec<f32> = (0..d).map(|_| r.f()).collect();
+
+        let mut st_cpu = GdnState::new(&c);
+        let cpu = gdn_forward(&w.view(), &x, 1, &mut st_cpu, &c)?;
+
+        // Exactly the two gates, exactly as a nearly-full card would place them.
+        let a_up = w.in_a.upload_to_device(0, 1 << 20)?;
+        let b_up = w.in_b.upload_to_device(0, 1 << 20)?;
+        if !(a_up && b_up) {
+            return Ok(()); // no headroom right now
+        }
+        let mut st_gpu = GdnState::new(&c);
+        let gpu = gdn_forward(&w.view(), &x, 1, &mut st_gpu, &c)?;
+
+        // Non-vacuity: the device path is numerically distinct, so identical
+        // bits would mean it never ran and this asserted nothing.
+        assert!(
+            cpu.iter().zip(&gpu).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "outputs are bit-identical: the device never computed, so this test is vacuous"
+        );
+        let scale = cpu.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = cpu.iter().zip(&gpu).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+        println!("gdn resident-gates: worst {worst:.3e} on scale {scale:.3e} ({:.2}%)", worst / scale * 100.0);
+        assert!(
+            worst / scale < 0.05,
+            "resident gates changed the layer output by {:.1}% — the recurrence is being fed wrong values",
+            worst / scale * 100.0
+        );
+        Ok(())
+    }
+
     #[test]
     fn gdn_one_call_matches_stepwise() -> Result<(), peregrine_core::Error> {
         // The recurrent form's state-carry contract: 6 tokens in one call and
