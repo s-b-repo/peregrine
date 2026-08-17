@@ -70,6 +70,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCud
                                ColiCudaTensor *down, float *y,
                                const float *x, int S);
 
+/* The same SwiGLU MLP for a SINGLE activation row (decode), in GEMV form: no
+ * WMMA fragments, so it does not pay the 16x row waste that makes the w4a16
+ * entry sit an order of magnitude above the device's bandwidth floor at S == 1.
+ * Batched shapes should keep using the w4a16 entry, whose fragments are full. */
+COLI_CUDA_DLLEXPORT int coli_cuda_dense_mlp_gemv(ColiCudaTensor *gate, ColiCudaTensor *up,
+                               ColiCudaTensor *down, float *y, const float *x);
+
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,

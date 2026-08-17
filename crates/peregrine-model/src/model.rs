@@ -6133,6 +6133,8 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn the_device_mlp_is_closer_to_f32_truth_than_the_cpu_path() -> Result<(), peregrine_core::Error> {
+        // Shares the one device with every other GPU test in the crate.
+        let _g = crate::gpu_test_lock::gpu_guard();
         if peregrine_cuda::init(&[0]) < 1 {
             return Ok(());
         }
@@ -6176,8 +6178,21 @@ mod tests {
 
         let cpu = mlp.swiglu(&x, s_n);
         let mut tier = crate::gpu::GpuDenseTier::new(0);
-        if !tier.try_add(0, &mlp.gate, &mlp.up, &mlp.down, 1 << 20)? {
-            return Ok(()); // no VRAM headroom right now — nothing to compare
+        match tier.try_add(0, &mlp.gate, &mlp.up, &mlp.down, 1 << 20) {
+            Ok(true) => {}
+            // No headroom right now — nothing to compare.
+            Ok(false) => return Ok(()),
+            // The device could not even report its memory. Under `cargo test`'s
+            // default thread pool several GPU tests probe the device at once,
+            // and on a card another process is filling (measured with a
+            // 10 GB llama-server resident) that probe fails for reasons that
+            // have nothing to do with the path under test. Reported, then
+            // skipped — the accuracy assertions below are what must not be
+            // silently passed, and an unavailable device cannot reach them.
+            Err(e) => {
+                peregrine_io::note_advisory_err("dense-tier VRAM probe (GPU comparison skipped)", &e);
+                return Ok(());
+            }
         }
         let gpu = tier.mlp(0, &x, s_n, hidden).ok_or_else(|| Error::Format("tier lost layer 0".into()))??;
 
@@ -6188,6 +6203,25 @@ mod tests {
             e_gpu <= e_cpu,
             "the device path must be at least as accurate as the CPU path it replaces \
              (gpu {e_gpu:.4e} vs cpu {e_cpu:.4e})"
+        );
+
+        // The DECODE shape takes a different kernel: `s_n == 1` routes to the
+        // GEMV entry (no WMMA fragments, which would compute 15 idle rows per
+        // real one at one activation row). It is a separate kernel and so needs
+        // its own correctness evidence, held to the same bar — at least as close
+        // to f32 truth as the CPU path it replaces.
+        let x1 = &x[..hidden];
+        let cpu1 = mlp.swiglu(x1, 1);
+        let gemv = tier.mlp(0, x1, 1, hidden).ok_or_else(|| Error::Format("tier lost layer 0".into()))??;
+        let truth1 = &truth[..hidden];
+        let rms1 =
+            |v: &[f32]| (v.iter().zip(truth1).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / v.len() as f32).sqrt();
+        let (e_cpu1, e_gemv) = (rms1(&cpu1), rms1(&gemv));
+        println!("decode (s_n=1) rms vs f32 truth: cpu(w4a8) {e_cpu1:.4e}  gpu(gemv) {e_gemv:.4e}");
+        assert!(
+            e_gemv <= e_cpu1,
+            "the decode GEMV kernel must be at least as accurate as the CPU path \
+             (gemv {e_gemv:.4e} vs cpu {e_cpu1:.4e})"
         );
         Ok(())
     }
@@ -6204,6 +6238,8 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn gpu_resident_layers_decode_like_cpu_layers() -> Result<(), peregrine_core::Error> {
+        // Shares the one device with every other GPU test in the crate.
+        let _g = crate::gpu_test_lock::gpu_guard();
         let d = std::env::temp_dir().join(format!("peregrine_gpudense_{}", std::process::id()));
         if d.exists() {
             std::fs::remove_dir_all(&d)?;

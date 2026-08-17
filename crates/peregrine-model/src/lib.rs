@@ -35,6 +35,27 @@ pub mod sample;
 pub mod telemetry;
 pub mod testkit;
 pub mod topic;
+
+/// One serialization point for every GPU test in this crate.
+///
+/// The tests share a single device: one CUDA context, one VRAM pool, one global
+/// scratch arena that the C entries `reserve()` and may reallocate. The engine
+/// itself only ever calls those entries from the one thread that owns the model,
+/// so they are not written to be thread-safe — but `cargo test`'s default pool
+/// runs test fns concurrently, which violated that quietly for as long as the
+/// GPU tests lived in one module and loudly (SIGSEGV, and `mem_info` failing
+/// outright) once a second module grew tests of its own. The lock lives at crate
+/// level so `gpu.rs` and `model.rs` share ONE, rather than each serializing only
+/// against itself.
+#[cfg(test)]
+pub(crate) mod gpu_test_lock {
+    static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// `unwrap_or_else` recovers a poisoned lock (a panicked test) without
+    /// tripping the no-`unwrap` gate.
+    pub(crate) fn gpu_guard() -> std::sync::MutexGuard<'static, ()> {
+        GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 pub mod weight;
 pub mod wmma_tune;
 pub mod workload;

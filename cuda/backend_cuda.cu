@@ -922,6 +922,89 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
     return 1;
 }
 
+/* ---- decode-shaped int4 GEMV ------------------------------------------------
+ *
+ * At decode there is exactly ONE activation row, and a WMMA fragment is 16 rows
+ * wide: `w4a16_*` then computes 15 idle rows for every real one. Measured on the
+ * Qwen 17408x5120 SwiGLU at S=1, that put the device 10.4x above its own
+ * bandwidth floor (3.85 ms against 134 MB / ~360 GB/s = 0.37 ms). No tile shape
+ * fixes it — every WMMA shape wastes M when M=1 — so this is the GEMV-shaped
+ * path instead: no fragments, one output row per block, threads striding the
+ * row's packed bytes and reducing.
+ *
+ * Layout matches the other DEVICE int4 consumers: element i of row o is byte i/2
+ * of that row, low nibble for even i and high for odd, and the nibble is
+ * **two's-complement signed** (`a & 8 ? a - 16 : a`), scaled per row. Note this
+ * is NOT the host container's convention, which biases by 8 — `upload_int4`
+ * re-encodes on the way to the device, and reading it host-style here produced a
+ * kernel that benchmarked 3x faster while computing nonsense (rms 4.2e-1 against
+ * an f32 truth the CPU path hits at 3.0e-3).
+ */
+__global__ void w4_gemv_rows(float *__restrict__ y, const float *__restrict__ x,
+                             const uint8_t *__restrict__ w, const float *__restrict__ s,
+                             int I) {
+    const int o = blockIdx.x;
+    const int half = I >> 1;                      /* packed bytes per row */
+    const uint8_t *row = w + (size_t)o * (size_t)half;
+    float acc = 0.f;
+    /* Coalesced: consecutive threads read consecutive bytes of the same row. */
+    for (int b = threadIdx.x; b < half; b += blockDim.x) {
+        const uint8_t byte = row[b];
+        int lo = byte & 0x0F; lo = (lo & 8) ? lo - 16 : lo;
+        int hi = byte >> 4;   hi = (hi & 8) ? hi - 16 : hi;
+        acc += (float)lo * x[2 * b];
+        acc += (float)hi * x[2 * b + 1];
+    }
+    /* Warp reduction, then one partial per warp through shared memory. */
+    for (int off = warpSize / 2; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x & (warpSize - 1);
+    const int warp = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        const int nwarps = (int)blockDim.x / warpSize;
+        float v = (lane < nwarps) ? warp_sums[lane] : 0.f;
+        for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+        if (lane == 0) y[o] = v * s[o];
+    }
+}
+
+/* Single-row SwiGLU MLP entirely in GEMV form: gate/up, silu-multiply, down.
+ * Same contract and tensor layout as `coli_cuda_shared_mlp_w4a16`, restricted to
+ * S == 1 — the caller falls back to the WMMA entry for batched shapes, where the
+ * fragments are no longer wasted. */
+extern "C" int coli_cuda_dense_mlp_gemv(ColiCudaTensor *gate, ColiCudaTensor *up,
+        ColiCudaTensor *down, float *y, const float *x) {
+    if(!gate||!up||!down||!x||!y||gate->fmt!=2||up->fmt!=2||down->fmt!=2||
+       gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
+       gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
+    DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx))return 0;
+    const int D=gate->I,I=gate->O;
+    if((D&1)||(I&1))return 0;                     /* packed nibbles need even widths */
+    size_t xb=(size_t)D*sizeof(float),ib=(size_t)I*sizeof(float);
+    if(!reserve(ctx,&ctx->x,&ctx->x_cap,xb)||!reserve(ctx,&ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(ctx,&ctx->up,&ctx->up_cap,ib)||!reserve(ctx,&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(ctx,&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(ctx,&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "dense gemv input upload"))return 0;
+    w4_gemv_rows<<<(unsigned)I,256,0,ctx->stream>>>(ctx->gate,ctx->x,
+        (const uint8_t*)gate->weights,gate->scales,D);
+    w4_gemv_rows<<<(unsigned)I,256,0,ctx->stream>>>(ctx->up,ctx->x,
+        (const uint8_t*)up->weights,up->scales,D);
+    silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I);
+    w4_gemv_rows<<<(unsigned)D,256,0,ctx->stream>>>(ctx->y,ctx->gate,
+        (const uint8_t*)down->weights,down->scales,I);
+    if(!cuda_ok(cudaGetLastError(),"dense gemv launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "dense gemv output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"dense gemv synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    return 1;
+}
+
 /* Which kernel arm a call takes. Also the first component of the graph key: two
  * calls of the same shape on different arms are different launch sequences. */
 enum { ARM_TC_INT4 = 0, ARM_W4A16 = 1, ARM_W4_PACKED = 2, ARM_GENERIC = 3 };

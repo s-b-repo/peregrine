@@ -62,6 +62,13 @@ mod ffi {
             x: *const f32,
             s: c_int,
         ) -> c_int;
+        pub fn coli_cuda_dense_mlp_gemv(
+            gate: *mut ColiCudaTensor,
+            up: *mut ColiCudaTensor,
+            down: *mut ColiCudaTensor,
+            y: *mut f32,
+            x: *const f32,
+        ) -> c_int;
         pub fn coli_cuda_expert_group(
             gates: *const *mut ColiCudaTensor,
             ups: *const *mut ColiCudaTensor,
@@ -473,8 +480,34 @@ pub fn expert_group(experts: &[&GpuExpert], rows: &[i32], x: &[f32], hidden: usi
 /// the shape triple and returns failure rather than computing something else.
 /// A failure here is reported, never fatal: the caller falls back to the CPU
 /// MLP for that layer, which is the same result by a slower road.
+/// Decode (`s_n == 1`) takes the GEMV entry instead: a WMMA fragment is 16 rows
+/// wide, so at one activation row the `w4a16` kernel computes 15 idle rows for
+/// every real one — measured at 3.85 ms on Qwen's 17408×5120 SwiGLU against a
+/// 0.37 ms bandwidth floor. No fragment shape fixes that (every WMMA shape
+/// wastes M when M=1), so the fix is shape, not tuning. Set `COLI_CUDA_GEMV=0`
+/// to force the WMMA path for an A/B; batched shapes never take GEMV, because
+/// there the fragments are full and WMMA is the right kernel.
+#[cfg(feature = "cuda")]
+fn gemv_enabled() -> bool {
+    !matches!(std::env::var("COLI_CUDA_GEMV").as_deref(), Ok("0") | Ok("false"))
+}
+
 #[cfg(feature = "cuda")]
 pub fn dense_mlp_w4a16(e: &GpuExpert, x: &[f32], s_n: usize, hidden: usize) -> Result<Vec<f32>, Error> {
+    if s_n == 1 && gemv_enabled() {
+        let mut y = vec![0f32; hidden];
+        if x.len() != hidden {
+            return Err(Error::Format(format!("dense_mlp_gemv: x is {} floats, expected {hidden}", x.len())));
+        }
+        // SAFETY: same contract as the w4a16 call below — `e`'s handles are live
+        // device tensors owned by `e`, and `x`/`y` are host buffers sized exactly
+        // as the C entry reads and writes them (one row of `hidden`), checked here.
+        let ok = unsafe { ffi::coli_cuda_dense_mlp_gemv(e.gate, e.up, e.down, y.as_mut_ptr(), x.as_ptr()) };
+        if ok == 0 {
+            return Err(Error::Format("dense_mlp_gemv: device MLP failed (format/shape/launch)".into()));
+        }
+        return Ok(y);
+    }
     if s_n == 0 || x.len() != s_n * hidden {
         return Err(Error::Format(format!(
             "dense_mlp_w4a16: x is {} floats, expected {s_n} x {hidden}",

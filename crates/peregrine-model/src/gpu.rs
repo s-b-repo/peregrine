@@ -994,13 +994,7 @@ mod gpu_residency_tests {
     use crate::testkit::build_tiny_model;
     use peregrine_core::{Cfg, Error, SafeTensors};
 
-    // These tests share the single GPU (context, VRAM, global scratch), so they
-    // must run serially; `unwrap_or_else` recovers a poisoned lock (a panicked
-    // test) without tripping the no-`unwrap` gate.
-    static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn gpu_guard() -> std::sync::MutexGuard<'static, ()> {
-        GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use crate::gpu_test_lock::gpu_guard;
 
     #[test]
     fn tier_spans_multiple_sparse_layers() -> Result<(), Error> {
