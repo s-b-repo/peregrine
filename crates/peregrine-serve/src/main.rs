@@ -570,6 +570,13 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
             "accept_rate": if t.spec_proposed > 0 {
                 t.spec_accepted as f64 / t.spec_proposed as f64
             } else { 0.0 },
+            // COLI_SPEC_GDN's cost side; all zero on a KV-only arch, where a
+            // reject is a truncate and there is nothing to copy. `replays` is
+            // the number of ticks that missed the free full-acceptance path —
+            // raising the COLI_SPEC_CONF floor is what drives it down.
+            "gdn_snapshot_bytes": t.gdn_snapshot_bytes,
+            "gdn_replays": t.gdn_replays,
+            "gdn_replay_rows": t.gdn_replay_rows,
         },
         // RLM recursive refinement (COLI_RLM): passes emitted and tokens that
         // triggered at least one.

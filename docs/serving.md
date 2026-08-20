@@ -243,6 +243,9 @@ expert reads, so the accept rate is what says whether `COLI_DRAFT`'s depth
 pays), `rlm` (recursive-refinement passes and tokens, `COLI_RLM`),
 `io_slab_in_use` (O_DIRECT landing buffers in flight; pinned at the pool cap
 means reads are serializing on buffers), and `memo` (response-memo counters).
+On a recurrent arch under `COLI_SPEC_GDN`, `spec` also carries
+`gdn_snapshot_bytes` / `gdn_replays` / `gdn_replay_rows` — the cost side of that
+rollback, which is what decides whether it pays at a given batch width.
 Cumulative counters are meant to be delta'd across two scrapes. At shutdown
 the engine prints `[prefix-cache]`, `[spec]` and `[rlm]` summary lines to
 stderr (each silent when its feature never engaged).
@@ -253,6 +256,15 @@ With an MTP head in the checkpoint, `COLI_DRAFT=<g>` drafts `g` tokens per
 sequence per tick and verifies them in the same batched forward (greedy
 requests take argmax-identity acceptance; sampled requests join only under
 `COLI_DRAFT_SAMPLED`, via distribution-preserving rejection sampling).
+On a **recurrent** arch (Qwen3.5-hybrid) drafting additionally needs
+`COLI_SPEC_GDN=1`: a linear-attention layer keeps a delta-rule state rather
+than rows, so a rejected draft cannot be truncated away and has to be rolled
+back by snapshot/restore plus a re-advance over the accepted rows
+([note](configuration.md#coli_spec_gdn)). Same greedy stream either way; the
+snapshot is ~151 MB per drafting sequence per tick at 27B dims, which is why it
+is a knob and why `/metrics` reports `gdn_snapshot_bytes` beside the accept
+rate.
+
 `COLI_RLM=1` additionally refines *uncertain* decision rows (top-2 margin /
 entropy policy, `COLI_RLM_*` knobs) with recursive replay passes over the
 request's own KV before the token is picked — composed with speculation

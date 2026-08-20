@@ -66,6 +66,16 @@ pub struct GdnSnapshot {
     len: usize,
 }
 
+impl GdnSnapshot {
+    /// Bytes this snapshot holds. The spec-decode caller reports the sum as
+    /// `[spec] gdn_snapshot_bytes`, because the whole question of whether
+    /// recurrent speculation pays is this copy against the tokens it buys, and
+    /// a cost nobody can see is a cost nobody tunes.
+    pub fn bytes(&self) -> usize {
+        (self.ring.len() + self.s.len()) * 4
+    }
+}
+
 /// Per-stream recurrent state for one GDN layer: the conv ring (last `k-1`
 /// pre-activation rows) and the delta-rule memory `S`. This replaces the KV
 /// cache for linear layers — constant size however long the context runs,

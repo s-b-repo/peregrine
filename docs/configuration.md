@@ -436,6 +436,8 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_TOK_MERGE_SIMD` | auto | tokenizer short-merge tier A/B (`auto`\|`scalar`\|`avx2`\|`avx512`); auto = measured scalar default — see [tokenizer.md](tokenizer.md) |
 | `COLI_DRAFT` | 0 | MTP speculative-decode depth — [note](#coli_draft) |
 | `COLI_DRAFT_SAMPLED` | off | extend speculation to temperature > 0 — [note](#coli_draft_sampled) |
+| `COLI_SPEC_GDN` | off | allow speculation on a **recurrent** (Qwen3.5-hybrid) arch — [note](#coli_spec_gdn) |
+| `COLI_SPEC_GDN_MAX_B` | 0 | batch width above which `COLI_SPEC_GDN` stops drafting; `0` = uncapped |
 | `X-Peregrine-Priority` | (HTTP header) | `high`/`1`/`true` → drained ahead of normal-priority requests |
 
 ### `COLI_FUSE_PREFILL`
@@ -530,6 +532,50 @@ rather than the obvious win it looks like. Needs `COLI_DRAFT` too.
 
 Every knob in this section is a **quality trade**. Gate each with
 `Model::prediction_flip_rate` against the unmodified configuration.
+
+
+### `COLI_SPEC_GDN`
+
+Speculation on a **recurrent** architecture (`Arch::HybridGdn` — Qwen3.5 and
+Qwen3-Next). Default **off**; output is unaffected either way.
+
+A KV-only arch rejects a draft by truncation: the rows are dropped and nothing
+remembers them. A hybrid's linear-attention layers do not keep rows at all —
+they keep a delta-rule state that the verify forward has already folded every
+drafted token into, and `truncate` cannot reach it. Before this knob the engine
+simply refused to draft there (`spec_reject_is_kv_only`), printing a line that
+said so.
+
+The rollback it enables is `GdnState`'s documented protocol: snapshot every
+recurrent layer before the verify forward; on **full** acceptance drop the
+snapshot, because the state is already exactly right; on partial acceptance
+restore it, rewind the KV to the same boundary, and re-advance over precisely
+the rows the client was sent. All the partially-accepting sequences of a tick
+re-advance in **one** forward, not one each.
+
+It is a knob and not an unconditional enable because the snapshot is not free:
+~3.1 MB per linear layer, so **≈151 MB per drafting sequence per tick** at
+Qwen3.5-27B's 48 linear layers, charged per *sequence* while the resident
+weight read that dominates a forward is shared across the batch. Past some
+width the copies cost more than the accepted tokens repay, and
+`COLI_SPEC_GDN_MAX_B` is where the operator puts that width. `/metrics` reports
+the cost directly under `spec`: `gdn_snapshot_bytes`, `gdn_replays` (ticks that
+missed the free full-acceptance path) and `gdn_replay_rows`.
+
+`gdn_replays` is the number to watch. Full acceptance is free and partial
+acceptance costs a second forward, so the useful lever is whatever makes whole
+runs land — which is the `COLI_SPEC_CONF` floor, measured at +37 % on the
+streaming arch for exactly that reason. Note that a per-token accept rate of
+0.83 is only a 0.39 chance of a *complete* run at depth 5, so expect replays to
+be common until the floor is tuned.
+
+Output-neutral: `accept_run` still decides acceptance by argmax identity, so a
+greedy request emits the same stream speculated or not. That is asserted end to
+end by `recurrent_speculation_does_not_change_the_served_token_stream`, and the
+rollback itself by `a_rejected_draft_leaves_no_recurrent_trace` and
+`a_partially_accepted_draft_re_advances_exactly_the_committed_rows` — each with
+a negative-control arm, because a rollback test that passes when the rollback
+does nothing is testing nothing.
 
 ### `COLI_KV_DTYPE`
 

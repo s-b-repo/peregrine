@@ -249,11 +249,33 @@ pub fn build_tiny_hybrid_model(dir: &Path, seed: u64) -> Result<(), Error> {
     build_tiny_gqa_family(dir, seed, tiny_hybrid_cfg_json())
 }
 
+/// [`build_tiny_hybrid_model`] plus a Qwen-dialect MTP head, for the tests that
+/// need a *recurrent* checkpoint that can speculate.
+///
+/// Deliberately a separate entry point rather than a flag on the shared
+/// fixture, for the same reason `build_tiny_model_with_indexer` is: every other
+/// test on the hybrid fixture should keep loading a checkpoint where
+/// `has_mtp()` is false, which is the state a converter without `--mtp`
+/// produces and the one those tests were written against.
+pub fn build_tiny_hybrid_model_with_mtp(dir: &Path, seed: u64) -> Result<(), Error> {
+    build_tiny_gqa_family_inner(dir, seed, tiny_hybrid_cfg_json(), true)
+}
+
 /// Shared writer for the two Qwen-family fixtures: emits exactly the Track C
 /// tensor contract (HF names verbatim, int4 + `.qs` matrices, float norms and
 /// GDN scalars, int8 embed/lm_head) so the production loader is what the tests
 /// exercise — no test-only naming.
 fn build_tiny_gqa_family(dir: &Path, seed: u64, cfg_json: serde_json::Value) -> Result<(), Error> {
+    build_tiny_gqa_family_inner(dir, seed, cfg_json, false)
+}
+
+/// [`build_tiny_gqa_family`], optionally emitting the `mtp.` head tensors.
+fn build_tiny_gqa_family_inner(
+    dir: &Path,
+    seed: u64,
+    cfg_json: serde_json::Value,
+    mtp: bool,
+) -> Result<(), Error> {
     let cfg: Cfg = Cfg::from_json(&cfg_json)?;
     let hybrid = cfg.arch == peregrine_core::Arch::HybridGdn;
     let mut r = Lcg(seed);
@@ -329,6 +351,39 @@ fn build_tiny_gqa_family(dir: &Path, seed: u64, cfg_json: serde_json::Value) -> 
         w4(&mut blobs, &p("mlp.gate_proj.weight"), di, d, &mut r);
         w4(&mut blobs, &p("mlp.up_proj.weight"), di, d, &mut r);
         w4(&mut blobs, &p("mlp.down_proj.weight"), d, di, &mut r);
+    }
+
+    // The Qwen-dialect MTP head: its own `mtp.` prefix, and its single layer is
+    // dense full-attention whatever the stack does at index `n_layers` — the
+    // hybrid's stack would say "linear attention" there, and the loader's
+    // `LayerSite { full_attn: Some(true), sparse: Some(false) }` says otherwise
+    // on purpose. Tensor names are the converter's verbatim, so the production
+    // loader path is what a test exercises.
+    if mtp {
+        let pm = |s: &str| format!("mtp.layers.0.{s}");
+        wf(&mut blobs, &pm("input_layernorm.weight"), d, &mut r);
+        wf(&mut blobs, &pm("post_attention_layernorm.weight"), d, &mut r);
+        let q_rows = if cfg.attn_gate { 2 * nh * hd } else { nh * hd };
+        w4(&mut blobs, &pm("self_attn.q_proj.weight"), q_rows, d, &mut r);
+        w4(&mut blobs, &pm("self_attn.k_proj.weight"), nkv * hd, d, &mut r);
+        w4(&mut blobs, &pm("self_attn.v_proj.weight"), nkv * hd, d, &mut r);
+        w4(&mut blobs, &pm("self_attn.o_proj.weight"), d, nh * hd, &mut r);
+        wf(&mut blobs, &pm("self_attn.q_norm.weight"), hd, &mut r);
+        wf(&mut blobs, &pm("self_attn.k_norm.weight"), hd, &mut r);
+        w4(&mut blobs, &pm("mlp.gate_proj.weight"), di, d, &mut r);
+        w4(&mut blobs, &pm("mlp.up_proj.weight"), di, d, &mut r);
+        w4(&mut blobs, &pm("mlp.down_proj.weight"), d, di, &mut r);
+        w4(&mut blobs, "mtp.fc.weight", d, 2 * d, &mut r);
+        // Zero-centered, like every other norm in a Qwen3Next-family
+        // checkpoint: the loader adds 1.0, so these are written around 0 rather
+        // than around 1 as `wf` does for the main stack's RMSNorms.
+        let wf0 = |blobs: &mut Vec<Blob>, name: &str, n: usize, r: &mut Lcg| {
+            let v: Vec<f32> = (0..n).map(|_| r.f() * 0.1).collect();
+            blobs.push(Blob::new(name.to_string(), "F32", vec![n as i64], f32_bytes(&v)));
+        };
+        wf0(&mut blobs, "mtp.pre_fc_norm_embedding.weight", d, &mut r);
+        wf0(&mut blobs, "mtp.pre_fc_norm_hidden.weight", d, &mut r);
+        wf0(&mut blobs, "mtp.norm.weight", d, &mut r);
     }
 
     std::fs::create_dir_all(dir)?;

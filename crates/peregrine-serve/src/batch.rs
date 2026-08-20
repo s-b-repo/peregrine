@@ -370,6 +370,17 @@ pub struct EngineTelemetry {
     /// Drafts the `COLI_SPEC_CONF` floor cut short of their requested depth,
     /// cumulative. Zero when the floor is off (the default).
     pub spec_conf_stops: u64,
+    /// The cost side of `COLI_SPEC_GDN`, cumulative, all three zero unless it
+    /// is on: bytes copied into pre-verify recurrent snapshots, ticks where at
+    /// least one sequence overshot and needed a re-advance, and rows that
+    /// re-advance redid. A snapshot is ~151 MB per drafting sequence at
+    /// Qwen3.5-27B dims, so `gdn_snapshot_bytes` against the tokens the same
+    /// window emitted is the break-even question stated directly; `gdn_replays`
+    /// says how often the free path (full acceptance) was missed, which is what
+    /// the `COLI_SPEC_CONF` floor exists to raise.
+    pub gdn_snapshot_bytes: u64,
+    pub gdn_replays: u64,
+    pub gdn_replay_rows: u64,
     /// RLM recursive refinement `(passes_emitted, tokens_recursed)`,
     /// cumulative — `(0, 0)` unless `COLI_RLM=1`.
     pub rlm: (u64, u64),
@@ -475,6 +486,10 @@ struct EngineKnobs {
     draft_sampled: bool,
     /// `COLI_SPEC_CONF` — see [`spec_conf`].
     spec_conf: f32,
+    /// `COLI_SPEC_GDN` — see [`spec_gdn`].
+    spec_gdn: bool,
+    /// `COLI_SPEC_GDN_MAX_B` — see [`spec_gdn_max_b`].
+    spec_gdn_max_b: usize,
     /// `COLI_MAX_BATCH_ROWS` — see [`max_batch_rows`].
     max_batch_rows: usize,
     /// `COLI_QUEUE_DEPTH` — see [`queue_depth_cap`].
@@ -496,6 +511,8 @@ impl EngineKnobs {
             draft_depth: draft_depth(),
             draft_sampled: draft_sampled(),
             spec_conf: spec_conf(),
+            spec_gdn: spec_gdn(),
+            spec_gdn_max_b: spec_gdn_max_b(),
             max_batch_rows: max_batch_rows(),
             queue_depth_cap: queue_depth_cap(),
             adaptive_window_ratio: adaptive_window_ratio(),
@@ -552,6 +569,8 @@ struct SpecOverride {
     sampled: Option<bool>,
     /// `COLI_SPEC_CONF`.
     conf: Option<f32>,
+    /// `COLI_SPEC_GDN`.
+    gdn: Option<bool>,
 }
 
 /// [`spawn`] with the fusion and the speculation depth forced (test knob override).
@@ -562,7 +581,7 @@ fn spawn_tuned(
     fuse: bool,
     depth: Option<usize>,
 ) -> Result<(EngineHandle, JoinHandle<()>), Error> {
-    spawn_spec(model, max_batch, fuse, SpecOverride { depth, sampled: None, conf: None })
+    spawn_spec(model, max_batch, fuse, SpecOverride { depth, ..SpecOverride::default() })
 }
 
 /// [`spawn_tuned`] with the sampled-speculation knob forced too.
@@ -584,6 +603,9 @@ fn spawn_spec(
     if let Some(c) = spec.conf {
         knobs.spec_conf = c;
     }
+    if let Some(g) = spec.gdn {
+        knobs.spec_gdn = g;
+    }
     spawn_with_knobs(model, max_batch, knobs)
 }
 
@@ -593,6 +615,39 @@ fn spawn_spec(
 /// slack appears. Unset → static `max_batch` (the historical default).
 fn batch_sla_ms() -> Option<u64> {
     std::env::var("COLI_BATCH_SLA_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0)
+}
+
+/// Speculation on a **recurrent** architecture (`COLI_SPEC_GDN`). Default
+/// **off**.
+///
+/// A hybrid (GDN) sequence's context is a point state, not per-position rows:
+/// the verify forward advances it by `1 + γ` tokens and `truncate` cannot undo
+/// that. The rollback is `SeqKv::gdn_snapshot` before the forward and
+/// `gdn_restore` + a re-advance over the accepted rows after a partial
+/// acceptance — see the tick in [`run`]. This knob is what says that rollback
+/// is wired; with it off, `spec_reject_is_kv_only()` alone decides and hybrid
+/// models decode one token at a time exactly as before.
+///
+/// It is a knob rather than an unconditional enable because the snapshot is not
+/// free: ~3.1 MB per linear layer (≈151 MB per sequence at Qwen3.5-27B's 48
+/// linear layers), taken every tick a sequence drafts. Output is unaffected
+/// either way — `accept_run` still pins the greedy stream — so this is a
+/// throughput decision, and it has to be measured per batch width.
+fn spec_gdn() -> bool {
+    matches!(std::env::var("COLI_SPEC_GDN").ok().as_deref(), Some("1") | Some("true"))
+}
+
+/// Batch width above which recurrent speculation switches itself off
+/// (`COLI_SPEC_GDN_MAX_B`). `0`/unset is uncapped.
+///
+/// The snapshot cost is per *sequence*, so it scales with the batch while the
+/// resident weight read that dominates a forward does not. There is therefore a
+/// width past which the copies cost more than the accepted tokens repay. Rather
+/// than let that regress a busy server silently, the operator caps it — and the
+/// `gdn_snapshot_bytes` counter says where the crossover actually is on this
+/// box, instead of leaving it to be guessed.
+fn spec_gdn_max_b() -> usize {
+    std::env::var("COLI_SPEC_GDN_MAX_B").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
 }
 
 /// Speculative draft depth for the batched engine (`COLI_DRAFT`). `0`/unset is
@@ -886,6 +941,12 @@ fn run(
     let mut spec_proposed: u64 = 0;
     let mut spec_accepted: u64 = 0;
     let mut spec_conf_stops: u64 = 0;
+    // Recurrent-rollback accounting (see `EngineTelemetry::gdn_snapshot_bytes`).
+    // These three are the whole cost side of `COLI_SPEC_GDN`: what the copies
+    // cost, how often the cheap path missed, and how many rows the miss redid.
+    let mut gdn_snapshot_bytes: u64 = 0;
+    let mut gdn_replays: u64 = 0;
+    let mut gdn_replay_rows: u64 = 0;
     // Adaptive-batching state. `working_cap` is the current admission ceiling
     // (starts at `max_batch`, shrinks under SLA overrun, grows on slack). EWMA
     // over per-forward wall time drives the adjustment.
@@ -895,16 +956,19 @@ fn run(
     let depth = knobs.draft_depth;
     let sampled_spec = knobs.draft_sampled;
     let conf_floor = knobs.spec_conf;
-    // Speculation additionally requires that rejecting a draft is a pure KV
-    // rewind. A recurrent arch's verify forward advances its GdnState in place
-    // and `truncate` cannot undo that, so drafts stay off there until the
-    // snapshot/restore rollback is wired into the accept path below — enabling
-    // them first would corrupt the state of every sequence that rejects one.
-    let has_mtp = model.has_mtp() && model.spec_reject_is_kv_only();
-    if model.has_mtp() && !model.spec_reject_is_kv_only() {
+    // Speculation additionally requires that rejecting a draft can be undone.
+    // On a KV-only arch that is `truncate` and nothing else. A recurrent arch's
+    // verify forward advances its `GdnState` in place and truncation cannot
+    // reach it, so it needs the snapshot/restore rollback — which is wired
+    // below, behind `COLI_SPEC_GDN` because the snapshot costs ~151 MB per
+    // drafting sequence per tick at 27B dims and that price has to be measured
+    // per batch width, not assumed.
+    let gdn_rollback = !model.spec_reject_is_kv_only() && knobs.spec_gdn;
+    let has_mtp = model.has_mtp() && (model.spec_reject_is_kv_only() || gdn_rollback);
+    if model.has_mtp() && !model.spec_reject_is_kv_only() && !gdn_rollback {
         eprintln!(
-            "peregrine: [spec] MTP head present but speculation is off — this arch needs \
-             recurrent-state rollback on reject (not yet wired)"
+            "peregrine: [spec] MTP head present but speculation is off — this arch rewinds \
+             a recurrent state, which costs a per-tick snapshot; set COLI_SPEC_GDN=1 to enable it"
         );
     }
     // A GDN sequence's context is a point state, not per-position rows: a
@@ -1066,6 +1130,22 @@ fn run(
                 owner.push(n_dec); // the prefilling sequence is appended after the decoders (owners are per *sequence*, not per row)
             }
         }
+        // A recurrent arch cannot rewind by truncation. This forward is about
+        // to advance every drafting sequence's `GdnState` by `1 + g` tokens,
+        // and only the accepted prefix of that is real, so the pre-forward
+        // context is saved first. On full acceptance the snapshot is dropped
+        // untouched; otherwise it is restored and the committed rows are
+        // re-advanced below. Taken for any sequence carrying a draft — never
+        // gated on the batch width, because a cap that changed between the
+        // draft and its verify would silently skip a snapshot that was needed.
+        let gdn_snaps: Vec<Option<Vec<(usize, peregrine_model::gdn::GdnSnapshot)>>> = if gdn_rollback {
+            active.iter().map(|s| if s.draft.is_empty() { None } else { s.seq.gdn_snapshot() }).collect()
+        } else {
+            Vec::new()
+        };
+        for snaps in gdn_snaps.iter().flatten() {
+            gdn_snapshot_bytes += snaps.iter().map(|(_, sn)| sn.bytes() as u64).sum::<u64>();
+        }
         // Dropped at the end of the tick: speculated rows record here so a
         // rejected draft never reaches the prefetch predictor.
         let scratch_hist = Mutex::new(model.new_route_history());
@@ -1157,9 +1237,19 @@ fn run(
         // have produced, one forward at a time.
         let d_hidden = model.cfg.hidden as usize;
         let mut keep: Vec<bool> = Vec::with_capacity(active.len());
+        // `(active index, first committed position, one past the last)` for the
+        // sequences whose recurrent state overshot and has to be re-advanced.
+        let mut gdn_replay: Vec<(usize, usize, usize)> = Vec::new();
+        // A restore that fails leaves the state part-rewound, which is a wiring
+        // bug and not something to serve through: those sequences are retired
+        // after the loop, where `keep` can still be corrected.
+        let mut gdn_failed: Vec<(usize, String)> = Vec::new();
         for (i, s) in active.iter_mut().enumerate() {
             let base = first_row.get(i).copied().unwrap_or(i);
             let g = s.draft.len();
+            // The position this sequence's block starts at — where the rewind
+            // goes back to, captured before `s.pos` advances below.
+            let pos0 = s.pos;
             // A greedy drafting sequence takes `accept_run`, whose argmax rule
             // and `sampler.pick` agree by construction. A sampled one (only
             // reachable under `COLI_DRAFT_SAMPLED`) takes the rejection-sampling
@@ -1266,7 +1356,26 @@ fn run(
             // speculated tail cached — the next round would append after rows
             // the client never received.
             s.pos += 1 + drafts_emitted;
-            s.seq.truncate(s.pos);
+            // The KV half of the rewind — and, on a recurrent arch that did not
+            // accept its whole draft, only the second half of it. `GdnState`'s
+            // protocol is restore-then-truncate-then-re-advance in that order,
+            // so the state goes back to the pre-forward snapshot, the KV goes
+            // back to the same boundary, and the replay forward below carries
+            // both to `s.pos` over exactly the rows the client was sent.
+            let overshot = alive && g > 0 && drafts_emitted < g;
+            match gdn_snaps.get(i).and_then(Option::as_ref).filter(|_| overshot) {
+                Some(snap) => match s.seq.gdn_restore(snap) {
+                    Ok(()) => {
+                        s.seq.truncate(pos0);
+                        gdn_replay.push((i, pos0, s.pos));
+                    }
+                    Err(e) => {
+                        s.seq.truncate(s.pos);
+                        gdn_failed.push((i, e.to_string()));
+                    }
+                },
+                None => s.seq.truncate(s.pos),
+            }
             // The fed-token log commits the same rows: the token fed this tick
             // (the *old* `next_tok`, so this must precede the overwrite below)
             // plus the accepted drafts, keeping `toks` row-aligned with `seq`.
@@ -1309,6 +1418,66 @@ fn run(
             }
             keep.push(alive);
         }
+        // A restore that failed left a part-rewound recurrent state. Nothing
+        // downstream can tell, which is exactly why the request ends here
+        // rather than continuing on a context that is quietly wrong.
+        for (i, e) in &gdn_failed {
+            if let (Some(k), Some(st)) = (keep.get_mut(*i), active.get(*i)) {
+                *k = false;
+                if st.out.send(EngineOut::Error(format!("recurrent state rollback failed: {e}"))).is_err() {
+                    peregrine_core::note_advisory_err("gdn restore", &"client already disconnected");
+                }
+            }
+        }
+
+        // Re-advance every overshooting sequence's recurrent state over the
+        // rows it actually committed. One forward for all of them, not one
+        // each: on a resident model the cost of a forward is the weight read,
+        // which these rows share exactly as the decode batch does.
+        //
+        // The logits are discarded — this pass exists for its side effect on
+        // `GdnState` and the KV. `s.hlast` keeps the value the verify forward
+        // produced, which is the same value this pass recomputes: same tokens,
+        // same positions, same restored state, and rows of different sequences
+        // do not see each other.
+        if !gdn_replay.is_empty() {
+            let mut rtok: Vec<i32> = Vec::new();
+            let mut rpos: Vec<usize> = Vec::new();
+            let mut rowner: Vec<usize> = Vec::new();
+            let mut rrefs: Vec<&mut SeqKv> = Vec::new();
+            for (i, st) in active.iter_mut().enumerate() {
+                let Some(&(_, pos0, pos_end)) = gdn_replay.iter().find(|&&(r, _, _)| r == i) else {
+                    continue;
+                };
+                let slot = rrefs.len();
+                for p in pos0..pos_end {
+                    // `toks` is row-aligned with the cache by construction, so
+                    // a miss here is a bookkeeping bug; skip the row rather
+                    // than index-panic an engine thread that runs under
+                    // `panic = "abort"` and would take every sequence with it.
+                    let Some(&t) = st.toks.get(p) else { continue };
+                    rtok.push(t);
+                    rpos.push(p);
+                    rowner.push(slot);
+                }
+                rrefs.push(&mut st.seq);
+            }
+            gdn_replays += 1;
+            gdn_replay_rows += rtok.len() as u64;
+            if let Err(e) = model.forward_rows_batched(&rtok, &rowner, &mut rrefs, &rpos, None) {
+                // The states are now neither pre- nor post-forward. Same
+                // reasoning as a failed restore: retire rather than serve on.
+                for &(i, _, _) in &gdn_replay {
+                    if let (Some(k), Some(st)) = (keep.get_mut(i), active.get(i)) {
+                        *k = false;
+                        if st.out.send(EngineOut::Error(e.to_string())).is_err() {
+                            peregrine_core::note_advisory_err("gdn replay", &"client already disconnected");
+                        }
+                    }
+                }
+            }
+        }
+
         let mut idx = 0usize;
         active.retain(|_| {
             let k = keep[idx];
@@ -1333,9 +1502,18 @@ fn run(
             } else {
                 usize::MAX
             };
+            // The recurrent snapshot is charged per *sequence* while the
+            // resident weight read a forward is made of is shared across the
+            // batch, so past some width the copies cost more than the accepted
+            // tokens repay. `COLI_SPEC_GDN_MAX_B` is where the operator says
+            // that width is; drafting simply stops above it, which is the same
+            // state the engine is in with speculation off.
+            let gdn_width_ok =
+                !gdn_rollback || knobs.spec_gdn_max_b == 0 || active.len() <= knobs.spec_gdn_max_b;
+            let may_draft = has_mtp && gdn_width_ok;
             for s in active.iter_mut() {
                 let g =
-                    draft_depth_for(depth, has_mtp, s.sampler.temp, s.max_new - s.produced.min(s.max_new), sampled)
+                    draft_depth_for(depth, may_draft, s.sampler.temp, s.max_new - s.produced.min(s.max_new), sampled)
                         .min(depth_cap);
                 s.draft.clear();
                 s.draft_q.clear();
@@ -1406,6 +1584,9 @@ fn run(
             spec_proposed,
             spec_accepted,
             spec_conf_stops,
+            gdn_snapshot_bytes,
+            gdn_replays,
+            gdn_replay_rows,
             rlm: model.rlm_stats(),
             kvstore: prefix.disk.as_ref().map(|d| (d.saved, d.loaded, d.tokens_restored)),
             io_slab_in_use: model.io_slab_in_use(),
@@ -1938,6 +2119,17 @@ mod tests {
             std::fs::remove_dir_all(&d)?;
         }
         peregrine_model::testkit::build_tiny_model(&d)?;
+        Ok(d)
+    }
+
+    /// A tiny Qwen3.5-hybrid checkpoint *with* an MTP head — the recurrent arch
+    /// that could not speculate until `COLI_SPEC_GDN` wired the state rollback.
+    fn hybrid_mtp_dir(tag: &str) -> Result<std::path::PathBuf, Error> {
+        let d = std::env::temp_dir().join(format!("peregrine_hyb_{}_{}", std::process::id(), tag));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        peregrine_model::testkit::build_tiny_hybrid_model_with_mtp(&d, 0x5EC)?;
         Ok(d)
     }
 
@@ -2502,6 +2694,82 @@ mod tests {
     }
 
     #[test]
+    fn recurrent_speculation_does_not_change_the_served_token_stream() -> Result<(), Error> {
+        // The same contract as `speculation_does_not_change_the_served_token_stream`,
+        // on the arch that could not honour it until now. A hybrid's context is
+        // a point state: the verify forward folds every draft into it and
+        // `truncate` cannot take them back out, which is why `COLI_SPEC_GDN`
+        // exists and why this test is the thing that licenses it.
+        //
+        // Two ragged prompts, so per-sequence draft blocks differ in width and
+        // the rollback runs on some sequences and not others in the same tick.
+        let dir = hybrid_mtp_dir("spec")?;
+        let prompts = [vec![1i32, 5, 9, 2], vec![3i32, 8, 4]];
+        let n = 8usize;
+
+        let run_engine = |spec: SpecOverride| -> Result<(Vec<Vec<u32>>, EngineTelemetry), Error> {
+            let (handle, join) = spawn_spec(Model::load(&dir)?, 8, false, spec)?;
+            let mut rxs = Vec::new();
+            for p in &prompts {
+                let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+                handle.submit(EngineRequest {
+                    prompt: p.clone(),
+                    max_new: n,
+                    sampler: Sampler::new(0.0, 0.9, 1), // greedy: the case speculation is exact for
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                })?;
+                rxs.push(rx);
+            }
+            let mut out = Vec::new();
+            for mut rx in rxs {
+                let mut toks = Vec::new();
+                while let Some(msg) = rx.blocking_recv() {
+                    match msg {
+                        EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Error(e) => return Err(Error::Format(e)),
+                    }
+                }
+                out.push(toks);
+            }
+            let t = handle.telemetry();
+            drop(handle);
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok((out, t))
+        };
+
+        // An independent decode, not the engine with the knob off — the same
+        // reasoning the KV-arch twin records: a reference sharing the path it
+        // checks agrees with it even when both are wrong.
+        let want: Vec<Vec<u32>> = {
+            let m = Model::load(&dir)?;
+            prompts.iter().map(|p| ref_decode(&m, p, n)).collect::<Result<_, Error>>()?
+        };
+
+        // Off: the historical behaviour on this arch, and the proof that the
+        // fixture and the reference agree before speculation is involved.
+        let (off, t_off) = run_engine(SpecOverride { depth: Some(4), gdn: Some(false), ..SpecOverride::default() })?;
+        assert_eq!(off, want, "the hybrid engine disagrees with a plain greedy decode before speculation");
+        assert_eq!(t_off.spec_proposed, 0, "COLI_SPEC_GDN off must leave a recurrent arch un-speculated");
+        assert_eq!(t_off.gdn_snapshot_bytes, 0, "nothing should be copied when speculation is off");
+
+        // On: same stream, and the mechanism has to have actually run.
+        let (on, t_on) = run_engine(SpecOverride { depth: Some(4), gdn: Some(true), ..SpecOverride::default() })?;
+        assert!(on.iter().all(|t| !t.is_empty()), "COLI_SPEC_GDN=1: nothing generated");
+        assert_eq!(on, want, "COLI_SPEC_GDN=1 changed the served token stream");
+        // A speculation test that passes because nothing speculated is not a
+        // test — the same rule the DSA arm is held to.
+        assert!(t_on.spec_proposed > 0, "COLI_SPEC_GDN=1 must actually draft; proposed=0");
+        assert!(t_on.gdn_snapshot_bytes > 0, "drafting on a recurrent arch must snapshot its state");
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn speculation_does_not_change_the_served_token_stream() -> Result<(), Error> {
         // **The contract.** Speculation buys wall clock, never different
         // output: a draft is accepted only where it matches the model's own
@@ -2609,7 +2877,7 @@ mod tests {
             Ok(toks)
         };
 
-        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None };
+        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None, gdn: None };
         let got = run_engine(on)?;
         assert!(!got.is_empty(), "sampled speculation generated nothing");
         assert!(got.len() <= n, "served {} tokens for max_new {n}", got.len());
@@ -2623,7 +2891,7 @@ mod tests {
         // And the knob is a knob: with it off, the same request takes the
         // historical one-row path, whose stream differs precisely because the
         // RNG is consumed differently.
-        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None })?;
+        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None, gdn: None })?;
         assert!(!off.is_empty(), "the unspeculated path generated nothing");
         assert_ne!(
             off, got,
@@ -2672,10 +2940,10 @@ mod tests {
             Ok(toks)
         };
 
-        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0) })?;
+        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0), gdn: None })?;
         assert!(!base.is_empty(), "the baseline generated nothing");
         for floor in [0.65f32, 0.999] {
-            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor) })?;
+            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor), gdn: None })?;
             assert_eq!(gated, base, "a {floor} confidence floor changed a greedy stream");
         }
         std::fs::remove_dir_all(&dir)?;

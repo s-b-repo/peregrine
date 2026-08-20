@@ -43,6 +43,24 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Scale-out designs](scale-out-design.md) | the five items needing a second GPU, a second host, or a GDS stack — what each would be, and the `file:line` seam it hooks into |
 | [peregrine vs colibrì](peregrine-vs-colibri.md) | the full same-hardware engineering study on the real GLM-5.2 744B model |
 
+## Faster decoding: designs and open ideas
+
+Nineteen pages of design notes on breaking strict one-token-at-a-time
+generation and on moving fewer bytes per token. Most are proposals, not shipped
+work — [Speculative decoding alternatives](speculative-decoding-alternatives.md)
+is the index of the first group and carries the per-approach status, the
+economics that decide it, and the closures for approaches this engine cannot
+take.
+
+| Page | What's in it |
+|---|---|
+| [Speculative decoding alternatives](speculative-decoding-alternatives.md) | **start here** — every parallel-decoding approach scored against the two serving tracks, with status, priority order, and what is closed and why |
+| [Blockwise decoding](blockwise-decoding.md) · [Medusa / EAGLE](medusa-eagle.md) · [Speculative routing](speculative-routing.md) | the individual sketches the index scores |
+| [Expert-union future execution](expert-union-future-execution.md) · [Expert-level non-causal execution](expert-non-causal-execution.md) · [Adaptive causal](adaptive-causal.md) · [Causal inversion](causal-inversion.md) · [Backward routing](backward-routing.md) | executing several futures from one expert load |
+| [Expert decomposition](expert-decomposition.md) · [Token-equivalence adaptive precision](token-equivalence-adaptive-precision.md) · [Residual algebra](residual-algebra.md) · [Speed vs bytes](speed-vs-bytes.md) | moving fewer bytes at the representation level |
+| [Expert address prediction](expert-address-prediction.md) · [Compute before read](compute-before-read.md) · [Geometric cache](geometric-cache.md) · [Physical checkpoint](physical-checkpoint.md) | prediction, staging and layout |
+| [Three most promising ideas](three-most-promising-ideas.md) · [Advanced optimization directions](advanced-optimization-directions.md) | the two summary pages |
+
 Root-level references: [`README.md`](../README.md) (project overview) ·
 [`DESIGN.md`](../DESIGN.md) (the original design document) ·
 [`todo.md`](../todo.md) (the audited per-item roadmap) ·

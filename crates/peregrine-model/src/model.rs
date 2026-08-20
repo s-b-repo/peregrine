@@ -7803,6 +7803,17 @@ mod tests {
         Ok(())
     }
 
+    /// A tiny Qwen3.5-hybrid fixture carrying an MTP head — the recurrent arch
+    /// that speculation needs a state rollback for.
+    fn tmp_hybrid_mtp_dir(tag: &str, seed: u64) -> Result<PathBuf, peregrine_core::Error> {
+        let d = std::env::temp_dir().join(format!("peregrine_hybmtp_{}_{}", std::process::id(), tag));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_hybrid_model_with_mtp(&d, seed)?;
+        Ok(d)
+    }
+
     fn tmp_indexer_model_dir(tag: &str, topk: i64) -> Result<PathBuf, peregrine_core::Error> {
         let d = std::env::temp_dir().join(format!("peregrine_dsa_{}_{}", std::process::id(), tag));
         if d.exists() {
@@ -7879,6 +7890,177 @@ mod tests {
         m.forward_step_batched(&[7], &mut one, &[toks.len()], None)?;
         assert_eq!(on.len(), toks.len() + 1);
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_rejected_draft_leaves_no_recurrent_trace() -> Result<(), peregrine_core::Error> {
+        // The recurrent twin of `a_rejected_draft_leaves_no_trace_in_the_cache`,
+        // and the reason speculation was gated off on this arch: KV rows for
+        // rejected drafts can be truncated away, but a GDN layer has already
+        // folded them into its delta-rule memory. `truncate` cannot reach that.
+        //
+        // Three arms, because two would not be enough. REF is what plain
+        // one-token-at-a-time decoding produces. SPEC drafts two tokens, has
+        // them rejected, and runs the documented rollback — restore, rewind the
+        // KV, re-advance the committed row — and must match REF bit for bit.
+        // BROKEN skips the restore, which is exactly what the engine did before
+        // this was wired, and must *not* match: a rollback test that passes
+        // when the rollback does nothing is testing nothing.
+        let d = tmp_hybrid_mtp_dir("rewind", 0x21C)?;
+        let m = Model::load(&d)?;
+        let prompt = [1i32, 5, 9, 2];
+        let (fed, next) = (6i32, 3i32);
+        let (w1, w2) = (11i32, 13i32); // drafts the verify forward will reject
+        let n = prompt.len();
+
+        // Advance one sequence by `toks` at `pos..`, discarding the logits.
+        fn step(m: &Model, seq: &mut SeqKv, toks: &[i32], pos: usize) -> Result<Vec<f32>, peregrine_core::Error> {
+            let owner = vec![0usize; toks.len()];
+            let at: Vec<usize> = (pos..pos + toks.len()).collect();
+            let mut refs: Vec<&mut SeqKv> = vec![seq];
+            m.forward_rows_batched(toks, &owner, &mut refs, &at, None)
+        }
+
+        // REF: no speculation at all.
+        let mut r_seq = SeqKv::new(&m.cfg);
+        step(&m, &mut r_seq, &prompt, 0)?;
+        step(&m, &mut r_seq, &[fed], n)?;
+        let want = step(&m, &mut r_seq, &[next], n + 1)?;
+
+        // SPEC: draft two, reject both, roll back, re-advance the committed row.
+        let mut s_seq = SeqKv::new(&m.cfg);
+        step(&m, &mut s_seq, &prompt, 0)?;
+        let snap = s_seq.gdn_snapshot().ok_or_else(|| {
+            peregrine_core::Error::Format("hybrid fixture carries no recurrent state".into())
+        })?;
+        step(&m, &mut s_seq, &[fed, w1, w2], n)?;
+        s_seq.gdn_restore(&snap)?; // state half of the rewind — before the KV half
+        s_seq.truncate(n);
+        step(&m, &mut s_seq, &[fed], n)?; // re-advance over what was committed
+        // The KV half is checked by the next call rather than by `len()`:
+        // `SeqKv::len()` reads layer 0, which on this hybrid is a *linear*
+        // layer holding no rows at all, so it reads 0 whatever the cache does.
+        // What does catch a misaligned rewind is `LayerKv::append`, which
+        // refuses a position that is not the cache's current length — so a
+        // successful step at `n + 1` is the assertion.
+        let got = step(&m, &mut s_seq, &[next], n + 1)?;
+        assert_eq!(got.len(), want.len());
+        for (k, (p, q)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "logit {k} differs: a rejected draft reached the recurrent state");
+        }
+
+        // BROKEN: the KV half alone, which is what `truncate` gives you.
+        let mut b_seq = SeqKv::new(&m.cfg);
+        step(&m, &mut b_seq, &prompt, 0)?;
+        step(&m, &mut b_seq, &[fed, w1, w2], n)?;
+        b_seq.truncate(n + 1);
+        let bad = step(&m, &mut b_seq, &[next], n + 1)?;
+        assert!(
+            want.iter().zip(&bad).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "truncation alone must NOT rewind a GDN state — if it did, this whole rollback is unnecessary"
+        );
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_partially_accepted_draft_re_advances_exactly_the_committed_rows() -> Result<(), peregrine_core::Error> {
+        // `a_rejected_draft_leaves_no_recurrent_trace` covers k = 0, where the
+        // rollback rewinds everything the drafts touched. The other half of the
+        // protocol is k > 0: the state must come back to the snapshot and then
+        // go *forward* again over the rows that were actually committed — one
+        // row too few and the next token attends a context missing a token the
+        // client already has; one too many and it attends one the client never
+        // got. Both are silent. So the draft here is deliberately mixed: the
+        // first entry is what the model itself would predict, the second is not.
+        let d = tmp_hybrid_mtp_dir("partial", 0x33D)?;
+        let m = Model::load(&d)?;
+        let vocab = m.cfg.vocab as usize;
+        let prompt = [1i32, 5, 9, 2];
+        let fed = 6i32;
+        let n = prompt.len();
+
+        fn step(m: &Model, seq: &mut SeqKv, toks: &[i32], pos: usize) -> Result<Vec<f32>, peregrine_core::Error> {
+            let owner = vec![0usize; toks.len()];
+            let at: Vec<usize> = (pos..pos + toks.len()).collect();
+            let mut refs: Vec<&mut SeqKv> = vec![seq];
+            m.forward_rows_batched(toks, &owner, &mut refs, &at, None)
+        }
+
+        // REF: plain greedy. `c1` is what the model predicts after `fed`, so a
+        // draft of `c1` is the one `accept_run` will keep.
+        let mut r_seq = SeqKv::new(&m.cfg);
+        step(&m, &mut r_seq, &prompt, 0)?;
+        let l1 = step(&m, &mut r_seq, &[fed], n)?;
+        let c1 = crate::sample::argmax(&l1[..vocab]) as i32;
+        let l2 = step(&m, &mut r_seq, &[c1], n + 1)?;
+        let c2 = crate::sample::argmax(&l2[..vocab]) as i32;
+        let want = step(&m, &mut r_seq, &[c2], n + 2)?;
+
+        // SPEC: draft [c1, wrong]. One accepted, one rejected.
+        let wrong = ((c1 as usize + 1) % vocab) as i32;
+        let mut s_seq = SeqKv::new(&m.cfg);
+        step(&m, &mut s_seq, &prompt, 0)?;
+        let snap = s_seq.gdn_snapshot().ok_or_else(|| {
+            peregrine_core::Error::Format("hybrid fixture carries no recurrent state".into())
+        })?;
+        let rows = step(&m, &mut s_seq, &[fed, c1, wrong], n)?;
+        let (k, _next) = accept_run(&rows, vocab, &[c1, wrong]);
+        assert_eq!(k, 1, "the fixture must accept exactly the first draft for this test to mean anything");
+
+        s_seq.gdn_restore(&snap)?;
+        s_seq.truncate(n);
+        step(&m, &mut s_seq, &[fed, c1], n)?; // re-advance the 1 + k committed rows
+        let got = step(&m, &mut s_seq, &[c2], n + 2)?;
+        for (j, (p, q)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "logit {j} differs after a partially accepted draft");
+        }
+
+        // And re-advancing the *wrong* number of rows must not silently agree —
+        // otherwise the assertion above would hold however many rows replayed.
+        let mut b_seq = SeqKv::new(&m.cfg);
+        step(&m, &mut b_seq, &prompt, 0)?;
+        let bsnap = b_seq.gdn_snapshot().ok_or_else(|| {
+            peregrine_core::Error::Format("hybrid fixture carries no recurrent state".into())
+        })?;
+        step(&m, &mut b_seq, &[fed, c1, wrong], n)?;
+        b_seq.gdn_restore(&bsnap)?;
+        b_seq.truncate(n);
+        step(&m, &mut b_seq, &[fed], n)?; // one row short: the accepted draft dropped
+        let short = step(&m, &mut b_seq, &[c2], n + 1)?;
+        assert!(
+            want.iter().zip(&short).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "replaying too few rows must change the next token's context"
+        );
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_hybrid_checkpoint_with_an_mtp_head_loads_and_drafts() -> Result<(), peregrine_core::Error> {
+        // The fixture half of recurrent speculation: a hybrid container that
+        // actually carries the Qwen-dialect head, loaded by the production
+        // path. Without this every engine test below would silently measure
+        // "speculation off" and pass.
+        let d = tmp_hybrid_mtp_dir("load", 0x11B)?;
+        let m = Model::load(&d)?;
+        assert!(m.has_mtp(), "the fixture must carry an MTP head");
+        assert!(!m.spec_reject_is_kv_only(), "a hybrid rejects by state rollback, not truncation");
+        // And it drafts: `mtp_draft` needs a pre-final-norm hidden, which one
+        // prefill produces.
+        let toks = [1i32, 5, 9];
+        let mut seq = SeqKv::new(&m.cfg);
+        let owner = vec![0usize; toks.len()];
+        let pos: Vec<usize> = (0..toks.len()).collect();
+        let mut refs: Vec<&mut SeqKv> = vec![&mut seq];
+        let (_lg, hidden) = m.forward_rows_batched_hidden(&toks, &owner, &mut refs, &pos, None)?;
+        let dh = m.cfg.hidden as usize;
+        let hlast = &hidden[(toks.len() - 1) * dh..toks.len() * dh];
+        let drafted = m.mtp_draft(9, 3, hlast, 0.0)?;
+        assert_eq!(drafted.len(), 3, "no confidence floor, so the head drafts its full depth");
+        assert!(drafted.iter().all(|&t| t >= 0 && (t as usize) < m.cfg.vocab as usize), "drafts must be real ids");
+        std::fs::remove_dir_all(&d)?;
         Ok(())
     }
 
