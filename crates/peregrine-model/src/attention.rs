@@ -1076,7 +1076,14 @@ fn attend_dense(
 /// latent average through `kv_b`'s value rows. Row `s` depends only on `q[s]` and
 /// its own KV view, so a batched decode step is arithmetically identical to
 /// running each sequence's decode alone (the `batched_matches_sequential` guard).
-fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg, par_min: usize) -> Vec<f32> {
+fn attend_absorb_batched(
+    w: &AttnWeights,
+    q: &[f32],
+    rows: &[RowAttn],
+    c: &Cfg,
+    par_min: usize,
+    sel: Option<&[Vec<usize>]>,
+) -> Vec<f32> {
     let s_n = rows.len();
     let h_n = c.n_heads as usize;
     let qk_nope = c.qk_nope as usize;
@@ -1094,6 +1101,17 @@ fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg, 
         let cache_lc = rows[s].lc;
         let cache_rc = rows[s].rc;
         let nt = rows[s].len;
+        // Keys this row attends: the DSA selection clamped to its causal prefix
+        // (own position forced in, as the dense core does), or all of them.
+        // `None` keeps the historical `0..nt` loops term for term below — the
+        // default dense path must not move a bit.
+        let sel_keys: Option<Vec<usize>> = sel.and_then(|sets| sets.get(s)).map(|set| {
+            let mut k: Vec<usize> = set.iter().copied().filter(|&t| t < nt).collect();
+            if k.is_empty() {
+                k.push(nt - 1);
+            }
+            k
+        });
         // Scratch reused across every head and every kv_b row of this token.
         // These dequantizations re-derive an immutable weight, so allocating per
         // call cost ~h_n*(qk_nope+v_head) heap allocations per token per layer.
@@ -1116,17 +1134,37 @@ fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg, 
             }
 
             sc.clear();
-            sc.resize(nt, 0.0);
-            for (t, sct) in sc.iter_mut().enumerate().take(nt) {
-                let raw = cache_lc.dot_row(t, kvl, &qabs) + cache_rc.dot_row(t, qk_rope, q_rope);
-                *sct = raw * c.attn_scale;
+            match &sel_keys {
+                Some(keys) => {
+                    sc.resize(keys.len(), 0.0);
+                    for (i, &t) in keys.iter().enumerate() {
+                        let raw = cache_lc.dot_row(t, kvl, &qabs) + cache_rc.dot_row(t, qk_rope, q_rope);
+                        sc[i] = raw * c.attn_scale;
+                    }
+                }
+                None => {
+                    sc.resize(nt, 0.0);
+                    for (t, sct) in sc.iter_mut().enumerate().take(nt) {
+                        let raw = cache_lc.dot_row(t, kvl, &qabs) + cache_rc.dot_row(t, qk_rope, q_rope);
+                        *sct = raw * c.attn_scale;
+                    }
+                }
             }
             softmax(&mut sc);
 
             // clat = Σ_t sc[t] · Lc[t]; ctx = kv_b value rows · clat
             clat.fill(0.0);
-            for (t, &a) in sc.iter().enumerate().take(nt) {
-                cache_lc.axpy_row(t, kvl, a, &mut clat);
+            match &sel_keys {
+                Some(keys) => {
+                    for (i, &t) in keys.iter().enumerate() {
+                        cache_lc.axpy_row(t, kvl, sc[i], &mut clat);
+                    }
+                }
+                None => {
+                    for (t, &a) in sc.iter().enumerate().take(nt) {
+                        cache_lc.axpy_row(t, kvl, a, &mut clat);
+                    }
+                }
             }
             let cx = &mut ctx_row[h * vh..h * vh + vh];
             for (j, out) in cx.iter_mut().enumerate() {
@@ -1144,7 +1182,7 @@ fn attend_absorb_batched(w: &AttnWeights, q: &[f32], rows: &[RowAttn], c: &Cfg, 
 /// pre-batching core (same `nt`, same slices, same arithmetic).
 fn attend_absorb(w: &AttnWeights, q: &[f32], s_n: usize, pos_base: usize, cache: &LayerKv, c: &Cfg) -> Vec<f32> {
     let rows: Vec<RowAttn> = (0..s_n).map(|s| cache.view_prefix(pos_base + s + 1)).collect();
-    attend_absorb_batched(w, q, &rows, c, peregrine_par::PAR_ATTN_MIN)
+    attend_absorb_batched(w, q, &rows, c, peregrine_par::PAR_ATTN_MIN, None)
 }
 
 /// MLA attention (dense reconstruction). `s_n` new tokens from `pos_base`,
@@ -1282,6 +1320,7 @@ pub fn mla_attention_batched(
     pos_of: &[usize],
     caches: &mut [&mut LayerKv],
     c: &Cfg,
+    ix: Option<&IndexerWeights>,
     absorb: bool,
 ) -> Result<Vec<f32>, Error> {
     let s_n = pos_of.len();
@@ -1292,7 +1331,7 @@ pub fn mla_attention_batched(
         )));
     }
     let owner: Vec<usize> = (0..s_n).collect();
-    mla_attention_rows(w, x, RowLayout { pos_of, owner: &owner }, caches, c, absorb)
+    mla_attention_rows(w, x, RowLayout { pos_of, owner: &owner }, caches, c, ix, absorb)
 }
 
 /// Where each row sits: its absolute position, and which cache it belongs to.
@@ -1328,12 +1367,23 @@ impl RowLayout<'_> {
 /// [`LayerKv::append`] reports a violation rather than corrupting the cache, so
 /// a scheduler bug fails one request instead of silently attending the wrong
 /// history.
+///
+/// `ix` is this layer's DSA indexer, when `COLI_DSA` is on and the checkpoint
+/// carries one. This is the path the batched server runs, so sparse long-context
+/// selection had to reach *both* cores here rather than only the single-sequence
+/// dense form of [`mla_attention_dsa_indexed`]: rows get their index keys cached
+/// (per sequence — the key stream lives inside each row's own `LayerKv`, so two
+/// sequences in one batch can never interleave keys), and past `index_topk` each
+/// row attends only its selected keys in whichever core `absorb` picks. Below
+/// `index_topk` the selection is the identity set and the step is exactly
+/// output-neutral, the same activation rule the single-sequence path uses.
 pub fn mla_attention_rows(
     w: &AttnWeights,
     x: &[f32],
     rows_at: RowLayout,
     caches: &mut [&mut LayerKv],
     c: &Cfg,
+    ix: Option<&IndexerWeights>,
     absorb: bool,
 ) -> Result<Vec<f32>, Error> {
     let RowLayout { pos_of, owner } = rows_at;
@@ -1347,20 +1397,57 @@ pub fn mla_attention_rows(
             caches.len()
         )));
     }
+    let hidden = c.hidden as usize;
     let kvl = c.kv_lora as usize;
     let qk_rope = c.qk_rope as usize;
-    let (q, _qr, lc_rows, rc_rows) = project_batched(w, x, s_n, pos_of, c);
+    let (q, qr, lc_rows, rc_rows) = project_batched(w, x, s_n, pos_of, c);
     // Append in row order, so a chunk's later rows see its earlier ones — the
-    // causal prefix, exactly as sequential prefill builds it.
+    // causal prefix, exactly as sequential prefill builds it. Indexer keys ride
+    // the same append, one per row, into that row's own sequence's cache — the
+    // third-stream lifecycle `LayerKv` already gives them.
     for s in 0..s_n {
+        let pos = pos_of[s];
         caches[owner[s]].append(
-            pos_of[s],
+            pos,
             &lc_rows[s * kvl..s * kvl + kvl],
             &rc_rows[s * qk_rope..s * qk_rope + qk_rope],
         )?;
+        if let Some(ix) = ix {
+            caches[owner[s]].append_index_key(&ix.key_row(&x[s * hidden..s * hidden + hidden], pos, c));
+        }
     }
     let views: Vec<&LayerKv> = caches.iter().map(|k| &**k).collect();
     let rows: Vec<RowAttn> = (0..s_n).map(|s| views[owner[s]].view_prefix(pos_of[s] + 1)).collect();
+    // DSA selections, per row, exactly when the single-sequence path would
+    // select: past `index_topk`, with the key cache covering the row's whole
+    // prefix. Below that, dense attention over ≤ topk keys *is* the selection,
+    // so the row's entry is the identity set. `sel` covers every row or the
+    // cores would read a missing entry as "attend self only" — which is why the
+    // dense rows carry explicit identity sets instead of holes. Key buffers are
+    // materialized once per *sequence*, the batched analogue of the
+    // single-sequence path's once-per-call.
+    let sel: Option<Vec<Vec<usize>>> = ix.map(|ix| {
+        let ql = c.q_lora as usize;
+        let mut key_mats: Vec<Option<Vec<f32>>> = vec![None; caches.len()];
+        (0..s_n)
+            .map(|s| {
+                let o = owner[s];
+                let tk = rows[s].len;
+                let dense_is_identical = ix.topk() == 0 || tk <= ix.topk() || views[o].index_len() < tk;
+                if dense_is_identical {
+                    return (0..tk).collect();
+                }
+                let keys = key_mats[o].get_or_insert_with(|| {
+                    let n = views[o].len();
+                    let mut k = Vec::with_capacity(n * ix.hd());
+                    views[o].ix_span(n).extend_f32(n, ix.hd(), &mut k);
+                    k
+                });
+                ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], pos_of[s], c, keys)
+            })
+            .collect()
+    });
+    let sel = sel.as_deref();
     // `absorb` is the caller's `COLI_MLA_ABSORB`. It used to be ignored here —
     // this core was absorb-only, so a served request ran its prefill dense and
     // every decode token absorbed, two numerically different implementations
@@ -1373,9 +1460,9 @@ pub fn mla_attention_rows(
     // decision, taken against the documented default, instead of one the code
     // made silently.
     let ctx = if absorb {
-        attend_absorb_batched(w, &q, &rows, c, peregrine_par::PAR_ATTN_MIN)
+        attend_absorb_batched(w, &q, &rows, c, peregrine_par::PAR_ATTN_MIN, sel)
     } else {
-        attend_dense_rows(w, &q, &rows, owner, c, None)
+        attend_dense_rows(w, &q, &rows, owner, c, sel)
     };
     Ok(w.o.apply_vec(&ctx, s_n))
 }
@@ -1836,7 +1923,7 @@ mod tests {
         // This test's reference is built with `mla_attention_absorb`, so the
         // batched call has to be the absorb core too — the comparison is
         // batched-vs-sequential, not dense-vs-absorb.
-        let bat_out = mla_attention_batched(&w.view(), &x, &pos_of, &mut refs, &c, true)?;
+        let bat_out = mla_attention_batched(&w.view(), &x, &pos_of, &mut refs, &c, None, true)?;
 
         for z in 0..b * hidden {
             assert!((seq_out[z] - bat_out[z]).abs() < 1e-6, "z={z} seq={} bat={}", seq_out[z], bat_out[z]);
@@ -2014,6 +2101,7 @@ mod tests {
             &[RowAttn { len: nt, lc: KvSpan::contiguous(&lc), rc: KvSpan::contiguous(&rc) }],
             &c,
             usize::MAX,
+            None,
         );
         // Every split point, including the degenerate ends, must agree.
         for cut in 0..=nt {
@@ -2025,6 +2113,7 @@ mod tests {
                 &[RowAttn { len: nt, lc: KvSpan::split(lh, lt), rc: KvSpan::split(rh, rt) }],
                 &c,
                 usize::MAX,
+                None,
             );
             for (k, (a, b)) in whole.iter().zip(&got).enumerate() {
                 assert_eq!(a.to_bits(), b.to_bits(), "split at row {cut}, output {k}: not bit-identical");
@@ -2293,7 +2382,7 @@ mod tests {
             let pos_of: Vec<usize> = (0..n).collect();
             let owner = vec![0usize; n];
             let mut refs: Vec<&mut LayerKv> = vec![&mut got_kv];
-            let got = mla_attention_rows(&w.view(), &x, RowLayout { pos_of: &pos_of, owner: &owner }, &mut refs, &c, absorb)?;
+            let got = mla_attention_rows(&w.view(), &x, RowLayout { pos_of: &pos_of, owner: &owner }, &mut refs, &c, None, absorb)?;
 
             assert_eq!(got.len(), want.len());
             for (k, (p, q)) in want.iter().zip(&got).enumerate() {
@@ -2338,7 +2427,7 @@ mod tests {
             let pos_of = [0usize, 1, 2, 2];
             let owner = [0usize, 0, 0, 1];
             let mut refs: Vec<&mut LayerKv> = vec![&mut ka, &mut kb];
-            let got = mla_attention_rows(&w.view(), &fused, RowLayout { pos_of: &pos_of, owner: &owner }, &mut refs, &c, absorb)?;
+            let got = mla_attention_rows(&w.view(), &fused, RowLayout { pos_of: &pos_of, owner: &owner }, &mut refs, &c, None, absorb)?;
 
             for (k, (p, q)) in want_a.iter().zip(&got[..3 * hidden]).enumerate() {
                 assert_eq!(p.to_bits(), q.to_bits(), "absorb={absorb}, seq A output {k}");
@@ -2369,8 +2458,8 @@ mod tests {
             .map(|s| RowAttn { len: lens[s], lc: KvSpan::contiguous(&lcs[s]), rc: KvSpan::contiguous(&rcs[s]) })
             .collect();
 
-        let par = attend_absorb_batched(&w.view(), &q, &rows, &c, 2); // parallel (s_n >= 2)
-        let ser = attend_absorb_batched(&w.view(), &q, &rows, &c, usize::MAX); // forced serial
+        let par = attend_absorb_batched(&w.view(), &q, &rows, &c, 2, None); // parallel (s_n >= 2)
+        let ser = attend_absorb_batched(&w.view(), &q, &rows, &c, usize::MAX, None); // forced serial
         assert!(par.iter().zip(&ser).all(|(a, b)| a.to_bits() == b.to_bits()), "attend_absorb must be bit-identical parallel vs serial");
         Ok(())
     }

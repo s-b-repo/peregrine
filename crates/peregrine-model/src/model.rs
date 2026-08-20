@@ -2795,7 +2795,19 @@ fn forward_layer_batched(
     let s_n = rows_at.len();
     let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
     let attn = match &l.attn {
-        LayerAttn::Mla { .. } => mla_attention_rows(&l.attn()?, &nrm, rows_at, caches, cfg, ctx.absorb)?,
+        // Same selector as the single-sequence path above: DSA runs only when
+        // `COLI_DSA` is on *and* this layer carries indexer weights. Passing it
+        // here is what extends sparse selection to the batched server; `None`
+        // keeps the historical dense/absorb behaviour bit for bit.
+        LayerAttn::Mla { .. } => mla_attention_rows(
+            &l.attn()?,
+            &nrm,
+            rows_at,
+            caches,
+            cfg,
+            ctx.dsa.then_some(()).and(l.indexer.as_ref()),
+            ctx.absorb,
+        )?,
         LayerAttn::Gqa { .. } => {
             // Batched GQA decode: each row attends its own cache, so the batch
             // form is the single form per row (the MoE-free analogue of what
@@ -7866,6 +7878,65 @@ mod tests {
         let mut one: [&mut SeqKv; 1] = [&mut on];
         m.forward_step_batched(&[7], &mut one, &[toks.len()], None)?;
         assert_eq!(on.len(), toks.len() + 1);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn batched_dsa_rows_get_what_each_sequence_would_get_alone() -> Result<(), peregrine_core::Error> {
+        // The batched row path grew a DSA arm, and with it a per-owner memo of
+        // materialized indexer keys. That memo is exactly where a cross-sequence
+        // bug would live: score sequence B's query against sequence A's keys and
+        // the selection is wrong, the output is still plausible, and nothing
+        // else in the tree notices. So two sequences fused into one forward must
+        // each get, bit for bit, what they get alone.
+        //
+        // The dense arm is measured first on purpose: a sparse-attention test
+        // that would pass unchanged if selection did nothing is not testing
+        // selection. This is the batched twin of
+        // `dsa_selects_a_subset_once_context_exceeds_index_topk`, which only
+        // ever exercised the single-sequence core.
+        let dir = tmp_indexer_model_dir("batched", 2)?;
+        let mut m = Model::load(&dir)?;
+        let vocab = m.cfg.vocab as usize;
+        let (pa, pb) = ([1i32, 5, 9, 2, 6, 3], [4i32, 8, 2, 7, 1, 9]);
+        let n = pa.len();
+
+        fn rows_alone(m: &Model, toks: &[i32]) -> Result<Vec<f32>, peregrine_core::Error> {
+            let mut s = SeqKv::new(&m.cfg);
+            let owner = vec![0usize; toks.len()];
+            let pos: Vec<usize> = (0..toks.len()).collect();
+            let mut refs: Vec<&mut SeqKv> = vec![&mut s];
+            m.forward_rows_batched(toks, &owner, &mut refs, &pos, None)
+        }
+
+        m.dsa = false;
+        let dense_a = rows_alone(&m, &pa)?;
+        m.dsa = true;
+        let want_a = rows_alone(&m, &pa)?;
+        let want_b = rows_alone(&m, &pb)?;
+        assert!(
+            dense_a.iter().zip(&want_a).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "index_topk=2 over {n} positions must attend a strict subset in the batched core too"
+        );
+
+        // Both sequences' rows in one forward, the regime the server runs.
+        let mut fa = SeqKv::new(&m.cfg);
+        let mut fb = SeqKv::new(&m.cfg);
+        let tokens: Vec<i32> = pa.iter().chain(pb.iter()).copied().collect();
+        let owner: Vec<usize> = std::iter::repeat_n(0, n).chain(std::iter::repeat_n(1, n)).collect();
+        let pos_of: Vec<usize> = (0..n).chain(0..n).collect();
+        let mut refs: Vec<&mut SeqKv> = vec![&mut fa, &mut fb];
+        let got = m.forward_rows_batched(&tokens, &owner, &mut refs, &pos_of, None)?;
+
+        assert_eq!(got.len(), 2 * n * vocab);
+        for (k, (p, q)) in want_a.iter().zip(&got[..n * vocab]).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "sequence A logit {k} moved when batched beside another DSA sequence");
+        }
+        for (k, (p, q)) in want_b.iter().zip(&got[n * vocab..]).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "sequence B logit {k} moved when batched beside another DSA sequence");
+        }
+        assert_eq!((fa.index_len(), fb.index_len()), (n, n), "each cache kept only its own indexer keys");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
