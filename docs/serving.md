@@ -246,6 +246,29 @@ means reads are serializing on buffers), and `memo` (response-memo counters).
 On a recurrent arch under `COLI_SPEC_GDN`, `spec` also carries
 `gdn_snapshot_bytes` / `gdn_replays` / `gdn_replay_rows` — the cost side of that
 rollback, which is what decides whether it pays at a given batch width.
+
+`decode` (`tokens_emitted`, `rows`) is the **numerator** `/metrics` was missing.
+The denominator was already there: `ecache.hits + misses` is every routed-expert
+entry the streaming lane resolved and `ecache.disk_reads` the subset that
+reached the device. Delta both across two scrapes and the metric this engine is
+ultimately tuned on falls out directly:
+
+```
+tokens per expert read = Δdecode.tokens_emitted / Δ(ecache.hits + ecache.misses)
+tokens per disk read   = Δdecode.tokens_emitted / Δecache.disk_reads
+rows per token         = Δdecode.rows           / Δdecode.tokens_emitted
+```
+
+The first two are *SSD bytes per accepted token* — the figure
+[`speculative-decoding-alternatives.md`](speculative-decoding-alternatives.md)
+names as the only one that decides a speculative technique on the streaming
+track — measured rather than derived. The third is speculation's row overhead
+and is what an expert-union budget would be spent against.
+
+Read `rows per token` with one correction: a request's **first** token is
+sampled from the prefill's last position and costs no decode row, so the ratio
+sits just below 1.0 unspeculated and approaches 1.0 as requests lengthen. Above
+1.0 is speculation's overhead.
 Cumulative counters are meant to be delta'd across two scrapes. At shutdown
 the engine prints `[prefix-cache]`, `[spec]` and `[rlm]` summary lines to
 stderr (each silent when its feature never engaged).

@@ -388,6 +388,36 @@ pub struct EngineTelemetry {
     /// what lets an operator see that the free source is carrying the run.
     pub ngram_proposed: u64,
     pub ngram_accepted: u64,
+    /// Tokens actually sent to clients, and decode rows actually forwarded,
+    /// both cumulative. **These are the numerators the engine was missing.**
+    ///
+    /// `/metrics` already published the denominator — `ecache.hits + misses` is
+    /// every routed-expert entry the streaming lane resolved, and
+    /// `ecache.disk_reads` is the subset that reached the device — but nothing
+    /// published what those reads bought. Delta both across two scrapes and the
+    /// quantity that decides every speculative technique on the streaming track
+    /// falls out directly:
+    ///
+    /// ```text
+    /// tokens per expert read  = Δtokens_emitted / Δ(hits + misses)
+    /// tokens per disk read    = Δtokens_emitted / Δdisk_reads
+    /// rows per token          = Δdecode_rows    / Δtokens_emitted
+    /// ```
+    ///
+    /// The first two are `docs/speculative-decoding-alternatives.md`'s stated
+    /// metric — SSD bytes per *accepted* token — made observable instead of
+    /// derived. The third is speculation's row overhead, and it is what an
+    /// expert-union budget would be spent against. Wall clock cannot separate
+    /// these, which is why the runbook keeps saying to measure fusion and
+    /// speculation with counters instead.
+    ///
+    /// Read `rows per token` with one correction: the **first** token of each
+    /// request is sampled from the prefill's last position and costs no decode
+    /// row at all, so the ratio sits just *below* 1.0 unspeculated and
+    /// approaches 1.0 as requests lengthen. Above 1.0 is speculation's
+    /// overhead; a short-request workload that reads 0.8 is not a win.
+    pub tokens_emitted: u64,
+    pub decode_rows: u64,
     /// RLM recursive refinement `(passes_emitted, tokens_recursed)`,
     /// cumulative — `(0, 0)` unless `COLI_RLM=1`.
     pub rlm: (u64, u64),
@@ -999,6 +1029,9 @@ fn run(
     // average a free source with an expensive one and mean nothing.
     let mut ngram_proposed: u64 = 0;
     let mut ngram_accepted: u64 = 0;
+    // The decode-economics numerators — see `EngineTelemetry::tokens_emitted`.
+    let mut tokens_emitted: u64 = 0;
+    let mut decode_rows: u64 = 0;
     // Adaptive-batching state. `working_cap` is the current admission ceiling
     // (starts at `max_batch`, shrinks under SLA overrun, grows on slack). EWMA
     // over per-forward wall time drives the adjustment.
@@ -1142,7 +1175,13 @@ fn run(
                     }
                     fused = Some((p, end));
                 }
-                None => prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids, chunk_div, &mut prefix),
+                None => {
+                    // A promoted sequence emits its first token here, and it
+                    // counts: the ratio this feeds is per *served* token.
+                    tokens_emitted +=
+                        prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids, chunk_div, &mut prefix)
+                            as u64;
+                }
             }
         }
         if active.is_empty() {
@@ -1176,6 +1215,9 @@ fn run(
             }
         }
         let n_dec_rows = tokens.len();
+        // Decode rows only: a fused prefill chunk's rows are appended after
+        // this and are not what speculation's overhead is measured against.
+        decode_rows += n_dec_rows as u64;
         if let Some((p, end)) = &fused {
             for (j, &t) in p.prompt[p.pos..*end].iter().enumerate() {
                 tokens.push(t);
@@ -1401,6 +1443,7 @@ fn run(
                     break;
                 }
                 s.produced += 1;
+                tokens_emitted += 1;
                 if j < k {
                     drafts_emitted += 1; // the final entry is not a cached row
                 }
@@ -1688,7 +1731,9 @@ fn run(
         // keeps the two ticks observationally identical.
         if let Some((p, end)) = fused {
             let out_cfg = OutputCfg { vocab, stop_ids: &stop_ids };
-            finish_prefill_chunk(p, end, &logits[n_dec_rows * vocab..], &mut pending, &mut active, out_cfg, &mut prefix);
+            tokens_emitted +=
+                finish_prefill_chunk(p, end, &logits[n_dec_rows * vocab..], &mut pending, &mut active, out_cfg, &mut prefix)
+                    as u64;
         }
 
         // Periodically migrate the hottest experts into VRAM (heat-ranked
@@ -1720,6 +1765,8 @@ fn run(
             gdn_replay_rows,
             ngram_proposed,
             ngram_accepted,
+            tokens_emitted,
+            decode_rows,
             rlm: model.rlm_stats(),
             kvstore: prefix.disk.as_ref().map(|d| (d.saved, d.loaded, d.tokens_restored)),
             io_slab_in_use: model.io_slab_in_use(),
@@ -2056,9 +2103,9 @@ fn prefill_step(
     stop_ids: &[i32],
     chunk_div: usize,
     prefix: &mut PrefixStore,
-) {
+) -> usize {
     let Some(mut p) = pending.pop_front() else {
-        return;
+        return 0;
     };
     let end = chunk_end(p.pos, p.prompt.len(), chunk_div);
     // The chunk is a plain slice of the prompt; `seq` is a disjoint field, so no
@@ -2070,10 +2117,10 @@ fn prefill_step(
             if out.send(EngineOut::Error(e.to_string())).is_err() {
                 peregrine_core::note_advisory_err("prefill error forward", &"client already disconnected");
             }
-            return; // drop this sequence
+            return 0; // drop this sequence
         }
     };
-    finish_prefill_chunk(p, end, &logits, pending, active, OutputCfg { vocab, stop_ids }, prefix);
+    finish_prefill_chunk(p, end, &logits, pending, active, OutputCfg { vocab, stop_ids }, prefix)
 }
 
 /// The two things sampling needs, together — they are read as a pair
@@ -2148,14 +2195,14 @@ fn finish_prefill_chunk(
     active: &mut Vec<SeqState>,
     out_cfg: OutputCfg,
     prefix: &mut PrefixStore,
-) {
+) -> usize {
     let OutputCfg { vocab, stop_ids } = out_cfg;
     let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist, seq_id } = p;
     let chunk_len = end - pos;
     if end < prompt.len() {
         // more chunks to go — round-robin with the others
         pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new, hist, seq_id });
-        return;
+        return 0;
     }
     // Prefill complete. Snapshot it before the KV moves into the active set, so
     // the next request sharing this prompt's head starts from here. No-op when
@@ -2164,17 +2211,18 @@ fn finish_prefill_chunk(
     // Sample the first token from the last prompt position. An empty chunk would
     // mean an empty prompt, which `admit_pending` rejects.
     let Some(last) = chunk_len.checked_sub(1).map(|c| c * vocab) else {
-        return;
+        return 0;
     };
     let t0 = sampler.pick(&logits[last..last + vocab], -1) as i32;
     if stop_ids.contains(&t0) {
-        return; // first token is a stop → emit nothing
+        return 0; // first token is a stop → emit nothing
     }
     if out.send(EngineOut::Token(t0 as u32)).is_err() {
-        return; // client already gone
+        return 0; // client already gone — the token reached nobody
     }
+    // Sent, so it counts from here whatever becomes of the sequence.
     if max_new <= 1 {
-        return; // only one token requested
+        return 1; // only one token requested
     }
     active.push(SeqState {
         seq,
@@ -2195,6 +2243,7 @@ fn finish_prefill_chunk(
         // whose rows so far are exactly the prompt); `t0` joins it when fed.
         toks: prompt,
     });
+    1
 }
 
 #[cfg(test)]
@@ -2825,6 +2874,81 @@ mod tests {
             "published lane timings must be the model's, not a default: {:?}",
             t.lane_last
         );
+        Ok(())
+    }
+
+    #[test]
+    fn decode_counters_are_the_numerator_the_ratio_needs() -> Result<(), Error> {
+        // `/metrics` has always published the denominator — `ecache.hits +
+        // misses` is every routed-expert entry the streaming lane resolved —
+        // and never what those reads bought. These two are that numerator, so
+        // what they have to be is *exact*: `tokens_emitted` must equal the
+        // tokens the clients actually received, not the tokens the engine
+        // decoded, or every ratio taken against it is quietly optimistic about
+        // work thrown away at a stop token or a budget edge.
+        //
+        // And `rows / tokens` must read 1.0 with speculation off, since that is
+        // the baseline the speculated figure is compared against.
+        let dir = tiny_dir("decode_counters")?;
+        let prompts = [vec![1i32, 5, 9, 2], vec![3i32, 8, 4]];
+        let n = 6usize;
+        let (handle, join) = spawn_tuned(Model::load(&dir)?, 8, false, Some(0))?;
+        let mut rxs = Vec::new();
+        for p in &prompts {
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: p.clone(),
+                max_new: n,
+                sampler: Sampler::new(0.0, 0.9, 1),
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            rxs.push(rx);
+        }
+        let mut received = 0u64;
+        for mut rx in rxs {
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    EngineOut::Token(_) => received += 1,
+                    EngineOut::Error(e) => return Err(Error::Format(e)),
+                }
+            }
+        }
+        let t = handle.telemetry();
+        drop(handle);
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+        assert!(received > 0, "sanity: something decoded");
+        // Not `== received`: telemetry publishes at the *end* of a tick, and a
+        // client can be holding the last tick's tokens before that publish
+        // lands, so an equality here is a race that passes alone and fails in a
+        // loaded suite. What is true at every tick boundary is asserted
+        // instead — an upper bound (no token is counted that no client got)
+        // and the exact relation below.
+        assert!(t.tokens_emitted > 0, "the counter must move at all");
+        assert!(
+            t.tokens_emitted <= received,
+            "counted {} tokens but clients got {received} — the counter is inventing work",
+            t.tokens_emitted
+        );
+        // Unspeculated, every token costs exactly one decode row *except* the
+        // first of each request, which is sampled from the prefill's last
+        // position and rides rows that were going to be forwarded anyway. So
+        // `rows / tokens` sits slightly below 1.0 on short requests and
+        // approaches 1.0 on long ones — worth knowing before reading it as a
+        // speculation figure, where the same ratio rises above 1.
+        assert_eq!(
+            t.decode_rows + prompts.len() as u64,
+            t.tokens_emitted,
+            "unspeculated: one decode row per token, minus the free first token of each request"
+        );
+        // This is the assertion that would have caught the counter as first
+        // written: it missed the token each request emits at promotion, which
+        // reads as a 20% understatement of tokens-per-expert-read on short
+        // requests — a bias in the flattering direction.
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

@@ -559,6 +559,15 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
             "hits": h, "misses": m, "disk_reads": d, "prefetch_reads": t.prefetch_reads,
         })),
         "routing_entropy_ewma": t.runtime.entropy_ewma,
+        // What the expert reads above actually bought. Delta these against
+        // `ecache` across two scrapes for the metric this engine is ultimately
+        // tuned on — SSD bytes per *accepted* token:
+        //   tokens per expert read = d(tokens) / d(hits + misses)
+        //   tokens per disk read   = d(tokens) / d(disk_reads)
+        //   rows per token         = d(rows)   / d(tokens)     <- 1.0 unspeculated
+        // Wall clock cannot separate a speculative win from a workload that had
+        // no drafts in it; these can.
+        "decode": { "tokens_emitted": t.tokens_emitted, "rows": t.decode_rows },
         // MTP speculation: delta across scrapes for a live accept rate. Every
         // proposed draft is a verify row in the batched forward; the accept
         // rate is what says whether COLI_DRAFT's depth pays for those rows.
