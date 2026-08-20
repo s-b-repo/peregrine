@@ -156,23 +156,38 @@ by how much of the literature a row covers.
 
 1. **Speculation on the resident track** — `COLI_SPEC_GDN`. **Done
    (2026-08-20).** The one change that turned the whole table on for `:8132`.
-2. **A second draft source: n-gram / prompt-lookup.** Zero weights, zero model
-   calls, no training, and it feeds the verify path that already exists. It is
-   the only draft source that on the streaming track does not first pay ~300 MB
-   of MTP expert reads, and its acceptance approaches 1 on the repetitive text
-   this box actually serves. Pays on both tracks.
-3. **Tree / blockwise verification.** One substrate; "tree spec", "token-tree",
-   "blockwise", "Jacobi" and "lookahead" all reduce to it. Needs no attention
-   mask work — `sel` already takes a per-row arbitrary key set in both cores,
-   and a DFS slot layout keeps `LayerKv::append`'s monotonic-position invariant
-   intact. The one real change is separating a row's RoPE position from its
-   attention extent in `RowLayout`.
-4. **Cut the MTP draft path's bytes** (streaming track) — the four causes above,
-   cheapest first: requantize that one layer to int4, hand the draft path the
-   `ExpertIndex`, batch the γ draft steps across sequences.
-5. **Union-cost draft admission** (streaming track). `COLI_SPEC_CONF` proved the
-   shape by pruning drafts on expected *acceptance*; the missing half is pruning
-   on expected *cost*, which is what directly attacks the 2.63×.
+2. **A second draft source: n-gram / prompt-lookup** — `COLI_DRAFT_NGRAM`.
+   **Done.** Zero weights, zero model calls, no training. The only draft source
+   that on the streaming track does not first pay ~300 MB of MTP expert reads,
+   and it works on a checkpoint with no MTP head at all. Pays on both tracks.
+3. **Tree / blockwise verification.** **Substrate done**, `batch.rs` half open.
+   One mechanism; "tree spec", "token-tree", "blockwise" and the tree half of
+   EAGLE-2 all reduce to it. Needed no attention-mask work and no `LayerKv`
+   change. Sequenced behind (5) because trees turned out to be MLA-only, so
+   their width is spent on the track where rows cost bytes.
+4. **Cut the MTP draft path's bytes** (streaming track). **Two of four done** —
+   the draft path has the `ExpertIndex`, and `mtp_draft_batched` turns B
+   disjoint unions per step into one. `--mtp-target int4` on that layer is
+   built and needs a conversion run to become a number; pinning its hot experts
+   is open, and needs a residency mechanism that is not the heat table (the
+   draft context withholds heat on purpose).
+5. **Union-cost draft admission** (streaming track). **Instrument done, gate
+   deliberately not.** `decode.tokens_emitted` / `decode.rows` against the
+   `ecache` counters give tokens per expert read directly. `COLI_SPEC_UNION_MAX`
+   — the cost-side twin of `COLI_SPEC_CONF`'s acceptance-side floor — stays
+   unbuilt until those counters say whether speculative rows are already
+   union-cheap under the 0.65 floor. Tuning a gate against an unmeasured
+   quantity is the failure `measurement.md` opens with.
+
+**What none of this has yet is a number.** Every item above is env-gated and
+default-off, and this workspace cannot load the real checkpoint. The A/Bs owed
+are: `COLI_SPEC_GDN` at B ∈ {1, 8, 32} on `:8132` (the ~151 MB/sequence snapshot
+is charged per sequence while a forward's weight read is shared, so the
+crossover is a batch width); `COLI_DRAFT_NGRAM` on a coding/IT corpus where its
+acceptance argument is supposed to hold; and the draft-path byte items measured
+as tokens-per-disk-read rather than wall clock. Use
+`scripts/bench-serve-envarms.sh` — rotating arms, medians, `REPEATS≥3` — and
+treat a gap smaller than the measured spread as unresolved.
 
 Deferred with reasons: draft-model routing prediction and expert-only
 speculative execution are *prefetch* ideas, and the router look-ahead they would
