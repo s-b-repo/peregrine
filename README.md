@@ -268,7 +268,7 @@ token stream is unchanged. (Annotated reference with deep-dive links:
 | `COLI_GPU_DENSE_HEADROOM_MB` | 1024 | VRAM the dense tier leaves for activations and the context |
 | `COLI_KV_STORE_DIR` / `_MB` / `_TRIM` | unset | Disk-persisted KV sessions: completed prefixes ≥256 tokens checkpoint here and a restarted server restores them instead of re-prefilling. The prefix cache's disk extension |
 | `COLI_IO_DEVICE_SCHED` | off | Device-aware ring scheduling — device-pure claim groups with cross-device work stealing, instead of one device-blind cursor. Needs streaming, >1 ring, and shards on >1 device |
-| `COLI_TOPIC_ROUTING` / `_HALFLIFE` | off / 512 | Per-`TokenClass` residency steering: cache tiebreaks prefer experts this topic has routed before, with profiles decayed at a rate scaled by routing entropy |
+| `COLI_TOPIC_ROUTING` / `_HALFLIFE` | off / 512 | Per-`TokenClass` residency steering: cache tiebreaks prefer experts this topic has routed before, with profiles decayed at a rate scaled by routing entropy. Streaming only — routing is recorded on the streaming path alone |
 | `COLI_PREFETCH_STALE_DROP` / `_SLACK` | off / 1 | Drop a queued speculative warm before its disk read once the sweep has moved past it. At B=16, 98.6 % of speculative reads arrived too late to use. Advisory lane only, so output is untouched |
 | `COLI_QWEN_THINK` | off | Keep Qwen's `<think>` block in the response. Off pre-closes it — with it open, a run whose budget expired before the closing tag rendered as an **empty completion** |
 | `COLI_ACT_F32` | off | Quantized matmuls against f32 activations instead of int8 (**changes token values** — more accurate, still different) |

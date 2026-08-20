@@ -22,9 +22,47 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
+/// Read a routing trace as `[position][layer][expert_id]`.
+///
+/// Accepts both shapes `dump-routes` can write. The bare nested array is the
+/// default and what every committed trace uses. The **envelope** form
+/// (`--weights`) carries `{layer, experts, weights}` frames; its gate weights
+/// are dropped here, because every consumer of this function —
+/// `consecutive_overlap`, `build_cooccurrence`, `order_experts`, `trace_heat` —
+/// ranks or clusters on selections and has no use for them. `peregrine-prune`
+/// reads the envelope directly, precisely because it is the one tool that does.
 pub fn read_routes(path: &Path) -> Result<Vec<Vec<Vec<i32>>>, Error> {
     let bytes = std::fs::read(path).ctx(|| format!("read {}", path.display()))?;
     let v: Value = serde_json::from_slice(&bytes).ctx(|| "parse routes".to_string())?;
+    if let Some(frames) = v.get("frames").and_then(|f| f.as_array()) {
+        // Envelope form: flat `(layer, experts)` frames in capture order. Group
+        // them back into positions by watching the layer index stop increasing —
+        // capture walks layers ascending within a position, so a non-increase is
+        // a position boundary.
+        let mut out: Vec<Vec<Vec<i32>>> = Vec::new();
+        let mut cur: Vec<Vec<i32>> = Vec::new();
+        let mut last: Option<usize> = None;
+        for f in frames {
+            let Some(layer) = f.get("layer").and_then(|l| l.as_u64()).map(|l| l as usize) else { continue };
+            // A frame with no `experts` array is malformed, not empty — skip it
+            // rather than recording a routed set of nothing, which would read
+            // downstream as "this layer routed no experts at this position".
+            let Some(ids) = f.get("experts").and_then(|e| e.as_array()) else { continue };
+            let ids: Vec<i32> = ids.iter().filter_map(|e| e.as_i64()).map(|e| e as i32).collect();
+            if last.is_some_and(|l| layer <= l) {
+                out.push(std::mem::take(&mut cur));
+            }
+            if cur.len() <= layer {
+                cur.resize(layer + 1, Vec::new());
+            }
+            cur[layer] = ids;
+            last = Some(layer);
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        return Ok(out);
+    }
     let arr = v.as_array().ok_or_else(|| Error::Format("routes JSON is not an array".to_string()))?;
     let mut out: Vec<Vec<Vec<i32>>> = Vec::with_capacity(arr.len());
     for forward in arr {
@@ -847,6 +885,49 @@ pub fn write_schedule(dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn read_routes_accepts_both_trace_shapes() -> Result<(), Error> {
+        // `dump-routes` writes the bare nested array by default and the
+        // envelope form under `--weights`. Every consumer here ranks on
+        // selections, so both must project to the same `[position][layer][ids]`
+        // — otherwise adding weights to a trace would silently change what
+        // `route-stats` and `layout-reorg` report about the same run.
+        let dir = std::env::temp_dir().join(format!("peregrine_rr_{}", std::process::id()));
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "stale fixture: {e}");
+        }
+        std::fs::create_dir_all(&dir)?;
+
+        // Two positions, layer 0 dense, layers 1-2 routed.
+        let bare = dir.join("bare.json");
+        std::fs::write(&bare, r#"[[[],[1,2],[3]],[[],[4],[5,6]]]"#)?;
+        let env = dir.join("env.json");
+        std::fs::write(
+            &env,
+            r#"{"version":1,"n_experts":8,"frames":[
+                 {"layer":1,"experts":[1,2],"weights":[0.6,0.4]},
+                 {"layer":2,"experts":[3],"weights":[1.0]},
+                 {"layer":1,"experts":[4],"weights":[1.0]},
+                 {"layer":2,"experts":[5,6],"weights":[0.5,0.5]}]}"#,
+        )?;
+
+        let a = read_routes(&bare)?;
+        let b = read_routes(&env)?;
+        assert_eq!(a, b, "the two shapes must describe the same trace");
+        assert_eq!(a.len(), 2, "two positions");
+        assert_eq!(a[0], vec![Vec::<i32>::new(), vec![1, 2], vec![3]]);
+        assert_eq!(a[1], vec![Vec::<i32>::new(), vec![4], vec![5, 6]]);
+
+        // And the statistics agree, which is the property that actually matters:
+        // adding weights to a capture must not move any number already reported.
+        let sa = consecutive_overlap(&a, 1, 8);
+        let sb = consecutive_overlap(&b, 1, 8);
+        assert_eq!(sa.pairs, sb.pairs);
+        assert!((sa.mean_overlap - sb.mean_overlap).abs() < 1e-12);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
     use super::*;
 
     #[test]

@@ -260,7 +260,8 @@ fn run() -> Result<(), Error> {
         Some("dump-routes") => {
             let usage = || {
                 Error::Format(
-                    "usage: peregrine dump-routes <model-dir> <out.json> [corpus-len] [--text FILE]".into(),
+                    "usage: peregrine dump-routes <model-dir> <out.json> [corpus-len] [--text FILE] [--weights]"
+                        .into(),
                 )
             };
             let dir = args.get(2).filter(|s| !s.starts_with("--")).ok_or_else(usage)?;
@@ -291,8 +292,19 @@ fn run() -> Result<(), Error> {
                     synth_corpus(model.cfg.vocab as usize, len)
                 }
             };
-            let n = model.dump_routes_to(&corpus, Path::new(out))?;
-            eprintln!("wrote {n} forwards of routing trace to {out} ({} tokens)", corpus.len());
+            // `--weights` emits the envelope form carrying each selection's gate
+            // weight. Off by default: the bare nested array is what `read_routes`
+            // and every committed trace use, and changing it under them would
+            // break `route-stats` and `layout-reorg` on a re-run. It is the only
+            // shape that carries gate mass, which is what `peregrine-prune` ranks
+            // on — without it, REAP saliency is counting wearing another name.
+            if args.iter().any(|a| a == "--weights") {
+                let n = model.dump_routes_weighted_to(&corpus, Path::new(out))?;
+                eprintln!("wrote {n} weighted routing frames to {out} ({} tokens)", corpus.len());
+            } else {
+                let n = model.dump_routes_to(&corpus, Path::new(out))?;
+                eprintln!("wrote {n} forwards of routing trace to {out} ({} tokens)", corpus.len());
+            }
             Ok(())
         }
         // `calib-capture <model-dir> <out.json> [corpus-len] [--text FILE]`: the

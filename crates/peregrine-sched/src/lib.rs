@@ -443,6 +443,9 @@ mod tests {
 
         let reactors = vec![Mutex::new(peregrine_io::Reactor::new(64)?)];
         let ctx = ForwardCtx {
+            // Tracing seam; the sched engine is the cross-engine oracle, not a
+            // capture path.
+            gate_trace: None,
             st: &st,
             absorb: false,
             dsa: false,

@@ -13,7 +13,7 @@ peregrine demo
 peregrine build <dir>
 peregrine bench [B ...]                                (model from COLI_MODEL)
 peregrine build-automaton <model-dir> [corpus-len]
-peregrine dump-routes <model-dir> <out.json> [corpus-len]
+peregrine dump-routes <model-dir> <out.json> [corpus-len] [--text FILE] [--weights]
 peregrine galactic <model-dir> [corpus-len]
 peregrine compile-plan <model-dir>
 peregrine <model-dir>                                  serve mode (stdio protocol)
@@ -53,7 +53,7 @@ corpus (default length 256), and writes the expert-transition FSA to
 `<model-dir>/automaton.json` (config-tagged; auto-loaded on the next
 `Model::load`). See [Prefetch & prediction](prefetch-and-caching.md).
 
-### `dump-routes <model-dir> <out.json> [corpus-len] [--text FILE]`
+### `dump-routes <model-dir> <out.json> [corpus-len] [--text FILE] [--weights]`
 
 Writes the raw per-forward routing trace to `<out.json>` (any path). The trace is
 a bare nested array `[forward][layer][expert-id]` — the input format of
@@ -70,6 +70,26 @@ truncated to `corpus-len`. The subcommand warns loudly when it is absent.
 
 Layout tools are less sensitive to this — they want co-occurrence over whatever
 workload you serve — but they are not *insensitive*, and the same flag applies.
+
+
+**`--weights`** emits the envelope form
+`{"version":1,"n_experts":E,"frames":[{layer,experts,weights}]}` instead of the
+bare `[position][layer][expert_id]` array. It is the **only** trace shape that
+carries gate mass: routing is normally recorded from `batch_union`, which keeps
+distinct expert ids and discards the weights, so every artifact the engine wrote
+before this flag existed carried selections only. `peregrine-prune` ranks
+experts by Σ gate weight and its own report has been correctly saying "ranking
+degrades to counting" on every real trace it was ever given.
+
+Off by default, because the bare array is what `read_routes` consumers
+(`route-stats`, `layout-reorg`) and every committed trace use, and changing the
+default would move numbers on a re-run. Both shapes are readable everywhere —
+`read_routes` projects the envelope back to selections and
+`read_routes_accepts_both_trace_shapes` pins that the two agree.
+
+Streaming only: routing is recorded from `moe_forward_concurrent`, and the
+resident path logs nothing. A resident model is refused with that reason rather
+than writing an empty trace.
 
 ### `galactic <model-dir> [corpus-len]`
 

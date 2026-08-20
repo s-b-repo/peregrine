@@ -170,6 +170,52 @@ struct MtpHead {
 /// and the raw per-forward routing trace the layout tools consume.
 pub type OfflineArtifacts = (TransitionTable, crate::predict::MacroTable, Vec<Vec<Vec<i32>>>);
 
+/// Routed sets with their gate weights, captured for a trace.
+///
+/// Exists because `RouteHistory` — the only routing record the engine keeps —
+/// stores `batch_union`: distinct expert **ids**, weights discarded
+/// (`concurrent.rs`, right after the reduce). So every artifact the engine has
+/// ever written carries selections and not gate mass, and `peregrine-prune`'s
+/// Σ-gate-weight saliency degrades to counting on all of them, which its own
+/// report has been faithfully saying while nobody could supply the weights.
+///
+/// One entry per `(layer, position)` in capture order, so a consumer can
+/// reconstruct per-position selections rather than a batch union.
+#[derive(Default)]
+pub struct GateTrace {
+    frames: Vec<(usize, Vec<i32>, Vec<f32>)>,
+}
+
+impl GateTrace {
+    pub fn push(&mut self, layer: usize, ids: Vec<i32>, weights: Vec<f32>) {
+        if !ids.is_empty() {
+            self.frames.push((layer, ids, weights));
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// The envelope form `peregrine-prune` and `peregrine-skipbound` already
+    /// parse: `{"version":1,"n_experts":E,"frames":[{layer,experts,weights}]}`.
+    /// A superset of the bare `[position][layer][ids]` array, which stays the
+    /// default output so existing traces and `read_routes` consumers are
+    /// untouched.
+    pub fn to_json(&self, n_experts: usize) -> serde_json::Value {
+        let frames: Vec<serde_json::Value> = self
+            .frames
+            .iter()
+            .map(|(l, ids, w)| serde_json::json!({ "layer": l, "experts": ids, "weights": w }))
+            .collect();
+        serde_json::json!({ "version": 1, "n_experts": n_experts, "frames": frames })
+    }
+}
+
 pub struct Model {
     pub cfg: Cfg,
     /// `[vocab, hidden]`, kept **packed**. Only one row per token is ever read
@@ -347,6 +393,9 @@ pub struct Model {
     /// the *active* topic reuses. `None` disables — protection then uses the
     /// global-heat tiebreak exactly as before. Read at build, not OnceLock.
     topic_profiles: Option<crate::topic::TopicProfiles>,
+    /// Gate-weight trace capture, when `enable_gate_trace` installed one.
+    /// `None` on every production path — this is a tracing seam, not a feature.
+    gate_trace: Option<Mutex<GateTrace>>,
     /// Base decay interval (forwards) for the adaptive profile aging
     /// (`COLI_TOPIC_HALFLIFE`, default 512; `0` = static all-time counters).
     /// The effective interval scales down with routing entropy — see
@@ -3597,6 +3646,7 @@ impl Model {
             last_iowq: Mutex::new(None),
             workload_class: Mutex::new(crate::workload::TokenClass::Prose),
             topic_profiles,
+            gate_trace: None,
             topic_halflife,
             effective_workers: std::sync::atomic::AtomicUsize::new(workers),
             governor: Mutex::new(GovernorState::new(workers)),
@@ -3854,10 +3904,62 @@ impl Model {
     /// the profile is worth building even when the evictor is not consuming it,
     /// so a later request (or a persisted sidecar) can.
     fn accumulate_topic(&self) {
-        let (Some(profiles), Some(hist)) = (&self.topic_profiles, &self.route_hist) else {
+        let Some(hist) = &self.route_hist else { return };
+        // The single-stream path has exactly one class in flight, so the
+        // process-wide one is the right key here. The batched path does not —
+        // see [`Self::accumulate_topic_for`].
+        self.accumulate_topic_for(*self.workload_class.lock(), hist);
+    }
+
+    /// Fold one stream's newest routed sets into the co-activation tracker, and
+    /// rebuild the affinity hints every 64 frames.
+    ///
+    /// Split out of the single-stream post-forward block so the batched engine
+    /// can call it per sequence. Co-activation is a statement about experts that
+    /// fire *together for one token*; folding a whole batch's union would say
+    /// that every pair of concurrently-served requests co-activates, which is a
+    /// statement about the scheduler and not about the model.
+    ///
+    /// The `route_hist_epoch` guard stays with the caller: it exists because
+    /// re-observing one frozen frame drives every pair in it to a co-firing rate
+    /// of ~1.0, the fusion threshold then declares them all fused, and that
+    /// fabricated snapshot gets persisted for the next session to start from.
+    pub fn accumulate_coactivation(&self, hist: &Mutex<RouteHistory>) {
+        let frames = {
+            let h = hist.lock();
+            let mut co = self.coactivation.lock();
+            for l in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
+                if let Some(f) = h.latest(l) {
+                    co.observe(l, f);
+                }
+            }
+            co.note_forward();
+            co.frames
+        };
+        if frames.is_multiple_of(64) {
+            self.rebuild_affinity();
+        }
+    }
+
+    /// Fold **one sequence's own** routing into **its own** class's profile.
+    ///
+    /// The batched engine needs this and cannot use [`Self::accumulate_topic`],
+    /// for a reason that is easy to miss and produces data rather than an
+    /// error: `workload_class` is a single `Mutex<TokenClass>` on the model,
+    /// set once per admission, so in a batch it holds whatever the most
+    /// recently admitted request happened to be. Folding a whole tick's routing
+    /// under that key credits a code request's experts to `Prose` because a
+    /// prose request arrived after it — and the result *looks* like a topic
+    /// map. A mislabelled map is worse than no map: nothing downstream can tell
+    /// it is wrong, and every consumer of it inherits the error silently.
+    ///
+    /// So attribution happens where both facts are known together — the engine
+    /// holds each sequence's own `RouteHistory` and each sequence's own class —
+    /// rather than being inferred from model-global state inside the forward.
+    pub fn accumulate_topic_for(&self, class: crate::workload::TokenClass, hist: &Mutex<RouteHistory>) {
+        let Some(profiles) = &self.topic_profiles else {
             return;
         };
-        let class = *self.workload_class.lock();
         let first_dense = self.cfg.first_dense as usize;
         let n_layers = self.cfg.n_layers as usize;
         {
@@ -4373,6 +4475,36 @@ impl Model {
         &self.checkpoint_dir
     }
 
+    /// Install the topic-routing profiles. The explicit seam behind
+    /// `COLI_TOPIC_ROUTING=1`, so tests and offline tools never touch process
+    /// env — the same rationale as [`Self::enable_calib_capture`].
+    ///
+    /// Idempotent, and deliberately **not** gated on `stream_experts` the way
+    /// the env path is — that gate is a policy about when the profile is
+    /// *useful* (a resident model has no eviction to steer), and forcing it
+    /// here would make the one content-conditioned per-expert statistic in the
+    /// tree unreachable from tests, which is a large part of how it came to be
+    /// silently inert on the serving path.
+    ///
+    /// Enabling it on a resident model is nonetheless a no-op in practice, and
+    /// for a separate reason worth knowing: routing is only ever *recorded* on
+    /// the streaming path. `route_log`/`route_log_multi` are written from
+    /// `moe_forward_concurrent`; the resident `moe_forward` logs nothing at all.
+    /// So a resident model has no routing history for anything — topic profiles,
+    /// co-activation, or the predictor — to fold.
+    pub fn enable_topic_profiles(&mut self) {
+        if self.topic_profiles.is_none() {
+            let (n_layers, n_experts) = (self.cfg.n_layers as usize, self.cfg.n_experts as usize);
+            self.topic_profiles = Some(crate::topic::TopicProfiles::new(n_layers, n_experts));
+        }
+    }
+
+    /// This class's routed-count for one `(layer, expert)`, or `None` without a
+    /// profile. For tests and for whatever reads the map offline.
+    pub fn topic_heat_for(&self, class: crate::workload::TokenClass, layer: usize, expert: usize) -> Option<u32> {
+        self.topic_profiles.as_ref().map(|p| p.heat_for(class, layer, expert))
+    }
+
     /// Install the calibration accumulator (ideas #7), directing the sidecar
     /// to `out`. The explicit seam behind `COLI_CALIB_CAPTURE`, so tests and
     /// the `calib-capture` subcommand never touch process env (the same
@@ -4539,20 +4671,7 @@ impl Model {
         // session to start from.
         let advanced = self.route_hist_epoch.swap(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(hist) = self.route_hist.as_ref().filter(|_| advanced) {
-            let frames = {
-                let h = hist.lock();
-                let mut co = self.coactivation.lock();
-                for l in (self.cfg.first_dense as usize)..(self.cfg.n_layers as usize) {
-                    if let Some(f) = h.latest(l) {
-                        co.observe(l, f);
-                    }
-                }
-                co.note_forward();
-                co.frames
-            };
-            if frames.is_multiple_of(64) {
-                self.rebuild_affinity();
-            }
+            self.accumulate_coactivation(hist);
         }
         // Feed the I/O tuner: sample the batched-read wall time (µs) plus this
         // forward's submission-queue-full rejections (the queue-pressure signal
@@ -4974,6 +5093,40 @@ impl Model {
         Ok(trace.len())
     }
 
+    /// [`Self::dump_routes_to`] carrying **gate weights**, in the envelope form
+    /// `{"version":1,"n_experts":E,"frames":[{layer,experts,weights}]}`.
+    ///
+    /// A separate entry point rather than a flag on the format, because the bare
+    /// `[position][layer][ids]` array is what `read_routes` and every existing
+    /// artifact use, and silently changing it would break `route-stats` and
+    /// `layout-reorg` on a re-run. Both shapes are readable by the tools that
+    /// want weights (`prune`, `skipbound`); only this one actually has them.
+    ///
+    /// **Streaming only.** Routing is recorded from `moe_forward_concurrent`;
+    /// the resident path logs nothing, so a resident model yields an empty
+    /// trace. Refused loudly rather than written empty — an empty trace that
+    /// parses is exactly the failure that made this defect invisible.
+    pub fn dump_routes_weighted_to(&mut self, corpus: &[i32], path: &std::path::Path) -> Result<usize, Error> {
+        self.gate_trace = Some(Mutex::new(GateTrace::default()));
+        let n_experts = self.cfg.n_experts as usize;
+        let run = self.dump_routes(corpus);
+        let captured = self.gate_trace.take();
+        run?;
+        let gt = captured.ok_or_else(|| Error::Format("gate trace vanished mid-capture".into()))?;
+        let gt = gt.lock();
+        if gt.is_empty() {
+            return Err(Error::Format(
+                "captured no routed sets — routing is only recorded on the streaming path, so this needs \
+                 a model loaded with COLI_STREAM=1"
+                    .into(),
+            ));
+        }
+        let json = serde_json::to_vec(&gt.to_json(n_experts))
+            .map_err(|e| Error::Format(format!("serialize weighted trace: {e}")))?;
+        peregrine_core::write_atomic(path, &json)?;
+        Ok(gt.len())
+    }
+
     /// Snapshot the current per-layer routed sets from the routing history (newest
     /// frame per layer). Empty vecs for layers with no history (dense / not yet routed).
     fn route_snapshot(&self, n_layers: usize) -> Vec<Vec<i32>> {
@@ -5156,6 +5309,7 @@ impl Model {
                 route_log: route_hist.as_ref(),
                 calib: calib.as_ref().map(|(_, a)| a),
                 route_log_multi: None,
+            gate_trace: self.gate_trace.as_ref(),
                 direct: *direct,
                 heat: heat.as_ref(),
                 spill: spill_log.as_ref(),
@@ -5516,6 +5670,7 @@ impl Model {
             route_log: None,
             calib: self.calib.as_ref().map(|(_, a)| a),
             route_log_multi: None,
+            gate_trace: self.gate_trace.as_ref(),
             direct: self.direct,
             heat: self.heat.as_ref(),
             // No balancer in this context, so no spill verdict can occur.
@@ -5857,6 +6012,7 @@ impl Model {
             route_log: None,
             calib: self.calib.as_ref().map(|(_, a)| a),
             route_log_multi: histories,
+            gate_trace: self.gate_trace.as_ref(),
             direct: self.direct,
             heat: self.heat.as_ref(),
             spill: self.spill_log.as_ref(),
@@ -6140,6 +6296,7 @@ impl Model {
             route_log: None, // drafts must not overwrite the main-stream prediction
             calib: None, // drafts replay accumulated positions — counting them double-weights
             route_log_multi: None,
+            gate_trace: self.gate_trace.as_ref(),
             direct: *direct,
             // Not a blanket `None`: see [`mtp_heat`]. Layer `n_layers` is the
             // MTP head and nothing else runs it, so its heat row has no
@@ -6291,6 +6448,7 @@ impl Model {
             route_log: None,
             calib: None,
             route_log_multi: None,
+            gate_trace: self.gate_trace.as_ref(),
             direct: *direct,
             // See the single-sequence twin above and [`mtp_heat`].
             heat: if mtp_heat() { heat.as_ref() } else { None },

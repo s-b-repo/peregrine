@@ -294,6 +294,14 @@ struct Prefilling {
     /// carried into the `SeqState`, for the same reason `hist` is: a fused prefill
     /// row prefetches too, and it must use the lane the sequence will keep.
     seq_id: usize,
+    /// What this request's content looked like, from `classify_request`.
+    ///
+    /// Carried per sequence rather than read from the model's process-wide
+    /// `workload_class`, which holds whatever was admitted most recently. The
+    /// topic profile is keyed on this, and crediting one request's experts to
+    /// another request's class produces a map that is confidently wrong — see
+    /// `Model::accumulate_topic_for`.
+    class: peregrine_model::TokenClass,
 }
 
 /// Request priority. Higher priority requests are admitted and drained before
@@ -1199,6 +1207,9 @@ struct SeqState {
     /// Stable prefetch-lane key — see [`NEXT_SEQ_ID`]. Not this sequence's index in
     /// `active`, which slides when an earlier sequence retires.
     seq_id: usize,
+    /// This request's content class, carried from admission — the key its
+    /// routing is folded under. See `Prefilling::class`.
+    class: peregrine_model::TokenClass,
     pos: usize,
     next_tok: i32,
     sampler: Sampler,
@@ -1669,6 +1680,28 @@ fn run(
         // sequence's own id, not its index here — see [`NEXT_SEQ_ID`].
         for s in active.iter() {
             model.enqueue_seq_prefetch(&s.hist, s.seq_id);
+            // Fold this sequence's own routing into its own class's profile and
+            // into co-activation. Both were single-stream-only: the batched
+            // forward sets `route_log: None`, so under `peregrine-serve` the
+            // topic map and the co-activation tracker accumulated *nothing* —
+            // while the shutdown path still wrote the empty profile out, which
+            // is why a served model's `route_stats.json` reads as "learned
+            // nothing" rather than as "never ran".
+            //
+            // Per sequence, not per tick, and keyed on `s.class` rather than the
+            // model's process-wide `workload_class`: see
+            // `Model::accumulate_topic_for` for why crediting a whole tick to
+            // one class produces a map that is confidently wrong.
+            model.accumulate_topic_for(s.class, &s.hist);
+            model.accumulate_coactivation(&s.hist);
+        }
+        // The fused prefill chunk records into its own sequence's history too,
+        // and that sequence has its own class — a chunk is where a request's
+        // content is most concentrated, so skipping it would bias the map
+        // toward whatever people ask *after* a long prompt.
+        if let Some((p, _)) = fused.as_ref() {
+            model.accumulate_topic_for(p.class, &p.hist);
+            model.accumulate_coactivation(&p.hist);
         }
 
         // Emit each sequence's confirmed run and decide who continues.
@@ -2553,6 +2586,7 @@ fn admit_pending(
         None => (SeqKv::new(&model.cfg), 0),
     };
     pending.push_back(Prefilling {
+        class: req.class,
         seq,
         prompt: req.prompt,
         pos,
@@ -2670,11 +2704,11 @@ fn finish_prefill_chunk(
     prefix: &mut PrefixStore,
 ) -> usize {
     let OutputCfg { vocab, stop_ids } = out_cfg;
-    let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist, seq_id } = p;
+    let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist, seq_id, class } = p;
     let chunk_len = end - pos;
     if end < prompt.len() {
         // more chunks to go — round-robin with the others
-        pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new, hist, seq_id });
+        pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new, hist, seq_id, class });
         return 0;
     }
     // Prefill complete. Snapshot it before the KV moves into the active set, so
@@ -2698,6 +2732,7 @@ fn finish_prefill_chunk(
         return 1; // only one token requested
     }
     active.push(SeqState {
+        class,
         seq,
         hist,
         seq_id,
@@ -2963,6 +2998,7 @@ mod tests {
                 seq: p.seq,
                 hist: p.hist,
                 seq_id: p.seq_id,
+                class: p.class,
                 pos: 0,
                 next_tok: 1,
                 sampler: p.sampler,
@@ -3582,6 +3618,110 @@ mod tests {
         // another, so a counter stuck at zero is a wiring failure, not a fast
         // machine.
         assert!(t.queue_wait_max_us > 0, "serialized admissions must show a non-zero wait");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_topic_map_accumulates_on_the_batched_path_and_credits_the_right_class() -> Result<(), Error> {
+        // Two defects in one test, because they compound and the second is only
+        // reachable once the first is fixed.
+        //
+        // (1) `accumulate_topic` had exactly one caller, inside `forward_hidden`.
+        //     The batched forward sets `route_log: None`, so under
+        //     `peregrine-serve` the topic map accumulated **nothing** — while
+        //     the shutdown path still wrote the empty profile out. A served
+        //     model's `topic_profiles.json` therefore read as "learned nothing"
+        //     rather than as "never ran", which is why the one
+        //     content-conditioned per-expert statistic in the tree has never
+        //     produced a number.
+        //
+        // (2) The key was the model's process-wide `workload_class`, set once
+        //     per admission. In a batch that is whichever request was admitted
+        //     most recently, so a whole tick's routing got credited to one
+        //     class. That does not fail — it produces a *map*, confidently
+        //     mislabelled, which nothing downstream can detect.
+        //
+        // So: two concurrent requests with deliberately different classes, and
+        // each class's counters must move only for its own sequence's routing.
+        let dir = tiny_dir("topic_map")?;
+        // Streaming, because routing is only ever *recorded* on the streaming
+        // path: `route_log_multi` is written from `moe_forward_concurrent`, and
+        // a resident model takes `moe_forward`, which logs nothing. The env gate
+        // requires `stream_experts` for a different reason (a resident model has
+        // no eviction to steer); this test needs it for the mechanism itself.
+        let mut model = Model::load_streaming(&dir, true)?;
+        model.enable_topic_profiles();
+        let (handle, join) = spawn_tuned(model, 8, false, Some(0))?;
+
+        // `classify_str`'s own rules: braces + punctuation read as Code/Json,
+        // mostly-alpha reads as Prose. Asserted below rather than assumed.
+        // No curly braces: `classify_str` checks the Json rule (>=2 curlies plus
+        // heavy punctuation) *before* the Code rule, and a braced function body
+        // trips it. Parens alone put this in Code.
+        let code = "let v = compute(a, b) + scale(c, d) - offset(e);";
+        let prose = "The river had been the town s reason for existing long before anyone wrote it down";
+        assert_eq!(peregrine_model::classify_str(code), peregrine_model::TokenClass::Code);
+        assert_eq!(peregrine_model::classify_str(prose), peregrine_model::TokenClass::Prose);
+
+        let mut rxs = Vec::new();
+        for (text, class) in [(code, peregrine_model::TokenClass::Code), (prose, peregrine_model::TokenClass::Prose)] {
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                // The engine never re-classifies; the HTTP layer does, and it is
+                // the class on the request that must travel with the sequence.
+                prompt: text.bytes().map(|b| (b % 29) as i32 + 1).collect(),
+                max_new: 6,
+                sampler: Sampler::new(0.0, 0.9, 1),
+                out: tx,
+                priority: Priority::Normal,
+                class,
+            })?;
+            rxs.push(rx);
+        }
+        for mut rx in rxs {
+            while let Some(msg) = rx.blocking_recv() {
+                if let EngineOut::Error(e) = msg {
+                    return Err(Error::Format(e));
+                }
+            }
+        }
+        drop(handle);
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+
+        // Assert on the persisted artifact rather than on the live model: the
+        // engine thread owns the `Model` exclusively and drops it at shutdown,
+        // and `topic_profiles.json` is precisely the file that has been written
+        // out empty. Checking it end to end covers the accumulation *and* the
+        // persistence that made the defect invisible.
+        let raw = std::fs::read(dir.join("topic_profiles.json"))
+            .map_err(|e| Error::Format(format!("no topic_profiles.json written: {e}")))?;
+        let doc: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| Error::Format(format!("bad profile json: {e}")))?;
+        let total = |want: &str| -> u64 {
+            doc["classes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| c["class"].as_str() == Some(want))
+                .flat_map(|c| c["entries"].as_array().into_iter().flatten())
+                .map(|e| e[2].as_u64().unwrap_or(0))
+                .sum()
+        };
+
+        // Something was learned at all — this is defect (1).
+        assert!(total("Code") > 0, "the batched path must feed the topic map; Code counters are all zero");
+        assert!(total("Prose") > 0, "the batched path must feed the topic map; Prose counters are all zero");
+
+        // And nothing leaked into a class no request carried — this is defect
+        // (2). With a single process-wide key, whichever class was admitted last
+        // would hold *both* requests' routing and the other would be empty; with
+        // per-sequence attribution, a class nobody asked for stays at zero.
+        for unused in ["Json", "Math", "Mixed"] {
+            assert_eq!(total(unused), 0, "{unused} was credited routing, but no request carried that class");
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

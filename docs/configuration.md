@@ -452,7 +452,7 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_KV_STORE_MB` | unset | byte cap on that store; the LRU trims to fit |
 | `COLI_KV_STORE_TRIM` | unset | how much the store trims past the cap when it evicts, so eviction is not one entry per admission |
 | `COLI_KV_STORE_SYNC` | off | serialize + fsync a checkpoint **on the engine thread** instead of the background writer. The control arm for the async-writer latency A/B, not a production setting: a synchronous checkpoint makes every other live stream's next token wait behind it |
-| `COLI_TOPIC_ROUTING` | off | per-`TokenClass` residency steering: cache tiebreaks prefer experts this topic has routed before, raising temporal locality on a workload that stays on one subject |
+| `COLI_TOPIC_ROUTING` | off | per-`TokenClass` residency steering: cache tiebreaks prefer experts this topic has routed before. **Accumulated nothing under `peregrine-serve` until 2026-08-20** — the batched forward never fed it, and the shutdown path wrote the empty profile out anyway |
 | `COLI_TOPIC_HALFLIFE` | 512 | decay half-life for those topic profiles, scaled by the routing-entropy EWMA, so a profile tracks recent routing and re-forms on a topic shift instead of anchoring to all-time counts |
 | `COLI_QWEN_THINK` | off | keep Qwen's `<think>` block in the response. Off pre-closes the block in the assistant turn (the shipped template's `enable_thinking=false` form) — with it open, any run whose token budget expired before the closing tag rendered as an **empty completion** |
 

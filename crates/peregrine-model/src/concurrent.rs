@@ -83,6 +83,14 @@ pub struct ForwardCtx<'a> {
     /// entries, pointing the speculated rows at a scratch history so a rejected draft
     /// never reaches the predictor. `forward_rows_inner` requires `len() == s_n`.
     pub route_log_multi: Option<&'a [&'a Mutex<RouteHistory>]>,
+    /// Routed sets **with their gate weights**, for trace capture
+    /// (`Model::enable_gate_trace`). `None` on every production path.
+    ///
+    /// Separate from `route_log` because `RouteHistory` stores `batch_union` —
+    /// expert ids with the weights discarded, which is why no artifact the
+    /// engine writes has ever carried gate mass, and why `peregrine-prune`'s
+    /// Σ-gate-weight saliency silently degrades to counting.
+    pub gate_trace: Option<&'a Mutex<crate::model::GateTrace>>,
     /// Stream expert reads via O_DIRECT (bypass the page cache) when the shards
     /// opened O_DIRECT fds. Bytes are identical to the buffered path; only the
     /// cache behavior differs. `false` disables (buffered reads).
@@ -2104,6 +2112,19 @@ pub fn moe_forward_concurrent(
             rh.lock().push_layer(layer, routed_at(&r, s));
         }
     }
+    // Per position, ids *and* weights, before `Routed` is dropped. This is the
+    // only place both exist together: `batch_union` above has already thrown the
+    // weights away, and nothing downstream can recover them.
+    if let Some(gt) = ctx.gate_trace {
+        let mut gt = gt.lock();
+        for s in 0..s_n {
+            let keff = r.keff.get(s).copied().unwrap_or(0).max(0) as usize;
+            let base = s * r.k;
+            let ids: Vec<i32> = (0..keff).filter_map(|kk| r.idx.get(base + kk).copied()).collect();
+            let w: Vec<f32> = (0..keff).filter_map(|kk| r.w.get(base + kk).copied()).collect();
+            gt.push(layer, ids, w);
+        }
+    }
     Ok(out)
 }
 
@@ -2262,6 +2283,7 @@ mod tests {
         let router_bias: Vec<f32> = (0..e_n).map(|_| f() * 0.1).collect();
 
         let ctx_of = |fd_devices| ForwardCtx {
+            gate_trace: None,
             st: &st,
             absorb: false,
             dsa: false,

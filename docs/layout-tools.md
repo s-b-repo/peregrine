@@ -156,6 +156,20 @@ weighted expert must not outrank a rare decisive one. If the trace carries no
 weights the ranking degrades to counting, and the report says so rather than
 letting a weaker signal pass as the stronger one.
 
+**Pass `--weights` to `dump-routes`, or you get the weaker signal.** Until
+2026-08-20 no trace the engine could write carried gate weights at all —
+routing is recorded from `batch_union`, which keeps distinct expert ids and
+throws the weights away — so *every* real run of this tool ranked on counting
+while its report faithfully said so. Worse, `load_trace` could not parse the
+nested array `dump-routes` writes (`f.get("layer")` on an array is `None`), so
+the pipeline below exited "no usable frames — nothing to rank". Both are fixed;
+`dump-routes --weights` is what makes the saliency real:
+
+```
+peregrine dump-routes "$COLI_MODEL" routes.json 2048 --text corpus.txt --weights
+peregrine-prune "$COLI_MODEL" --trace routes.json --dry-run
+```
+
 ### Two structural constraints worth knowing
 
 `config.json` carries a **single** `n_routed_experts` for the whole model, so

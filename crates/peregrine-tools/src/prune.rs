@@ -231,9 +231,25 @@ impl PruneReport {
 
 /// Load a routing trace and accumulate saliency.
 ///
-/// Accepts the shape `peregrine dump-routes` writes: an object with a `frames`
-/// array, each frame `{"layer": L, "experts": [...], "weights": [...]}`, or the
-/// bare array of those frames. `weights` is optional — see [`Saliency::observe`].
+/// Accepts **both** trace shapes.
+///
+/// The envelope form — an object with a `frames` array, or a bare array of
+/// `{"layer": L, "experts": [...], "weights": [...]}` — carries gate weights and
+/// is what saliency actually wants.
+///
+/// The **nested** form is what `peregrine dump-routes` has always written:
+/// `[position][layer][expert_id]`, no envelope and no weights. This doc claimed
+/// to accept it and did not: `f.get("layer")` on an array returns `None`, so
+/// every element hit the `continue` below and the tool exited "no usable frames"
+/// on the one artifact the engine produces. `docs/layout-tools.md`'s documented
+/// `dump-routes | peregrine-prune` pipeline could never have run.
+/// `skipbound.rs` hit this exact defect, lost a run's numbers to it, and grew
+/// the branch on 2026-08-13; this is the same fix.
+///
+/// On the nested form `weights` is empty, so ranking degrades from Σ gate mass
+/// to counting — which [`Saliency::observe`] handles and the report states.
+/// That is a real limitation, not a silent one: no trace the engine writes today
+/// carries gate weights at all.
 pub fn load_trace(path: &Path) -> Result<Saliency, Error> {
     let text = std::fs::read_to_string(path).ctx(|| format!("read trace {}", path.display()))?;
     let v: serde_json::Value =
@@ -252,6 +268,19 @@ pub fn load_trace(path: &Path) -> Result<Saliency, Error> {
     };
     let mut sal = Saliency::default();
     for f in &frames {
+        // Nested `dump-routes` form: this element is one position's per-layer
+        // routed sets, so the layer index is the array position. Empty entries
+        // are dense layers, which route nothing.
+        if let Some(pos_layers) = f.as_array() {
+            for (layer, ids) in pos_layers.iter().enumerate() {
+                let Some(ids) = ids.as_array() else { continue };
+                let ids: Vec<i32> = ids.iter().filter_map(|e| e.as_i64()).map(|e| e as i32).collect();
+                if !ids.is_empty() {
+                    sal.observe(layer, &ids, &[]);
+                }
+            }
+            continue;
+        }
         let Some(layer) = f.get("layer").and_then(|l| l.as_u64()) else { continue };
         let Some(experts) = f.get("experts").and_then(|e| e.as_array()) else { continue };
         let ids: Vec<i32> = experts.iter().filter_map(|e| e.as_i64()).map(|e| e as i32).collect();
@@ -497,6 +526,47 @@ pub fn default_outdir(indir: &Path, frac: f64) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn load_trace_reads_the_shape_dump_routes_actually_writes() -> Result<(), Error> {
+        // The defect this closes: `load_trace`'s doc claimed to accept
+        // `dump-routes`' output and could not. That output is
+        // `[position][layer][expert_id]` — `f.get("layer")` on an array returns
+        // `None`, so every element was skipped and the tool exited "no usable
+        // frames — nothing to rank". The pipeline `docs/layout-tools.md`
+        // documents could never have run.
+        let dir = std::env::temp_dir().join(format!("peregrine_prune_shape_{}", std::process::id()));
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "stale fixture: {e}");
+        }
+        std::fs::create_dir_all(&dir)?;
+
+        // Two positions; layer 0 dense (empty), layers 1-2 routed.
+        let path = dir.join("routes.json");
+        std::fs::write(&path, r#"[[[],[1,2],[3]],[[],[1],[3,4]]]"#)?;
+        let sal = load_trace(&path)?;
+        // Counting, not gate mass — the nested form carries no weights, and
+        // `observe` defaults each to 1.0.
+        assert_eq!(sal.hits.get(&(1, 1)).copied(), Some(2), "expert 1 routed at layer 1 in both positions");
+        assert_eq!(sal.hits.get(&(1, 2)).copied(), Some(1));
+        assert_eq!(sal.hits.get(&(2, 3)).copied(), Some(2));
+        assert_eq!(sal.hits.get(&(2, 4)).copied(), Some(1));
+        assert!(!sal.hits.contains_key(&(0, 0)), "a dense layer routes nothing");
+
+        // The envelope form still works, and still carries its weights — the
+        // fix must not cost the shape that has gate mass.
+        let env = dir.join("frames.json");
+        std::fs::write(&env, r#"{"frames":[{"layer":1,"experts":[7],"weights":[0.5]}]}"#)?;
+        let sal2 = load_trace(&env)?;
+        assert_eq!(sal2.hits.get(&(1, 7)).copied(), Some(1));
+        assert!(
+            sal2.mass.get(&(1, 7)).is_some_and(|m| (*m - 0.5).abs() < 1e-6),
+            "the envelope form's gate weight must survive: {:?}",
+            sal2.mass.get(&(1, 7))
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
     use super::*;
 
     fn sal_of(rows: &[(usize, usize, f32)]) -> Saliency {
