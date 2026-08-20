@@ -614,11 +614,24 @@ fn run() -> Result<(), Error> {
             if traces.len() < 2 {
                 return Err(Error::Format("expert-map needs at least two labelled traces to compare".into()));
             }
+            // Split each trace into contiguous chunks and label them by domain.
+            // Four per domain, because the permutation null needs items: two
+            // domains x two halves has only three distinct labellings, so the
+            // smallest reachable p-value is 1/3 and nothing can resolve.
+            // Contiguous on purpose — an interleaved split would give every
+            // chunk the same span and hide the positional drift the pair table
+            // exists to expose.
+            let mut chunks: Vec<(String, Vec<Vec<Vec<i32>>>)> = Vec::new();
+            for (name, t) in &traces {
+                for c in peregrine_tools::split_contiguous(t, 4) {
+                    chunks.push((name.clone(), c));
+                }
+            }
             // Core sizes spanning the measured structure: ~600 slots (3.1% of
             // GLM-5.2's 19 200) is where the stable component was found to live,
             // so bracket it rather than trusting one cut.
-            let ks = [100usize, 300, 600, 1200, 2400];
-            print!("{}", peregrine_tools::format_core_comparison(&traces, &ks, 200, 0x5EED));
+            let ks = [100usize, 600, 2400];
+            print!("{}", peregrine_tools::format_domain_separation(&chunks, &ks, 500, 0x5EED));
             Ok(())
         }
         Some("route-stats") => {
