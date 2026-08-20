@@ -11,6 +11,7 @@ tools — `peregrine-layout-reorg` and `peregrine-prune` — have their own page
 | [`peregrine-gen`](#peregrine-gen) | streaming client: watch generation live and time it | any time you want a decode number that means something |
 | [`peregrine-requantize`](#peregrine-requantize) | rewrite a container at lower precision | when bytes-per-expert is the bottleneck |
 | [`peregrine-skipbound`](#peregrine-skipbound) | measure whether reads could be skipped at all | before anyone touches the read path for skipping |
+| [`bench-serve-arrivals.py`](#bench-serve-arrivalspy) | open-loop load: fixed request *rate*, not fixed concurrency | finding the saturation knee, and anything about queue time |
 
 ---
 
@@ -210,3 +211,50 @@ measurement is the deliverable, and touching `read_regions` is gated on it.
 [Layout tools](layout-tools.md) · [Serving](serving.md) ·
 [Measurement discipline](measurement.md) · [Performance tuning](performance-tuning.md) ·
 [Model format & artifacts](model-format.md)
+
+
+---
+
+## `bench-serve-arrivals.py`
+
+```
+scripts/bench-serve-arrivals.py --rate <req/s> [--duration S] [--max-tokens N]
+                                [--host H] [--port P] [--model ID] [--seed N]
+                                [--repeat-prompt]
+```
+
+The other two serving clients are **closed-loop**: `bench-serve-lanes.py` starts
+N streams and waits for them, `bench-serve-gaps.py` does the same and reports
+inter-token gaps. In a closed loop the offered load is a *consequence* of the
+server's speed — a slower server gets fewer requests, and the queue can never
+grow. That is the one regime in which queue time is structurally invisible.
+
+This one submits on a Poisson process at `--rate` and never waits for a
+completion, so the server's own queue becomes the thing under test. Sweeping
+`--rate` shows a knee rather than a smooth curve:
+
+```
+--- offered rate 50/s ---
+  achieved=46.4/s   queue_mean=32us      ttft_p95=1.17ms
+--- offered rate 400/s ---
+  achieved=247.8/s  queue_mean=619910us  ttft_p95=1392.62ms
+```
+
+Below the knee, achieved ≈ offered and queue wait is microseconds. Past it,
+achieved plateaus at what the engine can actually do while queue wait grows
+without bound — and note what that second row says: **at saturation the queue
+wait is roughly half the TTFT.** That span ends before the first token is
+generated, so no client-side timer can see it; it comes from `/metrics`'
+`queue` block, deltaed across the run.
+
+**Prompts vary per request by default, and that is not cosmetic.**
+`peregrine-serve` answers an exact repeat of a greedy request from its response
+memo without touching the engine at all. The first version of this script
+offered 61 requests and the engine admitted **one** — `measurement.md`'s
+"benchmark that measures its own cache" in a new costume. `--repeat-prompt`
+restores the old behaviour for the rare case where the memo *is* the subject,
+and the script warns loudly whenever admissions fall far below completions.
+
+503s are reported as data, not failures: past the knee they are
+`COLI_QUEUE_DEPTH` shedding, which is the healthy outcome — an unbounded queue
+would surface as latency instead.

@@ -157,9 +157,16 @@ and it is right: `EnergyMeter` existed but was read only under the opt-in
 
 ### Still not built, deliberately
 
-- **Continuous-arrival (open-loop) workloads** (§20.7). Both existing clients are
-  closed-loop. An open-loop arrival process is what makes queue time mean
-  something; the counter above is the prerequisite, not the study.
+- ~~Continuous-arrival (open-loop) workloads (§20.7).~~ **Built**:
+  `scripts/bench-serve-arrivals.py` offers Poisson load at a fixed rate and
+  never waits for completions, so the server's queue is the thing under test.
+  Sweeping the rate finds the knee — at 50/s offered the tiny fixture achieves
+  46/s with 32 µs of queue wait; at 400/s it achieves 248/s with **620 ms**, and
+  the queue is then roughly half of TTFT. It also found a trap worth recording:
+  identical greedy prompts are answered from the response memo, so the first
+  version offered 61 requests and the engine admitted **one**. Prompts vary per
+  request by default now, and the script warns when admissions fall far below
+  completions.
 - **Long-context scaling sweeps** (§20.6). Needs the checkpoint.
 - **Multi-engine comparison** (§20.1). The audit is right that this repo
   demonstrates *peregrine vs colibrì*, not "peregrine is the best engine". A

@@ -1050,6 +1050,36 @@ const RSS_GUARD_EVERY: usize = 16;
 /// that weight into the query instead. It therefore changes token values, which
 /// puts it in the same class as `COLI_ROUTE_MIN_SHARE` — size the cost with
 /// `Model::prediction_flip_rate` before turning it on.
+/// Let the MTP head's experts accumulate residency heat (`COLI_MTP_HEAT`).
+/// Default **off**.
+///
+/// Every other field the draft [`ForwardCtx`] withholds is withheld because a
+/// speculative draft must not feed a main-stream signal — prediction,
+/// calibration, lane balance. Heat looks like one of those, and for a draft
+/// running the *main* stack it would be. But the MTP head is layer index
+/// `n_layers`, and **nothing except drafting ever executes that layer**: its
+/// heat row has no main-stream competitor to skew. The table has been sized
+/// `n_layers + 1` since 2026-08-09 precisely so that row exists, and the draft
+/// path's blanket `heat: None` has kept it empty ever since — so the LFRU
+/// eviction score and the VRAM reheat ranking are both still blind to one
+/// layer's worth of experts, which is the same defect that resize was meant to
+/// fix.
+///
+/// It matters most on the streaming container, where that layer is the one read
+/// in the worst regime the engine has: once per *draft step*, at `s_n = 1`, with
+/// no batch-union amortization, and stored int8 until `--mtp-target` converts
+/// it. Per byte it is the strongest resident candidate there is.
+///
+/// A knob rather than a default because it is a genuine **trade**: heat drives
+/// eviction and VRAM promotion, so MTP experts earning residency means main-
+/// stream experts losing it, out of the same 12 GB. Output-neutral on the CPU
+/// path; on a GPU build it changes which arm computes an expert, which is a
+/// residency decision and not a value one, but is why this is opt-in rather
+/// than assumed.
+fn mtp_heat() -> bool {
+    matches!(std::env::var("COLI_MTP_HEAT").ok().as_deref(), Some("1") | Some("true"))
+}
+
 /// Whether the DSA lightning indexer runs (`COLI_DSA`). Default **off**: the
 /// indexer selects a subset of cached keys, so it changes token values, and the
 /// laptop-converted container skipped the indexer tensors entirely — with no
@@ -6085,7 +6115,7 @@ impl Model {
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
 
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft without an MTP head".into()))?;
         let ctx = ForwardCtx {
@@ -6103,7 +6133,11 @@ impl Model {
             calib: None, // drafts replay accumulated positions — counting them double-weights
             route_log_multi: None,
             direct: *direct,
-            heat: None, // speculative drafts must not skew residency heat
+            // Not a blanket `None`: see [`mtp_heat`]. Layer `n_layers` is the
+            // MTP head and nothing else runs it, so its heat row has no
+            // main-stream signal to skew — the withholding rule that governs
+            // every other field here does not reach it.
+            heat: if mtp_heat() { heat.as_ref() } else { None },
             spill: None, // drafts must not queue uploads for a speculative future
             timings: None, // drafts must not skew the main-stream lane balance
             balancer: None, // drafts run under the plain static residency policy
@@ -6229,7 +6263,7 @@ impl Model {
         let vocab = self.cfg.vocab as usize;
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft_batched without an MTP head".into()))?;
         // Identical withholding policy to the single-sequence path — see the
@@ -6250,7 +6284,8 @@ impl Model {
             calib: None,
             route_log_multi: None,
             direct: *direct,
-            heat: None,
+            // See the single-sequence twin above and [`mtp_heat`].
+            heat: if mtp_heat() { heat.as_ref() } else { None },
             spill: None,
             timings: None,
             balancer: None,

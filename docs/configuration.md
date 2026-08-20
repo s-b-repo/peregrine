@@ -441,6 +441,7 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_DRAFT_NGRAM` | 0 | prompt-lookup drafting: match suffixes up to this length — [note](#coli_draft_ngram) |
 | `COLI_SPEC_UNION_MAX` | 0 | ceiling on a tick's projected routed-expert union, in expert-read requests — [note](#coli_spec_union_max) |
 | `COLI_DRAFT_TREE` | off | verify both draft sources as a token tree instead of choosing one — [note](#coli_draft_tree) |
+| `COLI_MTP_HEAT` | off | let the MTP head's experts accumulate residency heat — [note](#coli_mtp_heat) |
 | `X-Peregrine-Priority` | (HTTP header) | `high`/`1`/`true` → drained ahead of normal-priority requests |
 
 ### `COLI_FUSE_PREFILL`
@@ -722,6 +723,37 @@ each draft was drawn from, and there is no tree analogue of that rule.
 (hedges that paid — the accepted path left the prompt-lookup branch). `trees`
 climbing while `branch_wins` stays flat means the extra rows are buying nothing
 and the knob should go back off.
+
+
+### `COLI_MTP_HEAT`
+
+Let the MTP head's experts accumulate residency heat. Default **off**.
+
+Every other field the draft `ForwardCtx` withholds is withheld because a
+speculative draft must not feed a main-stream signal — prediction, calibration,
+lane balance. Heat looks like one of those, and for a draft running the *main*
+stack it would be. But the MTP head is layer index `n_layers`, and **nothing
+except drafting ever executes that layer**: its heat row has no main-stream
+competitor to skew.
+
+The heat table has been sized `n_layers + 1` since 2026-08-09 precisely so that
+row exists — before that resize, `bump` dropped out-of-range writes silently and
+the LFRU eviction score and the VRAM reheat ranking were blind to a whole
+layer's experts. The draft path's blanket `heat: None` has kept the row empty
+ever since, so they still are. This closes that.
+
+It matters most on the streaming container, where that layer is read in the
+worst regime the engine has: once per **draft step**, at `s_n = 1`, with no
+batch-union amortization, and stored int8 until
+[`--mtp-target`](tools.md#--mtp-target-the-one-rung-on-this-ladder-with-no-quality-gate)
+converts it. Per byte it is the strongest resident candidate in the container.
+
+A knob rather than a default because it is a genuine trade: heat drives eviction
+and VRAM promotion, so MTP experts earning residency means main-stream experts
+losing it, out of the same 12 GB. Output-neutral on the CPU path; on a GPU build
+it changes which arm computes an expert — a residency decision, not a value one,
+but the reason this is opt-in rather than assumed. Inert without a GPU tier,
+where no heat table is built at all.
 
 ### `COLI_KV_DTYPE`
 
