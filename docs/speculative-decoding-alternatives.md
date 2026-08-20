@@ -180,7 +180,27 @@ by how much of the literature a row covers.
    union-cheap under the 0.65 floor. Tuning a gate against an unmeasured
    quantity is the failure `measurement.md` opens with.
 
-**What none of this has yet is a number.** Every item above is env-gated and
+**One number now exists, and it is a negative.** `COLI_SPEC_GDN` was A/B'd on
+the resident Qwen container at B=1 (2026-08-20, REPEATS=3, rotated arms,
+isolated processes): **0.786 → 0.506 tok/s, 1.55× slower**, a 35 % gap against a
+7 % spread. The cause is the MTP head, which agrees with the main model **9.5 %**
+of the time with no confidence floor at all — against 83 % on the streaming
+GLM container. Full write-up and the rejected hypothesis:
+[`bench-data/2026-08-20-spec-gdn-qwen/`](../bench-data/2026-08-20-spec-gdn-qwen/README.md).
+
+Two things that measurement corrected, both of which were written down here as
+expectations:
+
+- The knob was gated on the **recurrent snapshot** being the cost. The snapshot
+  measured exactly as predicted (~160 MB/tick against a ~151 MB estimate) and is
+  **under 1 %** of the overhead. The `gdn_replays` — extra forwards, one per
+  partially-accepted tick — are the cost, and they are a direct function of
+  acceptance.
+- The stated mitigation was tuning the `COLI_SPEC_CONF` floor. It is not: the
+  floor was removed entirely and acceptance did not move, because the head's raw
+  agreement is the problem.
+
+**The rest still has no number.** Every item above is env-gated and
 default-off, and this workspace cannot load the real checkpoint. The A/Bs owed
 are: `COLI_SPEC_GDN` at B ∈ {1, 8, 32} on `:8132` (the ~151 MB/sequence snapshot
 is charged per sequence while a forward's weight read is shared, so the

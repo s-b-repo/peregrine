@@ -606,6 +606,15 @@ restore it, rewind the KV to the same boundary, and re-advance over precisely
 the rows the client was sent. All the partially-accepting sequences of a tick
 re-advance in **one** forward, not one each.
 
+**Measured 2026-08-20 on the resident Qwen container and it is a net loss
+there**: 0.786 → 0.506 tok/s at B=1, 1.55× slower, because that container's MTP
+head agrees with the main model only ~9.5 % of the time (against 83 % on
+streaming GLM). The knob works; the head it drives on that container does not
+earn its rows. See
+[`bench-data/2026-08-20-spec-gdn-qwen/`](../bench-data/2026-08-20-spec-gdn-qwen/README.md),
+which also records that the cost is the **replays**, not the snapshot below —
+the snapshot measured at under 1 % of the overhead.
+
 It is a knob and not an unconditional enable because the snapshot is not free:
 ~3.1 MB per linear layer, so **≈151 MB per drafting sequence per tick** at
 Qwen3.5-27B's 48 linear layers, charged per *sequence* while the resident
