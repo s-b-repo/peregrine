@@ -74,6 +74,7 @@ pub use mlp::{moe_forward, Mlp, MoeCfg};
 pub use ngram::NgramDrafter;
 pub use tree::{accept_tree, CandidateTree, TreeRows};
 pub use model::{
+    io_rings,
     accept_run, accept_run_sampled, kv_dtype, lookahead_issued, save_automaton, save_macrostates, KvExport,
     KvLayerExport, Model, SeqKv, Verified,
 };

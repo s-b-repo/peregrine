@@ -41,7 +41,7 @@ pub use cache::ExpertCache;
 pub use mem::{
     advise_dontneed, advise_dontneed_slice, advise_hugepages, advise_hugepages_slice,
     bind_local_if_enabled, current_numa_node, hugepage_disabled, mbind_to_node,
-    pin_current_thread, wire_resident, Wired,
+    numa_pin_enabled, pin_current_thread, wire_resident, Wired,
 };
 pub use perf::PerfCounter;
 pub use sensors::{energy_uj, max_temp_c, EnergyMeter};

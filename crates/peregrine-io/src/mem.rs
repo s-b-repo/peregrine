@@ -219,12 +219,31 @@ fn memlock_limit() -> u64 {
     }
 }
 
+/// Whether NUMA pinning and binding are enabled (`COLI_NUMA_PIN=1`).
+///
+/// **The single definition of what that knob means.** It used to be parsed at
+/// five sites in two crates with two different polarities: the two *policy*
+/// sites treated it as opt-in (`=1` enables, matching the documented default of
+/// off) and the two *primitives* treated it as opt-out (`=0` disables, so unset
+/// allowed them). That was not a live bug — each primitive has exactly one
+/// caller and each caller gates on `=1` first — but the inner guards failed
+/// **open**: a future caller that forgot to gate would have pinned threads on a
+/// box whose operator had never asked for it, and the documentation says the
+/// default is off.
+///
+/// Read per call rather than latched: this is decided at boot in practice, and
+/// a `OnceLock` here would only make an in-process A/B compare an arm with
+/// itself.
+pub fn numa_pin_enabled() -> bool {
+    matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("1") | Ok("true"))
+}
+
 /// Pin the *current* thread to a single logical CPU. Best-effort: returns
 /// `true` on kernel-accepted binding, `false` on rejection / non-Linux. No-op
-/// when `COLI_NUMA_PIN=0`.
+/// unless [`numa_pin_enabled`].
 #[cfg(target_os = "linux")]
 pub fn pin_current_thread(cpu: u32) -> bool {
-    if matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("0") | Ok("false")) {
+    if !numa_pin_enabled() {
         return false;
     }
     // `CPU_SET` indexes the fixed-size `cpu_set_t` bit array without any bounds
@@ -291,7 +310,7 @@ pub unsafe fn bind_local_if_enabled(ptr: *mut u8, len: usize) -> bool {
     if len < 2 * 1024 * 1024 {
         return false;
     }
-    if !matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("1") | Ok("true")) {
+    if !numa_pin_enabled() {
         return false;
     }
     if !crate::topo::snapshot().multi_numa() {
@@ -314,7 +333,7 @@ pub unsafe fn mbind_to_node(ptr: *mut u8, len: usize, node: u32) -> bool {
     if len == 0 || ptr.is_null() {
         return false;
     }
-    if matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("0") | Ok("false")) {
+    if !numa_pin_enabled() {
         return false;
     }
     #[cfg(target_os = "linux")]
@@ -352,6 +371,32 @@ pub unsafe fn mbind_to_node(ptr: *mut u8, len: usize, node: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn numa_primitives_are_inert_unless_the_knob_is_on() {
+        // `COLI_NUMA_PIN` used to be parsed at five sites with two polarities:
+        // the policy sites opt-in, the primitives opt-out. Not a live bug — each
+        // primitive had exactly one caller and that caller gated first — but the
+        // primitives failed *open*, so a future ungated caller would have pinned
+        // threads on a box that never asked, against a documented default of
+        // off.
+        //
+        // Asserted as a consistency property rather than an absolute one, so it
+        // holds whatever the ambient environment is and no test has to mutate
+        // it (which this suite forbids): whenever the knob is off, every
+        // primitive it governs must decline.
+        if numa_pin_enabled() {
+            return; // the operator asked for it; nothing to assert here
+        }
+        assert!(!pin_current_thread(0), "pinning must decline while COLI_NUMA_PIN is off");
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        // SAFETY: `buf` is a live, exclusively-owned allocation for this call.
+        let bound = unsafe { bind_local_if_enabled(buf.as_mut_ptr(), buf.len()) };
+        assert!(!bound, "NUMA binding must decline while COLI_NUMA_PIN is off");
+        // SAFETY: same allocation, still exclusively owned.
+        let forced = unsafe { mbind_to_node(buf.as_mut_ptr(), buf.len(), 0) };
+        assert!(!forced, "an explicit mbind must decline too — that is the guard that used to fail open");
+    }
     use super::*;
 
     #[test]

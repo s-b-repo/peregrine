@@ -2350,10 +2350,13 @@ fn run(
             // all, the rest being attention, the router and the reduce.
             let wall = s(t.lane_wall_us);
             if wall > 0.0 {
-                let rings = std::env::var("COLI_IO_RINGS").ok()
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-                    .filter(|&n| n > 0.0)
-                    .unwrap_or(4.0);
+                // The engine's *resolved* ring count, not a second reading of
+                // the environment. `io_rings()` clamps to 16; this line used to
+                // re-parse `COLI_IO_RINGS` raw, so `=64` ran 16 rings and
+                // divided the duty by 64 — understating the engine's headline
+                // occupancy number by 4x, in the direction that makes the I/O
+                // lane look idle when it is saturated.
+                let rings = peregrine_model::io_rings() as f64;
                 eprintln!(
                     "[lane] moe wall {wall:.1}s over {forwards} forwards ({:.2}s each); \
                      io duty {:.0}% of {rings:.0} rings, cpu {:.1} workers busy",

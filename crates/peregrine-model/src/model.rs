@@ -1101,7 +1101,15 @@ fn direct_enabled() -> bool {
 /// Number of parallel io_uring rings for the streaming I/O lane (`COLI_IO_RINGS`,
 /// default 4). More rings = more concurrent expert reads (and parallel dm-crypt on
 /// encrypted volumes); `1` restores single-ring behavior. Capped at 16.
-fn io_rings() -> usize {
+///
+/// Public because the **duty-cycle report needs the resolved value, not the raw
+/// environment**. `[lane] io duty N% of R rings` divides summed per-ring
+/// microseconds by `R x wall`, and the shutdown line used to re-read
+/// `COLI_IO_RINGS` itself — without this clamp. So `COLI_IO_RINGS=64` ran 16
+/// rings and reported the duty against 64, understating the engine's headline
+/// occupancy figure by 4x. Anything that reports against a knob has to resolve
+/// it the same way the engine did.
+pub fn io_rings() -> usize {
     std::env::var("COLI_IO_RINGS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1343,7 +1351,7 @@ fn spawn_prefetch_pool(
 /// usually just fights the OS scheduler). Also installed as the `peregrine-par`
 /// worker-startup hook (see [`install_numa_pin_hook`]).
 fn numa_pin_worker(worker: usize) {
-    if !matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("1") | Ok("true")) {
+    if !peregrine_io::numa_pin_enabled() {
         return;
     }
     let topo = peregrine_io::topo::snapshot();
@@ -1363,7 +1371,7 @@ fn numa_pin_worker(worker: usize) {
 /// pool is built lazily), which is why `Model::load` calls this first thing.
 fn install_numa_pin_hook() {
     peregrine_par::set_worker_start_hook(numa_pin_worker);
-    if !matches!(std::env::var("COLI_NUMA_PIN").as_deref(), Ok("1") | Ok("true")) {
+    if !peregrine_io::numa_pin_enabled() {
         return;
     }
     let topo = peregrine_io::topo::snapshot();

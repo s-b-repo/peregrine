@@ -48,8 +48,12 @@ than just ordering them by a 1-D traversal.
 
 1. **Collect co-activation statistics**: instrument the router to log which expert sets
    are routed together across the full model (not just per-layer). The existing
-   `COLI_COACT_THRESHOLD` (see [prefetch-and-caching.md](prefetch-and-caching.md))
-   already tracks pair co-firing rates — extend this to full set co-occurrence.
+   `CoActivation` tracker (`predict.rs`, thresholded by
+   [`COLI_FUSE_THRESHOLD`](configuration.md)) already records pair co-firing
+   rates — extend this to full set co-occurrence. (An earlier revision of this
+   page named a `COLI_COACT_THRESHOLD`; no such knob exists or ever did. The
+   pair threshold is `COLI_FUSE_THRESHOLD`, default 0.9, and the hyperedge
+   grouping uses half of it.)
 
 2. **Build a co-activation graph**: nodes = experts across all layers, edge weight =
    co-occurrence frequency weighted by gate mass. This is a global graph, not

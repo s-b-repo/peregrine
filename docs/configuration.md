@@ -123,6 +123,8 @@ Error: ... 6.8 GB short, so the kernel would OOM-kill this run part-way through 
 | `COLI_IO_RECOVERY` | on | per-region retry ladder on batched-read failure (transient EIO/EAGAIN/EINTR) |
 | `COLI_HUGEPAGE` | on | `MADV_HUGEPAGE` on every ≥ 2 MB allocation |
 | `COLI_MOE_ENGINE` | `concurrent` | `concurrent` (3-lane) or `sched` — [note](#coli_moe_engine) |
+| `COLI_IO_DEVICE_SCHED` | off | device-aware ring scheduling: claims are grouped per physical device instead of taken off one device-blind cursor, with cross-device work stealing. Built only when it can differ — streaming, >1 ring, shards genuinely on >1 device |
+| `COLI_IO_DEVICE_MAP` | probed | override the shard→device-ordinal mapping the above schedules on, for a topology the prober reads wrongly. Read once per model open, not latched |
 
 ### `COLI_IO_RINGS`
 
@@ -259,6 +261,7 @@ prefill step blocks decode.
 | `COLI_CACHE_COMPRESS` | off | zstd-compress warm-cache slabs on admit, decode on hit |
 | `COLI_CACHE_COMPRESS_IDLE` | off | background-recompress cold slots while the engine is idle |
 | `COLI_CACHE_NEGATIVE_TTL` | 0 | evict unhit warm-cache slots older than N clock ticks |
+| `COLI_ECACHE_AUTO_FRAC` | 0.80 | fraction of post-load `MemAvailable` that `COLI_ECACHE_GB=auto` claims, still capped by the transient reserve + 1 GiB safety |
 
 ### `COLI_ECACHE_GB`
 
@@ -340,6 +343,8 @@ which has no such gate — kept admitting everything. It now treats a missing ta
 | `COLI_ROUTE_HIST_DEPTH` | 4 | K-deep routing history feeding the predictor |
 | `COLI_PHASE_THRESHOLD` | 0.6 | Jaccard distance declaring a phase shift — [note](#coli_phase_threshold) |
 | `COLI_ENTROPY_ADAPT` | off | routing-entropy-adaptive breadth (needs `COLI_PREFETCH_TUNE`) |
+| `COLI_PREFETCH_STALE_DROP` | off | the prefetch worker drops a queued speculative warm **before its disk read** once the forward sweep has moved past its emit stamp. Motivated by measurement: at B=16, 98.6 % of speculative reads (40 352/41 159) arrived too late to be anything but waste. Advisory lane only, so output is untouched by construction |
+| `COLI_PREFETCH_STALE_SLACK` | 1 | how many layer-steps past the emit stamp a queued warm survives before the drop above takes it. `[prefetch] stale_dropped=/used=` says whether it is cutting waste or fresh work |
 
 > **Prefetch is worth keeping on.** Turning it off measured *slower* (23.8 vs
 > 21.9 s/tok), and `disk_reads` is identical either way — `prefetch_reads` is a
@@ -443,6 +448,13 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_DRAFT_TREE` | off | verify both draft sources as a token tree instead of choosing one — [note](#coli_draft_tree) |
 | `COLI_MTP_HEAT` | off | let the MTP head's experts accumulate residency heat — [note](#coli_mtp_heat) |
 | `X-Peregrine-Priority` | (HTTP header) | `high`/`1`/`true` → drained ahead of normal-priority requests |
+| `COLI_KV_STORE_DIR` | unset | disk-persisted KV sessions: completed prefixes ≥256 tokens checkpoint here (fingerprint + checksum + full-token compare) and a restarted server restores them instead of re-prefilling. The in-memory prefix cache's disk extension |
+| `COLI_KV_STORE_MB` | unset | byte cap on that store; the LRU trims to fit |
+| `COLI_KV_STORE_TRIM` | unset | how much the store trims past the cap when it evicts, so eviction is not one entry per admission |
+| `COLI_KV_STORE_SYNC` | off | serialize + fsync a checkpoint **on the engine thread** instead of the background writer. The control arm for the async-writer latency A/B, not a production setting: a synchronous checkpoint makes every other live stream's next token wait behind it |
+| `COLI_TOPIC_ROUTING` | off | per-`TokenClass` residency steering: cache tiebreaks prefer experts this topic has routed before, raising temporal locality on a workload that stays on one subject |
+| `COLI_TOPIC_HALFLIFE` | 512 | decay half-life for those topic profiles, scaled by the routing-entropy EWMA, so a profile tracks recent routing and re-forms on a topic shift instead of anchoring to all-time counts |
+| `COLI_QWEN_THINK` | off | keep Qwen's `<think>` block in the response. Off pre-closes the block in the assistant turn (the shipped template's `enable_thinking=false` form) — with it open, any run whose token budget expired before the closing tag rendered as an **empty completion** |
 
 ### `COLI_FUSE_PREFILL`
 
@@ -537,6 +549,43 @@ rather than the obvious win it looks like. Needs `COLI_DRAFT` too.
 Every knob in this section is a **quality trade**. Gate each with
 `Model::prediction_flip_rate` against the unmodified configuration.
 
+
+
+### `COLI_GPU_DENSE`
+
+Place a **dense** model's MLP weights in VRAM and compute them on the device.
+Refused when the checkpoint carries routed experts — this is the dense-model
+counterpart of the expert tier, not a replacement for it.
+
+**It changes token values, and not by a rounding error.** The device path is far
+more accurate than the CPU one: measured **rms 1.1e-7 against 3.0e-3** at decode,
+because the CPU path quantizes activations to int8 and the device path stays in
+f32. So *which* layers are resident changes the tokens produced — the GPU arm is
+the better one, but it is a different one.
+
+That is why `COLI_GPU_DENSE_LAYERS` exists. Left unset, the tier takes whatever
+fits in free VRAM, which depends on whatever else holds the card — so two boots
+of the same container can produce different output. Fine for serving, where the
+better path wins and the boot log says what ran; **not** fine for a measurement
+arm, where the comparison has to be repeatable. Pin the count for any gate.
+
+Gated on the *value*, not on the variable being present: `COLI_GPU_DENSE=0`
+means off. It read `is_ok()` once, so `=0` switched it **on** — found while
+trying to isolate a regression by turning it off, which is exactly the moment
+that bug costs the most.
+
+### `COLI_ACT_F32`
+
+Compute quantized matmuls against **f32** activations instead of the int8 ones
+`qrow_i8` produces. A quality/throughput trade in the opposite direction from
+the precision ladder: same weights, more accurate activations.
+
+Latched in a `OnceLock`, against this repo's usual preference, and the exception
+is specific: there is no config plumbed to the matmul hot path, and the one
+harness that A/Bs it — `peregrine flip-rate --candidate-env` — already runs each
+arm in its **own process**, precisely because latched knobs cannot be toggled
+in-process. So the latch cannot produce the vacuous same-arm comparison it would
+produce for a serving knob.
 
 ### `COLI_SPEC_GDN`
 
@@ -891,6 +940,11 @@ on a CPU-only binary.
 | `COLI_CUDA_TC_W4A16_MIN` | 16 | minimum rows before the W4A16 arm is taken |
 | `COLI_CUDA_W4_PACKED` | **on** | packed-W4 arm when every expert is int4; `=0` falls through to the generic kernel |
 | `COLI_CUDA_DUAL_PROJ` | **on** | in the packed-W4 arm, compute gate and up in one fused kernel; `=0` runs two passes |
+| `COLI_GPU_DENSE` | off | place a **dense** model's MLP weights in VRAM and run them on the device. Gated on the *value* (`=0` means off — it once read `is_ok()`, so `=0` enabled it). Dense containers only: refused when the checkpoint has routed experts. **Changes token values** — see [below](#coli_gpu_dense) |
+| `COLI_GPU_DENSE_LAYERS` | fit to free VRAM | pin the resident layer count instead of taking whatever fits. **Set this for any measurement arm**: fitting to free VRAM makes placement depend on whatever else holds the card, so two boots of one container can differ |
+| `COLI_GPU_DENSE_HEADROOM_MB` | 1024 | VRAM the dense tier refuses to spend, leaving room for activations and the context |
+| `COLI_GPU_SPILL` | off | act on the lane balancer's `GpuSpill` verdicts by queueing the spilled `(layer, expert)` pairs for the next residency generation. Off = the verdict stays advisory, the historical behaviour |
+| `COLI_CUDA_GEMV` | **on** | decode-shaped GEMV kernel for M=1 (a GEMM wastes M there); `=0` falls back to the general path |
 | `COLI_CUDA_GRAPH` | off | capture/replay `expert_group` launches — [note](#coli_cuda_graph) |
 | `COLI_CUDA_AUTOTUNE` | off | online WMMA tile selection — [note](#coli_cuda_autotune) |
 | `COLI_CUDA_FUSED_REDUCE` | off | device-side gate-weighted reduce — [note](#coli_cuda_fused_reduce) |
@@ -1006,6 +1060,7 @@ Nothing here is on the forward path; all of it prints at shutdown or on `/metric
 | `COLI_UNION_STATS` | off | batch-union sharing — [note](#coli_union_stats) |
 | `COLI_PREDICT_EVAL` | off | predictor scoreboard — [note](#coli_predict_eval) |
 | `COLI_PREDICT_EVAL_N` | `topk` | candidates per arm the scoreboard scores, so recall is comparable with a real routing decision's width |
+| `COLI_CALIB_CAPTURE` | unset | path to write an activation-importance trace to, for `peregrine-requantize --calib`. Read per model load rather than latched, so it can co-run with `COLI_PREDICT_EVAL` in one instrumented pass; `peregrine calib-capture` is the standalone subcommand |
 
 ### `COLI_PERF_COUNTERS`
 

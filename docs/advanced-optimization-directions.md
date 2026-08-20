@@ -1,5 +1,12 @@
 # Advanced Optimization Directions
 
+> **Proposals, not shipped work.** The env-var names below (`COLI_JOINT_EVICTION`,
+> `COLI_SSD_AWARE_SCHED`) appear in imperative "gate behind X" form because these
+> are implementation sketches — **no code reads either of them**. The complete
+> list of knobs that exist is [configuration.md](configuration.md); anything not
+> in that reference is not implemented. Same for the `COLI_GDS` and
+> `COLI_VRAM_REPLICATE_K` named in [scale-out-design.md](scale-out-design.md).
+
 ## 14. Reverse cache eviction
 
 Traditional systems ask:

@@ -263,6 +263,15 @@ token stream is unchanged. (Annotated reference with deep-dive links:
 | `COLI_PREFIX_CACHE_MB` | 2048 (`0` = off) | Cross-request KV prefix cache budget; caches prompts *and* generated tokens; a hit shares the prefix by refcount, it is not copied |
 | `COLI_KV_BUDGET_MB` | 0 (off) | Resident-KV byte ceiling for admission, alongside the `--max-batch` count |
 | `COLI_KV_DTYPE` | `f32` | KV latent element type; `f16` halves resident KV (**changes token values** — pair with `COLI_MLA_ABSORB`) |
+| `COLI_GPU_DENSE` | off | Place a **dense** model's MLP weights in VRAM and compute them there (refused on a checkpoint with routed experts). **Changes token values** — the device path is *more* accurate (rms 1.1e-7 vs the CPU path's 3.0e-3), so which layers are resident changes the output. Gated on the value: `=0` means off |
+| `COLI_GPU_DENSE_LAYERS` | fit to VRAM | Pin the resident layer count. **Required for any measurement arm** — fitting to free VRAM makes placement depend on whatever else holds the card, so two boots can differ |
+| `COLI_GPU_DENSE_HEADROOM_MB` | 1024 | VRAM the dense tier leaves for activations and the context |
+| `COLI_KV_STORE_DIR` / `_MB` / `_TRIM` | unset | Disk-persisted KV sessions: completed prefixes ≥256 tokens checkpoint here and a restarted server restores them instead of re-prefilling. The prefix cache's disk extension |
+| `COLI_IO_DEVICE_SCHED` | off | Device-aware ring scheduling — device-pure claim groups with cross-device work stealing, instead of one device-blind cursor. Needs streaming, >1 ring, and shards on >1 device |
+| `COLI_TOPIC_ROUTING` / `_HALFLIFE` | off / 512 | Per-`TokenClass` residency steering: cache tiebreaks prefer experts this topic has routed before, with profiles decayed at a rate scaled by routing entropy |
+| `COLI_PREFETCH_STALE_DROP` / `_SLACK` | off / 1 | Drop a queued speculative warm before its disk read once the sweep has moved past it. At B=16, 98.6 % of speculative reads arrived too late to use. Advisory lane only, so output is untouched |
+| `COLI_QWEN_THINK` | off | Keep Qwen's `<think>` block in the response. Off pre-closes it — with it open, a run whose budget expired before the closing tag rendered as an **empty completion** |
+| `COLI_ACT_F32` | off | Quantized matmuls against f32 activations instead of int8 (**changes token values** — more accurate, still different) |
 | `COLI_DSA` | off | DSA lightning-indexer sparse attention, where the checkpoint carries an indexer (**changes token values**) |
 | `COLI_SPEC_GDN` | off | Speculation on a **recurrent** arch (Qwen3.5-hybrid). A linear-attention layer keeps a delta-rule state, not rows, so a rejected draft is rolled back by snapshot/restore + a re-advance over the accepted rows instead of a KV truncate. Output-neutral (`accept_run` still decides by argmax identity); the cost is a ~151 MB/sequence snapshot per drafting tick, reported as `spec.gdn_snapshot_bytes` |
 | `COLI_SPEC_GDN_MAX_B` | 0 (uncapped) | Batch width above which `COLI_SPEC_GDN` stops drafting — the snapshot is charged per sequence while a forward's weight read is shared, so it stops paying at some width |

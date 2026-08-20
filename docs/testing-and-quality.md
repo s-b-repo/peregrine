@@ -57,7 +57,7 @@ The suite is built around **bit-identity anchors** rather than tolerances:
   prefill (`engine_chunked_prefill_matches_reference`).
 - **Adaptive knobs are bit-identical when off.** Almost all are also
   correctness-neutral when on — they may change latency or residency, never
-  token values. **Eight deliberate exceptions:**
+  token values. **Ten deliberate exceptions:**
   - `COLI_ROUTE_MIN_SHARE` drops routed experts carrying a negligible share of the
     gate mass, which removes a real (if small) term from the MoE sum. It is off by
     default, and it is gated by `Model::prediction_flip_rate` rather than by an
@@ -124,6 +124,25 @@ The suite is built around **bit-identity anchors** rather than tolerances:
     erroring. `COLI_CUDA_GRAPH` and `COLI_GPU_TIER_SWAP`, by contrast, are *not*
     on this list: the first replays the same kernels with the same arguments in
     the same order, and the second only changes which experts are resident.
+  - `COLI_GPU_DENSE` places a dense model's MLP weights in VRAM and computes
+    them there. It belongs here for the **opposite** reason to most of this
+    list: the device path is *more* accurate, not less — measured rms 1.1e-7
+    against the CPU path's 3.0e-3 at decode, because the CPU path quantizes
+    activations to int8 and the device path stays in f32. Which layers are
+    resident therefore changes the tokens produced. Left unset, the tier takes
+    whatever fits in free VRAM, so placement depends on whatever else holds the
+    card and two boots of one container can differ; `COLI_GPU_DENSE_LAYERS`
+    pins the count, and **any measurement arm must pin it** or the comparison
+    is not repeatable. Note that `COLI_GPU_TIER_SWAP` above is *not* on this
+    list while this is: swapping which experts are resident does not change how
+    they are computed, and this does.
+  - `COLI_ACT_F32` computes quantized matmuls against f32 activations instead
+    of the int8 ones `qrow_i8` produces. Same weights, more accurate
+    activations — again a trade in the accurate direction, and again a change.
+    Latched in a `OnceLock`, which is safe only because its one harness
+    (`peregrine flip-rate --candidate-env`) runs each arm in its own process;
+    that is the same latch that would make a serving-knob A/B vacuously compare
+    an arm against itself.
   - **A requantized checkpoint** (`peregrine-requantize`) changes token values by
     existing, not by being toggled, so it has no knob row. int4 → int2 is a double
     quantization; measure it with `prediction_flip_rate` against the source
