@@ -17,6 +17,7 @@
 pub mod attention;
 pub mod gdn;
 pub mod ngram;
+pub mod tree;
 pub mod concurrent;
 pub mod dsa;
 pub mod gpu;
@@ -71,6 +72,7 @@ pub use math::{
 };
 pub use mlp::{moe_forward, Mlp, MoeCfg};
 pub use ngram::NgramDrafter;
+pub use tree::{accept_tree, CandidateTree, TreeRows};
 pub use model::{
     accept_run, accept_run_sampled, kv_dtype, lookahead_issued, save_automaton, save_macrostates, KvExport,
     KvLayerExport, Model, SeqKv, Verified,

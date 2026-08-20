@@ -1331,7 +1331,7 @@ pub fn mla_attention_batched(
         )));
     }
     let owner: Vec<usize> = (0..s_n).collect();
-    mla_attention_rows(w, x, RowLayout { pos_of, owner: &owner }, caches, c, ix, absorb)
+    mla_attention_rows(w, x, RowLayout::rows(pos_of, &owner), caches, c, ix, absorb)
 }
 
 /// Where each row sits: its absolute position, and which cache it belongs to.
@@ -1343,6 +1343,38 @@ pub fn mla_attention_batched(
 pub struct RowLayout<'a> {
     pub pos_of: &'a [usize],
     pub owner: &'a [usize],
+    /// RoPE position per row, when it differs from the cache slot. `None` — the
+    /// only value any non-tree caller uses — means they are the same thing.
+    ///
+    /// They are the same thing for a chain and not for a tree. `pos_of` has to
+    /// stay the cache slot, because [`LayerKv::append`] requires strictly
+    /// ascending slots and the prefix views are cut by slot. But two sibling
+    /// branches of a token tree sit at *different* slots and the *same* logical
+    /// position, and RoPE has to be told the logical one or the siblings are
+    /// rotated as if one followed the other.
+    pub rope_pos: Option<&'a [usize]>,
+    /// Per-row allowed key sets, as absolute cache indices. `None` = the whole
+    /// causal prefix, which is every non-tree caller.
+    ///
+    /// This is how a tree is expressed without changing `LayerKv` at all: lay
+    /// the candidates out in DFS order as ordinary consecutive slots, and give
+    /// each row its ancestors. Siblings then cannot see each other because
+    /// neither is in the other's set, and a rejected branch disappears with the
+    /// same `truncate` a rejected chain does.
+    ///
+    /// Supplying this **replaces** any DSA selection for the call rather than
+    /// intersecting with it: a DSA mask is an efficiency choice about which
+    /// keys are worth attending, a tree mask is a correctness constraint about
+    /// which keys exist, and intersecting could drop an ancestor.
+    pub sel: Option<&'a [Vec<usize>]>,
+}
+
+impl<'a> RowLayout<'a> {
+    /// The ordinary chain layout: one cache slot per row, RoPE following the
+    /// slot, full causal prefix. Every caller that is not building a tree.
+    pub fn rows(pos_of: &'a [usize], owner: &'a [usize]) -> RowLayout<'a> {
+        RowLayout { pos_of, owner, rope_pos: None, sel: None }
+    }
 }
 
 impl RowLayout<'_> {
@@ -1352,6 +1384,12 @@ impl RowLayout<'_> {
 
     pub fn is_empty(&self) -> bool {
         self.pos_of.is_empty()
+    }
+
+    /// RoPE positions for these rows — the explicit vector when a tree supplied
+    /// one, the cache slots otherwise.
+    pub fn rope_of(&self) -> &[usize] {
+        self.rope_pos.unwrap_or(self.pos_of)
     }
 }
 
@@ -1386,8 +1424,17 @@ pub fn mla_attention_rows(
     ix: Option<&IndexerWeights>,
     absorb: bool,
 ) -> Result<Vec<f32>, Error> {
-    let RowLayout { pos_of, owner } = rows_at;
+    let RowLayout { pos_of, owner, rope_pos, sel: tree_sel } = rows_at;
+    let rope_of: &[usize] = rope_pos.unwrap_or(pos_of);
     let s_n = pos_of.len();
+    if rope_of.len() != s_n {
+        return Err(Error::Format(format!("row attention: {s_n} positions but {} rope positions", rope_of.len())));
+    }
+    if let Some(sel) = tree_sel {
+        if sel.len() != s_n {
+            return Err(Error::Format(format!("row attention: {s_n} rows but {} key sets", sel.len())));
+        }
+    }
     if owner.len() != s_n {
         return Err(Error::Format(format!("row attention: {s_n} positions but {} owners", owner.len())));
     }
@@ -1400,20 +1447,21 @@ pub fn mla_attention_rows(
     let hidden = c.hidden as usize;
     let kvl = c.kv_lora as usize;
     let qk_rope = c.qk_rope as usize;
-    let (q, qr, lc_rows, rc_rows) = project_batched(w, x, s_n, pos_of, c);
+    let (q, qr, lc_rows, rc_rows) = project_batched(w, x, s_n, rope_of, c);
     // Append in row order, so a chunk's later rows see its earlier ones — the
     // causal prefix, exactly as sequential prefill builds it. Indexer keys ride
     // the same append, one per row, into that row's own sequence's cache — the
     // third-stream lifecycle `LayerKv` already gives them.
     for s in 0..s_n {
         let pos = pos_of[s];
+        let rpos = rope_of[s];
         caches[owner[s]].append(
             pos,
             &lc_rows[s * kvl..s * kvl + kvl],
             &rc_rows[s * qk_rope..s * qk_rope + qk_rope],
         )?;
         if let Some(ix) = ix {
-            caches[owner[s]].append_index_key(&ix.key_row(&x[s * hidden..s * hidden + hidden], pos, c));
+            caches[owner[s]].append_index_key(&ix.key_row(&x[s * hidden..s * hidden + hidden], rpos, c));
         }
     }
     let views: Vec<&LayerKv> = caches.iter().map(|k| &**k).collect();
@@ -1443,11 +1491,13 @@ pub fn mla_attention_rows(
                     views[o].ix_span(n).extend_f32(n, ix.hd(), &mut k);
                     k
                 });
-                ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], pos_of[s], c, keys)
+                ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], rope_of[s], c, keys)
             })
             .collect()
     });
-    let sel = sel.as_deref();
+    // A tree mask is a correctness constraint and wins outright; see
+    // `RowLayout::sel`.
+    let sel = tree_sel.or(sel.as_deref());
     // `absorb` is the caller's `COLI_MLA_ABSORB`. It used to be ignored here —
     // this core was absorb-only, so a served request ran its prefill dense and
     // every decode token absorbed, two numerically different implementations
@@ -2382,7 +2432,7 @@ mod tests {
             let pos_of: Vec<usize> = (0..n).collect();
             let owner = vec![0usize; n];
             let mut refs: Vec<&mut LayerKv> = vec![&mut got_kv];
-            let got = mla_attention_rows(&w.view(), &x, RowLayout { pos_of: &pos_of, owner: &owner }, &mut refs, &c, None, absorb)?;
+            let got = mla_attention_rows(&w.view(), &x, RowLayout::rows(&pos_of, &owner), &mut refs, &c, None, absorb)?;
 
             assert_eq!(got.len(), want.len());
             for (k, (p, q)) in want.iter().zip(&got).enumerate() {
@@ -2427,7 +2477,7 @@ mod tests {
             let pos_of = [0usize, 1, 2, 2];
             let owner = [0usize, 0, 0, 1];
             let mut refs: Vec<&mut LayerKv> = vec![&mut ka, &mut kb];
-            let got = mla_attention_rows(&w.view(), &fused, RowLayout { pos_of: &pos_of, owner: &owner }, &mut refs, &c, None, absorb)?;
+            let got = mla_attention_rows(&w.view(), &fused, RowLayout::rows(&pos_of, &owner), &mut refs, &c, None, absorb)?;
 
             for (k, (p, q)) in want_a.iter().zip(&got[..3 * hidden]).enumerate() {
                 assert_eq!(p.to_bits(), q.to_bits(), "absorb={absorb}, seq A output {k}");

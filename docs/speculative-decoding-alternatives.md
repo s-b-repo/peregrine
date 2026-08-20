@@ -30,15 +30,15 @@ rows below were mis-scored.
 | Lookahead decoding | Yes | High | Not built. Its n-gram pool half is the cheapest unbuilt item on this page |
 | Medusa-style multiple heads | Yes | ~~High~~ **Low** | **Declined** — see [below](#closed-here-and-why) |
 | EAGLE-style draft heads | Yes | High | **Already present in EAGLE-1 form**: `MtpHead` drafts from the *hidden state*, which is EAGLE's defining move. The upgrade is EAGLE-2's dynamic tree |
-| Tree speculative decoding | Yes | Medium/high | Not built, and cheaper than expected: `sel` is already a per-row arbitrary key mask in both attention cores |
+| Tree speculative decoding | Yes | Medium/high | **Substrate built** (`tree.rs`, `Model::forward_tree_rows`, `accept_tree`) and proven end to end; what remains is the `batch.rs` half. **MLA only** — see below |
 | Draft-model routing prediction | Yes | Extremely interesting for MoE | Deferred — competes with a router look-ahead that already measures 92.5 % recall |
 | Expert-only speculative execution | Yes | Extremely interesting | Deferred, same reason |
 | Non-autoregressive generation | Yes | Potentially enormous | **Not buildable here** — needs a NAR checkpoint |
 | Mask-predict / iterative refinement | Yes | Potentially high | **Not buildable here.** Nearest in-tree analogue is RLM (`rlm.rs`), which already refines a hidden without appending KV |
 | Diffusion LLM decoding | Yes | Potentially huge | **Different model family** — [sized below](#closed-here-and-why), not dismissed |
 | Discrete diffusion / masked generation | Yes | Potentially huge | Same |
-| Blockwise parallel decoding | Partially | High | Partly expressible today (`COLI_DRAFT` *is* a width-1 block); the rest falls out of the tree substrate |
-| Token-tree execution | Partially | High | Not built — same substrate as tree speculative decoding |
+| Blockwise parallel decoding | Partially | High | `COLI_DRAFT` *is* a width-1 block, and `CandidateTree::chain` is that block in the tree substrate's terms |
+| Token-tree execution | Partially | High | Same substrate; same state |
 | Multi-sequence expert union decoding | Partially | Very high | **Shipping.** Continuous batching + `COLI_FUSE_PREFILL`. "Could go much further" = the `EXPERT_BUDGET` union cap, which is a *byte* lever tracked in `ideas-tokens-per-sec-2026-08-15.md`, not a decoding one |
 
 ### Recurrent architectures could not speculate at all until 2026-08-20
@@ -56,6 +56,41 @@ acceptance restore plus re-advance over exactly the committed rows (all such
 sequences in one forward). Output-neutral. See
 [`configuration.md`](configuration.md#coli_spec_gdn) for the cost, which is
 real: ~151 MB per drafting sequence per tick at 27B dims.
+
+### Trees are an MLA-track mechanism, and that is a real constraint
+
+The substrate landed with a limitation worth stating up front, because it
+inverts the obvious expectation.
+
+A tree needs sibling rows that branch from a shared context. A **recurrent**
+(GDN) layer keeps one delta-rule state per sequence and advances it row by row,
+so two siblings would chain into each other's state instead of branching —
+and giving each branch its own state costs a full `GdnState` copy per branch per
+layer (~3.1 MB × 48 at 27B dims). The batched **GQA** path takes no key set at
+all, so a mask there would be silently ignored. `Model::forward_tree_rows`
+refuses both rather than answering plausibly and wrongly.
+
+So trees work on **GLM/MLA — the streaming track**, where an extra verify row
+costs disk bytes, and *not* on **Qwen3.5 — the resident track**, where extra
+rows are nearly free. That is exactly backwards from where the value is, and it
+is why tree width on the track that supports it has to be spent against the
+union-cost gate rather than set to a constant. The hybrid speculates in chains.
+
+What the substrate does provide, proven rather than argued:
+
+- `CandidateTree` lays candidates out in **DFS order as ordinary consecutive
+  cache slots**, so `LayerKv` did not change at all — its append-only,
+  strictly-ascending invariant is untouched, and a rejected branch disappears
+  through the same `truncate` a rejected chain does.
+- `RowLayout::sel` gives each row its ancestors (siblings are absent from each
+  other's key sets) and `RowLayout::rope_pos` gives each row its tree *depth*,
+  so siblings share a logical position instead of being rotated as a sequence.
+- `accept_tree` walks from the root taking whichever child matches that node's
+  own argmax, and **reduces exactly to `accept_run` on a chain** — asserted, so
+  a tree changes how many tokens a forward commits and never which.
+- `a_tree_row_cannot_see_its_siblings` checks the masking on a real forward
+  against the same branch run alone, and also requires that an *unmasked* third
+  row would differ — otherwise it would pass with `sel` ignored.
 
 ### Why MTP is disk-bound, and what would fix it
 

@@ -5655,6 +5655,39 @@ impl Model {
         Ok(self.forward_rows_inner(tokens, owner, seqs, pos_of, histories)?.0)
     }
 
+    /// One batched forward over a **token tree** per sequence.
+    ///
+    /// The rows, positions and owners are laid out exactly as a chain's are —
+    /// DFS order, one ascending cache slot per node — so the cache, the prefix
+    /// sharing and the rewind are untouched. What makes them a tree is the two
+    /// extra vectors: `rope_pos` gives each row its tree *depth*, and `sel`
+    /// gives it its ancestors, so siblings occupy one logical position and
+    /// cannot see each other. Build both with [`CandidateTree::rope_positions`]
+    /// and [`CandidateTree::key_sets`].
+    ///
+    /// **MLA only.** A recurrent layer advances one delta-rule state per
+    /// sequence row by row, so sibling rows would chain into each other's state
+    /// instead of branching from a shared one; and GQA's batched path takes no
+    /// key set at all, so a mask would be silently ignored. Both are refused
+    /// here rather than producing a plausible wrong answer — see the
+    /// [`crate::tree`] module docs.
+    pub fn forward_tree_rows(
+        &self,
+        tokens: &[i32],
+        owner: &[usize],
+        seqs: &mut [&mut SeqKv],
+        pos_of: &[usize],
+        tree: crate::tree::TreeRows<'_>,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        if self.cfg.arch != Arch::GlmMla {
+            return Err(Error::Format(format!(
+                "token trees need MLA attention; this checkpoint is {:?}. A recurrent layer cannot branch                  a delta-rule state across siblings, and the batched GQA path takes no key set — a tree                  there would be silently linearized",
+                self.cfg.arch
+            )));
+        }
+        self.forward_rows_tree_inner(tokens, owner, seqs, pos_of, Some(tree), None)
+    }
+
     /// Shared body of the two forms above: `(logits, pre-final-norm hidden)`.
     fn forward_rows_inner(
         &self,
@@ -5662,6 +5695,20 @@ impl Model {
         owner: &[usize],
         seqs: &mut [&mut SeqKv],
         pos_of: &[usize],
+        histories: Option<&[&Mutex<RouteHistory>]>,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        self.forward_rows_tree_inner(tokens, owner, seqs, pos_of, None, histories)
+    }
+
+    /// [`Self::forward_rows_inner`] with the optional tree layout. `None` for
+    /// `tree` is the chain path, bit-identical to before it existed.
+    fn forward_rows_tree_inner(
+        &self,
+        tokens: &[i32],
+        owner: &[usize],
+        seqs: &mut [&mut SeqKv],
+        pos_of: &[usize],
+        tree: Option<crate::tree::TreeRows<'_>>,
         histories: Option<&[&Mutex<RouteHistory>]>,
     ) -> Result<(Vec<f32>, Vec<f32>), Error> {
         let s_n = tokens.len();
@@ -5754,7 +5801,13 @@ impl Model {
                     (&mut layers[li], gdn[li].as_mut())
                 })
                 .unzip();
-            forward_layer_batched(l, li, &mut caches, &mut gstates, RowLayout { pos_of, owner }, &ctx, &mut x)?;
+            // `rows_at` is the chain layout unless a tree supplied depths and
+            // key sets; `RowLayout::rows` is exactly `tree: None`.
+            let rows_at = match tree {
+                Some(t) => RowLayout { pos_of, owner, rope_pos: Some(t.rope_pos), sel: Some(t.sel) },
+                None => RowLayout::rows(pos_of, owner),
+            };
+            forward_layer_batched(l, li, &mut caches, &mut gstates, rows_at, &ctx, &mut x)?;
             if let Some(la) = &la {
                 la.emit(layers, li + 1, &x, la_width);
             }
@@ -7889,6 +7942,125 @@ mod tests {
         let mut one: [&mut SeqKv; 1] = [&mut on];
         m.forward_step_batched(&[7], &mut one, &[toks.len()], None)?;
         assert_eq!(on.len(), toks.len() + 1);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_linear_tree_is_bit_identical_to_the_chain_path() -> Result<(), peregrine_core::Error> {
+        // The safety property that lets trees be introduced at all: on the
+        // shape the engine already runs — one branch, no siblings — the tree
+        // path and the chain path must produce the same bits. If they do not,
+        // the extra `rope_pos`/`sel` plumbing has moved something, and every
+        // tree result would be measured against a shifted baseline.
+        let dir = tmp_model_dir("tree_chain")?;
+        let m = Model::load(&dir)?;
+        let prompt = [1i32, 5, 9, 2];
+        let block = [6i32, 3, 7];
+        let n = prompt.len();
+
+        let mut a = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&prompt, &mut a, 0)?;
+        let owner = vec![0usize; block.len()];
+        let pos: Vec<usize> = (n..n + block.len()).collect();
+        let want = {
+            let mut refs: Vec<&mut SeqKv> = vec![&mut a];
+            m.forward_rows_batched(&block, &owner, &mut refs, &pos, None)?
+        };
+
+        let mut b = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&prompt, &mut b, 0)?;
+        let chain = crate::tree::CandidateTree::chain(block[0], &block[1..]);
+        let (rope, sel) = (chain.rope_positions(n), chain.key_sets(n));
+        let got = {
+            let mut refs: Vec<&mut SeqKv> = vec![&mut b];
+            m.forward_tree_rows(&block, &owner, &mut refs, &pos, crate::tree::TreeRows { rope_pos: &rope, sel: &sel })?.0
+        };
+        assert_eq!(want.len(), got.len());
+        for (k, (p, q)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "logit {k}: a one-branch tree is not the chain");
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_tree_row_cannot_see_its_siblings() -> Result<(), peregrine_core::Error> {
+        // The correctness claim of the whole DFS-slot layout, end to end on a
+        // real forward rather than on the key sets alone: branch C sits at a
+        // later cache slot than branch B, and must produce exactly the logits
+        // it would produce if B had never been in the batch.
+        //
+        // Root A, then two alternatives B and C at the same depth.
+        let dir = tmp_model_dir("tree_siblings")?;
+        let m = Model::load(&dir)?;
+        let prompt = [1i32, 5, 9, 2];
+        let n = prompt.len();
+        let vocab = m.cfg.vocab as usize;
+        let (a_tok, b_tok, c_tok) = (6i32, 3i32, 7i32);
+
+        // Reference: A then C alone, as a plain two-row chain.
+        let mut refseq = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&prompt, &mut refseq, 0)?;
+        let want = {
+            let mut refs: Vec<&mut SeqKv> = vec![&mut refseq];
+            m.forward_rows_batched(&[a_tok, c_tok], &[0, 0], &mut refs, &[n, n + 1], None)?
+        };
+
+        // The tree: A at slot 0, B at slot 1, C at slot 2 — B and C both
+        // children of A, so both at depth 1.
+        let tree = crate::tree::CandidateTree::new(vec![a_tok, b_tok, c_tok], vec![0, 0, 0])?;
+        let mut tseq = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&prompt, &mut tseq, 0)?;
+        let (rope, sel) = (tree.rope_positions(n), tree.key_sets(n));
+        assert_eq!(rope, vec![n, n + 1, n + 1], "siblings must share a logical position");
+        let got = {
+            let mut refs: Vec<&mut SeqKv> = vec![&mut tseq];
+            m.forward_tree_rows(tree.tokens(), &[0, 0, 0], &mut refs, &[n, n + 1, n + 2], crate::tree::TreeRows { rope_pos: &rope, sel: &sel })?.0
+        };
+
+        // Row 0 is A in both; row 2 is C in the tree and row 1 in the reference.
+        for (k, (p, q)) in want[..vocab].iter().zip(&got[..vocab]).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "root logit {k} moved when a second branch joined");
+        }
+        for (k, (p, q)) in want[vocab..2 * vocab].iter().zip(&got[2 * vocab..3 * vocab]).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "logit {k}: branch C saw its sibling B");
+        }
+
+        // And the masking is doing real work: without it — B and C as an
+        // ordinary two-row chain, which is what the layout degenerates to if
+        // `sel` is ignored — C's logits differ.
+        let mut linear = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&prompt, &mut linear, 0)?;
+        let unmasked = {
+            let mut refs: Vec<&mut SeqKv> = vec![&mut linear];
+            m.forward_rows_batched(tree.tokens(), &[0, 0, 0], &mut refs, &[n, n + 1, n + 2], None)?
+        };
+        assert!(
+            want[vocab..2 * vocab]
+                .iter()
+                .zip(&unmasked[2 * vocab..3 * vocab])
+                .any(|(p, q)| p.to_bits() != q.to_bits()),
+            "if an unmasked third row matched too, this test would pass with `sel` ignored"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_tree_is_refused_on_an_architecture_that_cannot_branch() -> Result<(), peregrine_core::Error> {
+        // A hybrid's recurrent layers would linearize the siblings and a GQA
+        // batched row takes no key set, so both would answer plausibly and
+        // wrongly. Refusing is the only safe reading.
+        let dir = tmp_hybrid_mtp_dir("tree_refuse", 0x77E)?;
+        let m = Model::load(&dir)?;
+        let mut seq = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&[1i32, 5], &mut seq, 0)?;
+        let tree = crate::tree::CandidateTree::new(vec![6i32, 3, 7], vec![0, 0, 0])?;
+        let (rope, sel) = (tree.rope_positions(2), tree.key_sets(2));
+        let mut refs: Vec<&mut SeqKv> = vec![&mut seq];
+        let e = m.forward_tree_rows(tree.tokens(), &[0, 0, 0], &mut refs, &[2, 3, 4], crate::tree::TreeRows { rope_pos: &rope, sel: &sel });
+        assert!(e.is_err(), "a hybrid must refuse a token tree rather than silently linearize it");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
