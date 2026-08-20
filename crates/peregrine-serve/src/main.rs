@@ -596,6 +596,11 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
             // Drafts the COLI_SPEC_UNION_MAX byte ceiling cut short. conf_stops
             // vs union_stops says which term of (1+accepted)/union_growth binds.
             "union_stops": t.spec_union_stops,
+            // COLI_DRAFT_TREE: hedges taken, and hedges that paid (the accepted
+            // path left the prompt-lookup branch). trees climbing with
+            // branch_wins flat means the extra rows buy nothing.
+            "trees": t.spec_trees,
+            "tree_branch_wins": t.spec_tree_branch_wins,
             "accept_rate": if t.spec_proposed > 0 {
                 t.spec_accepted as f64 / t.spec_proposed as f64
             } else { 0.0 },

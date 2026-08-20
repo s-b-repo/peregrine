@@ -440,6 +440,7 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_SPEC_GDN_MAX_B` | 0 | batch width above which `COLI_SPEC_GDN` stops drafting; `0` = uncapped |
 | `COLI_DRAFT_NGRAM` | 0 | prompt-lookup drafting: match suffixes up to this length — [note](#coli_draft_ngram) |
 | `COLI_SPEC_UNION_MAX` | 0 | ceiling on a tick's projected routed-expert union, in expert-read requests — [note](#coli_spec_union_max) |
+| `COLI_DRAFT_TREE` | off | verify both draft sources as a token tree instead of choosing one — [note](#coli_draft_tree) |
 | `X-Peregrine-Priority` | (HTTP header) | `high`/`1`/`true` → drained ahead of normal-priority requests |
 
 ### `COLI_FUSE_PREFILL`
@@ -668,6 +669,59 @@ together they say which term of the fraction is actually limiting a run.
 Picking a ceiling before that measurement exists would be tuning against a
 quantity nobody has measured, which is the failure
 [`measurement.md`](measurement.md) opens with.
+
+
+### `COLI_DRAFT_TREE`
+
+Verify prompt-lookup **and** the MTP head in one forward, instead of choosing
+one. Default **off**.
+
+Today they are alternatives: when the n-gram matches it wins and the head's
+chain is discarded unseen. They are frequently right about different
+continuations, and one forward can check both — root = the pending token, one
+branch per source. Whichever the model's own argmax follows is what commits, by
+the same greedy-identity rule a chain uses, so the served stream is unchanged.
+The hedge is skipped when the two sources agree on their first token: the
+branches would not be alternatives, and paying two rows to verify the same
+candidate twice is strictly worse than the longer chain.
+
+Committing a tree is the one thing a chain never needed. An accepted path is a
+**non-contiguous** subset of the block's cache slots, with the rejected siblings
+interleaved, so `truncate` — which can only drop a suffix — cannot express it.
+`SeqKv::retain_tail` gathers the kept rows down instead, and that is a pure move
+rather than a recomputation because each row was roped at its **tree depth**,
+which is exactly the position it lands on once its ancestors pack below it.
+
+**MLA only.** A recurrent layer advances one delta-rule state row by row, so
+siblings would chain rather than branch; the batched GQA path takes no key set,
+so a mask there is silently ignored — the worst outcome of the three, because it
+looks like it worked. Both are refused. Which means this runs on the *streaming*
+track, where an extra verify row costs disk bytes, and not on the resident
+track, where extra rows would be nearly free. That is backwards from where the
+value is, and it is why tree width must be spent against
+[`COLI_SPEC_UNION_MAX`](#coli_spec_union_max) rather than set to a constant.
+
+Two costs to weigh before enabling it, both real and neither hidden:
+
+- **Every branch row is a full row of the routed-expert union.** A two-branch
+  hedge roughly doubles a sequence's draft rows, and on the streaming container
+  that is bytes, not FLOPs.
+- **A tree row's key set is explicit**, so it is O(context) to build and walks an
+  index list where a dense row runs a tight loop. At a 4 k context and five nodes
+  that is ~160 KB per forward; at 100 k it is megabytes. Trees are therefore
+  cheapest at **short** context — the opposite of the usual intuition. The fix is
+  a compact `prefix + extras` key-set representation so the prefix stays a range;
+  until that exists, this knob is for short-context workloads. Rows that are
+  *not* part of a tree are unaffected: their entry is `None`, meaning dense, so
+  one sequence hedging never drags the rest of the batch off the fast path.
+
+Greedy requests only — a sampled request needs `accept_run_sampled` and the `q`
+each draft was drawn from, and there is no tree analogue of that rule.
+
+`/metrics` reports `spec.trees` (hedges taken) and `spec.tree_branch_wins`
+(hedges that paid — the accepted path left the prompt-lookup branch). `trees`
+climbing while `branch_wins` stays flat means the extra rows are buying nothing
+and the knob should go back off.
 
 ### `COLI_KV_DTYPE`
 

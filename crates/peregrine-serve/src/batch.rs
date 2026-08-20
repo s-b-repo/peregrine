@@ -445,6 +445,16 @@ pub struct EngineTelemetry {
     /// Together they say which of the two terms in
     /// `(1 + accepted) / union_growth` is actually limiting a run.
     pub spec_union_stops: u64,
+    /// Ticks on which a sequence's two draft sources disagreed enough to be
+    /// worth verifying as a **tree** (`COLI_DRAFT_TREE`), and — of those — how
+    /// often the accepted path left the first branch.
+    ///
+    /// `trees` counts the hedge being taken at all; `branch_wins` counts it
+    /// paying, i.e. the model following the MTP chain where prompt-lookup would
+    /// have been committed alone. A `trees` that climbs with `branch_wins` flat
+    /// means the extra rows are buying nothing and the knob should go back off.
+    pub spec_trees: u64,
+    pub spec_tree_branch_wins: u64,
     /// Cumulative CPU-package energy in microjoules, or `None` when the host
     /// will not give it up.
     ///
@@ -590,6 +600,8 @@ struct EngineKnobs {
     draft_ngram: usize,
     /// `COLI_SPEC_UNION_MAX` — see [`spec_union_max`].
     spec_union_max: u64,
+    /// `COLI_DRAFT_TREE` — see [`draft_tree`].
+    draft_tree: bool,
     /// `COLI_MAX_BATCH_ROWS` — see [`max_batch_rows`].
     max_batch_rows: usize,
     /// `COLI_QUEUE_DEPTH` — see [`queue_depth_cap`].
@@ -615,6 +627,7 @@ impl EngineKnobs {
             spec_gdn_max_b: spec_gdn_max_b(),
             draft_ngram: draft_ngram(),
             spec_union_max: spec_union_max(),
+            draft_tree: draft_tree(),
             max_batch_rows: max_batch_rows(),
             queue_depth_cap: queue_depth_cap(),
             adaptive_window_ratio: adaptive_window_ratio(),
@@ -677,6 +690,8 @@ struct SpecOverride {
     ngram: Option<usize>,
     /// `COLI_SPEC_UNION_MAX`.
     union_max: Option<u64>,
+    /// `COLI_DRAFT_TREE`.
+    tree: Option<bool>,
 }
 
 /// [`spawn`] with the fusion and the speculation depth forced (test knob override).
@@ -718,6 +733,9 @@ fn spawn_spec(
     if let Some(u) = spec.union_max {
         knobs.spec_union_max = u;
     }
+    if let Some(t) = spec.tree {
+        knobs.draft_tree = t;
+    }
     spawn_with_knobs(model, max_batch, knobs)
 }
 
@@ -755,6 +773,44 @@ fn batch_sla_ms() -> Option<u64> {
 /// checkpoint converted without `--mtp` can speculate through this alone.
 fn draft_ngram() -> usize {
     std::env::var("COLI_DRAFT_NGRAM").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+}
+
+/// Verify both draft sources as a **token tree** instead of choosing one
+/// (`COLI_DRAFT_TREE=1`). Default **off**.
+///
+/// Today prompt-lookup and the MTP head are alternatives: when the n-gram
+/// matches it wins and the head's chain is discarded unseen. They are often
+/// right about different continuations, and one forward can check both — root
+/// = the pending token, one branch per source. Whichever the model's own argmax
+/// follows is the one that commits, by the same greedy-identity rule a chain
+/// uses, so the served stream is unchanged either way.
+///
+/// **MLA only, and that is the constraint that decides where this can pay.** A
+/// recurrent layer advances one delta-rule state row by row, so siblings would
+/// chain instead of branching; the batched GQA path takes no key set at all.
+/// `Model::forward_tree_rows_hidden` refuses both rather than silently
+/// linearizing a tree. So this runs on the *streaming* track, where an extra
+/// verify row costs disk bytes — and not on the resident track, where extra
+/// rows would be nearly free. That is backwards from where the value is, and it
+/// is why tree width must be spent against [`spec_union_max`] rather than set
+/// to a constant.
+///
+/// Two costs to weigh before enabling it, both real:
+///
+/// - **Every branch row is a full row of the routed-expert union.** A two-branch
+///   tree roughly doubles a sequence's draft rows, and on the streaming
+///   container that is bytes, not FLOPs.
+/// - **A tree row's key set is explicit, so it is O(context) to build and walks
+///   an index list where a dense row runs a tight loop.** At a 4 k context and
+///   five nodes that is ~160 KB per forward; at 100 k it is megabytes. Trees are
+///   therefore cheapest at *short* context. The fix is a compact
+///   `prefix + extras` key-set representation so the prefix part stays a range;
+///   until that exists, this knob is for short-context workloads.
+///
+/// Greedy requests only: a sampled request needs `accept_run_sampled` and the
+/// `q` each draft was drawn from, and there is no tree analogue of that rule.
+fn draft_tree() -> bool {
+    matches!(std::env::var("COLI_DRAFT_TREE").ok().as_deref(), Some("1") | Some("true"))
 }
 
 /// Ceiling on the routed-expert union a single tick may cost, in expert-read
@@ -899,6 +955,54 @@ fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize, 
     // Never draft past what the request can still emit: a draft accepted beyond
     // `max_new` is work done to produce a token that is thrown away.
     global.min(budget_left.saturating_sub(1))
+}
+
+/// Build the two-branch hedge: `root` with the prompt-lookup run as one child
+/// chain and the MTP chain as the other.
+///
+/// Returns the tree and its non-root tokens in DFS order — `SeqState::draft`
+/// keeps holding those, so the row-assembly loop counts `1 + draft.len()` rows
+/// exactly as it does for a chain and needs no branch of its own.
+///
+/// `None` when hedging would buy nothing: if the two sources agree on their
+/// first token the branches are not alternatives, and a tree over them would
+/// pay two rows at depth 1 to verify the same candidate twice. Falling back to
+/// the longer chain is strictly better there.
+fn hedge_tree(root: i32, ngram: &[i32], head: &[i32]) -> (Option<peregrine_model::CandidateTree>, Vec<i32>) {
+    let (Some(&a0), Some(&b0)) = (ngram.first(), head.first()) else {
+        return (None, if ngram.is_empty() { head.to_vec() } else { ngram.to_vec() });
+    };
+    if a0 == b0 {
+        let longer = if ngram.len() >= head.len() { ngram } else { head };
+        return (None, longer.to_vec());
+    }
+    // DFS: root, then all of branch A, then all of branch B. Parents precede
+    // children, which is what lets the whole thing be ordinary ascending cache
+    // slots.
+    let mut tokens = Vec::with_capacity(1 + ngram.len() + head.len());
+    let mut parent = Vec::with_capacity(tokens.capacity());
+    tokens.push(root);
+    parent.push(0);
+    for (j, &t) in ngram.iter().enumerate() {
+        tokens.push(t);
+        parent.push(j); // 0 for the first (child of root), then the previous node
+    }
+    let b_base = 1 + ngram.len();
+    for (j, &t) in head.iter().enumerate() {
+        tokens.push(t);
+        parent.push(if j == 0 { 0 } else { b_base + j - 1 });
+    }
+    let flat = tokens[1..].to_vec();
+    match peregrine_model::CandidateTree::new(tokens, parent) {
+        Ok(t) => (Some(t), flat),
+        // A malformed tree is a bug in the two lines above, not a request
+        // failure: fall back to the n-gram chain, which is what would have been
+        // used with the knob off.
+        Err(e) => {
+            peregrine_core::note_advisory_err("hedge tree", &e);
+            (None, ngram.to_vec())
+        }
+    }
 }
 
 /// Max draft depth that keeps a tick's *projected* routed-expert union under
@@ -1121,6 +1225,15 @@ struct SeqState {
     /// Whether this tick's `draft` came from prompt-lookup rather than the MTP
     /// head. Only for accounting — the accept rule is the same either way.
     draft_from_ngram: bool,
+    /// The candidate **tree** this tick's rows form, when `COLI_DRAFT_TREE` is
+    /// on and both draft sources produced something.
+    ///
+    /// `draft` still holds the tree's non-root tokens in DFS order, so the row
+    /// count is `1 + draft.len()` exactly as for a chain and the assembly loop
+    /// needs no special case. What the tree adds is the *shape*: which node each
+    /// row's parent is, which decides the row's RoPE depth, its key set, and
+    /// which subset of slots survives acceptance.
+    tree: Option<peregrine_model::CandidateTree>,
     /// The fed-token log, row-aligned with `seq`: `toks[i]` is the token whose
     /// feed produced KV row `i` (the prompt, then each committed decode/draft
     /// token). Kept so a retiring sequence can hand `prompt + output` to the
@@ -1183,6 +1296,8 @@ fn run(
     let mut union_entries_last: u64 = 0;
     let mut union_per_row_ewma: f64 = 0.0;
     let mut spec_union_stops: u64 = 0;
+    let mut spec_trees: u64 = 0;
+    let mut spec_tree_branch_wins: u64 = 0;
     let note_wait = |w: u64, total: &mut u64, n: &mut u64, max: &mut u64| {
         *total = total.saturating_add(w);
         *n += 1;
@@ -1377,16 +1492,49 @@ fn run(
         let mut owner: Vec<usize> = Vec::with_capacity(n_dec);
         let mut first_row: Vec<usize> = Vec::with_capacity(n_dec);
         let mut rows_of: Vec<usize> = Vec::with_capacity(n_dec);
+        // Tree rows need two extra vectors: a RoPE position that is the node's
+        // *depth* rather than its cache slot, and an explicit key set naming its
+        // ancestors. Both must cover every row, because the attention cores
+        // index them positionally — but an entry of `None` means dense, so
+        // ordinary chains and the fused prefill chunk stay on the untouched
+        // loops even when one sequence is speculating on a tree.
+        let mut rope_of: Vec<usize> = Vec::with_capacity(n_dec);
+        let mut sel: Vec<Option<Vec<usize>>> = Vec::with_capacity(n_dec);
+        let mut any_tree = false;
         for (i, st) in active.iter().enumerate() {
             first_row.push(tokens.len());
             rows_of.push(1 + st.draft.len());
             tokens.push(st.next_tok);
             pos_of.push(st.pos);
             owner.push(i);
-            for (j, &t) in st.draft.iter().enumerate() {
-                tokens.push(t);
-                pos_of.push(st.pos + 1 + j);
-                owner.push(i);
+            match &st.tree {
+                Some(t) => {
+                    any_tree = true;
+                    let rp = t.rope_positions(st.pos);
+                    let ks = t.key_sets(st.pos);
+                    rope_of.push(rp.first().copied().unwrap_or(st.pos));
+                    sel.push(ks.first().cloned());
+                    for (j, &tok) in st.draft.iter().enumerate() {
+                        tokens.push(tok);
+                        // The *slot* stays consecutive — `LayerKv::append`
+                        // requires it — while the RoPE position is the depth.
+                        pos_of.push(st.pos + 1 + j);
+                        owner.push(i);
+                        rope_of.push(rp.get(j + 1).copied().unwrap_or(st.pos + 1 + j));
+                        sel.push(ks.get(j + 1).cloned());
+                    }
+                }
+                None => {
+                    rope_of.push(st.pos);
+                    sel.push(None);
+                    for (j, &t) in st.draft.iter().enumerate() {
+                        tokens.push(t);
+                        pos_of.push(st.pos + 1 + j);
+                        owner.push(i);
+                        rope_of.push(st.pos + 1 + j);
+                        sel.push(None);
+                    }
+                }
             }
         }
         let n_dec_rows = tokens.len();
@@ -1398,6 +1546,10 @@ fn run(
                 tokens.push(t);
                 pos_of.push(p.pos + j);
                 owner.push(n_dec); // the prefilling sequence is appended after the decoders (owners are per *sequence*, not per row)
+                // A prefill chunk is ordinary causal rows: slot == position, and
+                // dense attention over the whole prefix.
+                rope_of.push(p.pos + j);
+                sel.push(None);
             }
         }
         // A recurrent arch cannot rewind by truncation. This forward is about
@@ -1458,7 +1610,13 @@ fn run(
                     hists.push(&*hist);
                 }
             }
-            match model.forward_rows_batched_hidden(&tokens, &owner, &mut refs, &pos_of, Some(&hists)) {
+            let out = if any_tree {
+                let rows = peregrine_model::TreeRows { rope_pos: &rope_of, sel: &sel };
+                model.forward_tree_rows_hidden(&tokens, &owner, &mut refs, &pos_of, rows, Some(&hists))
+            } else {
+                model.forward_rows_batched_hidden(&tokens, &owner, &mut refs, &pos_of, Some(&hists))
+            };
+            match out {
                 Ok(l) => l,
                 Err(e) => {
                     for s in &active {
@@ -1540,7 +1698,16 @@ fn run(
             // reachable under `COLI_DRAFT_SAMPLED`) takes the rejection-sampling
             // rule, which needs the `q` each draft was drawn from. A
             // non-drafting sequence keeps its own sampler, temperature and all.
-            let (k, spec_next) = if g > 0 {
+            // The accepted node path, for a tree — its entries are indices into
+            // the tree's DFS order, which are *not* `1..=k` when a branch was
+            // taken. Empty for a chain, where the path is implicit.
+            let mut path: Vec<usize> = Vec::new();
+            let (k, spec_next) = if let Some(t) = s.tree.as_ref().filter(|_| g > 0) {
+                let rows = logits.get(base * vocab..(base + g + 1) * vocab).unwrap_or(&[]);
+                let (p, next) = peregrine_model::accept_tree(rows, vocab, t);
+                path = p;
+                (path.len(), next)
+            } else if g > 0 {
                 let rows = logits.get(base * vocab..(base + g + 1) * vocab).unwrap_or(&[]);
                 if s.sampler.temp > 0.0 {
                     // `take`, not borrow: a `q` must never be scored against a
@@ -1591,7 +1758,11 @@ fn run(
                 // footing, not a second sample from the same one.)
                 if s.sampler.temp <= 0.0 {
                     let rows = ForwardRows { logits: &logits, hidden: &hidden, vocab, d_hidden };
-                    match rlm_refine_row(&model, &s.seq, s.pos + k, &rows, base + k, 0.0) {
+                    let decision_row = match s.tree.as_ref() {
+                        Some(_) => base + path.last().copied().unwrap_or(0),
+                        None => base + k,
+                    };
+                    match rlm_refine_row(&model, &s.seq, s.pos + k, &rows, decision_row, 0.0) {
                         Some((lg, h)) => {
                             refined_hidden = Some(h);
                             peregrine_model::argmax(&lg) as i32
@@ -1617,8 +1788,20 @@ fn run(
                     None => s.next_tok,
                 }
             };
+            // The hedge paid when the accepted path is not branch A's prefix —
+            // branch A occupies nodes `1..=len(A)` in DFS order, so any accepted
+            // node beyond that is the head's chain winning a row prompt-lookup
+            // would otherwise have committed alone.
+            if s.tree.is_some() && path.iter().enumerate().any(|(d, &nd)| nd != d + 1) {
+                spec_tree_branch_wins += 1;
+            }
             let mut run: Vec<i32> = Vec::with_capacity(k + 1);
-            run.extend_from_slice(&s.draft[..k.min(g)]);
+            match s.tree.as_ref() {
+                // A tree's accepted tokens are the nodes along the path, which
+                // is not a prefix of `draft` once a branch was taken.
+                Some(t) => run.extend(path.iter().filter_map(|&nd| t.tokens().get(nd).copied())),
+                None => run.extend_from_slice(&s.draft[..k.min(g)]),
+            }
             run.push(final_next);
 
             let mut alive = true;
@@ -1665,6 +1848,24 @@ fn run(
                         gdn_failed.push((i, e.to_string()));
                     }
                 },
+                // A **tree** cannot rewind by truncation either, for a different
+                // reason than a recurrent state: its accepted path is a
+                // non-contiguous subset of the block's slots, with the rejected
+                // siblings interleaved. The kept rows are gathered down instead,
+                // which is a pure move — each was roped at its tree depth, which
+                // is exactly the position it lands on. Trees are MLA-only, so
+                // this and the recurrent arm can never both apply.
+                None if s.tree.is_some() && g > 0 => {
+                    let keep: Vec<usize> = std::iter::once(pos0)
+                        .chain(path.iter().take(drafts_emitted).map(|&nd| pos0 + nd))
+                        .collect();
+                    if let Err(e) = s.seq.retain_tail(pos0, &keep) {
+                        // The cache is now neither shape. Retire rather than
+                        // serve on a history nothing else can detect is wrong.
+                        peregrine_core::note_advisory_err("tree commit", &e);
+                        alive = false;
+                    }
+                }
                 None => s.seq.truncate(s.pos),
             }
             // The fed-token log commits the same rows: the token fed this tick
@@ -1679,7 +1880,14 @@ fn run(
             // Carry the hidden at the row that produced `final_next`, so the
             // next draft continues from this forward rather than re-running
             // the stack.
-            let hrow = (base + drafts_emitted) * d_hidden;
+            // For a tree the decision row is the last accepted *node*, whose
+            // offset within the block is its DFS index — not `drafts_emitted`,
+            // which is a count and not a slot once a branch was taken.
+            let last_node = match s.tree.as_ref() {
+                Some(_) => path.get(drafts_emitted.wrapping_sub(1)).copied().unwrap_or(0),
+                None => drafts_emitted,
+            };
+            let hrow = (base + last_node) * d_hidden;
             // An absent row means the forward returned less than it was asked
             // for — clear the hidden rather than default it, so the next tick
             // skips drafting instead of drafting from zeros.
@@ -1816,6 +2024,10 @@ fn run(
             // through this one alone.
             let rollback_ok = model.spec_reject_is_kv_only() || (gdn_rollback && gdn_width_ok);
             let may_ngram = ngram.is_enabled() && rollback_ok;
+            // Trees are MLA-only — a recurrent layer would chain siblings and
+            // the batched GQA path ignores a key set — so the arch check is a
+            // gate here rather than an error at the forward.
+            let may_tree = knobs.draft_tree && may_draft && may_ngram && model.supports_token_trees();
             // Greedy sequences that fall through to the head draft *together*
             // in one call below: the MTP layer is sparse, so a per-sequence
             // loop streams one routed-expert union per sequence per step where
@@ -1837,6 +2049,7 @@ fn run(
                 s.draft.clear();
                 s.draft_q.clear();
                 s.draft_from_ngram = false;
+                s.tree = None;
                 if g == 0 {
                     continue;
                 }
@@ -1851,6 +2064,15 @@ fn run(
                         ngram_proposed += d.len() as u64;
                         s.draft_from_ngram = true;
                         s.draft = d;
+                        // With `COLI_DRAFT_TREE` the head still drafts, and both
+                        // branches are verified below instead of the n-gram
+                        // simply winning. Recorded here; the tree is assembled
+                        // after the batched head call, which is the only place
+                        // both chains exist at once.
+                        if may_tree {
+                            head_batch.push((i, g));
+                            continue;
+                        }
                         continue;
                     }
                 }
@@ -1919,7 +2141,26 @@ fn run(
                                 spec_conf_stops += 1;
                             }
                             if let Some(s) = active.get_mut(i) {
-                                s.draft = d;
+                                match (may_tree && s.draft_from_ngram, s.draft.is_empty(), d.is_empty()) {
+                                    // Both sources spoke: verify both. Branch A
+                                    // is the n-gram run already in `s.draft`,
+                                    // branch B the head's chain — two children
+                                    // of the pending token, each a chain below
+                                    // its own root child.
+                                    (true, false, false) => {
+                                        let (tree, flat) = hedge_tree(s.next_tok, &s.draft, &d);
+                                        s.draft = flat;
+                                        if tree.is_some() {
+                                            spec_trees += 1;
+                                        }
+                                        s.tree = tree;
+                                    }
+                                    // Only the head spoke (no n-gram match), or
+                                    // the head came up empty — a chain either
+                                    // way, which needs no tree at all.
+                                    (_, true, _) => s.draft = d,
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -1984,6 +2225,8 @@ fn run(
             queue_admits,
             queue_wait_max_us,
             spec_union_stops,
+            spec_trees,
+            spec_tree_branch_wins,
             energy_uj,
             rlm: model.rlm_stats(),
             kvstore: prefix.disk.as_ref().map(|d| (d.saved, d.loaded, d.tokens_restored)),
@@ -2465,6 +2708,7 @@ fn finish_prefill_chunk(
         draft: Vec::new(),
         draft_q: Vec::new(),
         draft_from_ngram: false,
+        tree: None,
         hlast: Vec::new(),
         // The fed-token log starts as the prompt (row-aligned with `seq`,
         // whose rows so far are exactly the prompt); `t0` joins it when fed.
@@ -2725,6 +2969,7 @@ mod tests {
                 draft: Vec::new(),
                 draft_q: Vec::new(),
                 draft_from_ngram: false,
+        tree: None,
                 hlast: Vec::new(),
                 toks: p.prompt,
             })
@@ -3104,6 +3349,77 @@ mod tests {
             "published lane timings must be the model's, not a default: {:?}",
             t.lane_last
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_hedged_tree_changes_no_token_and_actually_branches() -> Result<(), Error> {
+        // `COLI_DRAFT_TREE` stops the two draft sources being alternatives:
+        // instead of prompt-lookup winning and the head's chain being discarded
+        // unseen, both are verified in one forward and whichever the model's own
+        // argmax follows commits. The greedy-identity rule is unchanged, so the
+        // served stream must be unchanged — and this is the path where that is
+        // least obvious, because an accepted branch leaves a *non-contiguous*
+        // set of cache slots that has to be gathered rather than truncated.
+        //
+        // The prompt repeats a run so prompt-lookup fires; the head is a random
+        // tiny fixture, so the two disagree and the hedge is genuinely taken.
+        let dir = tiny_dir("hedge_tree")?;
+        let prompts = [vec![1i32, 5, 9, 2, 7, 1, 5, 9, 2], vec![3i32, 8, 4, 3, 8, 4]];
+        let n = 32usize;
+
+        let run = |spec: SpecOverride| -> Result<(Vec<Vec<u32>>, EngineTelemetry), Error> {
+            let (handle, join) = spawn_spec(Model::load(&dir)?, 8, false, spec)?;
+            let mut rxs = Vec::new();
+            for p in &prompts {
+                let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+                handle.submit(EngineRequest {
+                    prompt: p.clone(),
+                    max_new: n,
+                    sampler: Sampler::new(0.0, 0.9, 1),
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                })?;
+                rxs.push(rx);
+            }
+            let mut out = Vec::new();
+            for mut rx in rxs {
+                let mut toks = Vec::new();
+                while let Some(msg) = rx.blocking_recv() {
+                    match msg {
+                        EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Error(e) => return Err(Error::Format(e)),
+                    }
+                }
+                out.push(toks);
+            }
+            let t = handle.telemetry();
+            drop(handle);
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok((out, t))
+        };
+
+        // An independent decode, not the engine with the knob off.
+        let want: Vec<Vec<u32>> = {
+            let m = Model::load(&dir)?;
+            prompts.iter().map(|p| ref_decode(&m, p, n)).collect::<Result<_, Error>>()?
+        };
+
+        let base = SpecOverride { depth: Some(4), ngram: Some(3), ..SpecOverride::default() };
+        let (off, t_off) = run(SpecOverride { tree: Some(false), ..base })?;
+        assert_eq!(off, want, "the un-hedged engine already disagrees with a plain greedy decode");
+        assert_eq!(t_off.spec_trees, 0, "no trees may be built with the knob off");
+
+        let (on, t_on) = run(SpecOverride { tree: Some(true), ..base })?;
+        assert!(on.iter().all(|s| !s.is_empty()), "COLI_DRAFT_TREE=1: nothing generated");
+        assert_eq!(on, want, "COLI_DRAFT_TREE=1 changed the served token stream");
+        // Without this the test would pass on a run where the hedge never fired
+        // and no tree row was ever built — which is most of what could go wrong.
+        assert!(t_on.spec_trees > 0, "the two sources must actually have disagreed; trees=0");
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
@@ -3651,7 +3967,7 @@ mod tests {
             Ok(toks)
         };
 
-        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None, gdn: None, ngram: None, union_max: None };
+        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None, gdn: None, ngram: None, union_max: None, tree: None };
         let got = run_engine(on)?;
         assert!(!got.is_empty(), "sampled speculation generated nothing");
         assert!(got.len() <= n, "served {} tokens for max_new {n}", got.len());
@@ -3665,7 +3981,7 @@ mod tests {
         // And the knob is a knob: with it off, the same request takes the
         // historical one-row path, whose stream differs precisely because the
         // RNG is consumed differently.
-        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None, gdn: None, ngram: None, union_max: None })?;
+        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None, gdn: None, ngram: None, union_max: None, tree: None })?;
         assert!(!off.is_empty(), "the unspeculated path generated nothing");
         assert_ne!(
             off, got,
@@ -3714,10 +4030,10 @@ mod tests {
             Ok(toks)
         };
 
-        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0), gdn: None, ngram: None, union_max: None })?;
+        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0), gdn: None, ngram: None, union_max: None, tree: None })?;
         assert!(!base.is_empty(), "the baseline generated nothing");
         for floor in [0.65f32, 0.999] {
-            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor), gdn: None, ngram: None, union_max: None })?;
+            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor), gdn: None, ngram: None, union_max: None, tree: None })?;
             assert_eq!(gated, base, "a {floor} confidence floor changed a greedy stream");
         }
         std::fs::remove_dir_all(&dir)?;

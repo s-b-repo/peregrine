@@ -30,7 +30,7 @@ rows below were mis-scored.
 | Lookahead decoding | Yes | High | Not built. Its n-gram pool half is the cheapest unbuilt item on this page |
 | Medusa-style multiple heads | Yes | ~~High~~ **Low** | **Declined** — see [below](#closed-here-and-why) |
 | EAGLE-style draft heads | Yes | High | **Already present in EAGLE-1 form**: `MtpHead` drafts from the *hidden state*, which is EAGLE's defining move. The upgrade is EAGLE-2's dynamic tree |
-| Tree speculative decoding | Yes | Medium/high | **Substrate built** (`tree.rs`, `Model::forward_tree_rows`, `accept_tree`) and proven end to end; what remains is the `batch.rs` half. **MLA only** — see below |
+| Tree speculative decoding | Yes | Medium/high | **Built and wired** — `COLI_DRAFT_TREE` hedges prompt-lookup against the MTP head in one forward. **MLA only** — see below |
 | Draft-model routing prediction | Yes | Extremely interesting for MoE | Deferred — competes with a router look-ahead that already measures 92.5 % recall |
 | Expert-only speculative execution | Yes | Extremely interesting | Deferred, same reason |
 | Non-autoregressive generation | Yes | Potentially enormous | **Not buildable here** — needs a NAR checkpoint |
@@ -38,7 +38,7 @@ rows below were mis-scored.
 | Diffusion LLM decoding | Yes | Potentially huge | **Different model family** — [sized below](#closed-here-and-why), not dismissed |
 | Discrete diffusion / masked generation | Yes | Potentially huge | Same |
 | Blockwise parallel decoding | Partially | High | `COLI_DRAFT` *is* a width-1 block, and `CandidateTree::chain` is that block in the tree substrate's terms |
-| Token-tree execution | Partially | High | Same substrate; same state |
+| Token-tree execution | Partially | High | Same mechanism; `COLI_DRAFT_TREE` |
 | Multi-sequence expert union decoding | Partially | Very high | **Shipping.** Continuous batching + `COLI_FUSE_PREFILL`. "Could go much further" = the `EXPERT_BUDGET` union cap, which is a *byte* lever tracked in `ideas-tokens-per-sec-2026-08-15.md`, not a decoding one |
 
 ### Recurrent architectures could not speculate at all until 2026-08-20
@@ -160,11 +160,12 @@ by how much of the literature a row covers.
    **Done.** Zero weights, zero model calls, no training. The only draft source
    that on the streaming track does not first pay ~300 MB of MTP expert reads,
    and it works on a checkpoint with no MTP head at all. Pays on both tracks.
-3. **Tree / blockwise verification.** **Substrate done**, `batch.rs` half open.
-   One mechanism; "tree spec", "token-tree", "blockwise" and the tree half of
-   EAGLE-2 all reduce to it. Needed no attention-mask work and no `LayerKv`
-   change. Sequenced behind (5) because trees turned out to be MLA-only, so
-   their width is spent on the track where rows cost bytes.
+3. **Tree / blockwise verification.** **Done** — `COLI_DRAFT_TREE`. One
+   mechanism; "tree spec", "token-tree", "blockwise" and the tree half of
+   EAGLE-2 all reduce to it. Needed no attention-mask work and only one new KV
+   operation (`retain_tail`, the gather an accepted path requires). Its width is
+   spent against (5) because trees turned out to be MLA-only — they run on the
+   track where rows cost bytes, not the one where they would be free.
 4. **Cut the MTP draft path's bytes** (streaming track). **Two of four done** —
    the draft path has the `ExpertIndex`, and `mtp_draft_batched` turns B
    disjoint unions per step into one. `--mtp-target int4` on that layer is

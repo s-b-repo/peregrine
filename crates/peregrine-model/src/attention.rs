@@ -188,6 +188,20 @@ enum KvBuf {
     F16(Vec<u16>),
 }
 
+/// Move rows `keep` (ascending, relative to the buffer's own row 0) down so they
+/// sit contiguously starting at `from`, then truncate. `copy_within` rather than
+/// a fresh allocation because the destination never overtakes the source: `keep`
+/// is ascending and every entry is `>= from + its own output index`.
+fn gather_rows<T: Copy>(v: &mut Vec<T>, from: usize, keep: &[usize], width: usize) {
+    for (out, &src) in keep.iter().enumerate() {
+        let (dst_at, src_at) = ((from + out) * width, src * width);
+        if dst_at != src_at {
+            v.copy_within(src_at..src_at + width, dst_at);
+        }
+    }
+    v.truncate((from + keep.len()) * width);
+}
+
 impl KvBuf {
     fn new(dt: KvDtype) -> KvBuf {
         match dt {
@@ -212,6 +226,19 @@ impl KvBuf {
 
     fn bytes(&self) -> usize {
         self.elems() * self.dtype().elem_size()
+    }
+
+    /// Keep only rows `keep` (ascending, each `< len/width`) of the trailing
+    /// block that starts at row `from`, packed contiguously, and drop the rest.
+    /// Rows before `from` are untouched.
+    fn gather_tail(&mut self, from: usize, keep: &[usize], width: usize) {
+        if width == 0 {
+            return;
+        }
+        match self {
+            KvBuf::F32(v) => gather_rows(v, from, keep, width),
+            KvBuf::F16(v) => gather_rows(v, from, keep, width),
+        }
     }
 
     fn push(&mut self, row: &[f32]) {
@@ -553,6 +580,57 @@ impl LayerKv {
             self.ix.clear();
         }
         self.len = new_len;
+    }
+
+    /// Keep only positions `keep` of the block starting at `from`, packed down
+    /// to `from..from + keep.len()`, and drop everything else at or after
+    /// `from`. Positions before `from` are untouched.
+    ///
+    /// **This is what committing a token *tree* needs, and the only operation a
+    /// chain never did.** A tree's candidates are laid out as consecutive cache
+    /// slots in DFS order, so the accepted path — root, one child, one
+    /// grandchild — is a *non-contiguous* subset of them with the rejected
+    /// siblings interleaved. `truncate` can only drop a suffix, so the accepted
+    /// rows have to be gathered down instead.
+    ///
+    /// Two properties make the gather a pure move rather than a recomputation.
+    /// The latents do not depend on position at all; and the roped keys were
+    /// roped at each row's **tree depth**, which is exactly the position it
+    /// lands on once its ancestors are packed below it — so a path accepted out
+    /// of a tree is already roped for where it ends up.
+    ///
+    /// `from` must be at or after the shared prefix: the block being compacted
+    /// was appended by the forward that just ran, so it is private by
+    /// construction, and a shared prefix is immutable for the other sequences
+    /// still reading it. A `from` inside the prefix is refused rather than
+    /// silently corrupting every holder.
+    pub fn retain_tail(&mut self, from: usize, keep: &[usize]) -> Result<(), Error> {
+        if from < self.shared_rows {
+            return Err(Error::Format(format!(
+                "kv retain_tail: from {from} is inside a shared prefix of {} rows — the block being \
+                 compacted must be this sequence's own",
+                self.shared_rows
+            )));
+        }
+        if from > self.len {
+            return Err(Error::Format(format!("kv retain_tail: from {from} past the cache length {}", self.len)));
+        }
+        if keep.windows(2).any(|w| w[0] >= w[1]) || keep.iter().any(|&k| k < from || k >= self.len) {
+            return Err(Error::Format(format!(
+                "kv retain_tail: keep must be ascending and inside [{from}, {}), got {keep:?}",
+                self.len
+            )));
+        }
+        // Buffer-relative rows: the shared prefix is not in these buffers.
+        let base = from - self.shared_rows;
+        let rel: Vec<usize> = keep.iter().map(|&k| k - self.shared_rows).collect();
+        self.lc.gather_tail(base, &rel, self.kv_lora);
+        self.rc.gather_tail(base, &rel, self.qk_rope);
+        if self.ix_width > 0 {
+            self.ix.gather_tail(base, &rel, self.ix_width);
+        }
+        self.len = from + keep.len();
+        Ok(())
     }
 
     /// Logical bytes of the cached latents: what this sequence would cost if it
@@ -963,7 +1041,7 @@ fn attend_dense_rows(
     rows: &[RowAttn],
     owner: &[usize],
     c: &Cfg,
-    sel: Option<&[Vec<usize>]>,
+    sel: Option<&[Option<Vec<usize>>]>,
 ) -> Vec<f32> {
     let s_n = rows.len();
     let h_n = c.n_heads as usize;
@@ -1010,12 +1088,19 @@ fn attend_dense_rows(
         for &r in &members {
             let nt = rows[r].len;
             let pos = nt.saturating_sub(1);
-            // keys this query attends: the DSA selection (clamped causal), or all of them
+            // keys this query attends: an explicit selection (clamped causal),
+            // or all of them.
+            //
+            // `sel` covers every row because the cores index it positionally,
+            // but a row's entry may be `None`, meaning *dense*. That matters in
+            // a mixed batch: one sequence speculating on a tree must not drag
+            // every other row off this fast path, and materializing `0..nt` per
+            // ordinary row would be O(rows x context) of `usize` for nothing.
             let mut keys: Vec<usize> = match sel.and_then(|sets| sets.get(r)) {
-                // DSA selection for this row, clamped to its causal prefix.
-                Some(set) => set.iter().copied().filter(|&t| t < nt).collect(),
-                // Dense (`sel` is None) — or a selection that does not cover this
-                // row, which the public entry point rejects before we get here.
+                Some(Some(set)) => set.iter().copied().filter(|&t| t < nt).collect(),
+                Some(None) => (0..nt).collect(),
+                // A selection that does not cover this row — rejected by the
+                // public entry point before we get here.
                 None => match sel {
                     Some(_) => Vec::new(),
                     None => (0..nt).collect(),
@@ -1064,7 +1149,7 @@ fn attend_dense(
     pos_base: usize,
     cache: &LayerKv,
     c: &Cfg,
-    sel: Option<&[Vec<usize>]>,
+    sel: Option<&[Option<Vec<usize>>]>,
 ) -> Vec<f32> {
     let rows: Vec<RowAttn> = (0..s_n).map(|s| cache.view_prefix(pos_base + s + 1)).collect();
     let owner = vec![0usize; s_n];
@@ -1082,7 +1167,7 @@ fn attend_absorb_batched(
     rows: &[RowAttn],
     c: &Cfg,
     par_min: usize,
-    sel: Option<&[Vec<usize>]>,
+    sel: Option<&[Option<Vec<usize>>]>,
 ) -> Vec<f32> {
     let s_n = rows.len();
     let h_n = c.n_heads as usize;
@@ -1105,7 +1190,9 @@ fn attend_absorb_batched(
         // (own position forced in, as the dense core does), or all of them.
         // `None` keeps the historical `0..nt` loops term for term below — the
         // default dense path must not move a bit.
-        let sel_keys: Option<Vec<usize>> = sel.and_then(|sets| sets.get(s)).map(|set| {
+        // A row entry of `None` means *dense* — see the dense core for why a
+        // mixed batch needs that — and takes the untouched `0..nt` loops below.
+        let sel_keys: Option<Vec<usize>> = sel.and_then(|sets| sets.get(s)).and_then(Option::as_ref).map(|set| {
             let mut k: Vec<usize> = set.iter().copied().filter(|&t| t < nt).collect();
             if k.is_empty() {
                 k.push(nt - 1);
@@ -1210,7 +1297,7 @@ fn mla_attention_dsa(
     pos_base: usize,
     cache: &mut LayerKv,
     c: &Cfg,
-    sel: &[Vec<usize>],
+    sel: &[Option<Vec<usize>>],
 ) -> Result<Vec<f32>, Error> {
     if sel.len() != s_n {
         return Err(Error::Format(format!(
@@ -1277,10 +1364,10 @@ pub fn mla_attention_dsa_indexed(
         // as much for the same bytes.
         let mut keys: Vec<f32> = Vec::with_capacity(tk * ix.hd());
         cache.ix_span(tk).extend_f32(tk, ix.hd(), &mut keys);
-        let sel: Vec<Vec<usize>> = (0..s_n)
+        let sel: Vec<Option<Vec<usize>>> = (0..s_n)
             .map(|s| {
                 let pos = pos_base + s;
-                ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], pos, c, &keys)
+                Some(ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], pos, c, &keys))
             })
             .collect();
         attend_dense(w, &q, s_n, pos_base, cache, c, Some(&sel))
@@ -1356,6 +1443,12 @@ pub struct RowLayout<'a> {
     /// Per-row allowed key sets, as absolute cache indices. `None` = the whole
     /// causal prefix, which is every non-tree caller.
     ///
+    /// When present it must cover **every** row, because the cores index it
+    /// positionally — but an entry may be `None`, meaning *dense*. That is what
+    /// lets one sequence speculate on a tree without dragging the rest of the
+    /// batch onto the explicit-key path; materializing `0..nt` per ordinary row
+    /// would be O(rows x context) of `usize` for no benefit.
+    ///
     /// This is how a tree is expressed without changing `LayerKv` at all: lay
     /// the candidates out in DFS order as ordinary consecutive slots, and give
     /// each row its ancestors. Siblings then cannot see each other because
@@ -1366,7 +1459,7 @@ pub struct RowLayout<'a> {
     /// intersecting with it: a DSA mask is an efficiency choice about which
     /// keys are worth attending, a tree mask is a correctness constraint about
     /// which keys exist, and intersecting could drop an ancestor.
-    pub sel: Option<&'a [Vec<usize>]>,
+    pub sel: Option<&'a [Option<Vec<usize>>]>,
 }
 
 impl<'a> RowLayout<'a> {
@@ -1474,7 +1567,7 @@ pub fn mla_attention_rows(
     // dense rows carry explicit identity sets instead of holes. Key buffers are
     // materialized once per *sequence*, the batched analogue of the
     // single-sequence path's once-per-call.
-    let sel: Option<Vec<Vec<usize>>> = ix.map(|ix| {
+    let sel: Option<Vec<Option<Vec<usize>>>> = ix.map(|ix| {
         let ql = c.q_lora as usize;
         let mut key_mats: Vec<Option<Vec<f32>>> = vec![None; caches.len()];
         (0..s_n)
@@ -1483,7 +1576,12 @@ pub fn mla_attention_rows(
                 let tk = rows[s].len;
                 let dense_is_identical = ix.topk() == 0 || tk <= ix.topk() || views[o].index_len() < tk;
                 if dense_is_identical {
-                    return (0..tk).collect();
+                    // `None`, not `(0..tk)`: below `index_topk` the selection
+                    // *is* the dense prefix, and saying so lets the core keep
+                    // its untouched loops instead of walking a materialized
+                    // identity set. Output-neutral either way, which is what
+                    // `dsa_selecting_all_keys_equals_dense` pins.
+                    return None;
                 }
                 let keys = key_mats[o].get_or_insert_with(|| {
                     let n = views[o].len();
@@ -1491,7 +1589,7 @@ pub fn mla_attention_rows(
                     views[o].ix_span(n).extend_f32(n, ix.hd(), &mut k);
                     k
                 });
-                ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], rope_of[s], c, keys)
+                Some(ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], rope_of[s], c, keys))
             })
             .collect()
     });
@@ -1874,12 +1972,15 @@ mod tests {
         let mut r = Lcg(0xBEEF);
         let x: Vec<f32> = (0..s_n * hidden).map(|_| r.f()).collect();
         let mut cs = new_cache(&c);
-        let empty: Vec<Vec<usize>> = (0..s_n).map(|_| Vec::new()).collect();
+        // `Some(empty)` — an explicit selection that happens to be empty, which
+        // is the hazard. A row entry of `None` is a different thing entirely
+        // (dense) and is covered by `dsa_selecting_all_keys_equals_dense`.
+        let empty: Vec<Option<Vec<usize>>> = (0..s_n).map(|_| Some(Vec::new())).collect();
         let sparse = mla_attention_dsa(&w.view(), &x, s_n, 0, &mut cs, &c, &empty)?;
         assert!(sparse.iter().any(|v| v.abs() > 1e-9), "attention output must not be all zeros");
         // self-only selection produces the same thing (that is what it falls back to)
         let mut cs2 = new_cache(&c);
-        let self_only: Vec<Vec<usize>> = (0..s_n).map(|s| vec![s]).collect();
+        let self_only: Vec<Option<Vec<usize>>> = (0..s_n).map(|s| Some(vec![s])).collect();
         let expect = mla_attention_dsa(&w.view(), &x, s_n, 0, &mut cs2, &c, &self_only)?;
         for z in 0..s_n * hidden {
             assert!((sparse[z] - expect[z]).abs() < 1e-6, "z={z}");
@@ -1902,7 +2003,7 @@ mod tests {
         let x: Vec<f32> = (0..s_n * hidden).map(|_| r.f()).collect();
         let mut cd = new_cache(&c);
         let dense = mla_attention(&w.view(), &x, s_n, 0, &mut cd, &c)?;
-        let sel: Vec<Vec<usize>> = (0..s_n).map(|s| (0..=s).collect()).collect();
+        let sel: Vec<Option<Vec<usize>>> = (0..s_n).map(|s| Some((0..=s).collect())).collect();
         let mut cs = new_cache(&c);
         let sparse = mla_attention_dsa(&w.view(), &x, s_n, 0, &mut cs, &c, &sel)?;
         for z in 0..s_n * hidden {

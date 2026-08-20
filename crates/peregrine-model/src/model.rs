@@ -518,6 +518,28 @@ impl SeqKv {
         }
     }
 
+    /// Keep only positions `keep` of the block starting at `from` — the tree
+    /// analogue of [`Self::truncate`], which can only drop a suffix.
+    ///
+    /// A token tree's candidates occupy consecutive cache slots in DFS order,
+    /// so an accepted path is a *non-contiguous* subset of them with the
+    /// rejected siblings interleaved. Committing it means gathering the kept
+    /// rows down, which is a pure move: latents do not depend on position, and
+    /// the roped keys were roped at each row's tree **depth** — exactly where it
+    /// lands once its ancestors pack below it.
+    ///
+    /// **KV rows only, and that is sufficient here**: trees are MLA-only
+    /// (`Model::forward_tree_rows` refuses anything else), so there is no
+    /// recurrent state to gather. If that ever changes this must grow a
+    /// recurrent half, and a `GdnState` cannot be gathered at all — it would
+    /// have to be snapshotted and re-advanced, as `COLI_SPEC_GDN` does.
+    pub fn retain_tail(&mut self, from: usize, keep: &[usize]) -> Result<(), Error> {
+        for k in &mut self.layers {
+            k.retain_tail(from, keep)?;
+        }
+        Ok(())
+    }
+
     /// Snapshot every recurrent layer's context, `None` when no layer is
     /// recurrent (KV-only architectures: [`Self::truncate`] alone suffices,
     /// and the caller skips the ~151 MB copy entirely). One snapshot per
@@ -3893,6 +3915,20 @@ impl Model {
     /// The batch engine consults this so speculation can never silently run
     /// ahead of that rollback being wired: enabling drafts on a recurrent arch
     /// without it corrupts the state of every sequence that rejects a draft.
+    /// Whether this architecture can verify a token **tree**.
+    ///
+    /// MLA only. A recurrent layer advances one delta-rule state row by row, so
+    /// two sibling rows would chain into each other's state instead of
+    /// branching from a shared one, and the batched GQA path takes no key set
+    /// at all — a tree there would be silently linearized, which is the worst
+    /// of the three outcomes because it looks like it worked.
+    /// [`Self::forward_tree_rows`] refuses the other arches outright; this is
+    /// the same fact as a question, so a scheduler can decline to *build* a
+    /// tree rather than build one and be refused.
+    pub fn supports_token_trees(&self) -> bool {
+        self.cfg.arch == Arch::GlmMla
+    }
+
     pub fn spec_reject_is_kv_only(&self) -> bool {
         self.cfg.arch != Arch::HybridGdn
     }
@@ -5686,6 +5722,32 @@ impl Model {
             )));
         }
         self.forward_rows_tree_inner(tokens, owner, seqs, pos_of, Some(tree), None)
+    }
+
+    /// [`Self::forward_tree_rows`] with per-row routing histories and the
+    /// pre-final-norm hidden — the shape the batched engine needs, where a tick
+    /// mixes tree rows, ordinary decode rows and a fused prefill chunk in one
+    /// forward.
+    ///
+    /// `tree.sel` must cover **every** row; entries for rows that are not part
+    /// of a tree are `None`, meaning dense, which is what keeps the rest of the
+    /// batch on the attention cores' untouched loops.
+    pub fn forward_tree_rows_hidden(
+        &self,
+        tokens: &[i32],
+        owner: &[usize],
+        seqs: &mut [&mut SeqKv],
+        pos_of: &[usize],
+        tree: crate::tree::TreeRows<'_>,
+        histories: Option<&[&Mutex<RouteHistory>]>,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        if self.cfg.arch != Arch::GlmMla {
+            return Err(Error::Format(format!(
+                "token trees need MLA attention; this checkpoint is {:?}",
+                self.cfg.arch
+            )));
+        }
+        self.forward_rows_tree_inner(tokens, owner, seqs, pos_of, Some(tree), histories)
     }
 
     /// Shared body of the two forms above: `(logits, pre-final-norm hidden)`.
@@ -8042,6 +8104,12 @@ mod tests {
         Ok(())
     }
 
+    /// A whole forward made of one tree's rows: every entry explicit. The
+    /// engine's mixed batch is what needs `None` entries; these tests do not.
+    fn tree_sel(sets: Vec<Vec<usize>>) -> Vec<Option<Vec<usize>>> {
+        sets.into_iter().map(Some).collect()
+    }
+
     /// A tiny Qwen3.5-hybrid fixture carrying an MTP head — the recurrent arch
     /// that speculation needs a state rollback for.
     fn tmp_hybrid_mtp_dir(tag: &str, seed: u64) -> Result<PathBuf, peregrine_core::Error> {
@@ -8219,7 +8287,7 @@ mod tests {
         let mut b = SeqKv::new(&m.cfg);
         m.forward_prefill_seq(&prompt, &mut b, 0)?;
         let chain = crate::tree::CandidateTree::chain(block[0], &block[1..]);
-        let (rope, sel) = (chain.rope_positions(n), chain.key_sets(n));
+        let (rope, sel) = (chain.rope_positions(n), tree_sel(chain.key_sets(n)));
         let got = {
             let mut refs: Vec<&mut SeqKv> = vec![&mut b];
             m.forward_tree_rows(&block, &owner, &mut refs, &pos, crate::tree::TreeRows { rope_pos: &rope, sel: &sel })?.0
@@ -8260,7 +8328,7 @@ mod tests {
         let tree = crate::tree::CandidateTree::new(vec![a_tok, b_tok, c_tok], vec![0, 0, 0])?;
         let mut tseq = SeqKv::new(&m.cfg);
         m.forward_prefill_seq(&prompt, &mut tseq, 0)?;
-        let (rope, sel) = (tree.rope_positions(n), tree.key_sets(n));
+        let (rope, sel) = (tree.rope_positions(n), tree_sel(tree.key_sets(n)));
         assert_eq!(rope, vec![n, n + 1, n + 1], "siblings must share a logical position");
         let got = {
             let mut refs: Vec<&mut SeqKv> = vec![&mut tseq];
@@ -8296,6 +8364,110 @@ mod tests {
     }
 
     #[test]
+    fn committing_a_tree_path_leaves_the_cache_a_plain_chain() -> Result<(), peregrine_core::Error> {
+        // The claim `LayerKv::retain_tail` rests on, end to end: a path accepted
+        // out of a tree can be *gathered* into place rather than recomputed,
+        // because each row was roped at its tree **depth**, which is exactly the
+        // position it lands on once its ancestors pack below it.
+        //
+        // If that were wrong the failure would be silent — the cache would hold
+        // rows roped for the wrong positions and every later token would attend
+        // a subtly wrong history. So: build a tree, keep the branch through
+        // slot 2, compact, and require the result to be bit-identical to having
+        // decoded that branch as an ordinary two-row chain from the start.
+        let dir = tmp_model_dir("tree_commit")?;
+        let m = Model::load(&dir)?;
+        let prompt = [1i32, 5, 9, 2];
+        let n = prompt.len();
+        let (a_tok, b_tok, c_tok, after) = (6i32, 3i32, 7i32, 4i32);
+
+        // Reference: A then C as a plain chain, then one more token.
+        let mut refseq = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&prompt, &mut refseq, 0)?;
+        {
+            let mut r: Vec<&mut SeqKv> = vec![&mut refseq];
+            m.forward_rows_batched(&[a_tok, c_tok], &[0, 0], &mut r, &[n, n + 1], None)?;
+        }
+        let want = {
+            let mut r: Vec<&mut SeqKv> = vec![&mut refseq];
+            m.forward_rows_batched(&[after], &[0], &mut r, &[n + 2], None)?
+        };
+
+        // Tree: A at slot n, B at n+1, C at n+2 — B and C siblings at depth 1.
+        let tree = crate::tree::CandidateTree::new(vec![a_tok, b_tok, c_tok], vec![0, 0, 0])?;
+        let mut tseq = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&prompt, &mut tseq, 0)?;
+        let (rope, sel) = (tree.rope_positions(n), tree_sel(tree.key_sets(n)));
+        {
+            let mut r: Vec<&mut SeqKv> = vec![&mut tseq];
+            m.forward_tree_rows(
+                tree.tokens(),
+                &[0, 0, 0],
+                &mut r,
+                &[n, n + 1, n + 2],
+                crate::tree::TreeRows { rope_pos: &rope, sel: &sel },
+            )?;
+        }
+        // Accept the path root → C: nodes 0 and 2, i.e. slots n and n+2. The
+        // rejected sibling at n+1 sits *between* them, which is exactly why a
+        // suffix `truncate` cannot express this.
+        tseq.retain_tail(n, &[n, n + 2])?;
+        let got = {
+            let mut r: Vec<&mut SeqKv> = vec![&mut tseq];
+            m.forward_rows_batched(&[after], &[0], &mut r, &[n + 2], None)?
+        };
+        assert_eq!(want.len(), got.len());
+        for (k, (p, q)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(p.to_bits(), q.to_bits(), "logit {k}: a committed tree path is not a plain chain");
+        }
+
+        // The rejected sibling must be gone, not merely unreachable: keeping it
+        // would leave the next append landing at the wrong slot.
+        let mut bad = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&prompt, &mut bad, 0)?;
+        {
+            let mut r: Vec<&mut SeqKv> = vec![&mut bad];
+            m.forward_tree_rows(
+                tree.tokens(),
+                &[0, 0, 0],
+                &mut r,
+                &[n, n + 1, n + 2],
+                crate::tree::TreeRows { rope_pos: &rope, sel: &sel },
+            )?;
+        }
+        bad.truncate(n + 2); // the suffix rewind a chain would use: keeps A and *B*
+        let wrong = {
+            let mut r: Vec<&mut SeqKv> = vec![&mut bad];
+            m.forward_rows_batched(&[after], &[0], &mut r, &[n + 2], None)?
+        };
+        assert!(
+            want.iter().zip(&wrong).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "if a plain truncate matched too, this test would pass with the gather never running"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn retain_tail_refuses_what_it_cannot_do_safely() -> Result<(), peregrine_core::Error> {
+        // Three ways to corrupt a cache with this, all reported rather than
+        // absorbed: reaching into a prefix another sequence is still reading,
+        // and two malformed keep-lists.
+        let dir = tmp_model_dir("retain_guard")?;
+        let m = Model::load(&dir)?;
+        let mut seq = SeqKv::new(&m.cfg);
+        m.forward_prefill_seq(&[1i32, 5, 9, 2, 6], &mut seq, 0)?;
+        let shared = seq.clone_prefix(3); // freezes rows 0..3 as a shared prefix
+        let mut viewer = shared;
+        assert!(viewer.retain_tail(1, &[1, 2]).is_err(), "must refuse to compact inside a shared prefix");
+        assert!(seq.retain_tail(3, &[4, 3]).is_err(), "descending keep is a bug, not a sort request");
+        assert!(seq.retain_tail(3, &[3, 99]).is_err(), "a keep past the cache length is a bug");
+        assert!(seq.retain_tail(99, &[]).is_err(), "a `from` past the cache length is a bug");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn a_tree_is_refused_on_an_architecture_that_cannot_branch() -> Result<(), peregrine_core::Error> {
         // A hybrid's recurrent layers would linearize the siblings and a GQA
         // batched row takes no key set, so both would answer plausibly and
@@ -8305,7 +8477,7 @@ mod tests {
         let mut seq = SeqKv::new(&m.cfg);
         m.forward_prefill_seq(&[1i32, 5], &mut seq, 0)?;
         let tree = crate::tree::CandidateTree::new(vec![6i32, 3, 7], vec![0, 0, 0])?;
-        let (rope, sel) = (tree.rope_positions(2), tree.key_sets(2));
+        let (rope, sel) = (tree.rope_positions(2), tree_sel(tree.key_sets(2)));
         let mut refs: Vec<&mut SeqKv> = vec![&mut seq];
         let e = m.forward_tree_rows(tree.tokens(), &[0, 0, 0], &mut refs, &[2, 3, 4], crate::tree::TreeRows { rope_pos: &rope, sel: &sel });
         assert!(e.is_err(), "a hybrid must refuse a token tree rather than silently linearize it");

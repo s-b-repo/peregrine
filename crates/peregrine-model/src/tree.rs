@@ -184,7 +184,14 @@ pub struct TreeRows<'a> {
     pub rope_pos: &'a [usize],
     /// Each row's ancestors as absolute cache indices, plus the committed
     /// prefix every row may see.
-    pub sel: &'a [Vec<usize>],
+    ///
+    /// `Option` per row because this vector has to cover **every** row of the
+    /// forward, including rows belonging to sequences that are not speculating
+    /// on a tree at all: `None` is "dense", and is what keeps a mixed batch on
+    /// the attention cores' untouched loops. [`CandidateTree::key_sets`]
+    /// produces the tree's own rows; the caller places them at the right
+    /// offsets and leaves the rest `None`.
+    pub sel: &'a [Option<Vec<usize>>],
 }
 
 /// The tree analogue of [`crate::accept_run`], and it must reduce to it.
