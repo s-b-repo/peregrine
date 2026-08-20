@@ -6023,7 +6023,7 @@ impl Model {
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
 
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft without an MTP head".into()))?;
         let ctx = ForwardCtx {
@@ -6048,7 +6048,19 @@ impl Model {
             heat_counts: None,
             layout_schedule: None, // drafts benefit less from disk-order tuning
             affinity: None,
-            expert_index: None,
+            // **Not** `None`, unlike its neighbours. Every other field above is
+            // withheld because a draft must not feed a main-stream signal —
+            // heat, prediction, calibration, lane balance. The expert index is
+            // not a signal: it is the load-time map from (layer, expert) to
+            // `(fd, offset)`. Without it a draft step resolves every expert
+            // through `entry_for`'s `format!` fallback *and* loses the
+            // `(fd, offset)` sort, so its reads are issued in routing order
+            // rather than disk order — on a draft path that already runs at
+            // `s_n = 1` with no batch-union amortization, that is the worst
+            // place in the engine to be issuing unsorted reads. Correctness is
+            // untouched: the same expert resolves either way, and read
+            // completion order cannot reach a position-keyed reduce.
+            expert_index: expert_index.as_ref(),
             fd_devices: None, // drafts keep the blind claim cursor, like the rest of their tuning
         };
         let mut kv = LayerKv::new(kvl, qkr);
@@ -6093,6 +6105,180 @@ impl Model {
             h = hx; // next hidden = this MTP layer's output
         }
         Ok(draft)
+    }
+
+    /// Draft for **every sequence at once**: one forward per draft *step*
+    /// instead of one per sequence per step.
+    ///
+    /// This is the draft-path twin of what `verify_drafts_batched` already does
+    /// for the verify path, and it closes the larger of the two holes. The
+    /// verify forward puts `B·(1+γ)` rows through a single routed-expert union;
+    /// the draft loop, called per sequence, put `B·γ` rows through `B·γ`
+    /// *disjoint* unions. On the streaming container the MTP head is a sparse
+    /// MoE layer of its own — stored int8, so 37,748,736 bytes per expert
+    /// against 18,874,368 on a normal int4 layer — which at topk=8 is roughly
+    /// 300 MB of SSD per draft step. Paying that `B` times over for rows that
+    /// could have shared one union is the single biggest avoidable cost in
+    /// speculation here.
+    ///
+    /// Step `g` runs every still-drafting sequence as one row of one call, each
+    /// on its own local `LayerKv` at position `g`, so the batch-union covers
+    /// them exactly as it covers concurrent decode rows.
+    ///
+    /// **Greedy only.** The sampled path needs each sequence's own `Sampler`
+    /// and the `q` it drew from, and `COLI_DRAFT_SAMPLED` is a rarely-used
+    /// opt-in; it keeps the per-sequence [`Self::mtp_draft_sampled`] loop.
+    ///
+    /// Sequences drop out independently when the `conf_floor` gate fires or
+    /// when they reach their own `g_of[i]`, so
+    /// the row count shrinks as the depth grows — which is the shape that makes
+    /// the floor cheap as well as effective.
+    ///
+    /// `hlast[i]` empty means sequence `i` has no hidden to continue from
+    /// (a fresh or failed stream); it simply drafts nothing, as the
+    /// single-sequence path does.
+    pub fn mtp_draft_batched(
+        &self,
+        next_tok: &[i32],
+        hlast: &[&[f32]],
+        g_of: &[usize],
+        conf_floor: f32,
+    ) -> Result<Vec<Vec<i32>>, Error> {
+        let b = next_tok.len();
+        if hlast.len() != b || g_of.len() != b {
+            return Err(Error::Format(format!(
+                "mtp_draft_batched: {b} tokens but {} hiddens and {} depths",
+                hlast.len(),
+                g_of.len()
+            )));
+        }
+        let mut out: Vec<Vec<i32>> = vec![Vec::new(); b];
+        // Depths differ per sequence — a nearly-finished request drafts less —
+        // so the batch runs to the deepest and each row leaves at its own. A
+        // uniform depth with per-sequence truncation would spend real draft
+        // steps on rows whose tokens are discarded, which on this path is the
+        // ~300 MB/step the batching exists to stop paying twice.
+        let g_draft = g_of.iter().copied().max().unwrap_or(0);
+        if b == 0 || g_draft == 0 {
+            return Ok(out);
+        }
+        let d = self.cfg.hidden as usize;
+        let eps = self.cfg.eps;
+        let vocab = self.cfg.vocab as usize;
+        let n_layers = self.cfg.n_layers as usize;
+        let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, .. } =
+            self;
+        let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft_batched without an MTP head".into()))?;
+        // Identical withholding policy to the single-sequence path — see the
+        // comments on `mtp_draft_with`'s context. Batching changes which rows
+        // share a forward, not what a draft is allowed to influence.
+        let ctx = ForwardCtx {
+            st,
+            absorb: *absorb,
+            dsa: *dsa,
+            reactors: io_reactors,
+            gpu: gpu.as_ref(),
+            gpu_dense: gpu_dense.as_ref(),
+            workers: *workers,
+            cfg,
+            stream_experts: *stream_experts,
+            ecache: ecache.as_deref(),
+            route_log: None,
+            calib: None,
+            route_log_multi: None,
+            direct: *direct,
+            heat: None,
+            spill: None,
+            timings: None,
+            balancer: None,
+            heat_counts: None,
+            layout_schedule: None,
+            affinity: None,
+            expert_index: expert_index.as_ref(),
+            fd_devices: None,
+        };
+
+        let mut kvs: Vec<LayerKv> = (0..b).map(|_| LayerKv::new(kvl, qkr)).collect();
+        let mut hs: Vec<Vec<f32>> = hlast.iter().map(|h| h.to_vec()).collect();
+        let mut toks: Vec<i32> = next_tok.to_vec();
+        // Ascending and only ever shrinking, which is what lets the cache
+        // borrows below be taken by a filtered `iter_mut`.
+        let mut active: Vec<usize> = (0..b).filter(|&i| !hlast[i].is_empty() && g_of[i] > 0).collect();
+
+        for g in 0..g_draft {
+            if active.is_empty() {
+                break;
+            }
+            // One row per still-drafting sequence: norm(embed(tok)) concatenated
+            // with the normed incoming hidden, projected by `eh_proj`.
+            let mut hx: Vec<f32> = Vec::with_capacity(active.len() * d);
+            for &i in &active {
+                let tid = (toks[i].max(0) as usize).min(vocab.saturating_sub(1));
+                let mut erow = vec![0f32; d];
+                embed.dequant_row_into(tid, &mut erow);
+                let mut e = vec![0f32; d];
+                rmsnorm(&mut e, &erow, &mtp.enorm, eps);
+                // g == 0 carries the main model's pre-final-norm hidden, which
+                // has to be normed once here; later steps carry a previous MTP
+                // layer output and are used directly. Norming twice is not an
+                // error, just quietly worse drafts and an acceptance rate that
+                // reads as "MTP does not help here".
+                if g == 0 {
+                    let hc = hs[i].clone();
+                    rmsnorm(&mut hs[i], &hc, final_norm, eps);
+                }
+                let mut hn = vec![0f32; d];
+                rmsnorm(&mut hn, &hs[i], &mtp.hnorm, eps);
+                let mut cat = e;
+                cat.extend_from_slice(&hn);
+                hx.extend_from_slice(&mtp.eh_proj.apply_vec(&cat, 1));
+            }
+            let n_act = active.len();
+            let owner: Vec<usize> = (0..n_act).collect();
+            let pos_of: Vec<usize> = vec![g; n_act];
+            {
+                let mut caches: Vec<&mut LayerKv> = kvs
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(i, _)| active.binary_search(i).is_ok())
+                    .map(|(_, k)| k)
+                    .collect();
+                let mut gstates: Vec<Option<&mut GdnState>> = (0..n_act).map(|_| None).collect();
+                forward_layer_batched(
+                    &mtp.layer,
+                    n_layers,
+                    &mut caches,
+                    &mut gstates,
+                    RowLayout::rows(&pos_of, &owner),
+                    &ctx,
+                    &mut hx,
+                )?;
+            }
+            let rows = rmsnorm_rows(&hx, &mtp.mtp_norm, n_act, d, eps);
+            let logits = lm_head.apply_vec(&rows, n_act);
+            let mut still: Vec<usize> = Vec::with_capacity(n_act);
+            for (r, &i) in active.iter().enumerate() {
+                let Some(lg) = logits.get(r * vocab..(r + 1) * vocab) else { continue };
+                // Same gate, same place: before `pick`, so the low-confidence
+                // token itself is never proposed.
+                if conf_floor > 0.0 && crate::sample::top_prob(lg) < conf_floor {
+                    continue;
+                }
+                let t2 = crate::sample::argmax(lg) as i32;
+                out[i].push(t2);
+                toks[i] = t2;
+                if let Some(h) = hx.get(r * d..(r + 1) * d) {
+                    hs[i] = h.to_vec();
+                }
+                // Leave once this sequence has its own requested depth.
+                if out[i].len() < g_of[i] {
+                    still.push(i);
+                }
+            }
+            active = still;
+        }
+        Ok(out)
     }
 
     /// Greedy speculative decode with the MTP head: draft `g_draft` tokens, verify
@@ -7942,6 +8128,68 @@ mod tests {
         let mut one: [&mut SeqKv; 1] = [&mut on];
         m.forward_step_batched(&[7], &mut one, &[toks.len()], None)?;
         assert_eq!(on.len(), toks.len() + 1);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn batched_drafting_proposes_exactly_what_per_sequence_drafting_does() -> Result<(), peregrine_core::Error> {
+        // The payoff is bytes, not tokens: `B` sequences drafting step `g`
+        // together share one routed-expert union where the per-sequence loop
+        // streamed `B` disjoint ones. That is only a saving if the drafts come
+        // out the same, so this is the assertion the change rests on — and it
+        // is token equality, not a tolerance, because a differing draft would
+        // silently change the acceptance rate and read as a tuning result.
+        //
+        // Ragged on purpose: different pending tokens and different hidden
+        // states, so the rows are not accidentally interchangeable.
+        let dir = tmp_model_dir("draft_batched")?;
+        let m = Model::load(&dir)?;
+        let d = m.cfg.hidden as usize;
+        let prompts: [&[i32]; 3] = [&[1, 5, 9, 2], &[3, 8, 4], &[7, 7, 1, 2, 6]];
+        let nexts = [6i32, 2, 4];
+
+        // Each sequence's pre-final-norm hidden, the way the engine gets it.
+        let mut hids: Vec<Vec<f32>> = Vec::new();
+        for p in prompts {
+            let mut seq = SeqKv::new(&m.cfg);
+            let owner = vec![0usize; p.len()];
+            let pos: Vec<usize> = (0..p.len()).collect();
+            let mut refs: Vec<&mut SeqKv> = vec![&mut seq];
+            let (_lg, hidden) = m.forward_rows_batched_hidden(p, &owner, &mut refs, &pos, None)?;
+            hids.push(hidden[(p.len() - 1) * d..p.len() * d].to_vec());
+        }
+
+        for floor in [0.0f32, 0.35] {
+            let want: Vec<Vec<i32>> = nexts
+                .iter()
+                .zip(&hids)
+                .map(|(&t, h)| m.mtp_draft(t, 4, h, floor))
+                .collect::<Result<_, _>>()?;
+            let views: Vec<&[f32]> = hids.iter().map(|h| h.as_slice()).collect();
+            let got = m.mtp_draft_batched(&nexts, &views, &[4, 4, 4], floor)?;
+            assert_eq!(got, want, "floor {floor}: batched drafting proposed a different chain");
+        }
+
+        // A sequence with no hidden drafts nothing and must not disturb the
+        // rows beside it — the engine's `hlast.is_empty()` case, which in a
+        // batch is a hole in the middle rather than a skipped iteration.
+        let empty: Vec<f32> = Vec::new();
+        let mixed: Vec<&[f32]> = vec![hids[0].as_slice(), &empty, hids[2].as_slice()];
+        let got = m.mtp_draft_batched(&nexts, &mixed, &[4, 4, 4], 0.0)?;
+        assert!(got[1].is_empty(), "a sequence with no hidden must draft nothing");
+        assert_eq!(got[0], m.mtp_draft(nexts[0], 4, &hids[0], 0.0)?, "row 0 moved when a neighbour dropped out");
+        assert_eq!(got[2], m.mtp_draft(nexts[2], 4, &hids[2], 0.0)?, "row 2 moved when a neighbour dropped out");
+
+        // Ragged depths: each row must stop at its own, and stopping early must
+        // not shorten or lengthen anyone else's chain.
+        let views: Vec<&[f32]> = hids.iter().map(|h| h.as_slice()).collect();
+        let ragged = m.mtp_draft_batched(&nexts, &views, &[1, 3, 4], 0.0)?;
+        assert_eq!(ragged.iter().map(Vec::len).collect::<Vec<_>>(), vec![1, 3, 4], "each row keeps its own depth");
+        for (i, want_g) in [1usize, 3, 4].into_iter().enumerate() {
+            let alone = m.mtp_draft(nexts[i], want_g, &hids[i], 0.0)?;
+            assert_eq!(ragged[i], alone, "row {i} at depth {want_g} differs from drafting it alone");
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

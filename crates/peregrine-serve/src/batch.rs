@@ -1576,7 +1576,13 @@ fn run(
             // through this one alone.
             let rollback_ok = model.spec_reject_is_kv_only() || (gdn_rollback && gdn_width_ok);
             let may_ngram = ngram.is_enabled() && rollback_ok;
-            for s in active.iter_mut() {
+            // Greedy sequences that fall through to the head draft *together*
+            // in one call below: the MTP layer is sparse, so a per-sequence
+            // loop streams one routed-expert union per sequence per step where
+            // a batched call streams one per step for all of them. Collected
+            // here (index, depth) rather than drafted here.
+            let mut head_batch: Vec<(usize, usize)> = Vec::new();
+            for (i, s) in active.iter_mut().enumerate() {
                 let budget_left = s.max_new - s.produced.min(s.max_new);
                 let g = draft_depth_for(depth, may_draft || may_ngram, s.sampler.temp, budget_left, sampled)
                     .min(depth_cap);
@@ -1607,18 +1613,23 @@ fn run(
                 if !may_draft || s.hlast.is_empty() {
                     continue;
                 }
+                // The greedy majority defers to the batched call; only a
+                // sampled request drafts inline, because it needs its own
+                // `Sampler` and the `q` it drew from.
+                if s.sampler.temp <= 0.0 {
+                    head_batch.push((i, g));
+                    continue;
+                }
                 // A sampled request needs its drafts drawn from a distribution
                 // it can hand to the verifier; a greedy one needs argmax, and
                 // handing it a sampled draft would break `accept_run`'s
                 // sequence-identity with greedy decoding.
-                let drafted = if s.sampler.temp > 0.0 {
-                    model.mtp_draft_sampled(s.next_tok, g, &s.hlast, conf_floor, &mut s.sampler).map(|(d, q)| {
+                let drafted = model.mtp_draft_sampled(s.next_tok, g, &s.hlast, conf_floor, &mut s.sampler).map(
+                    |(d, q)| {
                         s.draft_q = q;
                         d
-                    })
-                } else {
-                    model.mtp_draft(s.next_tok, g, &s.hlast, conf_floor)
-                };
+                    },
+                );
                 match drafted {
                     Ok(d) => {
                         // A draft shorter than requested under an active floor
@@ -1635,6 +1646,39 @@ fn run(
                         s.draft_q.clear();
                         peregrine_core::note_advisory_err("mtp draft", &e);
                     }
+                }
+            }
+
+            // One forward per draft *step* for every greedy sequence, instead
+            // of one per sequence per step. On the streaming container the MTP
+            // layer is sparse and stored int8 — ~2× a normal expert's bytes —
+            // so a per-sequence loop was paying `B` disjoint routed-expert
+            // unions for rows that share one here. Depths are per sequence, so
+            // a nearly-finished request leaves the batch at its own depth
+            // rather than being drafted deep and truncated.
+            if !head_batch.is_empty() {
+                let nexts: Vec<i32> = head_batch.iter().map(|&(i, _)| active[i].next_tok).collect();
+                let hids: Vec<&[f32]> = head_batch.iter().map(|&(i, _)| active[i].hlast.as_slice()).collect();
+                let depths: Vec<usize> = head_batch.iter().map(|&(_, g)| g).collect();
+                match model.mtp_draft_batched(&nexts, &hids, &depths, conf_floor) {
+                    Ok(drafts) => {
+                        for ((i, g), d) in head_batch.iter().copied().zip(drafts) {
+                            // A draft shorter than requested under an active
+                            // floor is the gate firing — the number that says
+                            // whether 0.65 prunes wasted verify rows or starves
+                            // depth.
+                            if conf_floor > 0.0 && d.len() < g {
+                                spec_conf_stops += 1;
+                            }
+                            if let Some(s) = active.get_mut(i) {
+                                s.draft = d;
+                            }
+                        }
+                    }
+                    // Speculation is a wall-clock optimisation: a failed draft
+                    // drops the whole batch back to plain decode for this tick
+                    // rather than dropping any client.
+                    Err(e) => peregrine_core::note_advisory_err("mtp draft (batched)", &e),
                 }
             }
         }
