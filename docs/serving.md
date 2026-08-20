@@ -269,6 +269,22 @@ Read `rows per token` with one correction: a request's **first** token is
 sampled from the prefill's last position and costs no decode row, so the ratio
 sits just below 1.0 unspeculated and approaches 1.0 as requests lengthen. Above
 1.0 is speculation's overhead.
+
+`queue` (`wait_us`, `admits`, `max_us`, `mean_us`) is admission latency — the
+span between `submit` and a request becoming a `Prefilling`. Every other latency
+instrument here starts counting once a request is *already being served*, so
+queue time was indistinguishable from slow decode; with `COLI_QUEUE_DEPTH`
+shedding at the door, this is what separates "at capacity" from "over capacity".
+Counted per admission, not per submit: a refused request never waited.
+
+`energy_uj` is cumulative CPU-package energy, so `Δenergy_uj ÷
+Δdecode.tokens_emitted` is microjoules per token. It reads `null` unless the host
+grants the RAPL counter — it is root-only on current kernels (the PLATYPUS
+mitigation) — and `null` rather than `0` because zero energy and no permission
+are different facts. Treat it as a **floor** on system energy: RAPL sees the
+package, and the component doing the most work on this engine is the SSD, which
+it cannot see. See [external-audit-response.md](external-audit-response.md) for
+the udev rule and the caveats in full.
 Cumulative counters are meant to be delta'd across two scrapes. At shutdown
 the engine prints `[prefix-cache]`, `[spec]` and `[rlm]` summary lines to
 stderr (each silent when its feature never engaged).

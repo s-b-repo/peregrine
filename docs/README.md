@@ -42,6 +42,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Roadmap & status](roadmap.md) | completion dashboard, what shipped in which wave, the hardware-gated remainder |
 | [Scale-out designs](scale-out-design.md) | the five items needing a second GPU, a second host, or a GDS stack — what each would be, and the `file:line` seam it hooks into |
 | [peregrine vs colibrì](peregrine-vs-colibri.md) | the full same-hardware engineering study on the real GLM-5.2 744B model |
+| [External audit response](external-audit-response.md) | issue #6's 21-section review, triaged against what has since been measured — including the Tier 1 items that are already shipped or already rejected |
 
 ## Faster decoding: designs and open ideas
 

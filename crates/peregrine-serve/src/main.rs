@@ -568,6 +568,23 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
         // Wall clock cannot separate a speculative win from a workload that had
         // no drafts in it; these can.
         "decode": { "tokens_emitted": t.tokens_emitted, "rows": t.decode_rows },
+        // Admission latency: the span between submit and becoming a Prefilling.
+        // Every other latency instrument here starts counting once a request is
+        // already being served, so queue time was indistinguishable from slow
+        // decode. mean_us = wait_us / admits.
+        "queue": {
+            "wait_us": t.queue_wait_us,
+            "admits": t.queue_admits,
+            "max_us": t.queue_wait_max_us,
+            "mean_us": if t.queue_admits > 0 { t.queue_wait_us / t.queue_admits } else { 0 },
+        },
+        // CPU-package energy, or null when the host will not give up the RAPL
+        // counter (root-only on most current kernels — the PLATYPUS
+        // mitigation). d(energy_uj) / d(decode.tokens_emitted) is microjoules
+        // per token. Read it as a FLOOR on system energy, not an estimate: RAPL
+        // sees the package, and on this engine the component doing the most
+        // work is the SSD, which it cannot see at all.
+        "energy_uj": t.energy_uj,
         // MTP speculation: delta across scrapes for a live accept rate. Every
         // proposed draft is a verify row in the batched forward; the accept
         // rate is what says whether COLI_DRAFT's depth pays for those rows.

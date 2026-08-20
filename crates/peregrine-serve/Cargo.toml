@@ -20,6 +20,9 @@ peregrine-model = { path = "../peregrine-model" }
 # engine -> sched -> model is acyclic; model -> sched would not be.
 peregrine-sched = { path = "../peregrine-sched" }
 peregrine-core = { path = "../peregrine-core" }
+# For the host energy counter behind the joules-per-token metric; the same
+# workspace-path form as every other dependency here.
+peregrine-io = { path = "../peregrine-io" }
 peregrine-token = { path = "../peregrine-token" }
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }

@@ -26,6 +26,11 @@ use tokio::sync::mpsc;
 /// A no-op without a GPU tier, so it is harmless in CPU-only deployments.
 const REHEAT_EVERY: usize = 256;
 
+/// Ticks between package-energy samples. Matches `GovernorState::SENSOR_PERIOD`
+/// and exists for the same reason: a sysfs read per forward is overhead nobody
+/// asked for. Totals are unaffected — see the sample site.
+const ENERGY_SAMPLE_EVERY: usize = 16;
+
 /// Ticket dispenser for [`SeqState::seq_id`] — the value that picks a sequence's
 /// prefetch lane, and the only thing about a sequence that must not move.
 ///
@@ -418,6 +423,39 @@ pub struct EngineTelemetry {
     /// overhead; a short-request workload that reads 0.8 is not a win.
     pub tokens_emitted: u64,
     pub decode_rows: u64,
+    /// Admission latency: total and count (mean = total / count) plus the worst
+    /// single wait, all cumulative, in microseconds.
+    ///
+    /// The one span no existing instrument covers.
+    /// `bench-serve-lanes.py` times whole requests and `bench-serve-gaps.py`
+    /// times inter-token gaps; both start counting once a request is *already
+    /// being served*, so queue time hides inside "the server was slow" and
+    /// cannot be told apart from decode being slow. With `COLI_QUEUE_DEPTH`
+    /// shedding at the door, knowing whether admitted requests also *waited* is
+    /// what separates "at capacity" from "over capacity".
+    pub queue_wait_us: u64,
+    pub queue_admits: u64,
+    pub queue_wait_max_us: u64,
+    /// Cumulative CPU-package energy in microjoules, or `None` when the host
+    /// will not give it up.
+    ///
+    /// With `tokens_emitted` this is **joules per token**, which the project has
+    /// never measured. Two caveats it must be read with, both real:
+    ///
+    /// - **RAPL covers the CPU package, not the machine.** On this box the
+    ///   domains are `package-0` and `core` — no DRAM domain, and certainly no
+    ///   SSD. On an engine whose bottleneck is 10.85 GB of expert reads per
+    ///   token, the component doing the most work is the one RAPL cannot see,
+    ///   so this figure is a floor on system energy, not an estimate of it.
+    /// - **`energy_uj` is root-only on most current kernels** (the PLATYPUS
+    ///   mitigation), so this reads `None` for an unprivileged server. To
+    ///   enable it, grant the counter rather than running the server as root:
+    ///   `SUBSYSTEM=="powercap", ACTION=="add", RUN+="/bin/chmod g+r
+    ///   /sys/class/powercap/%k/energy_uj"` plus a group the server belongs to.
+    ///
+    /// `None` is therefore the expected reading on a stock host, and is
+    /// deliberately not `0` — zero energy and no permission are different facts.
+    pub energy_uj: Option<u64>,
     /// RLM recursive refinement `(passes_emitted, tokens_recursed)`,
     /// cumulative — `(0, 0)` unless `COLI_RLM=1`.
     pub rlm: (u64, u64),
@@ -434,8 +472,8 @@ pub struct EngineTelemetry {
 /// `Send + Sync` (a tokio unbounded sender), so it lives in shared server state.
 #[derive(Clone)]
 pub struct EngineHandle {
-    tx_normal: mpsc::UnboundedSender<EngineRequest>,
-    tx_high: mpsc::UnboundedSender<EngineRequest>,
+    tx_normal: mpsc::UnboundedSender<Queued>,
+    tx_high: mpsc::UnboundedSender<Queued>,
     /// Published by the engine thread each tick; read by `/metrics`.
     telemetry: std::sync::Arc<parking_lot::Mutex<EngineTelemetry>>,
     /// Requests sent but not yet drained by the engine (see [`queue_depth_cap`]).
@@ -480,7 +518,8 @@ impl EngineHandle {
             Priority::High => &self.tx_high,
             Priority::Normal => &self.tx_normal,
         };
-        ch.send(req).map_err(|send_err| SubmitRefused::Down(send_err.to_string()))?;
+        ch.send(Queued { req, at: std::time::Instant::now() })
+            .map_err(|send_err| SubmitRefused::Down(send_err.to_string()))?;
         self.queued.fetch_add(1, Relaxed);
         Ok(())
     }
@@ -490,6 +529,17 @@ impl EngineHandle {
     pub fn telemetry(&self) -> EngineTelemetry {
         self.telemetry.lock().clone()
     }
+}
+
+/// A submitted request plus the instant it entered the queue.
+///
+/// Internal, and deliberately not a field on [`EngineRequest`]: a caller should
+/// not have to stamp its own clock to be measured, and a caller that stamped it
+/// wrong would bias the number silently. The engine takes the timestamp at the
+/// one place every request passes through — [`EngineHandle::submit`].
+struct Queued {
+    req: EngineRequest,
+    at: std::time::Instant,
 }
 
 /// State shared between the engine thread and its [`EngineHandle`], bundled
@@ -577,8 +627,8 @@ fn spawn_with_knobs(
     max_batch: usize,
     knobs: EngineKnobs,
 ) -> Result<(EngineHandle, JoinHandle<()>), Error> {
-    let (tx_normal, rx_normal) = mpsc::unbounded_channel::<EngineRequest>();
-    let (tx_high, rx_high) = mpsc::unbounded_channel::<EngineRequest>();
+    let (tx_normal, rx_normal) = mpsc::unbounded_channel::<Queued>();
+    let (tx_high, rx_high) = mpsc::unbounded_channel::<Queued>();
     let cap = max_batch.max(1);
     let telemetry = std::sync::Arc::new(parking_lot::Mutex::new(EngineTelemetry::default()));
     let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1000,8 +1050,8 @@ struct SeqState {
 /// budget, or a dropped client.
 fn run(
     mut model: Model,
-    mut rx_normal: mpsc::UnboundedReceiver<EngineRequest>,
-    mut rx_high: mpsc::UnboundedReceiver<EngineRequest>,
+    mut rx_normal: mpsc::UnboundedReceiver<Queued>,
+    mut rx_high: mpsc::UnboundedReceiver<Queued>,
     max_batch: usize,
     knobs: EngineKnobs,
     shared: EngineShared,
@@ -1032,6 +1082,26 @@ fn run(
     // The decode-economics numerators — see `EngineTelemetry::tokens_emitted`.
     let mut tokens_emitted: u64 = 0;
     let mut decode_rows: u64 = 0;
+    // Admission latency — the span between `submit` and the request becoming a
+    // `Prefilling`. Sum/count/max rather than a histogram: percentiles for the
+    // *serving* side already live in `bench-serve-gaps.py`, and this is the
+    // queueing side, where the question is "is anything waiting at all" before
+    // it is "how long is the tail".
+    let mut queue_wait_us: u64 = 0;
+    let mut queue_admits: u64 = 0;
+    let mut queue_wait_max_us: u64 = 0;
+    let note_wait = |w: u64, total: &mut u64, n: &mut u64, max: &mut u64| {
+        *total = total.saturating_add(w);
+        *n += 1;
+        *max = (*max).max(w);
+    };
+    // Package energy, accumulated so `Δenergy / Δtokens` is joules per token.
+    // Sampled on the same period the sensor governors use, for the same reason
+    // — one sysfs read per forward is overhead nobody asked for — and totals
+    // stay exact regardless, because `delta_uj` reports everything since the
+    // *last call*, not since the last tick.
+    let mut energy = peregrine_io::EnergyMeter::new();
+    let mut energy_uj: Option<u64> = None;
     // Adaptive-batching state. `working_cap` is the current admission ceiling
     // (starts at `max_batch`, shrinks under SLA overrun, grows on slack). EWMA
     // over per-forward wall time drives the adjustment.
@@ -1101,14 +1171,24 @@ fn run(
         // because every admission grows the resident set.
         while active.len() + pending.len() < working_cap && kv_headroom(&active, &pending, kv_budget) {
             match rx_high.try_recv() {
-                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix, &queued),
+                Ok(q) => note_wait(
+                    admit_pending(&model, &mut pending, q, &mut prefix, &queued),
+                    &mut queue_wait_us,
+                    &mut queue_admits,
+                    &mut queue_wait_max_us,
+                ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
         while active.len() + pending.len() < working_cap && kv_headroom(&active, &pending, kv_budget) {
             match rx_normal.try_recv() {
-                Ok(req) => admit_pending(&model, &mut pending, req, &mut prefix, &queued),
+                Ok(q) => note_wait(
+                    admit_pending(&model, &mut pending, q, &mut prefix, &queued),
+                    &mut queue_wait_us,
+                    &mut queue_admits,
+                    &mut queue_wait_max_us,
+                ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => break, // drain, then exit
             }
@@ -1123,15 +1203,17 @@ fn run(
                 // or disconnected queue just continues the sweep — disconnection
                 // is handled as shutdown by `recv_priority` below.
                 match rx_high.try_recv() {
-                    Ok(req) => {
-                        admit_pending(&model, &mut pending, req, &mut prefix, &queued);
+                    Ok(q) => {
+                        let w = admit_pending(&model, &mut pending, q, &mut prefix, &queued);
+                        note_wait(w, &mut queue_wait_us, &mut queue_admits, &mut queue_wait_max_us);
                         break;
                     }
                     Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
                 }
                 match rx_normal.try_recv() {
-                    Ok(req) => {
-                        admit_pending(&model, &mut pending, req, &mut prefix, &queued);
+                    Ok(q) => {
+                        let w = admit_pending(&model, &mut pending, q, &mut prefix, &queued);
+                        note_wait(w, &mut queue_wait_us, &mut queue_admits, &mut queue_wait_max_us);
                         break;
                     }
                     Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
@@ -1140,10 +1222,10 @@ fn run(
             if !pending.is_empty() {
                 continue;
             }
-            let req = recv_priority(idle_rt.as_ref(), &mut rx_high, &mut rx_normal);
-            match req {
-                Some(req) => {
-                    admit_pending(&model, &mut pending, req, &mut prefix, &queued);
+            match recv_priority(idle_rt.as_ref(), &mut rx_high, &mut rx_normal) {
+                Some(q) => {
+                    let w = admit_pending(&model, &mut pending, q, &mut prefix, &queued);
+                    note_wait(w, &mut queue_wait_us, &mut queue_admits, &mut queue_wait_max_us);
                     continue;
                 }
                 None => break,
@@ -1740,6 +1822,14 @@ fn run(
         // residency). Between steps, so it holds the exclusive borrow reheat needs;
         // a no-op without a GPU tier.
         steps += 1;
+        // Package energy on the sensor-governor period. Sampling coarsely does
+        // not lose energy: `delta_uj` reports everything since the previous
+        // call, so the running total is exact whatever the period.
+        if steps.is_multiple_of(ENERGY_SAMPLE_EVERY) {
+            if let Some(uj) = energy.delta_uj() {
+                energy_uj = Some(energy_uj.unwrap_or(0).saturating_add(uj));
+            }
+        }
         if steps.is_multiple_of(REHEAT_EVERY) {
             if let Err(e) = model.reheat() {
                 eprintln!("peregrine: reheat failed: {e}");
@@ -1767,6 +1857,10 @@ fn run(
             ngram_accepted,
             tokens_emitted,
             decode_rows,
+            queue_wait_us,
+            queue_admits,
+            queue_wait_max_us,
+            energy_uj,
             rlm: model.rlm_stats(),
             kvstore: prefix.disk.as_ref().map(|d| (d.saved, d.loaded, d.tokens_restored)),
             io_slab_in_use: model.io_slab_in_use(),
@@ -1979,9 +2073,9 @@ fn run(
 /// high-priority. Returns `None` when both senders are dropped (shutdown).
 fn recv_priority(
     rt: Option<&tokio::runtime::Runtime>,
-    rx_high: &mut mpsc::UnboundedReceiver<EngineRequest>,
-    rx_normal: &mut mpsc::UnboundedReceiver<EngineRequest>,
-) -> Option<EngineRequest> {
+    rx_high: &mut mpsc::UnboundedReceiver<Queued>,
+    rx_normal: &mut mpsc::UnboundedReceiver<Queued>,
+) -> Option<Queued> {
     // Fast path: something already queued (fold both into one blocking wait if
     // not; empty/disconnected queues fall through — the slow path treats
     // both-senders-gone as the shutdown signal).
@@ -2046,13 +2140,21 @@ fn recv_priority(
 /// The most recent admission's workload class becomes the model's active class —
 /// a pragmatic "latest wins" policy for a mixed batch (per-sequence classes would
 /// need per-sequence prefetch policies; the breadth knob is batch-global today).
+/// Returns how long this request waited between `submit` and admission, in
+/// microseconds — the one span no existing instrument covers.
+/// `bench-serve-lanes.py` measures whole-request wall time and
+/// `bench-serve-gaps.py` measures inter-token gaps; both start counting once a
+/// request is already being served, so queue time hides inside "the server was
+/// slow" and cannot be told apart from decode being slow.
 fn admit_pending(
     model: &Model,
     pending: &mut VecDeque<Prefilling>,
-    req: EngineRequest,
+    q: Queued,
     prefix: &mut PrefixStore,
     queued: &std::sync::atomic::AtomicUsize,
-) {
+) -> u64 {
+    let waited = q.at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    let req = q.req;
     // The request has left the channel: it no longer counts against
     // `COLI_QUEUE_DEPTH`. Saturating (a plain `fetch_sub` would wrap) because
     // tests drive this function directly with a counter no submit incremented.
@@ -2069,7 +2171,7 @@ fn admit_pending(
         }
     }
     if req.prompt.is_empty() || req.max_new == 0 {
-        return; // nothing to generate; dropping req.out closes the stream cleanly
+        return waited; // nothing to generate; dropping req.out closes the stream cleanly
     }
     model.set_workload_class(req.class);
     // Seed from the longest cached prefix of this prompt, so the shared head of a
@@ -2090,6 +2192,7 @@ fn admit_pending(
         hist: Mutex::new(model.new_route_history()),
         seq_id: NEXT_SEQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
+    waited
 }
 
 /// Advance the front prefilling sequence by up to `PREFILL_CHUNK` tokens. When its
@@ -2350,8 +2453,8 @@ mod tests {
         // process-wide OnceLock, so the cap is injected here the same way the
         // spec/fuse overrides are): at the cap a submit refuses Full — nothing
         // wrong with the request — and draining makes room again.
-        let (tx_normal, _rx_n) = mpsc::unbounded_channel::<EngineRequest>();
-        let (tx_high, _rx_h) = mpsc::unbounded_channel::<EngineRequest>();
+        let (tx_normal, _rx_n) = mpsc::unbounded_channel::<Queued>();
+        let (tx_high, _rx_h) = mpsc::unbounded_channel::<Queued>();
         let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let handle = EngineHandle {
             tx_normal,
@@ -2462,13 +2565,16 @@ mod tests {
             admit_pending(
                 &model,
                 &mut pending,
-                EngineRequest {
-                    prompt: vec![3i32, 7],
-                    max_new: 4,
-                    sampler: Sampler::new(0.0, 0.9, 1),
-                    out: tx,
-                    priority: Priority::Normal,
-                    class: peregrine_model::TokenClass::Prose,
+                Queued {
+                    at: std::time::Instant::now(),
+                    req: EngineRequest {
+                        prompt: vec![3i32, 7],
+                        max_new: 4,
+                        sampler: Sampler::new(0.0, 0.9, 1),
+                        out: tx,
+                        priority: Priority::Normal,
+                        class: peregrine_model::TokenClass::Prose,
+                    },
                 },
                 &mut prefix,
                 &std::sync::atomic::AtomicUsize::new(0),
@@ -2874,6 +2980,62 @@ mod tests {
             "published lane timings must be the model's, not a default: {:?}",
             t.lane_last
         );
+        Ok(())
+    }
+
+    #[test]
+    fn queue_wait_is_measured_and_only_counts_admitted_requests() -> Result<(), Error> {
+        // The gap this closes: `bench-serve-lanes.py` times whole requests and
+        // `bench-serve-gaps.py` times inter-token gaps, and both start counting
+        // once a request is *already being served*. Time spent waiting to be
+        // admitted was therefore indistinguishable from slow decode — which, on
+        // a server that sheds at `COLI_QUEUE_DEPTH`, is exactly the distinction
+        // between "at capacity" and "over capacity".
+        //
+        // `max_batch = 1` forces the queueing: the second and third requests
+        // cannot be admitted until the first retires.
+        let dir = tiny_dir("queue_wait")?;
+        let (handle, join) = spawn_tuned(Model::load(&dir)?, 1, false, Some(0))?;
+        let mut rxs = Vec::new();
+        for p in [vec![1i32, 5, 9, 2], vec![3i32, 8, 4], vec![7i32, 1, 6]] {
+            let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: p,
+                max_new: 6,
+                sampler: Sampler::new(0.0, 0.9, 1),
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            rxs.push(rx);
+        }
+        for mut rx in rxs {
+            while let Some(msg) = rx.blocking_recv() {
+                if let EngineOut::Error(e) = msg {
+                    return Err(Error::Format(e));
+                }
+            }
+        }
+        let t = handle.telemetry();
+        drop(handle);
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+        // Counted per admission, not per submit: a request refused at the door
+        // never waited for anything, and averaging a refusal in as a zero would
+        // flatter the mean exactly when the server is most overloaded.
+        assert_eq!(t.queue_admits, 3, "every admitted request must be counted once");
+        assert!(
+            t.queue_wait_max_us >= t.queue_wait_us / t.queue_admits,
+            "the max must bound the mean: max={} mean={}",
+            t.queue_wait_max_us,
+            t.queue_wait_us / t.queue_admits
+        );
+        // With `max_batch = 1` at least one request demonstrably waited behind
+        // another, so a counter stuck at zero is a wiring failure, not a fast
+        // machine.
+        assert!(t.queue_wait_max_us > 0, "serialized admissions must show a non-zero wait");
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
