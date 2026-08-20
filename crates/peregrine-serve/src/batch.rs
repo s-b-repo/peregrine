@@ -381,6 +381,13 @@ pub struct EngineTelemetry {
     pub gdn_snapshot_bytes: u64,
     pub gdn_replays: u64,
     pub gdn_replay_rows: u64,
+    /// Prompt-lookup drafting (`COLI_DRAFT_NGRAM`), cumulative and **separate
+    /// from `spec_*`**: the two sources cost so differently — a memcmp against
+    /// a sparse-MoE layer per draft step — that one pooled accept rate would
+    /// average them into a number that decides nothing. Keeping them apart is
+    /// what lets an operator see that the free source is carrying the run.
+    pub ngram_proposed: u64,
+    pub ngram_accepted: u64,
     /// RLM recursive refinement `(passes_emitted, tokens_recursed)`,
     /// cumulative — `(0, 0)` unless `COLI_RLM=1`.
     pub rlm: (u64, u64),
@@ -490,6 +497,8 @@ struct EngineKnobs {
     spec_gdn: bool,
     /// `COLI_SPEC_GDN_MAX_B` — see [`spec_gdn_max_b`].
     spec_gdn_max_b: usize,
+    /// `COLI_DRAFT_NGRAM` — see [`draft_ngram`].
+    draft_ngram: usize,
     /// `COLI_MAX_BATCH_ROWS` — see [`max_batch_rows`].
     max_batch_rows: usize,
     /// `COLI_QUEUE_DEPTH` — see [`queue_depth_cap`].
@@ -513,6 +522,7 @@ impl EngineKnobs {
             spec_conf: spec_conf(),
             spec_gdn: spec_gdn(),
             spec_gdn_max_b: spec_gdn_max_b(),
+            draft_ngram: draft_ngram(),
             max_batch_rows: max_batch_rows(),
             queue_depth_cap: queue_depth_cap(),
             adaptive_window_ratio: adaptive_window_ratio(),
@@ -571,6 +581,8 @@ struct SpecOverride {
     conf: Option<f32>,
     /// `COLI_SPEC_GDN`.
     gdn: Option<bool>,
+    /// `COLI_DRAFT_NGRAM`.
+    ngram: Option<usize>,
 }
 
 /// [`spawn`] with the fusion and the speculation depth forced (test knob override).
@@ -606,6 +618,9 @@ fn spawn_spec(
     if let Some(g) = spec.gdn {
         knobs.spec_gdn = g;
     }
+    if let Some(n) = spec.ngram {
+        knobs.draft_ngram = n;
+    }
     spawn_with_knobs(model, max_batch, knobs)
 }
 
@@ -615,6 +630,34 @@ fn spawn_spec(
 /// slack appears. Unset → static `max_batch` (the historical default).
 fn batch_sla_ms() -> Option<u64> {
     std::env::var("COLI_BATCH_SLA_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&n| n > 0)
+}
+
+/// Prompt-lookup draft depth in *suffix length* (`COLI_DRAFT_NGRAM=<max_n>`,
+/// typical 3). `0`/unset is off, and anything below the module's 2-token floor
+/// reads as off.
+///
+/// A second draft source for the same verify path, costing a backward scan of
+/// the token history instead of a model call. It proposes whatever followed the
+/// last occurrence of the current suffix, so it is right exactly when the
+/// output repeats something already in context — quoted code, an edited file, a
+/// list being walked.
+///
+/// It takes priority over the MTP head whenever it matches, because it is
+/// strictly cheaper: an MTP draft step is a full sparse-MoE layer at `s_n = 1`
+/// (~300 MB of SSD per step on the streaming container, with no batch-union
+/// amortization), and this is a memcmp. When it does not match, the MTP head
+/// drafts as before — the two are alternatives per tick, not a chain, because
+/// `mtp_draft` continues from a hidden state that assumes its own prefix.
+///
+/// Greedy requests only, and not because of a policy choice: an n-gram draft is
+/// not drawn from any distribution, so `accept_run_sampled` would have no `q`
+/// to score it against and the distribution-preserving guarantee would be void.
+/// `COLI_DRAFT_SAMPLED` does not extend to it.
+///
+/// Needs `COLI_DRAFT` non-zero for the depth, but **not** an MTP head: a
+/// checkpoint converted without `--mtp` can speculate through this alone.
+fn draft_ngram() -> usize {
+    std::env::var("COLI_DRAFT_NGRAM").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
 }
 
 /// Speculation on a **recurrent** architecture (`COLI_SPEC_GDN`). Default
@@ -909,6 +952,9 @@ struct SeqState {
     /// Pre-final-norm hidden at this sequence's last committed position: what
     /// the next draft continues from. Empty until the first verify produces it.
     hlast: Vec<f32>,
+    /// Whether this tick's `draft` came from prompt-lookup rather than the MTP
+    /// head. Only for accounting — the accept rule is the same either way.
+    draft_from_ngram: bool,
     /// The fed-token log, row-aligned with `seq`: `toks[i]` is the token whose
     /// feed produced KV row `i` (the prompt, then each committed decode/draft
     /// token). Kept so a retiring sequence can hand `prompt + output` to the
@@ -947,6 +993,12 @@ fn run(
     let mut gdn_snapshot_bytes: u64 = 0;
     let mut gdn_replays: u64 = 0;
     let mut gdn_replay_rows: u64 = 0;
+    // Prompt-lookup accounting, split out from `spec_*` because the two draft
+    // sources have completely different costs: an n-gram draft is a memcmp, an
+    // MTP draft is a sparse-MoE layer. A single accept rate over both would
+    // average a free source with an expensive one and mean nothing.
+    let mut ngram_proposed: u64 = 0;
+    let mut ngram_accepted: u64 = 0;
     // Adaptive-batching state. `working_cap` is the current admission ceiling
     // (starts at `max_batch`, shrinks under SLA overrun, grows on slack). EWMA
     // over per-forward wall time drives the adjustment.
@@ -963,6 +1015,7 @@ fn run(
     // below, behind `COLI_SPEC_GDN` because the snapshot costs ~151 MB per
     // drafting sequence per tick at 27B dims and that price has to be measured
     // per batch width, not assumed.
+    let ngram = peregrine_model::NgramDrafter::new(knobs.draft_ngram);
     let gdn_rollback = !model.spec_reject_is_kv_only() && knobs.spec_gdn;
     let has_mtp = model.has_mtp() && (model.spec_reject_is_kv_only() || gdn_rollback);
     if model.has_mtp() && !model.spec_reject_is_kv_only() && !gdn_rollback {
@@ -1270,8 +1323,13 @@ fn run(
                 (0, 0)
             };
             if g > 0 {
-                spec_proposed += g as u64;
-                spec_accepted += k.min(g) as u64;
+                // Same accept rule, separate ledgers — see `ngram_proposed`.
+                if s.draft_from_ngram {
+                    ngram_accepted += k.min(g) as u64;
+                } else {
+                    spec_proposed += g as u64;
+                    spec_accepted += k.min(g) as u64;
+                }
             }
             // **`s.next_tok` was already emitted** — by the prefill that
             // promoted this sequence, or by the previous round. It is the token
@@ -1511,13 +1569,42 @@ fn run(
             let gdn_width_ok =
                 !gdn_rollback || knobs.spec_gdn_max_b == 0 || active.len() <= knobs.spec_gdn_max_b;
             let may_draft = has_mtp && gdn_width_ok;
+            // Prompt-lookup needs the same rollback guarantee the MTP head does
+            // — any draft row advances a recurrent state — but it does *not*
+            // need an MTP head in the checkpoint, so the two sources gate
+            // separately. A container converted without `--mtp` can speculate
+            // through this one alone.
+            let rollback_ok = model.spec_reject_is_kv_only() || (gdn_rollback && gdn_width_ok);
+            let may_ngram = ngram.is_enabled() && rollback_ok;
             for s in active.iter_mut() {
-                let g =
-                    draft_depth_for(depth, may_draft, s.sampler.temp, s.max_new - s.produced.min(s.max_new), sampled)
-                        .min(depth_cap);
+                let budget_left = s.max_new - s.produced.min(s.max_new);
+                let g = draft_depth_for(depth, may_draft || may_ngram, s.sampler.temp, budget_left, sampled)
+                    .min(depth_cap);
                 s.draft.clear();
                 s.draft_q.clear();
-                if g == 0 || s.hlast.is_empty() {
+                s.draft_from_ngram = false;
+                if g == 0 {
+                    continue;
+                }
+                // Prompt-lookup first, because when it matches it is strictly
+                // the cheaper source: a backward scan of `toks` against a full
+                // sparse-MoE layer per draft step. Greedy only — an n-gram
+                // draft comes from no distribution, so `accept_run_sampled`
+                // would have no `q` to score it against.
+                if may_ngram && s.sampler.temp <= 0.0 {
+                    let d = ngram.draft(&s.toks, s.next_tok, g);
+                    if !d.is_empty() {
+                        ngram_proposed += d.len() as u64;
+                        s.draft_from_ngram = true;
+                        s.draft = d;
+                        continue;
+                    }
+                }
+                // No match (or a sampled request): fall back to the head. The
+                // two are alternatives per tick rather than a chain, because
+                // `mtp_draft` continues from a hidden that assumes its own
+                // prefix and cannot be seeded with someone else's tokens.
+                if !may_draft || s.hlast.is_empty() {
                     continue;
                 }
                 // A sampled request needs its drafts drawn from a distribution
@@ -1587,6 +1674,8 @@ fn run(
             gdn_snapshot_bytes,
             gdn_replays,
             gdn_replay_rows,
+            ngram_proposed,
+            ngram_accepted,
             rlm: model.rlm_stats(),
             kvstore: prefix.disk.as_ref().map(|d| (d.saved, d.loaded, d.tokens_restored)),
             io_slab_in_use: model.io_slab_in_use(),
@@ -2056,6 +2145,7 @@ fn finish_prefill_chunk(
         // No draft yet: the first verify produces the hidden a draft needs.
         draft: Vec::new(),
         draft_q: Vec::new(),
+        draft_from_ngram: false,
         hlast: Vec::new(),
         // The fed-token log starts as the prompt (row-aligned with `seq`,
         // whose rows so far are exactly the prompt); `t0` joins it when fed.
@@ -2311,6 +2401,7 @@ mod tests {
                 max_new: p.max_new,
                 draft: Vec::new(),
                 draft_q: Vec::new(),
+                draft_from_ngram: false,
                 hlast: Vec::new(),
                 toks: p.prompt,
             })
@@ -2694,6 +2785,131 @@ mod tests {
     }
 
     #[test]
+    fn prompt_lookup_drafts_do_not_change_the_served_token_stream() -> Result<(), Error> {
+        // Same contract as every other draft source, and the reason this one is
+        // worth having: it proposes tokens without a model call at all, so on
+        // the streaming track it is the only source that does not first pay
+        // ~300 MB of MTP expert reads per draft step. It has to be exactly as
+        // output-neutral as the head it bypasses.
+        //
+        // The prompt deliberately repeats a run, so the suffix match fires:
+        // without an actual match the drafter is silent and this test would be
+        // measuring nothing, which is what the `ngram_proposed > 0` assertion
+        // below refuses to allow.
+        let dir = tiny_dir("ngram_engine")?;
+        let prompts = [vec![1i32, 5, 9, 2, 7, 1, 5, 9, 2], vec![3i32, 8, 4, 3, 8, 4]];
+        // Long enough that suffix repeats have somewhere to land: `draft_depth_for`
+        // clamps to `budget_left - 1`, so the last couple of positions never
+        // draft at all and a short run can spend its whole match window there.
+        let n = 32usize;
+
+        let run = |spec: SpecOverride| -> Result<(Vec<Vec<u32>>, EngineTelemetry), Error> {
+            let (handle, join) = spawn_spec(Model::load(&dir)?, 8, false, spec)?;
+            let mut rxs = Vec::new();
+            for p in &prompts {
+                let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+                handle.submit(EngineRequest {
+                    prompt: p.clone(),
+                    max_new: n,
+                    sampler: Sampler::new(0.0, 0.9, 1),
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                })?;
+                rxs.push(rx);
+            }
+            let mut out = Vec::new();
+            for mut rx in rxs {
+                let mut toks = Vec::new();
+                while let Some(msg) = rx.blocking_recv() {
+                    match msg {
+                        EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Error(e) => return Err(Error::Format(e)),
+                    }
+                }
+                out.push(toks);
+            }
+            let t = handle.telemetry();
+            drop(handle);
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok((out, t))
+        };
+
+        // An independent decode, not the engine with the knob off.
+        let want: Vec<Vec<u32>> = {
+            let m = Model::load(&dir)?;
+            prompts.iter().map(|p| ref_decode(&m, p, n)).collect::<Result<_, Error>>()?
+        };
+
+        let (got, t) = run(SpecOverride { depth: Some(4), ngram: Some(3), ..SpecOverride::default() })?;
+        assert!(got.iter().all(|t| !t.is_empty()), "COLI_DRAFT_NGRAM=3: nothing generated");
+        assert_eq!(got, want, "COLI_DRAFT_NGRAM=3 changed the served token stream");
+        assert!(t.ngram_proposed > 0, "the repeated prompt must produce suffix matches; proposed=0");
+
+        // Off is the historical path, and must land in the same place.
+        let (off, t_off) = run(SpecOverride { depth: Some(4), ngram: Some(0), ..SpecOverride::default() })?;
+        assert_eq!(off, want, "the un-lookahead engine already disagrees with a plain greedy decode");
+        assert_eq!(t_off.ngram_proposed, 0, "COLI_DRAFT_NGRAM=0 must propose nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_lookup_speculates_without_an_mtp_head() -> Result<(), Error> {
+        // The capability the n-gram source adds beyond cost: it needs no head
+        // in the checkpoint. A hybrid container converted without `--mtp` could
+        // not speculate at all before — `draft_depth_for` returns 0 without one
+        // — and now it can, provided the recurrent rollback is enabled, because
+        // an n-gram draft row advances the GDN state exactly like any other.
+        let dir = std::env::temp_dir().join(format!("peregrine_hyb_nomtp_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        peregrine_model::testkit::build_tiny_hybrid_model(&dir, 0x5EC)?; // no MTP head
+        let prompt = vec![1i32, 5, 9, 2, 7, 1, 5, 9, 2];
+        let n = 8usize;
+
+        let m = Model::load(&dir)?;
+        assert!(!m.has_mtp(), "this fixture must have no head, or the test proves nothing");
+        let want = ref_decode(&m, &prompt, n)?;
+        drop(m);
+
+        let (handle, join) = spawn_spec(
+            Model::load(&dir)?,
+            4,
+            false,
+            SpecOverride { depth: Some(4), ngram: Some(3), gdn: Some(true), ..SpecOverride::default() },
+        )?;
+        let (tx, mut rx) = mpsc::unbounded_channel::<EngineOut>();
+        handle.submit(EngineRequest {
+            prompt: prompt.clone(),
+            max_new: n,
+            sampler: Sampler::new(0.0, 0.9, 1),
+            out: tx,
+            priority: Priority::Normal,
+            class: peregrine_model::TokenClass::Prose,
+        })?;
+        let mut got = Vec::new();
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                EngineOut::Token(t) => got.push(t),
+                EngineOut::Error(e) => return Err(Error::Format(e)),
+            }
+        }
+        let t = handle.telemetry();
+        drop(handle);
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+        assert_eq!(got, want, "prompt-lookup changed the stream on a headless checkpoint");
+        assert!(t.ngram_proposed > 0, "a headless checkpoint must still draft through prompt-lookup");
+        assert_eq!(t.spec_proposed, 0, "there is no MTP head, so nothing may be drafted by one");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn recurrent_speculation_does_not_change_the_served_token_stream() -> Result<(), Error> {
         // The same contract as `speculation_does_not_change_the_served_token_stream`,
         // on the arch that could not honour it until now. A hybrid's context is
@@ -2877,7 +3093,7 @@ mod tests {
             Ok(toks)
         };
 
-        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None, gdn: None };
+        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None, gdn: None, ngram: None };
         let got = run_engine(on)?;
         assert!(!got.is_empty(), "sampled speculation generated nothing");
         assert!(got.len() <= n, "served {} tokens for max_new {n}", got.len());
@@ -2891,7 +3107,7 @@ mod tests {
         // And the knob is a knob: with it off, the same request takes the
         // historical one-row path, whose stream differs precisely because the
         // RNG is consumed differently.
-        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None, gdn: None })?;
+        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None, gdn: None, ngram: None })?;
         assert!(!off.is_empty(), "the unspeculated path generated nothing");
         assert_ne!(
             off, got,
@@ -2940,10 +3156,10 @@ mod tests {
             Ok(toks)
         };
 
-        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0), gdn: None })?;
+        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0), gdn: None, ngram: None })?;
         assert!(!base.is_empty(), "the baseline generated nothing");
         for floor in [0.65f32, 0.999] {
-            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor), gdn: None })?;
+            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor), gdn: None, ngram: None })?;
             assert_eq!(gated, base, "a {floor} confidence floor changed a greedy stream");
         }
         std::fs::remove_dir_all(&dir)?;

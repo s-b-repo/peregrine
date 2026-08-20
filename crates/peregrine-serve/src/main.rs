@@ -578,6 +578,17 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
             "gdn_replays": t.gdn_replays,
             "gdn_replay_rows": t.gdn_replay_rows,
         },
+        // Prompt-lookup drafting (COLI_DRAFT_NGRAM), deliberately its own
+        // block: an n-gram draft costs a backward scan and an MTP draft costs a
+        // sparse-MoE layer, so pooling their accept rates would hide which
+        // source is doing the work.
+        "ngram": {
+            "proposed": t.ngram_proposed,
+            "accepted": t.ngram_accepted,
+            "accept_rate": if t.ngram_proposed > 0 {
+                t.ngram_accepted as f64 / t.ngram_proposed as f64
+            } else { 0.0 },
+        },
         // RLM recursive refinement (COLI_RLM): passes emitted and tokens that
         // triggered at least one.
         "rlm": { "passes": t.rlm.0, "tokens_recursed": t.rlm.1 },

@@ -438,6 +438,7 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_DRAFT_SAMPLED` | off | extend speculation to temperature > 0 — [note](#coli_draft_sampled) |
 | `COLI_SPEC_GDN` | off | allow speculation on a **recurrent** (Qwen3.5-hybrid) arch — [note](#coli_spec_gdn) |
 | `COLI_SPEC_GDN_MAX_B` | 0 | batch width above which `COLI_SPEC_GDN` stops drafting; `0` = uncapped |
+| `COLI_DRAFT_NGRAM` | 0 | prompt-lookup drafting: match suffixes up to this length — [note](#coli_draft_ngram) |
 | `X-Peregrine-Priority` | (HTTP header) | `high`/`1`/`true` → drained ahead of normal-priority requests |
 
 ### `COLI_FUSE_PREFILL`
@@ -576,6 +577,52 @@ rollback itself by `a_rejected_draft_leaves_no_recurrent_trace` and
 `a_partially_accepted_draft_re_advances_exactly_the_committed_rows` — each with
 a negative-control arm, because a rollback test that passes when the rollback
 does nothing is testing nothing.
+
+
+### `COLI_DRAFT_NGRAM`
+
+A second speculative draft source, costing no weights, no forward pass and no
+training. Set it to the longest suffix to match (typical `3`); `0` is off, and
+anything below the 2-token floor reads as off. It needs `COLI_DRAFT` non-zero
+for the depth, but **not** an MTP head — a container converted without `--mtp`
+can speculate through this alone.
+
+It proposes whatever followed the most recent earlier occurrence of the
+sequence's current suffix. That is the right guess exactly when the output
+repeats something already in context: quoted code, an edited file, a repeated
+identifier, a list being walked, or a model that has fallen into a loop.
+
+**Why it is worth a second source rather than a tuning knob on the first.** An
+MTP draft step is a full sparse-MoE layer at `s_n = 1` — on the streaming
+container ~300 MB of SSD per step, with none of the batch-union amortization
+the verify forward gets. This is a backward `memcmp` over the token log. So
+when it matches it is not marginally cheaper, it is free; and
+[`ideas-from-colibri.md`](../ideas-from-colibri.md) records why that matters
+more here than elsewhere — on a disk-bound engine speculation only *loses* when
+drafts are rejected, so a source whose acceptance approaches 1 sidesteps the
+failure mode both engines measured.
+
+Prompt-lookup takes priority whenever it matches; the head drafts when it does
+not. The two are alternatives per tick rather than a chain, because `mtp_draft`
+continues from a hidden state that assumes its own prefix and cannot be seeded
+with someone else's tokens.
+
+**Greedy requests only**, and not as a policy choice: an n-gram draft is not
+drawn from any distribution, so `accept_run_sampled` would have no `q` to score
+it against and the distribution-preserving guarantee would be void.
+`COLI_DRAFT_SAMPLED` does not extend to it.
+
+It never *invents* a continuation — it only replays what the history holds — so
+a run of identical tokens drafts one per tick rather than filling the depth.
+That is deliberate: on the streaming track an invented token that misses costs a
+verify row's worth of expert reads.
+
+`/metrics` reports it under its own `ngram` block (`proposed` / `accepted` /
+`accept_rate`) rather than pooling it into `spec`, because averaging a free
+source with an expensive one produces a number that decides nothing. Output is
+unaffected — `accept_run` still decides by argmax identity, asserted by
+`prompt_lookup_drafts_do_not_change_the_served_token_stream` and, on a headless
+checkpoint, `prompt_lookup_speculates_without_an_mtp_head`.
 
 ### `COLI_KV_DTYPE`
 

@@ -256,6 +256,14 @@ With an MTP head in the checkpoint, `COLI_DRAFT=<g>` drafts `g` tokens per
 sequence per tick and verifies them in the same batched forward (greedy
 requests take argmax-identity acceptance; sampled requests join only under
 `COLI_DRAFT_SAMPLED`, via distribution-preserving rejection sampling).
+`COLI_DRAFT_NGRAM=<n>` adds a **second draft source** to the same verify path:
+prompt-lookup, which proposes whatever followed the last occurrence of the
+current suffix ([note](configuration.md#coli_draft_ngram)). It costs a backward
+scan rather than a model call, takes priority over the head whenever it matches,
+works on a checkpoint with no MTP head at all, and is reported separately under
+`ngram` on `/metrics` — pooling a free source's accept rate with an expensive
+one's hides which is doing the work.
+
 On a **recurrent** arch (Qwen3.5-hybrid) drafting additionally needs
 `COLI_SPEC_GDN=1`: a linear-attention layer keeps a delta-rule state rather
 than rows, so a rejected draft cannot be truncated away and has to be rolled
