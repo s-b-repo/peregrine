@@ -1,0 +1,120 @@
+[« Docs index](README.md)
+
+ Measurement discipline
+
+How to get a number out of this engine that means something.
+
+This page exists because the repo has been wrong four times in one direction: a
+plausible measurement, taken once, that pointed at the wrong conclusion. Each time
+the fix was not a better guess but a better instrument. If you are about to tune a
+knob or publish a figure, read this first — every trap below has already cost a
+day.
+
+**The short version.** Take medians, not single runs. Check that your benchmark is
+reading the device and not its own page cache. And when a counter is summed over
+threads, never read it as wall time.
+
+
+
+ 1. One run is not a measurement
+
+Five *identical* passes of `iobench` against a tmpfs file — no device in the path
+at all, nothing to vary but the scheduler — returned:
+
+
+2.58   2.13   1.78   2.27   2.34  GB/s        median 2.27, spread 35 % of median
+
+
+That is a **35 % spread with zero variables**. The cause is contention, not the
+storage: this box runs an OSX-KVM guest and a VNC helper holding ~36 % of all
+twelve threads before a benchmark starts.
+
+Two published conclusions were drawn from single passes inside a distribution that
+wide, and both were wrong:
+
+ A ring-count sweep taken one-pass-per-point put the software ceiling at
+  **2.99 GB/s**. Re-run with 5 reps per point, the same configuration measures
+  **3.77 GB/s** — the original had simply landed low.
+ `M1-storage-config.md` argued from a one-pass sweep that throughput "plateaus at
+  4 rings and declines", and used the non-scaling as evidence *against* a
+  CPU-bound crypto path. That curve reproduces on tmpfs with no dm-crypt and no
+  device, so it was never evidence about crypto. [The argument is
+  withdrawn](../bench-data/2026-08-09-prefetch-causes/M1-storage-config.md).
+
+ What the tools do about it
+
+iobench` defaults to **`REPS=5`** and reports the distribution, not a number:
+
+
+$ iobench shard.safetensors 64 8 4 0 uring 15
+...
+median 1.12 GB/s over 15 reps (min 1.11, max 1.17, spread 5.4% of median)
+
+
+When the spread exceeds 15 % of the median it says so explicitly:
+
+
+NOTE: spread is 25.8% of the median, so any A/B gap smaller than that is not
+resolvable on this box right now. Quiesce background load or raise REPS before
+concluding anything from a difference that size.
+
+
+**Read that note as a hard gate.** A 6 % difference between two arms, against a
+25 % spread, is not a small effect — it is *no measured effect*. Say "unresolved",
+not "slightly better".
+
+Between reps the file is cooled with `POSIX_FADV_DONTNEED`, so rep *N* is not
+reading what rep *N−1* warmed. It is advisory and best-effort — a no-op on tmpfs,
+irrelevant under O_DIRECT — and if it ever silently stopped working the reps would
+converge and the reported spread would collapse, which is a visible symptom rather
+than a hidden one.
+
+
+
+ 2. The benchmark that measures its own cache
+
+iobench` walks offsets as `(ring * iters + i) * blk % flen`. That `% flen` is the
+trap: when the working set exceeds the file, offsets **wrap**, and the back half of
+a pass re-reads regions the front half just pulled into the page cache.
+
+It looks exactly like a scaling win. A 15-rep sweep on a 2.5 GiB shard read:
+
+
+rings=4  0.94 GB/s     rings=8  1.39     rings=12  1.82     rings=16  1.76
+
+
+— an apparently clean **2× from ring count**. At 12 rings that is 96 reads of
+64 MB over **40 distinct slots**: 58 % of each pass re-reading its own cache. Held
+to equal work with no wrap, the same sweep is flat within noise:
+
+
+4×24  0.87      8×12  0.92      12×8  1.04      16×6  1.00   GB/s
+
+
+There was no 2×. The harness now computes the distinct-slot count before it prints
+any rate:
+
+
+WARNING: 96 reads of 64 MB over a 2.7 GB file is only 40 distinct slots — offsets
+wrap, so ~58% of each pass re-reads what it just cached. This measures the page
+cache, not the device.
+
+
+**Rule:** keep `rings × iters × blk` **below** the file size, or shrink `BLK_MB`.
+Against tmpfs the wrap is harmless (everything is RAM either way) — the warning
+still fires, and there it can be ignored.
+
+
+
+ 3. Thread-summed counters are not wall time
+
+The `[lane]` counters (`io_us`, `cpu_us`, `gpu_us`, `reduce_us`) are accumulated by
+every lane thread independently. **A sum of 17 s across four io rings is equally
+"four rings busy for 4.3 s" and "one ring busy for 17 s."** On its own the counter
+cannot tell you whether a lane was saturated or idle, which is precisely the
+question you are usually asking.
+
+LaneTimings::lane_wall_us` is the denominator that resolves it — the wall clock of
+the 3-lane region itself. With it, the shutdown report prints duty cycles:
+
+

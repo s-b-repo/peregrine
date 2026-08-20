@@ -709,6 +709,194 @@ pub fn union_growth_null(n_experts: usize, k: usize, w: usize) -> f64 {
 /// independence null, then union growth for speculative windows and batch
 /// proxies. Returned as text rather than printed so the caller owns the stream
 /// and tests can assert on it.
+/// How much two domains' routing "cores" overlap, against the null that domain
+/// membership does not matter.
+///
+/// A **core** is the top-`k` `(layer, expert)` slots by routing frequency within
+/// one domain. Cores rather than whole distributions because the measured
+/// structure lives there: on the committed 256-position trace the *entire*
+/// stable long-range component is a small hot set — removing the top 600 slots
+/// (3.1 % of 19 200) drops overlap at distance 128 from 14.9 % to 3.17 %, which
+/// is the independence null. Whatever a domain map can say, it says about the
+/// core, and the tail is too thinly sampled to say anything at 256 positions
+/// (11.2 firings per fired slot).
+///
+/// The null is what makes the answer readable. Two traces of *anything* share
+/// core slots, because a hot expert is hot in both — so an observed Jaccard is
+/// meaningless alone. Positions are pooled across domains and reassigned to
+/// pseudo-domains of the same sizes, `reps` times; that destroys the domain
+/// grouping and keeps everything else, so the gap between observed and null is
+/// the domain effect and nothing else.
+///
+/// Pure so the gate is testable without a model — the same reason
+/// `consecutive_overlap` and `draft_depth_for` are.
+#[derive(Debug, Clone)]
+pub struct CoreComparison {
+    pub core_k: usize,
+    /// `(a, b, jaccard)` per domain pair, in input order.
+    pub pairs: Vec<(String, String, f64)>,
+    /// Mean observed Jaccard over all pairs.
+    pub observed: f64,
+    /// Mean and standard deviation of the same statistic under label shuffling.
+    pub null_mean: f64,
+    pub null_sd: f64,
+}
+
+impl CoreComparison {
+    /// How many standard deviations the observed mean sits **below** the null.
+    /// Positive means the domains' cores are *more different* than chance.
+    /// `None` when the null has no spread (degenerate input).
+    pub fn z(&self) -> Option<f64> {
+        (self.null_sd > 0.0).then(|| (self.null_mean - self.observed) / self.null_sd)
+    }
+}
+
+/// Per-`(layer, expert)` routing counts for one trace.
+fn slot_counts(trace: &[Vec<Vec<i32>>]) -> HashMap<(usize, i32), u64> {
+    let mut m: HashMap<(usize, i32), u64> = HashMap::new();
+    for pos in trace {
+        for (layer, ids) in pos.iter().enumerate() {
+            for &e in ids {
+                *m.entry((layer, e)).or_insert(0) += 1;
+            }
+        }
+    }
+    m
+}
+
+/// The top-`k` slots by count. Ties break on `(layer, expert)` ascending so the
+/// core is deterministic — a core that depended on hash order would make every
+/// comparison below irreproducible.
+fn core_of(counts: &HashMap<(usize, i32), u64>, k: usize) -> BTreeSet<(usize, i32)> {
+    let mut v: Vec<((usize, i32), u64)> = counts.iter().map(|(s, c)| (*s, *c)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v.into_iter().take(k).map(|(s, _)| s).collect()
+}
+
+fn jaccard(a: &BTreeSet<(usize, i32)>, b: &BTreeSet<(usize, i32)>) -> f64 {
+    let inter = a.intersection(b).count() as f64;
+    let union = a.union(b).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+/// Mean pairwise core Jaccard over a labelled partition of pooled positions.
+fn mean_pair_jaccard(groups: &[Vec<&Vec<Vec<i32>>>], k: usize) -> f64 {
+    let cores: Vec<BTreeSet<(usize, i32)>> = groups
+        .iter()
+        .map(|g| {
+            let owned: Vec<Vec<Vec<i32>>> = g.iter().map(|p| (*p).clone()).collect();
+            core_of(&slot_counts(&owned), k)
+        })
+        .collect();
+    let mut sum = 0.0;
+    let mut n = 0u32;
+    for i in 0..cores.len() {
+        for j in (i + 1)..cores.len() {
+            sum += jaccard(&cores[i], &cores[j]);
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum / n as f64
+    }
+}
+
+/// Compare domain cores against the label-shuffled null. `traces` is
+/// `(domain name, positions)`; every trace must come from the same model.
+pub fn compare_domain_cores(
+    traces: &[(String, Vec<Vec<Vec<i32>>>)],
+    core_k: usize,
+    reps: usize,
+    seed: u64,
+) -> CoreComparison {
+    let cores: Vec<(String, BTreeSet<(usize, i32)>)> =
+        traces.iter().map(|(n, t)| (n.clone(), core_of(&slot_counts(t), core_k))).collect();
+    let mut pairs = Vec::new();
+    for i in 0..cores.len() {
+        for j in (i + 1)..cores.len() {
+            pairs.push((cores[i].0.clone(), cores[j].0.clone(), jaccard(&cores[i].1, &cores[j].1)));
+        }
+    }
+    let observed = if pairs.is_empty() { 0.0 } else { pairs.iter().map(|p| p.2).sum::<f64>() / pairs.len() as f64 };
+
+    // Null: same positions, same group sizes, domain membership destroyed.
+    let pooled: Vec<&Vec<Vec<i32>>> = traces.iter().flat_map(|(_, t)| t.iter()).collect();
+    let sizes: Vec<usize> = traces.iter().map(|(_, t)| t.len()).collect();
+    // xorshift64*, so the shuffle is reproducible from `seed` without a
+    // dependency — `peregrine-tools` links `peregrine-core` and `serde_json`
+    // only, on purpose.
+    let mut st = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+    let mut next = move || {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        st
+    };
+    let mut samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let mut idx: Vec<usize> = (0..pooled.len()).collect();
+        for i in (1..idx.len()).rev() {
+            idx.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+        let mut groups: Vec<Vec<&Vec<Vec<i32>>>> = Vec::with_capacity(sizes.len());
+        let mut at = 0usize;
+        for &sz in &sizes {
+            groups.push(idx[at..at + sz].iter().map(|&i| pooled[i]).collect());
+            at += sz;
+        }
+        samples.push(mean_pair_jaccard(&groups, core_k));
+    }
+    let null_mean = if samples.is_empty() { 0.0 } else { samples.iter().sum::<f64>() / samples.len() as f64 };
+    let null_sd = if samples.len() < 2 {
+        0.0
+    } else {
+        (samples.iter().map(|v| (v - null_mean).powi(2)).sum::<f64>() / (samples.len() - 1) as f64).sqrt()
+    };
+    CoreComparison { core_k, pairs, observed, null_mean, null_sd }
+}
+
+/// Human-readable report for [`compare_domain_cores`] at several core sizes, so
+/// the verdict does not rest on one arbitrary cut.
+pub fn format_core_comparison(traces: &[(String, Vec<Vec<Vec<i32>>>)], ks: &[usize], reps: usize, seed: u64) -> String {
+    let mut out = String::new();
+    for (n, t) in traces {
+        out.push_str(&format!("{n:10} {} positions\n", t.len()));
+    }
+    out.push_str(&format!("\nlabel-shuffled null over {reps} reps, seed {seed}\n\n"));
+    out.push_str("  core   observed    null (sd)     z   verdict\n");
+    for &k in ks {
+        let c = compare_domain_cores(traces, k, reps, seed);
+        let z = c.z();
+        // A domain effect makes cores *less* similar than chance. Anything
+        // inside ~2 sd is not a difference this trace length can resolve.
+        let verdict = match z {
+            Some(z) if z >= 2.0 => "cores differ",
+            Some(z) if z <= -2.0 => "cores MORE alike than chance",
+            Some(_) => "unresolved",
+            None => "no null spread",
+        };
+        out.push_str(&format!(
+            "  {:5}  {:.4}     {:.4} ({:.4})  {:+5.1}   {}\n",
+            k,
+            c.observed,
+            c.null_mean,
+            c.null_sd,
+            z.unwrap_or(0.0),
+            verdict
+        ));
+    }
+    out.push_str("\nreading it: two traces of anything share core slots, because a hot expert\n");
+    out.push_str("is hot in both. The null is that same statistic with domain membership\n");
+    out.push_str("shuffled away, so only the gap between the two is a domain effect.\n");
+    out
+}
+
 pub fn format_route_stats(trace: &[Vec<Vec<i32>>], n_experts: usize) -> String {
     let n_layers = trace.iter().map(|f| f.len()).max().unwrap_or(0);
     let mut out = String::new();
@@ -885,6 +1073,87 @@ pub fn write_schedule(dir: &Path, ordered: &[Vec<i32>]) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Build a trace: `positions` positions, each routing `k` ids per sparse
+    /// layer, drawn from `pool` with a deterministic walk.
+    fn synth(positions: usize, layers: usize, k: usize, pool: &[i32], seed: u64) -> Vec<Vec<Vec<i32>>> {
+        let mut st = seed | 1;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        (0..positions)
+            .map(|_| {
+                (0..layers)
+                    .map(|l| {
+                        if l == 0 {
+                            return Vec::new(); // a dense layer routes nothing
+                        }
+                        (0..k).map(|_| pool[(next() % pool.len() as u64) as usize]).collect()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_domain_null_separates_different_cores_from_the_same_one() {
+        // The gate rests entirely on this statistic being able to say "no", so
+        // it is checked in both directions. Two traces of *anything* share core
+        // slots — a hot expert is hot in both — so an observed Jaccard alone
+        // says nothing, and only the gap to the label-shuffled null is a domain
+        // effect.
+        let layers = 8;
+
+        // Disjoint expert pools: the strongest possible domain effect.
+        let a: Vec<i32> = (0..32).collect();
+        let b: Vec<i32> = (32..64).collect();
+        let differ = vec![
+            ("a".to_string(), synth(120, layers, 4, &a, 11)),
+            ("b".to_string(), synth(120, layers, 4, &b, 22)),
+        ];
+        let c = compare_domain_cores(&differ, 100, 64, 0x5EED);
+        // `z()` is `None` only when the null has no spread at all, which for a
+        // 64-rep shuffle over 240 positions would itself be the bug — so assert
+        // that first and the extraction below cannot be the thing that fails.
+        assert!(c.null_sd > 0.0, "null had no spread over 64 reps — the shuffle is not shuffling");
+        let z = c.z().unwrap_or(0.0);
+        assert!(c.observed < c.null_mean, "disjoint pools must share less core than shuffled labels");
+        assert!(z >= 2.0, "disjoint pools must resolve as a domain effect; z={z:.2}");
+
+        // Same pool, different seeds: no domain effect to find. The observed
+        // value is still *high* — both cores are the same hot set — which is
+        // exactly why the raw number cannot be read on its own.
+        let same = vec![
+            ("x".to_string(), synth(120, layers, 4, &a, 33)),
+            ("y".to_string(), synth(120, layers, 4, &a, 44)),
+        ];
+        let c2 = compare_domain_cores(&same, 100, 64, 0x5EED);
+        assert!(c2.null_sd > 0.0, "null had no spread over 64 reps — the shuffle is not shuffling");
+        let z2 = c2.z().unwrap_or(0.0);
+        assert!(z2.abs() < 2.0, "one pool split two ways must read as unresolved, not as specialization; z={z2:.2}");
+        assert!(
+            c2.observed > c.observed,
+            "sanity: same-pool cores overlap more than disjoint-pool cores ({:.3} vs {:.3})",
+            c2.observed,
+            c.observed
+        );
+    }
+
+    #[test]
+    fn a_core_is_deterministic_under_ties() {
+        // Every count equal: without the `(layer, expert)` tie-break the core
+        // would follow HashMap iteration order and no comparison would
+        // reproduce.
+        let flat: Vec<Vec<Vec<i32>>> = (0..4).map(|_| vec![Vec::new(), vec![9, 8, 7, 6, 5]]).collect();
+        let t = vec![("f".to_string(), flat.clone()), ("g".to_string(), flat)];
+        let first = compare_domain_cores(&t, 3, 8, 1).pairs;
+        for _ in 0..5 {
+            assert_eq!(compare_domain_cores(&t, 3, 8, 1).pairs, first, "core selection must not depend on hash order");
+        }
+    }
 
     #[test]
     fn read_routes_accepts_both_trace_shapes() -> Result<(), Error> {

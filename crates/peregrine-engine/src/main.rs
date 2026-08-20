@@ -595,6 +595,32 @@ fn run() -> Result<(), Error> {
                 .map_err(|e| Error::Format(format!("flip-arm: stdout: {e}")))?;
             Ok(())
         }
+        // `expert-map <n_experts> <name=routes.json> ...`: do these domains route
+        // to different expert cores? Pure analysis over traces — no model load.
+        Some("expert-map") => {
+            let usage = || {
+                Error::Format(
+                    "usage: peregrine expert-map <name=routes.json> [name=routes.json ...]".into(),
+                )
+            };
+            // No pool size: a Jaccard over `(layer, expert)` slots needs the
+            // sets, not the space they live in. `route-stats` takes one because
+            // its independence null does.
+            let mut traces: Vec<(String, Vec<Vec<Vec<i32>>>)> = Vec::new();
+            for a in args.iter().skip(2) {
+                let (name, path) = a.split_once('=').ok_or_else(usage)?;
+                traces.push((name.to_string(), peregrine_tools::read_routes(Path::new(path))?));
+            }
+            if traces.len() < 2 {
+                return Err(Error::Format("expert-map needs at least two labelled traces to compare".into()));
+            }
+            // Core sizes spanning the measured structure: ~600 slots (3.1% of
+            // GLM-5.2's 19 200) is where the stable component was found to live,
+            // so bracket it rather than trusting one cut.
+            let ks = [100usize, 300, 600, 1200, 2400];
+            print!("{}", peregrine_tools::format_core_comparison(&traces, &ks, 200, 0x5EED));
+            Ok(())
+        }
         Some("route-stats") => {
             let path = args
                 .get(2)

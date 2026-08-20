@@ -1,0 +1,171 @@
+}
+
+pub fn route(x: &[f32], router_w: &[f32], router_bias: &[f32], cfg: RouterCfg) -> Routed {
+    let RouterCfg { s_n, d_n, e_n, k, norm_topk, routed_scale, min_share } = cfg;
+    let mut logits = vec![0f32; s_n * e_n];
+    // The router matmul runs once per MoE layer per token (`n_experts × hidden`
+    // MACs — ~1M per layer at GLM-5.2 shapes, ~90M across the stack), and it was
+    // the one matmul with no threading at all.
+    //
+    // Parallelized *around* the kernel rather than inside it: each output
+    // element keeps its own left-to-right accumulation, so results are
+    // bit-identical (`matmul_f32` is also this workspace's f32 reference oracle,
+    // and its documented contract is to match the C engine bit-for-bit).
+    let work = s_n.saturating_mul(d_n).saturating_mul(e_n);
+    if work < (1 << 20) {
+        matmul_f32(&mut logits, x, router_w, s_n, d_n, e_n);
+    } else if s_n > 1 {
+        // Prefill: one row per task.
+        peregrine_par::par_rows_mut(&mut logits, e_n, s_n, peregrine_par::PAR_MATMUL_MIN, |s, row| {
+            matmul_f32(row, &x[s * d_n..s * d_n + d_n], router_w, 1, d_n, e_n);
+        });
+    } else {
+        // Decode (a single row): split the *experts* instead, so the latency-
+        // critical path still uses the pool.
+        peregrine_par::par_chunks_mut(&mut logits, 1, e_n, peregrine_par::PAR_MATMUL_MIN, |start, end, chunk| {
+            matmul_f32(chunk, x, &router_w[start * d_n..end * d_n], 1, d_n, end - start);
+        });
+    }
+
+    let mut idx = vec![0i32; s_n * k];
+    let mut w = vec![0f32; s_n * k];
+    let mut choice = vec![0f32; e_n];
+    // Per-position kept count; filled in as each position selects (a position
+    // can keep fewer than `k` — see the selection loop).
+    let mut keff = vec![k as i32; s_n];
+
+    for s in 0..s_n {
+        let logit = &mut logits[s * e_n..s * e_n + e_n];
+        for e in 0..e_n {
+            logit[e] = sigmoidf(logit[e]);
+            choice[e] = logit[e] + router_bias[e];
+        }
+        // greedy top-k by `choice` (bias-augmented), no replacement; ties go to
+        // the lowest index (strict `>`), matching the C selection loop.
+        let ib = &mut idx[s * k..s * k + k];
+        let wb = &mut w[s * k..s * k + k];
+        // How many experts this position actually kept. Selection can come up
+        // empty before `k` rounds — every expert already taken, or all-NaN
+        // scores (`NaN > x` is false, so nothing is ever "best"). Recording the
+        // real count keeps `keff` honest instead of emitting a `-1` expert id
+        // that downstream indexing would turn into an out-of-bounds access.
+        let mut kept = k;
+        for kk in 0..k {
+            let mut best = -1i32;
+            let mut bv = f32::NEG_INFINITY;
+            for (e, &c) in choice.iter().enumerate().take(e_n) {
+                if ib[..kk].contains(&(e as i32)) {
+                    continue;
+                }
+                if c > bv {
+                    bv = c;
+                    best = e as i32;
+                }
+            }
+            let Ok(bi) = usize::try_from(best) else {
+                kept = kk;
+                break;
+            };
+            ib[kk] = best;
+            wb[kk] = logit[bi]; // weight is the sigmoid, not choice
+        }
+        // Unfilled slots must not be read: zero their weight and point them at
+        // expert 0 so even a caller that ignores `keff` stays in range.
+        for slot in kk_range(kept, k) {
+            ib[slot] = 0;
+            wb[slot] = 0.0;
+        }
+        // Drop the negligible tail before normalization, so the `norm_topk`
+        // block below renormalizes over the survivors and the MoE sum keeps its
+        // original scale instead of quietly shrinking by the dropped mass.
+        let drop = negligible_tail(wb, kept, min_share);
+        for slot in (kept - drop)..kept {
+            ib[slot] = 0;
+            wb[slot] = 0.0;
+        }
+        kept -= drop;
+        keff[s] = kept as i32;
+        if norm_topk {
+            let mut sm = 0f32;
+            for &wi in wb.iter() {
+                sm += wi;
+            }
+            sm += 1e-20;
+            for wi in wb.iter_mut() {
+                *wi /= sm;
+            }
+        }
+        for wi in wb.iter_mut() {
+            *wi *= routed_scale;
+        }
+    }
+
+    // Diagnostics only, and only when asked: how much of the routed set carries a
+    // negligible share of the gate mass. Every routed expert costs a full weight
+    // read whatever its weight, so this is the number that says whether truncating
+    // the set is worth anything on this workload.
+    if gate_stats_enabled() {
+        use std::sync::atomic::Ordering;
+        let mut below = [0u64; 4];
+        for s in 0..s_n {
+            let kept = (keff[s].max(0) as usize).min(k);
+            gate_share_below(&w[s * k..s * k + k], kept, k, &GATE_THRESHOLDS, &mut below);
+            GATE_TOTAL.fetch_add(kept as u64, Ordering::Relaxed);
+        }
+        for (c, n) in GATE_BELOW.iter().zip(below) {
+            c.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    Routed { idx, w, keff, k }
+}
+
+/// How many *trailing* selections to drop because each carries less than
+/// `min_share` of the position's gate mass. Returns `0` when the feature is off
+/// (`min_share <= 0`), the row is degenerate, or nothing qualifies.
+///
+/// Every routed expert costs a full weight read — ~18.9 MB at int4, and 600 of
+/// them per token — regardless of how much it contributes. An expert carrying 1%
+/// of the gate mass costs exactly what the top expert costs and contributes 1%.
+///
+/// Only a trailing run is dropped, and only from the end of the *selection*
+/// order. Selection ranks by the bias-augmented `choice` while the stored weight
+/// is the plain sigmoid, so the weights are not guaranteed monotonic — scanning
+/// from the end is the conservative reading of "the tail", and it keeps the
+/// surviving slots in their original order, which the batch-union and the
+/// position-keyed reduce both depend on.
+///
+/// At least one expert always survives: a position with no expert would leave the
+/// token with only the shared expert's contribution.
+///
+/// Pure — unit-testable without a model.
+pub fn negligible_tail(w: &[f32], kept: usize, min_share: f32) -> usize {
+    if min_share <= 0.0 || kept <= 1 {
+        return 0;
+    }
+    let kept = kept.min(w.len());
+    let sum: f32 = w[..kept].iter().sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        return 0; // degenerate row — leave the selection alone
+    }
+    let mut drop = 0usize;
+    while drop < kept - 1 {
+        let i = kept - 1 - drop;
+        if w[i] / sum >= min_share {
+            break;
+        }
+        drop += 1;
+    }
+    drop
+}
+
+/// Minimum gate share a routed expert must carry to be worth its weight read
+/// (`COLI_ROUTE_MIN_SHARE`). `0`/unset disables truncation.
+///
+/// **This is the one knob in the engine that changes token values.** Every other
+/// adaptive knob may only move latency or residency; this one drops a real (if
+/// small) term from the MoE sum. It is off by default for that reason, and
+/// `COLI_GATE_STATS` is how to size it before turning it on.
+pub fn route_min_share() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
