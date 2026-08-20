@@ -436,6 +436,15 @@ pub struct EngineTelemetry {
     pub queue_wait_us: u64,
     pub queue_admits: u64,
     pub queue_wait_max_us: u64,
+    /// Times `COLI_SPEC_UNION_MAX` cut a draft below the depth the row cap and
+    /// token budget would otherwise have allowed, cumulative. Zero when the
+    /// ceiling is unset (the default) or never binds.
+    ///
+    /// The cost-side counterpart of `spec_conf_stops`: that one says how often
+    /// the *acceptance* floor bit, this one how often the *byte* ceiling did.
+    /// Together they say which of the two terms in
+    /// `(1 + accepted) / union_growth` is actually limiting a run.
+    pub spec_union_stops: u64,
     /// Cumulative CPU-package energy in microjoules, or `None` when the host
     /// will not give it up.
     ///
@@ -579,6 +588,8 @@ struct EngineKnobs {
     spec_gdn_max_b: usize,
     /// `COLI_DRAFT_NGRAM` — see [`draft_ngram`].
     draft_ngram: usize,
+    /// `COLI_SPEC_UNION_MAX` — see [`spec_union_max`].
+    spec_union_max: u64,
     /// `COLI_MAX_BATCH_ROWS` — see [`max_batch_rows`].
     max_batch_rows: usize,
     /// `COLI_QUEUE_DEPTH` — see [`queue_depth_cap`].
@@ -603,6 +614,7 @@ impl EngineKnobs {
             spec_gdn: spec_gdn(),
             spec_gdn_max_b: spec_gdn_max_b(),
             draft_ngram: draft_ngram(),
+            spec_union_max: spec_union_max(),
             max_batch_rows: max_batch_rows(),
             queue_depth_cap: queue_depth_cap(),
             adaptive_window_ratio: adaptive_window_ratio(),
@@ -663,6 +675,8 @@ struct SpecOverride {
     gdn: Option<bool>,
     /// `COLI_DRAFT_NGRAM`.
     ngram: Option<usize>,
+    /// `COLI_SPEC_UNION_MAX`.
+    union_max: Option<u64>,
 }
 
 /// [`spawn`] with the fusion and the speculation depth forced (test knob override).
@@ -701,6 +715,9 @@ fn spawn_spec(
     if let Some(n) = spec.ngram {
         knobs.draft_ngram = n;
     }
+    if let Some(u) = spec.union_max {
+        knobs.spec_union_max = u;
+    }
     spawn_with_knobs(model, max_batch, knobs)
 }
 
@@ -738,6 +755,43 @@ fn batch_sla_ms() -> Option<u64> {
 /// checkpoint converted without `--mtp` can speculate through this alone.
 fn draft_ngram() -> usize {
     std::env::var("COLI_DRAFT_NGRAM").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+}
+
+/// Ceiling on the routed-expert union a single tick may cost, in expert-read
+/// requests (`COLI_SPEC_UNION_MAX`). `0`/unset is off.
+///
+/// The cost-side twin of [`spec_conf`]. `COLI_SPEC_CONF` prunes drafts by
+/// expected **acceptance** and inverted the `COLI_DRAFT=4` regression into
+/// +37 % — but nothing pruned them by expected **cost**, which is the term the
+/// 2.63× union growth at γ=4 actually lives in. Speculation's whole economics
+/// on the streaming track is
+///
+/// ```text
+/// speedup = (1 + accepted) / union_growth
+/// ```
+///
+/// and until this knob the engine could only act on the numerator.
+///
+/// The projection is deliberately **conservative**: expected union entries are
+/// estimated as `rows × (entries per row)`, where the per-row figure is an EWMA
+/// of what recent ticks actually cost (`ecache` hits + misses, which is exactly
+/// the union entries the warm tier resolved). A real union is *sublinear* in
+/// rows — that sublinearity is the entire batching win — so a linear projection
+/// overestimates, and the gate cuts depth sooner than strictly necessary. For a
+/// budget that is the safe direction, and it is stated here rather than
+/// discovered later from a disappointing sweep.
+///
+/// Depth-only, exactly like the confidence floor: it changes how many rows are
+/// proposed and never which token is emitted, so a greedy stream stays
+/// bit-identical. Inert on a resident model, where `ecache_stats` is `None`
+/// because no expert is ever read.
+///
+/// **Unset by default and deliberately untuned.** The number that should set it
+/// is `decode.tokens_emitted` against `ecache`, measured on the real container;
+/// picking a ceiling before that exists would be tuning against a quantity
+/// nobody has measured, which is the failure `docs/measurement.md` opens with.
+fn spec_union_max() -> u64 {
+    std::env::var("COLI_SPEC_UNION_MAX").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0)
 }
 
 /// Speculation on a **recurrent** architecture (`COLI_SPEC_GDN`). Default
@@ -845,6 +899,38 @@ fn draft_depth_for(global: usize, has_mtp: bool, temp: f32, budget_left: usize, 
     // Never draft past what the request can still emit: a draft accepted beyond
     // `max_new` is work done to produce a token that is thrown away.
     global.min(budget_left.saturating_sub(1))
+}
+
+/// Max draft depth that keeps a tick's *projected* routed-expert union under
+/// `cap` entries, given `per_row` measured entries per row and `n_active`
+/// decoding sequences. `usize::MAX` means "no opinion" — the ceiling is off, or
+/// nothing has been measured yet.
+///
+/// Each sequence contributes `1 + g` rows, and the committed row is not
+/// optional: a budget too small for even one row per sequence still yields
+/// depth 0 rather than refusing to decode. A ceiling is allowed to stop
+/// speculation and is never allowed to stop progress.
+///
+/// The projection is linear in rows and a real union is **sublinear** — that
+/// sublinearity is the entire batching win — so this overestimates and cuts
+/// sooner than strictly necessary. Conservative is the right direction for a
+/// budget, and saying so here is cheaper than rediscovering it from a
+/// disappointing sweep.
+///
+/// Pure so the policy is testable without a model, for the same reason
+/// [`draft_depth_for`] and `prefill_chunk` are.
+fn union_depth_cap(cap: u64, per_row: f64, n_active: usize) -> usize {
+    // `is_finite` first so a NaN or infinite EWMA — which an empty or
+    // pathological measurement window could produce — reads as "no opinion"
+    // rather than as a cap of zero.
+    if cap == 0 || n_active == 0 || !per_row.is_finite() || per_row <= 0.0 {
+        return usize::MAX;
+    }
+    let rows_afforded = cap as f64 / per_row / n_active as f64;
+    // `as usize` on a non-finite or huge float saturates rather than wrapping,
+    // but clamp explicitly so the intent does not depend on that.
+    let rows = if rows_afforded >= usize::MAX as f64 { usize::MAX } else { rows_afforded as usize };
+    rows.max(1) - 1
 }
 
 /// Fuse a prefill chunk into the same forward as the decode batch
@@ -1090,6 +1176,13 @@ fn run(
     let mut queue_wait_us: u64 = 0;
     let mut queue_admits: u64 = 0;
     let mut queue_wait_max_us: u64 = 0;
+    // Union-cost accounting for `COLI_SPEC_UNION_MAX`. `entries` is the warm
+    // tier's hit+miss count, i.e. exactly the routed-expert union entries a
+    // forward resolved; the EWMA is per row, so a draft depth can be priced
+    // before it is proposed.
+    let mut union_entries_last: u64 = 0;
+    let mut union_per_row_ewma: f64 = 0.0;
+    let mut spec_union_stops: u64 = 0;
     let note_wait = |w: u64, total: &mut u64, n: &mut u64, max: &mut u64| {
         *total = total.saturating_add(w);
         *n += 1;
@@ -1383,6 +1476,21 @@ fn run(
                 }
             }
         };
+        // What this tick's forward actually cost in union entries, per row.
+        // Folded before the draft step below, so the depth it prices is priced
+        // against the most recent evidence rather than last tick's.
+        if let Some((h, m, _)) = model.ecache_stats() {
+            let now = h.saturating_add(m);
+            let delta = now.saturating_sub(union_entries_last);
+            union_entries_last = now;
+            let rows = tokens.len().max(1) as f64;
+            if delta > 0 {
+                let per_row = delta as f64 / rows;
+                // α = 0.3, the same smoothing the decode-time EWMA uses.
+                union_per_row_ewma =
+                    if union_per_row_ewma == 0.0 { per_row } else { union_per_row_ewma * 0.7 + per_row * 0.3 };
+            }
+        }
         let decode_us = t_decode.elapsed().as_micros() as u64;
         // EWMA of decode wall time (α = 0.3). Feeds the SLA-driven cap adjustment.
         ewma_decode_us = if ewma_decode_us == 0 {
@@ -1685,6 +1793,13 @@ fn run(
             } else {
                 usize::MAX
             };
+            // `COLI_SPEC_UNION_MAX`: the same ceiling expressed in *bytes* rather
+            // than rows. Rows are what the engine controls; union entries are
+            // what they cost, and the two are related by a per-row figure only
+            // this tick's measurement can supply. Conservative by construction —
+            // a real union is sublinear in rows, so a linear projection cuts
+            // sooner than strictly necessary.
+            let union_cap = union_depth_cap(knobs.spec_union_max, union_per_row_ewma, active.len());
             // The recurrent snapshot is charged per *sequence* while the
             // resident weight read a forward is made of is shared across the
             // batch, so past some width the copies cost more than the accepted
@@ -1709,8 +1824,16 @@ fn run(
             let mut head_batch: Vec<(usize, usize)> = Vec::new();
             for (i, s) in active.iter_mut().enumerate() {
                 let budget_left = s.max_new - s.produced.min(s.max_new);
-                let g = draft_depth_for(depth, may_draft || may_ngram, s.sampler.temp, budget_left, sampled)
+                let want = draft_depth_for(depth, may_draft || may_ngram, s.sampler.temp, budget_left, sampled)
                     .min(depth_cap);
+                let g = want.min(union_cap);
+                if g < want {
+                    // The byte budget bit, not the row cap or the token budget —
+                    // the number that says whether the ceiling is pruning waste
+                    // or starving depth, which is the same question
+                    // `spec_conf_stops` answers for the acceptance side.
+                    spec_union_stops += 1;
+                }
                 s.draft.clear();
                 s.draft_q.clear();
                 s.draft_from_ngram = false;
@@ -1860,6 +1983,7 @@ fn run(
             queue_wait_us,
             queue_admits,
             queue_wait_max_us,
+            spec_union_stops,
             energy_uj,
             rlm: model.rlm_stats(),
             kvstore: prefix.disk.as_ref().map(|d| (d.saved, d.loaded, d.tokens_restored)),
@@ -2984,6 +3108,110 @@ mod tests {
     }
 
     #[test]
+    fn union_depth_cap_prices_rows_and_never_stops_progress() {
+        // The engine-level test above can only prove the ceiling changes no
+        // token — on a resident fixture `ecache_stats` is `None`, so the gate is
+        // inert and every cap passes trivially. This is where the policy itself
+        // is exercised, the same way `draft_depth_for` is.
+        //
+        // "No opinion" cases: off, nothing decoding, nothing measured yet.
+        assert_eq!(union_depth_cap(0, 8.0, 4), usize::MAX, "cap 0 is off");
+        assert_eq!(union_depth_cap(1000, 8.0, 0), usize::MAX, "no sequences, no opinion");
+        assert_eq!(union_depth_cap(1000, 0.0, 4), usize::MAX, "no measurement yet, no opinion");
+        assert_eq!(union_depth_cap(1000, f64::NAN, 4), usize::MAX, "a NaN EWMA must not become a cap");
+
+        // 800 entries at 8 per row over 4 sequences = 25 rows each → depth 24
+        // (one of those rows is the committed token, which is not a draft).
+        assert_eq!(union_depth_cap(800, 8.0, 4), 24);
+        // Halving the budget: 12.5 rows each, truncated to 12 → depth 11. Rows
+        // are whole, so the answer is floor-then-subtract and not half of 24.
+        assert_eq!(union_depth_cap(400, 8.0, 4), 11);
+        // Doubling the batch cuts it again: the budget is per *tick*, so more
+        // sequences means each may speculate less. 6.25 rows → depth 5.
+        assert_eq!(union_depth_cap(400, 8.0, 8), 5);
+        // Costlier rows buy fewer of them — same 12.5 rows by another route.
+        assert_eq!(union_depth_cap(800, 16.0, 4), 11);
+
+        // The floor, which is the case that matters: a budget affording exactly
+        // one row per sequence permits depth 0 — speculation stops, decoding
+        // does not.
+        assert_eq!(union_depth_cap(32, 8.0, 4), 0, "one row each: no drafts, still decodes");
+        assert_eq!(union_depth_cap(8, 8.0, 4), 0, "a quarter of a row each must not underflow");
+        assert_eq!(union_depth_cap(1, 1e9, 64), 0, "an absurd ceiling still yields a legal depth");
+    }
+
+    #[test]
+    fn the_union_ceiling_is_depth_only_and_changes_no_token() -> Result<(), Error> {
+        // `COLI_SPEC_UNION_MAX` is the cost-side twin of `COLI_SPEC_CONF`, and
+        // it inherits the same hard promise: it may change how many rows are
+        // *proposed* and never which token is *emitted*. A ceiling that moved a
+        // token would be a correctness bug wearing a performance knob's name.
+        //
+        // Swept from "unbound" to "so tight nothing may draft", because the
+        // interesting failure is at the tight end — a cap that pushed depth
+        // negative, or that refused to decode at all rather than merely
+        // refusing to speculate.
+        let dir = tiny_dir("union_cap")?;
+        let prompts = [vec![1i32, 5, 9, 2], vec![3i32, 8, 4]];
+        let n = 10usize;
+
+        let run = |cap: u64| -> Result<(Vec<Vec<u32>>, EngineTelemetry), Error> {
+            let (handle, join) = spawn_spec(
+                Model::load(&dir)?,
+                8,
+                false,
+                SpecOverride { depth: Some(4), union_max: Some(cap), ..SpecOverride::default() },
+            )?;
+            let mut rxs = Vec::new();
+            for p in &prompts {
+                let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
+                handle.submit(EngineRequest {
+                    prompt: p.clone(),
+                    max_new: n,
+                    sampler: Sampler::new(0.0, 0.9, 1),
+                    out: tx,
+                    priority: Priority::Normal,
+                    class: peregrine_model::TokenClass::Prose,
+                })?;
+                rxs.push(rx);
+            }
+            let mut out = Vec::new();
+            for mut rx in rxs {
+                let mut toks = Vec::new();
+                while let Some(msg) = rx.blocking_recv() {
+                    match msg {
+                        EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Error(e) => return Err(Error::Format(e)),
+                    }
+                }
+                out.push(toks);
+            }
+            let t = handle.telemetry();
+            drop(handle);
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok((out, t))
+        };
+
+        // An independent decode, not the engine with the knob off.
+        let want: Vec<Vec<u32>> = {
+            let m = Model::load(&dir)?;
+            prompts.iter().map(|p| ref_decode(&m, p, n)).collect::<Result<_, Error>>()?
+        };
+        for cap in [0u64, 1, 8, 64, 100_000] {
+            let (got, t) = run(cap)?;
+            assert!(got.iter().all(|s| !s.is_empty()), "cap {cap}: nothing generated");
+            assert_eq!(got, want, "COLI_SPEC_UNION_MAX={cap} changed the served token stream");
+            if cap == 0 {
+                assert_eq!(t.spec_union_stops, 0, "the ceiling is off at 0 and must never bite");
+            }
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn queue_wait_is_measured_and_only_counts_admitted_requests() -> Result<(), Error> {
         // The gap this closes: `bench-serve-lanes.py` times whole requests and
         // `bench-serve-gaps.py` times inter-token gaps, and both start counting
@@ -3423,7 +3651,7 @@ mod tests {
             Ok(toks)
         };
 
-        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None, gdn: None, ngram: None };
+        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None, gdn: None, ngram: None, union_max: None };
         let got = run_engine(on)?;
         assert!(!got.is_empty(), "sampled speculation generated nothing");
         assert!(got.len() <= n, "served {} tokens for max_new {n}", got.len());
@@ -3437,7 +3665,7 @@ mod tests {
         // And the knob is a knob: with it off, the same request takes the
         // historical one-row path, whose stream differs precisely because the
         // RNG is consumed differently.
-        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None, gdn: None, ngram: None })?;
+        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None, gdn: None, ngram: None, union_max: None })?;
         assert!(!off.is_empty(), "the unspeculated path generated nothing");
         assert_ne!(
             off, got,
@@ -3486,10 +3714,10 @@ mod tests {
             Ok(toks)
         };
 
-        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0), gdn: None, ngram: None })?;
+        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0), gdn: None, ngram: None, union_max: None })?;
         assert!(!base.is_empty(), "the baseline generated nothing");
         for floor in [0.65f32, 0.999] {
-            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor), gdn: None, ngram: None })?;
+            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor), gdn: None, ngram: None, union_max: None })?;
             assert_eq!(gated, base, "a {floor} confidence floor changed a greedy stream");
         }
         std::fs::remove_dir_all(&dir)?;

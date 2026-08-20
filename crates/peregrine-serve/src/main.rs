@@ -593,6 +593,9 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
             "accepted": t.spec_accepted,
             // Drafts the COLI_SPEC_CONF floor cut short (0 with the floor off).
             "conf_stops": t.spec_conf_stops,
+            // Drafts the COLI_SPEC_UNION_MAX byte ceiling cut short. conf_stops
+            // vs union_stops says which term of (1+accepted)/union_growth binds.
+            "union_stops": t.spec_union_stops,
             "accept_rate": if t.spec_proposed > 0 {
                 t.spec_accepted as f64 / t.spec_proposed as f64
             } else { 0.0 },

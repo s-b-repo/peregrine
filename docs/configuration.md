@@ -439,6 +439,7 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_SPEC_GDN` | off | allow speculation on a **recurrent** (Qwen3.5-hybrid) arch — [note](#coli_spec_gdn) |
 | `COLI_SPEC_GDN_MAX_B` | 0 | batch width above which `COLI_SPEC_GDN` stops drafting; `0` = uncapped |
 | `COLI_DRAFT_NGRAM` | 0 | prompt-lookup drafting: match suffixes up to this length — [note](#coli_draft_ngram) |
+| `COLI_SPEC_UNION_MAX` | 0 | ceiling on a tick's projected routed-expert union, in expert-read requests — [note](#coli_spec_union_max) |
 | `X-Peregrine-Priority` | (HTTP header) | `high`/`1`/`true` → drained ahead of normal-priority requests |
 
 ### `COLI_FUSE_PREFILL`
@@ -623,6 +624,50 @@ source with an expensive one produces a number that decides nothing. Output is
 unaffected — `accept_run` still decides by argmax identity, asserted by
 `prompt_lookup_drafts_do_not_change_the_served_token_stream` and, on a headless
 checkpoint, `prompt_lookup_speculates_without_an_mtp_head`.
+
+
+### `COLI_SPEC_UNION_MAX`
+
+The **cost-side** twin of [`COLI_SPEC_CONF`](#coli_spec_conf). Default **off**.
+
+Speculation's economics on the streaming track is one fraction:
+
+```
+speedup = (1 + accepted) / union_growth
+```
+
+`COLI_SPEC_CONF` prunes drafts by expected **acceptance** — the numerator — and
+that alone inverted the `COLI_DRAFT=4` regression into +37 %. Nothing pruned
+them by expected **cost**, which is the term the measured 2.63× union growth at
+γ=4 actually lives in. This is that knob: a ceiling on the routed-expert union
+entries a single tick may cost.
+
+The projection is deliberately **conservative**. Expected entries are
+`rows × (entries per row)`, where the per-row figure is an EWMA of what recent
+ticks actually cost (`ecache` hits + misses is exactly the union entries the
+warm tier resolved). A real union is *sublinear* in rows — that sublinearity is
+the whole batching win — so a linear projection overestimates and the ceiling
+cuts sooner than strictly necessary. For a budget that is the safe direction,
+and it is written down here rather than rediscovered from a disappointing sweep.
+
+A ceiling may stop **speculation** and never stops **progress**: a budget too
+small for even one row per sequence still yields depth 0, not a refusal to
+decode. Depth-only, exactly like the confidence floor, so a greedy stream is
+bit-identical whatever the setting — swept and asserted by
+`the_union_ceiling_is_depth_only_and_changes_no_token`, with the arithmetic
+itself pinned separately in `union_depth_cap_prices_rows_and_never_stops_progress`
+because on a resident fixture the gate is inert and an engine test alone would
+pass without exercising it.
+
+Inert on a resident model, where `ecache_stats` is `None` because no expert is
+ever read. `/metrics` reports `spec.union_stops` beside `spec.conf_stops`:
+together they say which term of the fraction is actually limiting a run.
+
+**Unset by default and deliberately untuned.** The number that should set it is
+`decode.tokens_emitted` against `ecache`, measured on the real container.
+Picking a ceiling before that measurement exists would be tuning against a
+quantity nobody has measured, which is the failure
+[`measurement.md`](measurement.md) opens with.
 
 ### `COLI_KV_DTYPE`
 
