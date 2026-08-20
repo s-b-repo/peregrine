@@ -367,6 +367,22 @@ pub struct Plan {
     /// `HeatTable`), so `keep_last_layers=6` on GLM-5.2 keeps layers 73–78
     /// including the experts that draft every speculative token.
     pub keep_last_layers: usize,
+    /// Precision for the **MTP head's** own expert pool (layer index
+    /// `n_layers`), independent of everything else. `None` = no override.
+    ///
+    /// That layer is the one int8 rung left in a GLM-5.2 container —
+    /// 37,748,736 bytes per expert against 18,874,368 at int4 — and it is read
+    /// once per *draft step*, at `s_n = 1`, with no batch-union amortization.
+    /// Halving it halves the draft path's bytes.
+    ///
+    /// **It needs no flip-rate gate, which is unique on this ladder.** Every
+    /// other precision change here alters served tokens and has to be measured
+    /// against `FLIP_MAX`. A draft is accepted only where it equals the verify
+    /// forward's own argmax, so a coarser draft head can move the acceptance
+    /// rate and cannot move a token. The gate is still worth running — as an
+    /// *assertion* that it reads 0.000, which is what proves the override
+    /// landed on the head layer and nowhere else.
+    pub mtp_target: Option<Target>,
     /// Importance-weighted rounding (`--calib`). int3-g64 only; applies where
     /// the tensor's input width matches the layer's stats vector — gate/up
     /// (input = hidden) yes, down (input = moe_inter) no, dense layers no.
@@ -383,6 +399,7 @@ impl Default for Plan {
             shard_bytes: 5_000_000_000,
             down: DownPolicy::Same,
             keep_last_layers: 0,
+            mtp_target: None,
             calib: None,
         }
     }
@@ -413,6 +430,9 @@ fn params_fingerprint(plan: &Plan) -> String {
     // existed still match their recorded spelling and remain resumable.
     if plan.down != DownPolicy::Same {
         s.push_str(&format!(" down={}", plan.down.label()));
+    }
+    if let Some(t) = plan.mtp_target {
+        s.push_str(&format!(" mtp_target={}", t.label()));
     }
     if plan.keep_last_layers > 0 {
         s.push_str(&format!(" keep_last_layers={}", plan.keep_last_layers));
@@ -681,6 +701,9 @@ pub fn requantize(indir: &Path, outdir: &Path, plan: &Plan) -> Result<Report, Er
     if plan.down != DownPolicy::Same {
         scheme.push_str(&format!(" down={}", plan.down.label()));
     }
+    if let Some(t) = plan.mtp_target {
+        scheme.push_str(&format!(" mtp_target={}", t.label()));
+    }
     if plan.keep_last_layers > 0 {
         scheme.push_str(&format!(" keep_last_layers={}", plan.keep_last_layers));
     }
@@ -889,6 +912,9 @@ fn check_writable(plan: &Plan, cfg: &Cfg) -> Result<(), Error> {
 /// will eventually repeat that failure.
 ///
 /// Precedence, most specific first:
+/// 0. `mtp_target` — the MTP head's expert pool, named explicitly, beats a
+///    window that merely happens to cover it. It also beats `down`, because an
+///    override aimed at one layer is a statement about that whole layer.
 /// 1. `keep_last_layers` — the tail of the stack passes through untouched. The
 ///    slot count is `n_layers + 1` because the MTP head sits at layer index
 ///    `n_layers` and routes a full set of experts (the `HeatTable` convention);
@@ -898,6 +924,13 @@ fn check_writable(plan: &Plan, cfg: &Cfg) -> Result<(), Error> {
 ///    recipe: see [`DownPolicy`]).
 /// 3. The heat tier, then the uniform target — unchanged historical behavior.
 fn plan_target(plan: &Plan, name: &str, cfg: &Cfg) -> Option<Target> {
+    if let Some(t) = plan.mtp_target {
+        if let Some((layer, _)) = expert_coords(name) {
+            if layer == cfg.n_layers as usize {
+                return Some(t);
+            }
+        }
+    }
     if plan.keep_last_layers > 0 {
         if let Some((layer, _)) = expert_coords(name) {
             let slots = cfg.n_layers as usize + 1;
@@ -1184,6 +1217,57 @@ mod tests {
         assert_eq!(predicted.tensors_requantized, actual.tensors_requantized, "requantized count");
         assert_eq!(predicted.bytes_in, actual.bytes_in, "input bytes");
         assert_eq!(predicted.bytes_out, actual.bytes_out, "predicted output bytes must be exact");
+        std::fs::remove_dir_all(&dir)?;
+        std::fs::remove_dir_all(&out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mtp_target_hits_the_head_layer_and_beats_the_keep_window() -> Result<(), Error> {
+        // The MTP head's expert pool is the one int8 rung left in a GLM-5.2
+        // container, it is read once per *draft step* at `s_n = 1` with no
+        // batch-union amortization, and — alone on this ladder — recoding it
+        // needs no flip gate, because a draft survives only where it equals the
+        // verify pass's own argmax.
+        //
+        // So it gets an override, and the override has to be *specific*: a
+        // `--keep-last-layers` window that happens to cover the head must not
+        // silently win, or the flag would look applied and do nothing.
+        let (dir, out) = fixture_dirs("mtptarget")?;
+        peregrine_model::testkit::build_tiny_model(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+        let head = cfg.n_layers as usize;
+        let name = |l: usize| format!("model.layers.{l}.mlp.experts.0.gate_proj.weight");
+
+        // Head layer takes the override; an ordinary expert layer does not.
+        let plan = Plan { target: Target::Int4, mtp_target: Some(Target::Int2), ..Plan::default() };
+        assert_eq!(plan_target(&plan, &name(head), &cfg), Some(Target::Int2), "the head layer takes --mtp-target");
+        assert_eq!(plan_target(&plan, &name(1), &cfg), Some(Target::Int4), "an ordinary layer keeps --target");
+
+        // …even when the keep window covers it, and even under --down keep,
+        // both of which would otherwise claim that layer.
+        let covered =
+            Plan { keep_last_layers: 2, down: DownPolicy::Keep, mtp_target: Some(Target::Int2), ..plan.clone() };
+        assert_eq!(
+            plan_target(&covered, &name(head), &cfg),
+            Some(Target::Int2),
+            "an override naming one layer must beat a window that merely covers it"
+        );
+        let down = format!("model.layers.{head}.mlp.experts.0.down_proj.weight");
+        assert_eq!(plan_target(&covered, &down, &cfg), Some(Target::Int2), "the override covers all three projections");
+        // Without the override the window still wins, as it always did.
+        let windowed = Plan { keep_last_layers: 2, mtp_target: None, ..plan.clone() };
+        assert_eq!(plan_target(&windowed, &name(head), &cfg), None, "no override: the keep window is unchanged");
+
+        // And it actually converts: the head layer shrinks, layer 1 does not.
+        let rep = requantize(&dir, &out, &Plan { target: Target::Int4, mtp_target: Some(Target::Int2), ..Plan::default() })?;
+        assert!(rep.tensors_requantized > 0);
+        let (src, dst) = (SafeTensors::open(&dir)?, SafeTensors::open(&out)?);
+        let sz = |st: &SafeTensors, n: &str| st.uncompressed_nbytes(n).unwrap_or(0).max(0) as usize;
+        assert!(
+            sz(&dst, &name(head)) < sz(&src, &name(head)),
+            "the head layer's experts must actually shrink under --mtp-target int2"
+        );
         std::fs::remove_dir_all(&dir)?;
         std::fs::remove_dir_all(&out)?;
         Ok(())

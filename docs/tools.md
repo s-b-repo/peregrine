@@ -93,7 +93,29 @@ peregrine-requantize <indir> <outdir> [options]
   --tier-hot-frac <f>  heat-tiered: keep this fraction of each layer's experts
                        (by routing heat) at --tier-hot, the rest at --target
   --tier-hot <scheme>  precision for the hot fraction      (default int4)
+  --mtp-target <scheme>  precision for the MTP head's own expert pool
 ```
+
+### `--mtp-target`: the one rung on this ladder with no quality gate
+
+The MTP head is a sparse MoE layer with its **own** expert pool, at layer index
+`n_layers`, and in a GLM-5.2 container it is the last **int8** rung:
+**37,748,736 bytes per expert against 18,874,368 at int4**. It is also read in
+the worst possible regime — once per *draft step*, at `s_n = 1`, so unlike the
+main stack it gets no batch-union amortization at all. At topk=8 that is roughly
+300 MB of SSD per draft step.
+
+`--mtp-target int4` halves it, and **needs no flip-rate gate**, which nothing
+else on this ladder can say. A draft is accepted only where it equals the
+verify forward's own argmax, so a coarser draft head can change the *acceptance
+rate* and cannot change a served token. Run `peregrine flip-rate` anyway — as an
+assertion that it reads **0.000**, which is what proves the override landed on
+the head layer and nowhere else.
+
+It is deliberately more specific than the other selectors: it beats both
+`--keep-last-layers` (whose window counts `n_layers + 1` slots and therefore
+covers the head) and `--down`, because a flag naming one layer is a statement
+about that whole layer. Without it, both behave exactly as before.
 
 **Always `--dry-run` first** — it reads only headers and tells you what the run
 will cost in space:

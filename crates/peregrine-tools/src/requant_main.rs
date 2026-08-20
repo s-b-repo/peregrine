@@ -36,6 +36,15 @@ fn usage() -> i32 {
          \x20                      (byte-identical pass-through), or its own scheme.\n\
          \x20                      The evidenced low-bit recipes quantize gate/up harder\n\
          \x20                      than down — down feeds the residual stream directly\n\
+         \x20 --mtp-target <scheme> precision for the MTP head's own expert pool\n\
+         \x20                      (layer n_layers). That layer is int8 in a GLM-5.2\n\
+         \x20                      container -- 2x a normal expert's bytes -- and is\n\
+         \x20                      read once per DRAFT STEP with no batch-union\n\
+         \x20                      amortization. Needs no flip gate: a draft is kept\n\
+         \x20                      only where it equals the verify pass's own argmax,\n\
+         \x20                      so a coarser head moves the acceptance rate and\n\
+         \x20                      cannot move a served token. Beats --keep-last-layers\n\
+         \x20                      and --down for that layer.\n\
          \x20 --keep-last-layers N pass the last N expert layer indices through\n\
          \x20                      untouched (the MTP head row counts as one) — the\n\
          \x20                      hybrid hedge for the layers closest to the logits\n\
@@ -101,6 +110,16 @@ fn main() -> std::process::ExitCode {
                     Some(d) => plan.down = d,
                     None => {
                         eprintln!("peregrine-requantize: --down needs keep | same | a scheme (e.g. int4)");
+                        return std::process::ExitCode::from(2);
+                    }
+                }
+            }
+            "--mtp-target" => {
+                i += 1;
+                match args.get(i).and_then(|s| Target::parse(s)) {
+                    Some(t) => plan.mtp_target = Some(t),
+                    None => {
+                        eprintln!("peregrine-requantize: unknown --mtp-target (int8|int4|int4-g<N>|int3-g64|int2-g64|int2)");
                         return std::process::ExitCode::from(2);
                     }
                 }
