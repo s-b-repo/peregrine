@@ -191,3 +191,49 @@ order of magnitude, so `min`/`p95` carry information the mean destroys.
 [Validation runbook](validation-runbook.md) · [Benchmarks](benchmarks.md) ·
 [Performance tuning](performance-tuning.md) · [Tools](tools.md) ·
 [The concurrent 3-lane scheduler](concurrent-scheduler.md)
+
+## The byte ledger — 11.3 GB/token is not one number
+
+`COLI_UNION_STATS=1` now prints a `[ledger]` block at shutdown decomposing the
+figure this project quotes into the numbers it is actually made of. Measured on
+the real GLM-5.2 int4 container, 15 tokens across B=1 and B=4:
+
+| column | GB/token | |
+|---|---:|---|
+| **requested** | **11.349** | `Σ keff` — the arithmetic figure |
+| **unique (union)** | 7.188 | 36.7 % removed by the batch union |
+| cache-served | — | 3.9 % of unique |
+| **from disk** | **6.905** | what the drive actually moved |
+| prefetch waste | — | 12.8 % of disk traffic |
+
+**The arithmetic figure is confirmed and it is not the disk traffic.** 11.349
+GB/token matches what this repo has always quoted; the drive moved **6.905
+GB/token**, 39 % less. Quoting the top row as if it were the bottom one
+overstates disk traffic by 1.64×, and this documentation did exactly that.
+
+### How the columns are defined, and why the denominators differ
+
+- **requested** is routed selections × per-expert bytes. It double-counts every
+  expert that more than one row in a batch selected.
+- **unique** is the batch union: at B>1 one read serves every row that chose it.
+  This is the byte identity underneath the batching claim, which had only ever
+  been published as a throughput ratio.
+- **prefetch waste** is a share of **disk traffic**, not of `requested`. The
+  latter is ~1.6× larger and would report 7.8 % where the truth is 12.8 %. The
+  flattering denominator is the wrong one.
+- **re-read after eviction** prints `NOT MEASURED`. Distinguishing a re-read
+  from a first read needs per-slab eviction history the warm cache does not
+  retain, and those bytes sit inside `from disk` unlabelled. Named rather than
+  folded in silently — a missing column that looks present is worse than one
+  that is labelled absent.
+
+### The rule the report enforces
+
+Every saving printed is a **byte** figure, and the block refuses to present one
+without naming the gate that has to qualify it. The precedent travels with it:
+`COLI_ROUTE_MIN_SHARE` cut 12.5 % of reads and cost **27.9 %** of top-1
+predictions. A byte saving with no quality figure beside it is not a result.
+
+Proposed by `cwahq` (2026-08-21), who argued the ledger should precede the
+factorization work. It should have: `peregrine-basisfit` prices against the
+*requested* denominator, which this table shows overcounts by 1.58×.

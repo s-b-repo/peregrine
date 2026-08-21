@@ -34,6 +34,10 @@ path = "src/prune_main.rs"
 name = "peregrine-skipbound"
 path = "src/skipbound_main.rs"
 
+[[bin]]
+name = "peregrine-basisfit"
+path = "src/basis_main.rs"
+
 # Streaming client for peregrine-serve: prints the completion live and times it.
 # Deliberately here rather than in peregrine-serve — it must be runnable without
 # building the engine, and it takes no dependency the crate does not already have

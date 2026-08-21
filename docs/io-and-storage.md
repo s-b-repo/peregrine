@@ -240,3 +240,88 @@ to io_uring submission, aligned-buffer allocation, and the OS-interface
 helpers (`madvise`, `sched_setaffinity`/`mbind`, `perf_event_open`). The
 [bad-patterns audit](BAD_PATTERNS.md) reports any `unsafe` outside the
 expected crates.
+
+## Per-read latency distribution (`COLI_IO_LATENCY`)
+
+Every other I/O figure on this page is a mean or a steady-state aggregate. None
+of them can answer *"what is p99 for one token, and how much of it is page-fault
+handling rather than device time"* — and **a mean is exactly the statistic an
+SSD garbage-collection tail survives**. Periodic multi-hundred-millisecond
+stalls move a mean by a few percent while dominating the tail, and `IoTuner`
+smooths that signal by design.
+
+`peregrine-io/src/latency.rs` is therefore a **histogram, not another EWMA**:
+log-scale, four sub-buckets per octave, 0 µs–16 s, sampled **per completion** in
+`Reactor::read_many` (a wave mean would average away the single slow read being
+hunted), plus a `RUSAGE_THREAD` minor/major fault delta over the same window.
+Per-ring histograms are merged at shutdown, because a per-ring p99 answers "how
+slow was ring 2" when the question is "how slow was a read".
+
+### Reading it honestly
+
+- The tail figure is **p99/p50**. The first version used p99/mean and was wrong
+  in the only case that matters: one large outlier drags the mean above p99, so
+  a fat tail reads as flat.
+- `max/p50` is reported beside it. **p99 cannot resolve fewer than `count/100`
+  stalls** — one stall in a hundred reads reports flat, correctly — so a window
+  where p99 is flat and `max` is not prints "rare stalls p99 cannot resolve at
+  this sample count", never "no tail".
+- Undersampled quantiles print `n/a(20<100)`. A p99 from twenty samples is the
+  slowest of twenty wearing the name.
+- **Submit→complete is not device service time.** It includes queueing behind
+  the ring's depth cap and io-wq scheduling. The report says so rather than
+  letting a fat tail read as a statement about the drive.
+
+### Measured on the real GLM-5.2 container, 2026-08-21
+
+2400 expert reads, B=1, cold:
+
+```
+[latency] expert-read: n=2400 mean=61745.9us p50=40959us p90=114687us
+                       p99=262143us p99.9=3381313us max=3381313us
+[latency] expert-read: minor-faults=0 (0.00/read) major-faults=0
+                       tail(p99/p50)=6.4x worst(max/p50)=82.6x
+[latency] p99 is flat but the slowest read is >=10x the median: rare stalls
+          p99 cannot resolve at this sample count.
+```
+
+**There is a fat tail, and p99 alone would have missed it.** The p99/p50 ratio is
+6.4× — under the 10× threshold, i.e. "flat". The slowest read is **3.38 seconds
+against a 41 ms median, 82.6×**. That is exactly the case the `max/p50` column
+exists for, and the reason the report distinguishes "no tail" from "rare stalls
+this window cannot resolve". A ratio-on-p99-alone instrument would have printed
+reassurance.
+
+**The host/device split is unambiguous here: zero.** `minor-faults=0`,
+`major-faults=0` over 2400 reads, so essentially none of that latency is
+page-fault handling — it is queueing plus device time. This answers directly a
+question that had been put to this project and could not previously be answered.
+
+Note what it does *not* settle: submit→complete includes queueing behind the
+ring's depth cap, so a 3.38 s outlier is not yet proof the drive stalled. The
+next step is an `iobench` arm at fixed queue depth to separate the two.
+
+## Device geometry and layout alignment (`peregrine align-cost`)
+
+The engine aligns O_DIRECT reads to 4096 (`slab::ALIGN`) because the *syscall*
+requires it. That is not the granularity the **drive** serves at: NVMe parts
+commonly advertise a 128 KB optimal transfer. An expert is read through six
+regions, so a region whose start is arbitrary pays a straddled unit at each end,
+six times per expert per routing.
+
+`peregrine-io/src/geometry.rs` probes `optimal_io_size` from sysfs and models
+what aligning region starts would cost and save. **The constant is probed, not
+chosen** — an unprobeable device reports `ASSUMED` rather than quoting the
+fallback as a measurement.
+
+Note what this is *not* about. The idea arrived as "remap tensors to 2 MB
+hugepages at the filesystem layer", which targets TLB pressure — and TLB
+pressure is not in this read path, because **nothing `mmap`s the checkpoint**.
+Reads go through io_uring or `pread` into owned buffers. What a straddled read
+costs is **queue depth**: it becomes two device operations, and the second is
+what stalls the pipeline.
+
+Measured expectation on real expert shapes: a ~3 MB region spans ~23 units, so
+starting mid-unit costs about **4 % more units for about 0.5 % more disk**. Small
+but real — and a unit count is not a latency, so the writer stays untouched
+until `iobench` confirms it on the real shards with a cold cache.

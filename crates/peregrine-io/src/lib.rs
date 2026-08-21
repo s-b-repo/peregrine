@@ -27,7 +27,9 @@ pub fn note_advisory_err(op: &str, err: &dyn std::fmt::Display) {
     }
 }
 
+pub mod geometry;
 pub mod cache;
+pub mod latency;
 pub mod mem;
 pub mod perf;
 pub mod ring;
@@ -40,14 +42,14 @@ pub mod warmcache;
 pub use cache::ExpertCache;
 pub use mem::{
     advise_dontneed, advise_dontneed_slice, advise_hugepages, advise_hugepages_slice,
-    bind_local_if_enabled, current_numa_node, hugepage_disabled, mbind_to_node,
+    bind_local_if_enabled, current_numa_node, hugepage_disabled, mbind_to_node, page_size,
     numa_pin_enabled, pin_current_thread, wire_resident, Wired,
 };
 pub use perf::PerfCounter;
 pub use sensors::{energy_uj, max_temp_c, EnergyMeter};
 pub use ring::{
-    pread_many, pread_many_threaded, probe_direct, read_file, OwnedReadReq, Reactor, ReadReq,
-    RegionDone,
+    fadvise_many, pread_many, pread_many_threaded, probe_direct, read_file, FADV_DONTNEED,
+    FADV_WILLNEED, OwnedReadReq, Reactor, ReadReq, RegionDone,
 };
 pub use slab::{align_down, align_up, AlignedBuf, Bytes, SlabHandle, SlabPool, ALIGN};
 pub use tier::{decay, lfru_score, pick_lfru, pick_swap, Swap};

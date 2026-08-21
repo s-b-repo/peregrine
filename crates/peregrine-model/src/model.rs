@@ -376,6 +376,11 @@ pub struct Model {
     /// Cheap: four atomics bumped once per forward, not per layer.
     lane_totals: Arc<crate::lane::LaneTimingsAccum>,
     lane_forwards: std::sync::atomic::AtomicU64,
+    /// Rows pushed through `forward_step`, i.e. tokens the engine actually
+    /// processed. The byte ledger's denominator: without it, per-token figures
+    /// would have to be derived from union call counts, which conflates a
+    /// batched step (one call, B tokens) with a single-sequence one.
+    rows_forwarded: std::sync::atomic::AtomicU64,
     /// Adaptive io_uring worker-cap tuner. Consumes per-forward `io_us` from
     /// [`Self::publish_lane_timings`] and — when `COLI_IO_TUNE` is on — applies
     /// the recommended `(bounded, unbounded)` cap to every reactor between
@@ -1556,8 +1561,18 @@ fn router_lookahead_batch() -> bool {
 
 /// The arms the predictor scoreboard compares, in the order the forward loop stashes
 /// them. See [`predict_eval_init`].
-const PREDICT_EVAL_ARMS: [&str; 4] =
-    ["router-lookahead", "router-lookahead-2", "predictor", "prev-token"];
+const PREDICT_EVAL_ARMS: [&str; 5] = [
+    "router-lookahead",
+    "router-lookahead-2",
+    "predictor",
+    "prev-token",
+    // The control. Not optional, and last so the real arms keep their indices:
+    // a scoreboard that can be run without its own null is one whose recall
+    // figures have an unmeasured floor, and every arm above it is one someone
+    // believed in — so "always reports fine" and "works" look identical without
+    // this. See `predeval::CONTROL_ARM`.
+    crate::predeval::CONTROL_ARM,
+];
 
 /// Build the predictor scoreboard when `COLI_PREDICT_EVAL=1`
 /// (`COLI_PREDICT_EVAL_N` candidates per arm, default: the model's top-k, so recall
@@ -1647,7 +1662,7 @@ fn prefetch_tuner_init() -> Option<PrefetchTuner> {
 ///
 /// **Deliberately a second gate, not folded into `COLI_PERF_COUNTERS`.** The
 /// counter is a measurement; this is a control loop driven by it, and the two
-/// deserve separate consent. `todo.md` §10 argues the case against ever wiring
+/// deserve separate consent. `docs/todo.md` §10 argues the case against ever wiring
 /// this — "what a miss rate *should* change is unmeasured, and wiring a governor
 /// to an unvalidated signal is how a knob becomes load-bearing by accident" —
 /// while the shortlist carries "hardware-counter-driven scheduler feedback" as an
@@ -2361,9 +2376,21 @@ fn score_and_stash(sc: &ScoreCtx, li: usize, x: &[f32], deep: &mut [Vec<i32>]) {
     }
     let mut ev = eval.lock();
     ev.score(li, &actual);
+    // Varies per scored layer, so the control is a different draw at every
+    // layer and every token — but derived, not random, so a rerun reproduces it.
+    let seed = ev.scored();
     if predict_next {
         // Arm order must match `PREDICT_EVAL_ARMS`.
-        ev.stash(next, vec![lookahead, lookahead2, statistical, prev]);
+        // Arm order must match `PREDICT_EVAL_ARMS`; the control is generated
+        // here rather than by a predictor because its whole point is that no
+        // predictor produced it.
+        let control = crate::predeval::control_candidates(
+            width,
+            cfg.n_experts.max(0) as usize,
+            next,
+            seed,
+        );
+        ev.stash(next, vec![lookahead, lookahead2, statistical, prev, control]);
     }
 }
 
@@ -2388,6 +2415,118 @@ impl Model {
     /// scoreboard is on and something has actually been scored — an evaluation with
     /// no evidence reports nothing rather than a row of zeroes that reads like a
     /// result.
+    /// Merged per-read latency distribution across every streaming ring
+    /// (`COLI_IO_LATENCY=1`), or `None` when sampling is off.
+    ///
+    /// Merged rather than reported per ring: a read is served by whichever ring
+    /// claimed it, so a per-ring p99 answers "how slow was ring 2" when the
+    /// question is "how slow was a read". The fault counters are summed the
+    /// same way — each ring runs on its own thread, and `RUSAGE_THREAD` is
+    /// exactly the right granularity to add up.
+    pub fn io_latency_report(&self) -> Option<String> {
+        let mut hist = peregrine_io::latency::Histogram::new();
+        let mut faults = peregrine_io::latency::Faults::default();
+        let mut any = false;
+        for r in &self.io_reactors {
+            let r = r.lock();
+            if let Some(l) = r.latency() {
+                any = true;
+                hist.merge(&l.hist);
+                let f = l.faults();
+                faults.minor += f.minor;
+                faults.major += f.major;
+            }
+        }
+        if !any {
+            return None;
+        }
+        // Sampling was on and collected nothing. That is a *defect report*, not
+        // a flat distribution — the first version fell through to the verdict
+        // below and printed "no fat tail in this window" from zero samples,
+        // which is precisely the zero-that-reads-as-a-measurement this repo
+        // keeps catching. It happened because the histogram was wired only into
+        // the wave lane while the engine streams through the owned-completion
+        // lane, so a real run reported no samples beside 7593 disk reads.
+        if hist.count() == 0 {
+            return Some(
+                "[latency] expert-read: NO SAMPLES — sampling was enabled but no completion was \
+                 recorded. This is not a flat distribution; it means no read reached an \
+                 instrumented path in this run.\n"
+                    .to_string(),
+            );
+        }
+        let mut s = hist.report("expert-read");
+        s.push_str(&format!(
+            "[latency] expert-read: minor-faults={} ({:.2}/read) major-faults={} \
+             tail(p99/p50)={:.1}x worst(max/p50)={:.1}x\n",
+            faults.minor,
+            if hist.count() > 0 { faults.minor as f64 / hist.count() as f64 } else { 0.0 },
+            faults.major,
+            hist.tail_ratio(),
+            hist.max_ratio(),
+        ));
+        s.push_str(match (hist.tail_ratio() >= 10.0, hist.max_ratio() >= 10.0) {
+            (true, _) => {
+                "[latency] p99 is >=10x the median: the typical read does not describe this \
+                 workload. submit->complete includes queueing behind the ring depth cap, so this \
+                 is not yet evidence about the device.\n"
+            }
+            (false, true) => {
+                "[latency] p99 is flat but the slowest read is >=10x the median: rare stalls p99 \
+                 cannot resolve at this sample count.\n"
+            }
+            (false, false) => "[latency] no fat tail in this window: p99 and max both within 10x of the median.\n",
+        });
+        Some(s)
+    }
+
+    /// Rows this model has forwarded — the byte ledger's per-token denominator.
+    pub fn rows_forwarded(&self) -> u64 {
+        self.rows_forwarded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Assemble the byte ledger from this model's live counters.
+    ///
+    /// `None` when union stats are off (`COLI_UNION_STATS`), because without
+    /// the union column the ledger's headline saving — the one the whole
+    /// continuous-batching claim rests on — would be missing, and a ledger
+    /// with a hole in it invites exactly the reading it exists to prevent.
+    pub fn byte_ledger(&self) -> Option<crate::ledger::Ledger> {
+        let (selections, distinct, _calls) = crate::router::union_stats_snapshot()?;
+        // Probe the container rather than assuming: a tiered checkpoint has
+        // experts of different sizes and the conversion stops being exact.
+        let first_sparse = self.cfg.first_dense.max(0) as usize;
+        let bytes_per_expert = self.expert_bytes_on_disk(first_sparse, 0).unwrap_or(0);
+        let uniform = self
+            .expert_bytes_on_disk(first_sparse, 1)
+            .is_none_or(|b| b == bytes_per_expert);
+        let (hits, misses, wasted) = match self.ecache.as_ref() {
+            Some(c) => {
+                let c = c.lock();
+                (c.hits, c.total_misses(), c.prefetch_wasted)
+            }
+            None => (0, 0, 0),
+        };
+        Some(
+            crate::ledger::LedgerInput {
+                selections,
+                distinct,
+                cache_hits: hits,
+                cache_misses: misses,
+                prefetch_wasted: wasted,
+                bytes_per_expert,
+                uniform_expert_size: uniform,
+            }
+            .build(),
+        )
+    }
+
+    /// The scoreboard's verdict about its own ability to discriminate — the
+    /// best real arm against the control arm. See [`crate::predeval::CONTROL_ARM`].
+    pub fn predict_eval_separation(&self) -> Option<crate::predeval::Separation> {
+        self.predict_eval.as_ref()?.lock().separation()
+    }
+
     pub fn predict_eval_report(&self) -> Option<(Vec<crate::predeval::ArmReport>, u64)> {
         let ev = self.predict_eval.as_ref()?.lock();
         let report = ev.report();
@@ -3210,7 +3349,7 @@ impl Model {
         // the process (prefetch lanes, the SafeTensors loader) keep plain rings
         // — each SQPOLL ring costs a polling kthread, worth it only on the
         // per-token critical path, and only when measured to win.
-        let io_reactors: Vec<Mutex<Reactor>> = if stream_experts {
+        let io_reactors: Vec<Mutex<Reactor>> = if stream_experts && crate::concurrent::engine_needs_rings() {
             let n = io_rings();
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
@@ -3245,18 +3384,34 @@ impl Model {
         } else {
             Vec::new()
         };
+        // The ring path prints `[io] rings=...` above. Say something equivalent
+        // when there are no rings, so a host running the fallback engine is
+        // never left guessing which one it got — a silent degrade that halves
+        // throughput is worse than a loud one.
+        if stream_experts && io_reactors.is_empty() {
+            eprintln!("peregrine: [io] rings=0 engine=pread (no io_uring) threads={}", default_workers());
+        }
         let workers = default_workers();
         // O_DIRECT streaming (opt-in via `COLI_DIRECT`): bypass the page cache for
         // the 0.6%-reuse expert reads. Only when streaming AND the shards actually
         // opened O_DIRECT fds. Size each reactor's aligned slab pool to the largest
         // expert region (Strategy A: 2 buffers in flight ≈ 2×19 MB).
         let want_direct = force_direct.unwrap_or_else(direct_enabled) && stream_experts;
-        let direct = want_direct && st.has_any_direct();
+        // O_DIRECT needs block-aligned buffers, which only the ring path has; the
+        // pread engine would take `EINVAL` on every read. Report the reason
+        // rather than the outcome, because "requested but unavailable" on a host
+        // whose disk is perfectly capable of O_DIRECT is a confusing thing to
+        // read in a log.
+        let direct = want_direct && st.has_any_direct() && crate::concurrent::engine_supports_direct();
         if want_direct {
-            eprintln!(
-                "peregrine: O_DIRECT streaming {}",
-                if direct { "enabled" } else { "requested but unavailable — buffered fallback" }
-            );
+            let why = if direct {
+                "enabled"
+            } else if !crate::concurrent::engine_supports_direct() {
+                "off — the pread engine has no aligned buffers; buffered fallback"
+            } else {
+                "requested but unavailable — buffered fallback"
+            };
+            eprintln!("peregrine: O_DIRECT streaming {why}");
         }
         if direct {
             let cap = max_expert_region_bytes(&st);
@@ -3303,10 +3458,21 @@ impl Model {
         // cache exists (streaming mode). `route_hist` is the predictor's state.
         let sweep = Arc::new(SweepClock::from_env());
         let (route_hist, prefetch) = match &ecache {
-            Some(cache) => (
-                Some(Mutex::new(RouteHistory::new(cfg.n_layers as usize, route_hist_depth()))),
-                Some(spawn_prefetch_pool(cache, &st, direct, prefetch_lanes(), &sweep)?),
-            ),
+            Some(cache) => {
+                // Prefetch is speculative warming and nothing else: every expert
+                // it loads is re-read correctly on a miss. So a pool that will
+                // not spawn costs throughput, never correctness — and making it
+                // fatal is what stopped this engine loading at all on a host
+                // with no io_uring, since each lane wants its own ring.
+                let pool = match spawn_prefetch_pool(cache, &st, direct, prefetch_lanes(), &sweep) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        peregrine_io::note_advisory_err("spawn prefetch pool (running without prefetch)", &e);
+                        None
+                    }
+                };
+                (Some(Mutex::new(RouteHistory::new(cfg.n_layers as usize, route_hist_depth()))), pool)
+            }
             None => (None, None),
         };
         // Optional GPU VRAM tier (opt-in via COLI_GPU): dequantize as many experts
@@ -3634,6 +3800,7 @@ impl Model {
             lane_timings: Arc::new(crate::lane::LaneTimingsAccum::new()),
             lane_totals: Arc::new(crate::lane::LaneTimingsAccum::new()),
             lane_forwards: std::sync::atomic::AtomicU64::new(0),
+            rows_forwarded: std::sync::atomic::AtomicU64::new(0),
             bubble: Mutex::new(crate::lane::BubbleTuner::new(0.3, 1.5, 3)),
             plan_optimizer: Mutex::new(crate::telemetry::PlanOptimizer::new()),
             last_telemetry: Mutex::new(crate::telemetry::RuntimeTelemetry::default()),
@@ -5506,6 +5673,8 @@ impl Model {
     /// Run `tokens` through all layers and return logits `[S, vocab]`.
     pub fn forward_step(&mut self, tokens: &[i32], pos_base: usize) -> Result<Vec<f32>, Error> {
         let s_n = tokens.len();
+        self.rows_forwarded
+            .fetch_add(s_n as u64, std::sync::atomic::Ordering::Relaxed);
         let d = self.cfg.hidden as usize;
         let eps = self.cfg.eps;
         let x = self.forward_hidden(tokens, pos_base)?;
@@ -5734,6 +5903,12 @@ impl Model {
         histories: Option<&[&Mutex<RouteHistory>]>,
     ) -> Result<Vec<f32>, Error> {
         let s_n = tokens.len();
+        // Counted here as well as in `forward_step`: the batched path is the
+        // one `bench` and the server use, and a denominator that only saw the
+        // single-sequence path reported the ledger "over 0 tokens" on exactly
+        // the runs it exists for.
+        self.rows_forwarded
+            .fetch_add(s_n as u64, std::sync::atomic::Ordering::Relaxed);
         if seqs.len() != s_n || pos_of.len() != s_n {
             return Err(Error::Format(format!(
                 "forward_step_batched: {s_n} tokens but {} seqs / {} positions",
@@ -7423,6 +7598,56 @@ mod tests {
         };
         assert_eq!(got, want, "affinity/fusion ordering must not change tokens");
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Streaming must work on a host with **no io_uring at all**: an older
+    /// kernel, `kernel.io_uring_disabled=2`, or a container whose seccomp
+    /// profile blocks `io_uring_setup`. Before this, the engine treated that as
+    /// fatal — `load_streaming` built one ring per lane with `?` — even though
+    /// the `pread` engine beside it needs no ring whatsoever.
+    ///
+    /// `COLI_IO_ENGINE=pread` now takes exactly that path: `engine_needs_rings()`
+    /// is false, so **zero** reactors are constructed and the lane runs with
+    /// `ring: None`. That makes the no-io_uring path reachable on a box that has
+    /// io_uring, which is the only way it gets tested here.
+    ///
+    /// Re-execs the test binary because `io_engine()` resolves into a `OnceLock`
+    /// that whichever test ran first has already latched; the engine genuinely
+    /// cannot be switched in-process.
+    #[test]
+    fn streaming_runs_with_zero_rings() -> Result<(), peregrine_core::Error> {
+        const MARKER: &str = "PEREGRINE_ZERO_RING_CHILD";
+        if std::env::var(MARKER).is_ok() {
+            let dir = tmp_model_dir("zeroring")?;
+            let toks: Vec<i32> = (0..40).map(|k| (k * 5 + 2) % 32).collect();
+            let mut resident = Model::load_streaming(&dir, false)?;
+            let mut streamed = Model::load_streaming(&dir, true)?;
+            // The whole point: same logits with no ring as with one.
+            assert_eq!(
+                resident.forward_step(&toks, 0)?,
+                streamed.forward_step(&toks, 0)?,
+                "the ring-free streaming lane must produce identical logits"
+            );
+            std::fs::remove_dir_all(&dir)?;
+            return Ok(());
+        }
+        let exe = std::env::current_exe()?;
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "model::tests::streaming_runs_with_zero_rings", "--nocapture", "--test-threads=1"])
+            .env(MARKER, "1")
+            .env("COLI_IO_ENGINE", "pread")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "child failed.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        // Prove it really ran ringless rather than quietly taking the ring path:
+        // the boot line is the only evidence that survives into the parent, and
+        // a knob whose effect no output can confirm is a knob that silently dies.
+        assert!(
+            stderr.contains("rings=0 engine=pread"),
+            "expected the zero-ring boot line.\n--- stderr ---\n{stderr}"
+        );
         Ok(())
     }
 
@@ -9574,6 +9799,22 @@ mod tests {
         // the structural advantage over both history-based arms, and it shows up on
         // the very first decode step of a cold process.
         assert_eq!(arms[0].silent, 0, "the router look-ahead always has an answer");
+        // The control arm reaches the real forward path, not just the unit
+        // tests in `predeval`. A control that only exists in the module that
+        // defines it proves nothing about the scoreboard the engine runs.
+        let ctrl = arms
+            .iter()
+            .find(|a| a.name == crate::predeval::CONTROL_ARM)
+            .ok_or_else(|| Error::Format("the control arm must be scored end to end".into()))?;
+        assert_eq!(ctrl.silent, 0, "uniform noise always has an answer — silence would mean it is not wired");
+        assert!(ctrl.asked > 0, "the control must be asked on every scored layer");
+        // And the scoreboard can state its own verdict from a real decode.
+        let sep = m
+            .predict_eval_separation()
+            .ok_or_else(|| Error::Format("separation needs the control arm".into()))?;
+        assert!(sep.best_name != crate::predeval::CONTROL_ARM, "the control cannot be its own baseline");
+        assert!(sep.control >= 0.0 && sep.best_real >= 0.0);
+        assert!(!sep.verdict().is_empty());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

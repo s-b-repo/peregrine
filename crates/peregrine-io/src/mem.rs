@@ -52,12 +52,46 @@ pub unsafe fn advise_hugepages(ptr: *mut u8, len: usize) -> bool {
 /// is 0 when there is no full page inside the range (which is when the caller
 /// should skip the advice entirely).
 #[cfg(target_os = "linux")]
+/// The kernel's page size, read once from `sysconf(_SC_PAGESIZE)`.
+///
+/// Hard-coding 4096 is right on x86_64 and wrong on plenty of Linux boxes this
+/// engine is meant to run on: aarch64 kernels are commonly built with 16 KB or
+/// 64 KB pages (RHEL/CentOS aarch64 ships 64 KB) and ppc64le uses 64 KB. Two
+/// things then break *silently*, which is why this is a function and not a
+/// constant:
+///
+/// - `/proc/self/statm` is denominated in kernel pages, so an RSS guard that
+///   multiplies by 4096 understates by up to 16x and never fires.
+/// - `madvise` wants a page-aligned start, so a merely-4096-aligned one is
+///   rejected with `EINVAL` and the hugepage hint quietly stops working.
+pub fn page_size() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            // SAFETY: `sysconf` takes no pointers, mutates no caller state, and
+            // is documented thread-safe.
+            let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            // A negative return means the name is unsupported. A non-power-of-two
+            // would break the mask arithmetic in `narrow_to_full_pages`, so it is
+            // rejected rather than trusted: 4096 is wrong on such a kernel but it
+            // is *safely* wrong, where a bad mask is not.
+            let n = usize::try_from(n).unwrap_or(0);
+            if n > 0 && n.is_power_of_two() { n } else { 4096 }
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        4096
+    }
+}
+
 fn narrow_to_full_pages(ptr: *mut u8, len: usize) -> (usize, usize) {
-    const PAGE: usize = 4096;
+    let page = page_size();
     let start = ptr as usize;
     let end = start.saturating_add(len);
-    let aligned_start = (start + PAGE - 1) & !(PAGE - 1);
-    let aligned_end = end & !(PAGE - 1);
+    let aligned_start = (start + page - 1) & !(page - 1);
+    let aligned_end = end & !(page - 1);
     if aligned_start >= aligned_end {
         (aligned_start, 0)
     } else {
@@ -371,6 +405,44 @@ pub unsafe fn mbind_to_node(ptr: *mut u8, len: usize, node: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The mask arithmetic in `narrow_to_full_pages` is only correct for a
+    /// power-of-two page, and every caller of `page_size` assumes a sane floor.
+    /// Both are properties of the value, not of this box, so assert them rather
+    /// than asserting 4096 — which is exactly the constant this replaced.
+    #[test]
+    fn page_size_is_a_sane_power_of_two() {
+        let p = super::page_size();
+        assert!(p.is_power_of_two(), "page size {p} is not a power of two");
+        assert!(p >= 4096, "page size {p} below the 4 KB floor");
+        assert!(p <= 1 << 20, "page size {p} implausibly large");
+        assert_eq!(p, super::page_size(), "page_size must be stable across calls");
+    }
+
+    /// The narrowing must land on real page boundaries and stay *inside* the
+    /// caller's range. Widening backwards is the destructive case the function's
+    /// own comment warns about (MADV_DONTNEED on a neighbour's pages), so the
+    /// containment half of this matters more than the alignment half.
+    #[test]
+    fn narrowing_stays_inside_the_range_and_lands_on_page_boundaries() {
+        let page = super::page_size();
+        let mut buf = vec![0u8; page * 4];
+        let ptr = buf.as_mut_ptr();
+        let base = ptr as usize;
+        for &off in &[0usize, 1, 17, 4095] {
+            let len = page * 3;
+            // SAFETY: `off + len` stays within the 4-page allocation above.
+            let start = unsafe { ptr.add(off) };
+            let (b, n) = super::narrow_to_full_pages(start, len);
+            if n == 0 {
+                continue;
+            }
+            assert_eq!(b % page, 0, "start {b:#x} not page-aligned (off {off})");
+            assert_eq!(n % page, 0, "len {n} not a page multiple (off {off})");
+            assert!(b >= base + off, "narrowed start ran backwards (off {off})");
+            assert!(b + n <= base + off + len, "narrowed end ran past the range (off {off})");
+        }
+    }
+
 
     #[test]
     fn numa_primitives_are_inert_unless_the_knob_is_on() {

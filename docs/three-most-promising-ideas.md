@@ -38,6 +38,21 @@ Potentially enormous reduction in expert computation and I/O.
 - The flip-rate gate (`Model::prediction_flip_rate`) measures whether this changes
   outputs — the quality safety net already exists.
 
+### The runtime objection, and the proposed answer (`orionzion`, 2026-08-21)
+
+The criterion can only be evaluated **after** the ~18.9 MB read it exists to avoid, so as
+stated it is an offline pruning pass, not a scheduler change. The suggested way out is a
+**tiny resident per-expert surrogate** — a low-rank sketch, sized so every expert's surrogate
+stays resident at once — predicting *projected output novelty* against the already-selected
+span before the weights are issued.
+
+Two costs must be charged to the same budget or the result is not readable: the surrogates'
+own resident bytes, and the **false-negative** rate, which drops an expert that mattered and
+is therefore a flip-rate cost rather than a byte cost. The bar is set by prior art in this
+repo — `peregrine-skipbound` measured a weight-norm bound and found it added **0.12 points**
+over the gate weight alone, because `C_e` barely varies across similarly-trained experts. A
+surrogate has to beat **the gate**, not zero.
+
 ## 2. Cross-expert factorization
 
 Search for:
@@ -63,6 +78,51 @@ The int3-g64 failure (0.447 flip rate, data-free quantization) is NOT evidence
 against this — it used data-free rounding. Adaptive precision (see
 [token-equivalence-adaptive-precision.md](token-equivalence-adaptive-precision.md))
 uses a calibration signal, which is the standard approach that survived in llama.cpp.
+
+### How to measure it, and the control it needs (`orionzion`, 2026-08-21)
+
+**Weight-space reconstruction error is the wrong objective.** A basis can lower
+`‖W_i − (B + Δ_i)‖_F` while making `Δ_i` high-entropy and **hostile to the int4/block
+quantization the residual then has to survive** — the fit looks good and the container does
+not shrink. That is the failure mode that decides this idea, and Frobenius error cannot see it.
+
+Score it instead as **rate–distortion on activations**: fit the basis per layer, then measure
+the *residual bytes required to preserve downstream logits* under the existing flip-rate gate.
+Sweep **basis rank and residual quantization jointly** — they are not separable, since a rank
+that looks wasteful may buy a residual that quantizes far better. Report **bytes/token with the
+resident basis charged once**, read amplification, and flip rate, so the result is comparable to
+`--tier-hot-frac` and int2-g64 rather than living on its own scale.
+
+**The control: shuffled experts at equal rank.** If a learned grouping does not beat *random*
+groups at equal rank and equal residual precision, the basis is capturing **layer-wide
+structure** rather than cross-expert redundancy. The saving would still be real, but it would be
+attributable to one per-layer mean and no grouping search — and calling it cross-expert
+compression would be the same error as reporting a warm-cache hit rate as a routing statistic.
+Print both arms side by side.
+
+### Both of the above are now implemented — `peregrine-basisfit`
+
+```bash
+peregrine calib-capture <model-dir> calib.json 512 --text corpus.txt
+peregrine-basisfit <model-dir> --calib calib.json --rank 2 --groups 8 \
+    --residual int2-g64 --control
+```
+
+Fits the basis, quantizes the residual through the same producer and consumer
+the loader uses, scores the error weighted by calibrated per-channel `mean|x|`,
+and runs the shuffled control against **four** random partitions rather than
+one. Both arms default to the same precision one rung below the container, so
+streamed bytes are identical and the only variable is the basis; the resident
+basis is charged separately and never folded into the comparison.
+
+**The control needed four draws, not one.** Against a single shuffled partition
+the demo container reported its grouping as load-bearing at a 6.87 % margin;
+against the best of four it reads 2.56 % against a 4.63 % spread of the draws
+themselves — a negative. The floor is `max(15 %, spread)`, not a sign test.
+
+**What is still owed: the sweep on real GLM-5.2 weights.** The harness is
+validated on fixtures only, and a fixture cannot tell you whether *this*
+checkpoint's experts share anything.
 
 ## 3. Future-state computation
 

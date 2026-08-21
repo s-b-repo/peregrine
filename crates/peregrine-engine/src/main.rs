@@ -388,7 +388,7 @@ fn run() -> Result<(), Error> {
         // knobs worth gating this way latch once per process
         // (`route_min_share` is a `OnceLock`), so an exported var would set
         // both arms and the gate would compare the knob to itself: 0.000,
-        // indistinguishable from a lossless candidate. This is how todo.md's
+        // indistinguishable from a lossless candidate. This is how docs/todo.md's
         // "knob set on the candidate side, unset on the source, same container
         // both times" is actually run.
         Some("flip-rate") => {
@@ -632,6 +632,41 @@ fn run() -> Result<(), Error> {
             // so bracket it rather than trusting one cut.
             let ks = [100usize, 600, 2400];
             print!("{}", peregrine_tools::format_domain_separation(&chunks, &ks, 500, 0x5EED));
+            Ok(())
+        }
+        // `align-cost <model-dir>`: price aligning expert regions to the drive's
+        // own transfer unit, BEFORE any layout writer is touched. Padding region
+        // starts inflates the container, which is the quantity §13 exists to
+        // shrink, so the trade has to be sized rather than assumed — and the
+        // constant is probed from the device, not chosen from the host page
+        // size (nothing here `mmap`s the checkpoint, so TLB pressure is not in
+        // the read path; what a straddled read costs is queue depth).
+        Some("align-cost") => {
+            let dir = args
+                .get(2)
+                .ok_or_else(|| Error::Format("usage: peregrine align-cost <model-dir>".into()))?;
+            let path = std::path::Path::new(dir);
+            let st = peregrine_core::safetensors::SafeTensors::open(path)?;
+            let geo = peregrine_model::geometry::probe(path);
+            // Routed-expert tensors only: they are ~97 % of the bytes and the
+            // only ones read per token. Including the trunk would dilute the
+            // straddle share with weights that are read once at load.
+            let mut regions: Vec<(u64, u64)> = st
+                .tensors()
+                .iter()
+                .filter(|t| t.name.contains(".mlp.experts."))
+                .map(|t| (t.off, t.nbytes.max(0) as u64))
+                .collect();
+            if regions.is_empty() {
+                return Err(Error::Format(format!(
+                    "{}: no routed-expert tensors — nothing to align",
+                    path.display()
+                )));
+            }
+            // Layout order, which is what a rewriter would preserve.
+            regions.sort_by_key(|r| r.0);
+            let cost = peregrine_model::geometry::align_cost(&geo, &regions);
+            print!("{}", cost.verdict(&geo));
             Ok(())
         }
         Some("route-stats") => {
@@ -1150,6 +1185,17 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                                 by_rank.join(" ")
                             );
                         }
+                        // The scoreboard's verdict about ITSELF, printed last so
+                        // it is the line an operator leaves with. Every arm above
+                        // is one someone believed in, so "the instrument works"
+                        // and "the instrument always says fine" produce identical
+                        // output without a control to separate them.
+                        match model.predict_eval_separation() {
+                            Some(sep) => eprint!("{}", sep.verdict()),
+                            None => eprintln!(
+                                "[predict-eval] no control arm — the recall figures above have an                                  unmeasured floor and should not be quoted"
+                            ),
+                        }
                     }
                     // LLC misses on this thread (COLI_PERF_COUNTERS=1). Scoped
                     // deliberately: the counter follows one thread, so this is
@@ -1168,6 +1214,17 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
                     // predicts only ~1.26x. This line reads it off the live engine
                     // rather than deriving it. Silent unless asked.
                     report_union_stats();
+                    // The byte ledger: the same run's expert traffic split into
+                    // the columns "11.3 GB/token" is actually made of. Printed
+                    // after the union line because it consumes it — a sum
+                    // without its decomposition is how a saving in one column
+                    // gets reported as a saving overall.
+                    if let Some(l) = model.byte_ledger() {
+                        print!("{}", l.report(model.rows_forwarded()));
+                    }
+                    if let Some(l) = model.io_latency_report() {
+                        print!("{l}");
+                    }
                     let g = model.telemetry().gpu;
                     if g.calls > 0 {
                         match g.transfer_fraction() {
@@ -1447,6 +1504,19 @@ fn run_bench(batch_args: &[String]) -> Result<(), Error> {
     // to a specific B.
     report_gate_stats();
     report_union_stats();
+    // The byte ledger for the sweep. Same caveat as the union line above: the
+    // counters are process-wide cumulative, so a multi-B sweep blends them —
+    // one batch size per fresh process when the figure is meant to belong to a
+    // specific B.
+    if let Some(l) = model.byte_ledger() {
+        print!("{}", l.report(model.rows_forwarded()));
+    }
+    // Per-read latency distribution (COLI_IO_LATENCY=1). Printed here because a
+    // histogram collected and never surfaced is an inert knob — the exact
+    // failure this repo keeps catching in its own instrumentation.
+    if let Some(l) = model.io_latency_report() {
+        print!("{l}");
+    }
     Ok(())
 }
 

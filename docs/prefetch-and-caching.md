@@ -17,7 +17,7 @@ answered on previous tokens. The router look-ahead (`model.rs`,
 It costs one extra `E×D` matvec per layer against weights already resident
 (under 1 % of a decode step at K3 shapes) and needs no stored artifact, no
 warm-up and no format change. The router is kept at full precision by
-[contract](../todo.md), which is what makes the ranking trustworthy.
+[contract](todo.md), which is what makes the ranking trustworthy.
 
 **Why it is a different question from the one `predict.rs` answers.** The
 authoritative router at layer `L+1` sees `rmsnorm(x + attn_{L+1},
@@ -297,3 +297,32 @@ successful one, and is much easier to lose.
 | **Cache floor = one token's working set** | Was true, then stopped being the constraint — because the look-ahead only needs a record to survive from one *layer* to the next, not one *token* to the next. A cache far too small to hold a token's working set now runs within 10 % of one five times its size (WASTE §39) | A reason to re-measure `COLI_ECACHE_GB` sizing *after* enabling the look-ahead rather than before. The two interact |
 | **Speculative decoding under streaming** | Pays for deltafin (which streams the spine, so drafts amortize a per-token read peregrine also has) and is refused by WASTE (which keeps the trunk resident, so there is nothing to amortize) | peregrine streams experts but keeps the trunk resident — between the two. Our MTP path (`COLI_DRAFT`) is measured on its own terms; this says which of their conclusions is the relevant analogy, not what ours will be |
 | **`mlock`** | Does not raise the ceiling; removes variance. Wiring the *trunk* is what mattered, not the cache (WASTE §30–32) | Exactly what `COLI_MLOCK` does, and why it uses `MCL_CURRENT` rather than `MCL_FUTURE` |
+
+## The scoreboard's own control arm
+
+`COLI_PREDICT_EVAL` scores each predictor against the routing that actually
+happened, and it exists because a correctness-neutral predictor that has decayed
+to noise costs throughput silently. But until 2026-08-21 **it had never been
+shown to detect anything**: every arm it scored was one someone believed in, so
+a scoreboard that always printed "fine" would have produced identical output.
+
+It now always carries a fifth arm, `control/noise` — deterministic
+uniform-random expert ids at the same emission rate, seeded from `(layer,
+scored-layer count)` so a rerun reproduces it. **Not optional**, because a
+scoreboard that can be run without its own null is one whose recall figures have
+an unmeasured floor. Whatever the control scores is the floor that comes free
+from guessing (expectation `k/n` — small, but not zero, which is exactly why a
+raw recall figure misleads), and a real arm's number only means something as a
+margin over it.
+
+`PredictEval::separation()` reports the best real arm against it, and the engine
+prints that verdict **last** so it is the line an operator leaves with. If the
+best arm is within 2× of uniform noise, the report says its recall columns
+should not be quoted until it is known whether every predictor degraded or the
+scoreboard cannot discriminate at that width and sample count.
+
+Proposed by `miacollective` (2026-08-21). **The harder half is still open**:
+scoring against realized routing measures what a predictor *allowed*, never what
+it *prevented*, and those diverge exactly when the fallback is good by
+construction — which here it always is, since a wrong prefetch just re-streams
+identical bytes.

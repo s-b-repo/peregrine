@@ -22,6 +22,8 @@ pub mod concurrent;
 pub mod dsa;
 pub mod gpu;
 pub mod iotune;
+pub mod statefp;
+pub mod ledger;
 pub mod lane;
 pub mod learn;
 pub mod math;
@@ -84,7 +86,7 @@ pub use learn::{learn_mode, BanditScheduler, KnobArm, LearnMode, QAction, QSched
 pub use telemetry::{open_l3_miss_counter, PlanOptimizer, RuntimeTelemetry};
 pub use wmma_tune::{KernelShape, TileConfig, WmmaTuner};
 pub use workload::{classify_str, TokenClass};
-pub use predeval::{ArmReport, PredictEval};
+pub use predeval::{ArmReport, PredictEval, Separation, CONTROL_ARM};
 pub use predict::{phase_boost, Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 pub use rlm::{rlm_enabled, rlm_layers, rlm_margin, rlm_max_depth, RLMController};
 pub use mtp::speculative_sample;
@@ -98,6 +100,9 @@ pub use weight::{QtWeight, QuantFmt};
 /// Re-exported so the binaries can cap glibc malloc arenas at startup (drops the
 /// `MALLOC_ARENA_MAX=2` requirement). See [`peregrine_io::cap_malloc_arenas`].
 pub use peregrine_io::cap_malloc_arenas;
+/// Device I/O geometry, re-exported so the CLI can price layout alignment
+/// without the engine binary taking a direct edge on `peregrine-io`.
+pub use peregrine_io::geometry;
 
 /// One-line-per-fact description of the machine this process will run on:
 /// SIMD tier, CPU/NUMA topology, GPU backend status, and PCIe link per display

@@ -44,7 +44,7 @@ The full docs wiki lives in [**docs/**](docs/README.md):
   [roadmap & status](docs/roadmap.md) ·
   [peregrine vs colibrì (full study)](docs/peregrine-vs-colibri.md)
 
-[`DESIGN.md`](DESIGN.md) is the original design document; [`todo.md`](todo.md)
+[`DESIGN.md`](docs/DESIGN.md) is the original design document; [`todo.md`](docs/todo.md)
 is the audited per-item roadmap.
 
 ## Status
@@ -94,7 +94,7 @@ describes the host from inside a container; and a **bounded exact response memo*
 the serve layer. The borrowed *negative* results are recorded too, in
 [prefetch & caching](docs/prefetch-and-caching.md#borrowed-negative-results).
 
-See [`todo.md`](todo.md) for the audited roadmap (**~86% strict / ~89% weighted of
+See [`todo.md`](docs/todo.md) for the audited roadmap (**~86% strict / ~89% weighted of
 136 tracked items**).
 
 | Area | Crate(s) | Status | Validated by |
@@ -136,7 +136,7 @@ One item is open **by choice rather than by hardware**: CPU/GPU split GEMM. The
 plumbing is small, but the CPU half computes int4 and the GPU half f32, and a
 split point derived from wall-clock timings would make low-order output bits
 depend on machine timing — the same prompt giving different logits run to run.
-See [`todo.md`](todo.md).
+See [`todo.md`](docs/todo.md).
 
 ## Architecture
 
@@ -144,11 +144,13 @@ See [`todo.md`](todo.md).
 crates/
   peregrine-core     formats: Cfg, safetensors index (with zstd), QT quant detect, dtype, pack, compress
   peregrine-kernels  std::arch int8/int4 dots + matmuls (scalar ref + AVX2/AVX-VNNI)
-  peregrine-model    MLA attention, router, MoE, sampler, MTP, prefetch prediction, lane
+  peregrine-model    MLA attention, router, MoE, sampler, MTP, prefetch prediction,
+                     the byte ledger, tolerance-keyed state fingerprints, lane
                      telemetry + bubble tuner + lane balancer, IoTuner, PhaseTracker,
                      WmmaTuner, PlanOptimizer, the N-ring concurrent lane
                      (concurrent.rs), top-level Model
   peregrine-io       io_uring Reactor (registered files, O_DIRECT, fadvise, batched hint),
+                     per-read latency histogram + fault split, device geometry probe,
                      priority-weighted LRU cache, warm cache (Bloom + optional zstd),
                      mem hints (hugepages, NUMA pinning), topology probe, perf counters,
                      aligned slab pool
@@ -163,7 +165,9 @@ crates/
   peregrine-engine   binary `peregrine`: stdio serve protocol, demo, bench, automaton
   peregrine-serve    binary `peregrine-serve`: OpenAI HTTP server + continuous batching
                      (two-tier priority queue, adaptive batch cap, adaptive prefill window)
-  peregrine-tools    lib + binary `peregrine-layout-reorg`: offline expert re-layout
+  peregrine-tools    lib + binaries. `peregrine-basisfit`: cross-expert factorization
+                     priced as rate-distortion on activations, with a shuffled-grouping
+                     control. `peregrine-layout-reorg`: offline expert re-layout
                      (greedy / Louvain / spectral / Hilbert, --optimize 2-opt), tier
                      placement (tiers.json), physical checkpoint rewrite (--apply)
   peregrine-token    vendored gigatoken v0.10.0 BPE subset (MIT): SIMD pretokenizers,
@@ -173,7 +177,7 @@ cuda/                vendored CUDA kernels from colibrì (backend_cuda.cu / .h)
 
 Five independent layers of concurrency (all I/O on io_uring; N work-stealing rings;
 a data-parallel compute pool; an async GPU stream; prefill/decode interleaving in the
-server) are mapped in [`DESIGN.md`](DESIGN.md#concurrency--parallelism-map-where-the-threads-are).
+server) are mapped in [`DESIGN.md`](docs/DESIGN.md#concurrency--parallelism-map-where-the-threads-are).
 
 ## Build & test
 
@@ -254,6 +258,8 @@ token stream is unchanged. (Annotated reference with deep-dive links:
 | `COLI_REPLICATE_K` | 0 | Top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
 | `COLI_NUMA_PIN` | off | Pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
 | `COLI_PERF_COUNTERS` | off | LLC-miss counter on the decode thread; `[perf] llc-misses=N` at shutdown (that thread only) |
+| `COLI_IO_LATENCY` | off | Per-read submit→complete **histogram** (not an EWMA — a mean is what a GC tail survives) plus the thread's page-fault delta. Reports p99/p50 and max/p50, and names undersampled quantiles instead of printing them |
+| `COLI_UNION_STATS` | off | Batch-union sharing, and the **byte ledger**: `requested` / `unique after union` / `cache-served` / `from disk` / `prefetch waste`, with the flip-rate gate named beside every saving |
 | `COLI_DEBUG` | off | Surface advisory-operation failures (madvise/fadvise hints, NUMA pinning, route-stats persistence) on stderr |
 | `COLI_SHAPE_SPECIALIZE` | off | Per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
 | `COLI_GPU_F32_FRAC` | unset | Adaptive per-expert precision: hottest fraction of residents promoted to f32 (cuda) |
@@ -349,9 +355,49 @@ CPU-streaming decode):
 | Warm cache on a repeated forward | **3.58×** (100 % hit, 0 disk) | learned pin |
 | Warm-cache hit rate, sustained decode (10 GB cache) | 0.6 % (measured) | — |
 
-Both are **disk-bandwidth-bound** (600 experts ≈ 11 GB/token); colibrì is currently
+Both are **disk-bandwidth-bound**; colibrì is currently
 ~1.4× faster at raw *single-sequence* streaming (deeper io_uring queue), while
 peregrine adds a verified warm-cache/scheduler stack and memory safety.
+
+### Per-read latency has a tail p99 alone does not see — measured 2026-08-21
+
+`COLI_IO_LATENCY=1`, 2400 expert reads on the real container, B=1 cold:
+
+| | |
+|---|---:|
+| median | 41.0 ms |
+| p90 | 114.7 ms |
+| p99 | 262.1 ms |
+| **p99.9 / max** | **3.38 s** |
+| p99/p50 | 6.4× |
+| **max/p50** | **82.6×** |
+| minor / major page faults | **0 / 0** |
+
+p99/p50 is under 10× — "flat" by that measure. The slowest read is **82.6× the
+median**. The `max/p50` column is what catches it, and the report says "rare
+stalls p99 cannot resolve at this sample count" rather than "no tail". Zero page
+faults over 2400 reads, so none of this is host fault handling; it is queueing
+plus device time, and separating those needs a fixed-queue-depth arm.
+
+### 11.3 GB/token is not one number — measured 2026-08-21
+
+`COLI_UNION_STATS=1` prints a `[ledger]` block decomposing the figure this README
+has been quoting. On the real GLM-5.2 int4 container, 15 tokens over B=1 and B=4:
+
+| column | GB/token | |
+|---|---:|---|
+| **requested** | **11.349** | the arithmetic figure — routed selections × expert size |
+| unique (union) | 7.188 | 36.7 % removed by the batch union |
+| cache-served | — | 3.9 % of unique |
+| **from disk** | **6.905** | what the drive actually moved |
+| prefetch waste | — | 12.8 % of disk traffic |
+
+The arithmetic figure is confirmed. **The disk traffic is 39 % lower**, and this
+README previously used the two interchangeably — quoting `600 experts ≈ 11
+GB/token` in a sentence about disk bandwidth overstates it by 1.64×. The
+`from disk` row is the one an operator feels. One column, bytes re-read after a
+wrong eviction, prints `NOT MEASURED` rather than being folded in silently. See
+[docs/measurement.md](docs/measurement.md#the-byte-ledger--113-gbtoken-is-not-one-number).
 
 Continuous batching is where the concurrent design starts paying on this hardware:
 decoding B sequences together reads each routed expert **once per step and shares it
@@ -371,7 +417,7 @@ limitations.
 
 peregrine is a Rust spin-off of **colibrì** and ports its numerics and streaming
 model faithfully. The design rationale (the phased-vs-concurrent gap, the
-three-lane scheduler, milestones) is in [`DESIGN.md`](DESIGN.md).
+three-lane scheduler, milestones) is in [`DESIGN.md`](docs/DESIGN.md).
 
 - Upstream: [JustVugg/colibri](https://github.com/JustVugg/colibri) · fork:
   [s-b-repo/colibri](https://github.com/s-b-repo/colibri)

@@ -264,7 +264,7 @@ GLM-5.2 744B int4 model and the same box as
 which change *how* expert bytes are fetched. The work that followed this pass acts
 on *how many*: adaptive prefill chunking, the cross-request prefix cache, adaptive
 top-k (`COLI_ROUTE_MIN_SHARE`) and the int2 producer, tracked in
-[`todo.md`](../todo.md) §12–§13. None of them is measured below, and the finding
+[`todo.md`](todo.md) §12–§13. None of them is measured below, and the finding
 that motivated opening that axis is the one in the first TL;DR bullet.
 
 ### TL;DR
@@ -317,7 +317,7 @@ but nothing calls them outside tests and no code reads the variable — the
 streaming path always takes the plain read. So the `improved` arm was eight live
 knobs and one no-op. It does not change the conclusion (the bundle was already
 1.00×, with byte-identical disk reads), but the arm description would otherwise
-overstate what was exercised. Tracked in [`todo.md`](../todo.md) §4.
+overstate what was exercised. Tracked in [`todo.md`](todo.md) §4.
 
 ² **`COLI_DIRECT` was crippled, which this pass could not have known.**
 Discovered 2026-08-02: `Reactor::read_direct_aligned` — the call the streaming
@@ -860,3 +860,41 @@ above are all measurements of *per-row* containers. A future g128 gate must be
 compared against a per-row gate re-run on the same corpus and reference, never
 against these — the same class of mistake as reading a cross-engine rate
 against a same-engine bar.
+
+## Benchmark pass — 2026-08-21 (real GLM-5.2, with the byte ledger)
+
+`COLI_BENCH_STEPS=3`, one process, batch sweep `1 4 16`. Note the standing
+caveat: the union and ledger counters are **process-wide cumulative**, so a
+multi-B sweep blends them — use one batch size per fresh process when a figure
+is meant to belong to a specific B.
+
+| B | steps | tokens | seconds | agg tok/s | per-seq tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 3 | 3 | 45.03 | **0.067** | 0.0666 |
+| 4 | 3 | 12 | 90.93 | **0.132** | 0.0330 |
+| 16 | 3 | 48 | 241.47 | **0.199** | 0.0124 |
+
+B=1 at 0.067 tok/s is slightly above the 0.054 this repo has published. **B=16
+gives 3.0× aggregate over B=1**, not the 4.4× recorded from the earlier pass —
+these are 3-step runs from cold, so the cache never reaches the steady state the
+earlier figure was measured in, and the two are not directly comparable.
+
+### The ledger for the same sweep
+
+```
+[union] selections=37800 distinct=13622 calls=675 share=2.775x
+[ledger] requested         714.999 GB   11.349 GB/token
+[ledger] unique (union)    257.665 GB    4.090 GB/token   (64.0% saved by batch union)
+[ledger] cache-served        9.495 GB                     (3.7% of unique)
+[ledger] from disk         248.169 GB    3.939 GB/token
+[ledger] prefetch waste     18.764 GB                     (7.6% of disk traffic)
+```
+
+**The 11.349 GB/token arithmetic figure is confirmed**, and the batch union
+removes **64 %** of it across this sweep — a 2.775× expert-read sharing factor.
+Disk traffic is 3.939 GB/token blended. At B=1 alone the ledger reads
+`requested == from disk == 11.349`, which is the identity: with one row and a
+cold cache there is nothing to share and nothing to hit.
+
+This is the number `benchmarks.md` previously credited the batching gain to
+without ever printing it as bytes.

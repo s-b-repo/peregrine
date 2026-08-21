@@ -1,6 +1,6 @@
 //! Requantize an existing container to a different on-disk precision.
 //!
-//! `todo.md` §13's conclusion is that the remaining throughput lever is reading
+//! `docs/todo.md` §13's conclusion is that the remaining throughput lever is reading
 //! *fewer or smaller* experts: cross-token expert locality measures 0.6%, and
 //! nine adaptive I/O knobs together measured 1.004× with byte-identical disk
 //! reads. Two of that section's items — int2 expert storage and heat-tiered
@@ -39,7 +39,7 @@
 
 use peregrine_core::pack::{quant_i2, quant_i2_g64, quant_i3_g64, quant_i4, quant_i4_grouped, quant_i8, QtView};
 use peregrine_core::config::Cfg;
-use peregrine_core::qt::QtInfo;
+use peregrine_core::qt::{QtFmt, QtInfo};
 use peregrine_core::safetensors::SafeTensors;
 use peregrine_core::{Context, Error};
 use std::path::{Path, PathBuf};
@@ -115,7 +115,7 @@ impl Target {
         }
     }
 
-    fn quantize(&self, w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<f32>) {
+    pub fn quantize(&self, w: &[f32], o: usize, i: usize) -> (Vec<u8>, Vec<f32>) {
         match self {
             Target::Int8 => quant_i8(w, o, i),
             Target::Int4 => quant_i4(w, o, i),
@@ -124,6 +124,53 @@ impl Target {
             Target::Int2G64 => quant_i2_g64(w, o, i),
             Target::Int4Grouped(g) => quant_i4_grouped(w, o, i, *g),
         }
+    }
+
+    /// The container format this target writes, so a caller can build the
+    /// [`QtView`] that reads it back.
+    pub fn fmt(&self) -> QtFmt {
+        match self {
+            Target::Int8 => QtFmt::Int8,
+            Target::Int4 => QtFmt::Int4,
+            Target::Int2 => QtFmt::Int2,
+            Target::Int3G64 => QtFmt::Int3G64,
+            Target::Int2G64 => QtFmt::Int2G64,
+            Target::Int4Grouped(_) => QtFmt::Int4Grouped,
+        }
+    }
+
+    /// Group size the format's `.qs` is indexed by — `0` where scales are
+    /// per row, matching [`QtInfo::gs`]'s convention.
+    pub fn group_size(&self) -> usize {
+        match self {
+            Target::Int4Grouped(g) => *g,
+            Target::Int3G64 => peregrine_core::pack::I3_GROUP,
+            Target::Int2G64 => peregrine_core::pack::I2G_GROUP,
+            _ => 0,
+        }
+    }
+
+    /// Quantize and immediately dequantize — what the engine would actually
+    /// read back for a weight stored in this format.
+    ///
+    /// Exists for **measurement**, not conversion: a rate–distortion sweep has
+    /// to score the error a format introduces without writing a container per
+    /// point of the sweep. Round-tripping through the same `quant_*` producer
+    /// and the same [`QtView`] consumer the loader uses is the only way the
+    /// number transfers — an independently written "simulated" quantizer would
+    /// be measuring itself.
+    pub fn roundtrip(&self, w: &[f32], o: usize, i: usize) -> Vec<f32> {
+        let (q, scale) = self.quantize(w, o, i);
+        let view = QtView { fmt: self.fmt(), o, i, gs: self.group_size(), q: &q, scale: &scale };
+        let mut out = vec![0f32; o * i];
+        let mut row = vec![0f32; i];
+        for r in 0..o {
+            view.dequant_row_into(r, &mut row);
+            if let Some(dst) = out.get_mut(r * i..(r + 1) * i) {
+                dst.copy_from_slice(&row);
+            }
+        }
+        out
     }
 }
 
@@ -240,7 +287,7 @@ impl HeatTier {
 /// 2-bit containers) are *asymmetric*: gate/up take the harder quantization,
 /// down keeps more precision — down's output feeds the residual stream
 /// directly, where gate/up error is first laundered through the SwiGLU
-/// nonlinearity. Uniform int3-g64 here measured flip_rate 0.514 (todo.md §13);
+/// nonlinearity. Uniform int3-g64 here measured flip_rate 0.514 (docs/todo.md §13);
 /// this knob exists to test the asymmetric point on that ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownPolicy {

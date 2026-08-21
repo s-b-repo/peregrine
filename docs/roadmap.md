@@ -2,7 +2,7 @@
 
 # Roadmap & status
 
-The audited, per-item roadmap is [`todo.md`](../todo.md) — 137 tracked items
+The audited, per-item roadmap is [`todo.md`](todo.md) — 137 tracked items
 with file:line evidence, status verified against the codebase. This page is
 the summary.
 
@@ -16,7 +16,7 @@ the summary.
 Per-section: Prefetch **11/11** · GPU 9/10 · Caching **13/13** · I/O 10/11 ·
 Memory/NUMA **8/8** · Scheduling 16/18 · Disk-layout **10/10** · Workload
 **5/5** · Compilation **5/5** · Self-optimizing **10/10** · Multi-GPU 0/4 ·
-Attention/serving **7/7** · Workload-reduction **15/16**.
+Attention/serving **7/7** · Workload-reduction **15/19**.
 
 What remains open splits four ways, and only the first group is blocked here
 (the 2026-07-30 revision of this page said ten items needed hardware; five of

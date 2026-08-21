@@ -144,6 +144,33 @@ peregrine flip-rate ~/models/GLM-5.2 ~/models/GLM-5.2 \
   itself is pinned in both directions by `flip_rate_gate.rs`: zero flips against
   an identical container, non-zero against a deliberately lossy one.
 
+### `align-cost <model-dir>`
+
+Prices aligning the container's routed-expert regions to the **drive's own**
+transfer unit, before any layout writer is touched. Probes `optimal_io_size`
+from sysfs (resolving partitions to their parent device) and reports, over the
+container's real offsets: device units touched as laid out versus with every
+start on a boundary, and the padding bytes that would cost.
+
+```
+[align] 4680 regions, unit=128 KB (probed)
+[align] device units: 112320 now -> 108160 aligned (3.70% fewer)
+[align] padding: 68.60 MB (0.49% container inflation)
+[align] VERDICT: worth measuring for real. ...
+```
+
+**The constant is probed, not chosen.** An unprobeable device prints `ASSUMED`
+rather than quoting the 128 KB fallback as a measurement — the original form of
+this idea was "remap tensors to 2 MB hugepages", which targets TLB pressure, and
+TLB pressure is not in this engine's read path: nothing `mmap`s the checkpoint.
+What a straddled read costs is **queue depth**.
+
+Two things cut against acting on it and both are in the verdict: the O_DIRECT
+lane is already 4096-aligned, so any win lives above that; and the padding
+inflates the container, which is the quantity §13 exists to reduce. A unit count
+is not a latency — confirm with `iobench` on the real shards with a cold cache
+before touching the writer.
+
 ### `compile-plan <model-dir>`
 
 Pure file bundling, no model load: folds whatever artifacts exist

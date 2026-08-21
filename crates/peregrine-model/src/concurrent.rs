@@ -598,6 +598,49 @@ fn tplan(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<TPlan, Erro
     Ok(TPlan { w_fd, w_off, w_len, s_fd, s_off, s_len, w_fd_direct, s_fd_direct, fmt, o, i, gs: info.gs as usize })
 }
 
+/// The reactor a ring-backed engine requires.
+///
+/// `None` can only arrive here if the resolved engine disagrees with what
+/// `load_streaming` built rings for, so this is a clean error rather than an
+/// unwrap: the engine is env-resolved and a mismatch should name itself.
+fn need_ring(r: Option<&mut Reactor>) -> Result<&mut Reactor, Error> {
+    r.ok_or_else(|| {
+        Error::Format("a ring-backed io engine was selected but no io_uring ring was constructed".into())
+    })
+}
+
+/// Finish a short positioned read without assuming a ring exists.
+///
+/// A positioned read may return short on *either* engine, so the completion has
+/// to work on both. With a ring it reuses `read_exact`; without one it re-issues
+/// plain `pread` until the tail is filled, which is what makes the pread engine
+/// usable on a host that has no io_uring to fall back to.
+fn complete_short_read(r: Option<&mut Reactor>, fd: RawFd, off: u64, buf: &mut [u8]) -> Result<(), Error> {
+    if let Some(r) = r {
+        return r.read_exact(fd, off, buf).ctx(|| "io_uring short-read completion".to_string());
+    }
+    let total = buf.len();
+    let mut done = 0usize;
+    while done < total {
+        let mut req = [ReadReq { fd, offset: off + done as u64, buf: &mut buf[done..], tag: 0 }];
+        let res = peregrine_io::pread_many(&mut req);
+        let Some(&n) = res.first() else {
+            return Err(Error::Format("pread short-read completion returned no result".into()));
+        };
+        if n < 0 {
+            return Err(Error::Io(std::io::Error::from_raw_os_error((-n) as i32)));
+        }
+        if n == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "pread short-read completion hit EOF",
+            )));
+        }
+        done += n as usize;
+    }
+    Ok(())
+}
+
 /// Read a flat list of `(fd, offset, len)` regions and return one [`Bytes`] per
 /// region, in order. Two lanes, both byte-identical to the resident path:
 ///
@@ -610,9 +653,9 @@ fn tplan(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<TPlan, Erro
 ///   any short read is completed per region.
 /// - **pread** — `COLI_IO_ENGINE=pread`: N OS threads of blocking `pread`,
 ///   bypassing io_uring entirely. See [`io_engine`] for why this exists.
-fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) -> Result<Vec<Bytes>, Error> {
+fn read_regions(mut r: Option<&mut Reactor>, regions: &[(RawFd, u64, usize)], direct: bool) -> Result<Vec<Bytes>, Error> {
     if direct && io_engine() != IoEngine::Pread {
-        return r
+        return need_ring(r.as_deref_mut())?
             .read_direct_aligned(regions)
             .ctx(|| "io_uring O_DIRECT zero-copy expert read".to_string());
     }
@@ -660,6 +703,7 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
                 // is not fatal: fall back to the plain submit rather than lose
                 // the request, since this engine is a measurement option.
                 let want = reqs.iter().map(|q| q.buf.len()).max().unwrap_or(0);
+                let r = need_ring(r.as_deref_mut())?;
                 match ensure_fixed_buffers(r, want) {
                     Ok(()) => r.read_fixed_many(&mut reqs).ctx(|| "io_uring fixed-buffer expert read".to_string())?,
                     Err(e) => {
@@ -675,7 +719,9 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
                     }
                 }
             }
-            IoEngine::Uring => r.read_many(&mut reqs).ctx(|| "io_uring batched expert read".to_string())?,
+            IoEngine::Uring => need_ring(r.as_deref_mut())?
+                .read_many(&mut reqs)
+                .ctx(|| "io_uring batched expert read".to_string())?,
         };
         for (j, &n) in res.iter().enumerate() {
             if n < 0 {
@@ -685,8 +731,12 @@ fn read_regions(r: &mut Reactor, regions: &[(RawFd, u64, usize)], direct: bool) 
             let done = n as usize;
             if done < len {
                 let (fd, off, _) = regions[i];
-                r.read_exact(fd, off + (sub + done) as u64, &mut bufs[i][sub + done..sub + len])
-                    .ctx(|| "io_uring short-read completion".to_string())?;
+                complete_short_read(
+                    r.as_deref_mut(),
+                    fd,
+                    off + (sub + done) as u64,
+                    &mut bufs[i][sub + done..sub + len],
+                )?;
             }
         }
     }
@@ -746,6 +796,51 @@ fn ensure_fixed_buffers(r: &mut Reactor, want: usize) -> std::io::Result<()> {
 /// Setting both is not an error — `pread` simply wins, and `read_regions` says
 /// so at its branch — because the point of the knob is to compare engines, and
 /// silently honouring `COLI_DIRECT` here would compare something else.
+/// Can this kernel give us an io_uring at all?
+///
+/// Probed once, by building a minimal ring and dropping it. Three common Linux
+/// configurations say no and none of them are exotic: kernels older than 5.1,
+/// hosts hardened with `kernel.io_uring_disabled=2` (increasingly the default in
+/// security-conscious distros since the 2023 exploit run), and containers whose
+/// seccomp profile blocks `io_uring_setup` — Docker's default profile does.
+///
+/// The engine used to treat all three as fatal: `Reactor::new_streaming` failed
+/// and the model would not load, even though the `pread` engine beside it needs
+/// no ring whatsoever. Probing lets the default degrade instead of dying.
+fn uring_available() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match Reactor::new(1) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "peregrine: [io] io_uring unavailable ({e}); falling back to the pread engine. \
+                 Set COLI_IO_ENGINE=uring to make this fatal instead."
+            );
+            false
+        }
+    })
+}
+
+/// Does the resolved engine need io_uring rings built at load time?
+///
+/// `load_streaming` asks before constructing any, so the `pread` engine costs no
+/// ring — and, more importantly, cannot fail to load on a host that has none.
+pub(crate) fn engine_needs_rings() -> bool {
+    !matches!(io_engine(), IoEngine::Pread)
+}
+
+/// Can the resolved engine issue O_DIRECT reads?
+///
+/// O_DIRECT requires the buffer, offset and length to be block-aligned, and the
+/// only aligned buffers in this engine are the `Reactor`'s slab
+/// (`read_direct_aligned`). The `pread` path lands into plain heap `Vec`s, so
+/// handing it the O_DIRECT twin fd would fail every read with `EINVAL`. Kept as
+/// its own predicate rather than folded into [`engine_needs_rings`] because the
+/// two happen to agree today for different reasons.
+pub(crate) fn engine_supports_direct() -> bool {
+    !matches!(io_engine(), IoEngine::Pread)
+}
+
 fn io_engine() -> IoEngine {
     static V: std::sync::OnceLock<IoEngine> = std::sync::OnceLock::new();
     *V.get_or_init(|| match std::env::var("COLI_IO_ENGINE").as_deref() {
@@ -754,9 +849,17 @@ fn io_engine() -> IoEngine {
         // Historical spelling: `COLI_REGBUF=1` was documented and benchmarked
         // for a year while being read by no code at all. Honour it here so the
         // knob finally means something, rather than deleting it and silently
-        // changing what a published benchmark arm did.
+        // changing what a published benchmark arm did. It stays *ahead* of the
+        // explicit `uring` arm below because that is the precedence it already
+        // had, and reordering it would change a published arm just as silently.
         _ if matches!(std::env::var("COLI_REGBUF").as_deref(), Ok("1") | Ok("true")) => IoEngine::RegBuf,
-        _ => IoEngine::Uring,
+        // An *explicit* `uring` stays strict — no probe, and a missing ring stays
+        // fatal. A benchmark arm that asked for io_uring must fail loudly rather
+        // than quietly become a pread arm and report its number under the wrong
+        // name. Only the unset default falls back.
+        Ok("uring") => IoEngine::Uring,
+        _ if uring_available() => IoEngine::Uring,
+        _ => IoEngine::Pread,
     })
 }
 
@@ -812,7 +915,7 @@ fn pack_slab(six: Vec<Bytes>) -> Result<peregrine_io::ExpertSlab, Error> {
 /// a **single batched submit**. Zero-copy on the O_DIRECT lane (see [`read_regions`]);
 /// byte-identical to six `read_exact`s either way, so the streamed output stays
 /// bit-identical to the resident path.
-fn read_expert(r: &mut Reactor, e: &ExpertEntry, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
+fn read_expert(r: Option<&mut Reactor>, e: &ExpertEntry, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
     let regions = expert_regions(e, direct);
     pack_slab_from(e, read_regions(r, &regions, direct)?)
 }
@@ -921,7 +1024,7 @@ fn fadvise_drop_enabled() -> bool {
 /// completed per region, so the returned bytes are identical to [`read_expert`] —
 /// the streamed output stays bit-identical to the resident path. Slabs are returned
 /// in `plans` order.
-fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Result<Vec<peregrine_io::ExpertSlab>, Error> {
+fn read_experts_batched(mut r: Option<&mut Reactor>, plans: &[&EPlan], direct: bool) -> Result<Vec<peregrine_io::ExpertSlab>, Error> {
     let n = plans.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -944,14 +1047,20 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
     // one extra syscall and can overlap NVMe queue depth with our submit ceremony.
     // Purely advisory — bytes returned are identical either way.
     if !direct && fadvise_main_enabled() {
-        // Soft-failure only: readahead failures never affect correctness.
-        if let Err(e) = r.fadvise_willneed_many(&regions) {
+        // Soft-failure only: readahead failures never affect correctness. With a
+        // ring the hints ride one submit; without one they are plain
+        // `posix_fadvise` calls, which is the same advice at a syscall each.
+        let hinted = match r.as_deref_mut() {
+            Some(r) => r.fadvise_willneed_many(&regions),
+            None => peregrine_io::fadvise_many(&regions, peregrine_io::FADV_WILLNEED),
+        };
+        if let Err(e) = hinted {
             peregrine_io::note_advisory_err("fadvise willneed (batched readahead)", &e);
         }
     }
     // one deep submit for all 6·n regions (buffered) or per-region aligned DMA
     // (direct, zero-copy); bytes come back in region order, six per expert.
-    let bytes = match read_regions(r, &regions, direct) {
+    let bytes = match read_regions(r.as_deref_mut(), &regions, direct) {
         Ok(b) => b,
         Err(e) if io_recovery_enabled() && !direct => {
             // Retry ladder: on a batched-read failure, re-issue each region as
@@ -960,7 +1069,7 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
             // the fast path has already failed. O_DIRECT is skipped because the
             // recovery path uses buffered reads.
             eprintln!("[io-recovery] batched read failed ({e}); retrying regions individually");
-            read_regions_with_retry(r, &regions)?
+            read_regions_with_retry(r.as_deref_mut(), &regions)?
         }
         Err(e) => return Err(e),
     };
@@ -974,10 +1083,23 @@ fn read_experts_batched(r: &mut Reactor, plans: &[&EPlan], direct: bool) -> Resu
     // useful when the warm cache is off / cold — a hit would otherwise re-read the
     // pages we just dropped. Purely advisory, so a soft failure is harmless.
     if !direct && fadvise_drop_enabled() {
-        for &(fd, off, len) in &regions {
-            if let Err(e) = r.fadvise_dontneed(fd, off, len) {
-                peregrine_io::note_advisory_err("fadvise dontneed (page-cache release)", &e);
+        let dropped = match r {
+            Some(r) => {
+                let mut first_err = None;
+                for &(fd, off, len) in &regions {
+                    if let Err(e) = r.fadvise_dontneed(fd, off, len) {
+                        first_err.get_or_insert(e);
+                    }
+                }
+                match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
             }
+            None => peregrine_io::fadvise_many(&regions, peregrine_io::FADV_DONTNEED),
+        };
+        if let Err(e) = dropped {
+            peregrine_io::note_advisory_err("fadvise dontneed (page-cache release)", &e);
         }
     }
     Ok(slabs)
@@ -1009,12 +1131,19 @@ fn cache_admit_min_heat() -> u32 {
 /// `Reactor::read_exact_retry` (transient EIO/EAGAIN/EINTR retried with linear
 /// backoff). Slower than the batched submit, but preserves the byte-identical
 /// contract when the batched path suffers a transient failure.
-fn read_regions_with_retry(r: &mut Reactor, regions: &[(RawFd, u64, usize)]) -> Result<Vec<Bytes>, Error> {
+fn read_regions_with_retry(mut r: Option<&mut Reactor>, regions: &[(RawFd, u64, usize)]) -> Result<Vec<Bytes>, Error> {
     let mut out: Vec<Bytes> = Vec::with_capacity(regions.len());
     for &(fd, off, len) in regions {
         let mut buf = vec![0u8; len];
-        r.read_exact_retry(fd, off, &mut buf, 3)
-            .ctx(|| format!("io_uring per-region retry @ off={off} len={len}"))?;
+        match r.as_deref_mut() {
+            Some(r) => r
+                .read_exact_retry(fd, off, &mut buf, 3)
+                .ctx(|| format!("io_uring per-region retry @ off={off} len={len}"))?,
+            // `complete_short_read` already re-issues until the buffer is full,
+            // so on the pread path the loop *is* the retry.
+            None => complete_short_read(None, fd, off, &mut buf)
+                .ctx(|| format!("pread per-region retry @ off={off} len={len}"))?,
+        }
         out.push(Bytes::from(buf));
     }
     Ok(out)
@@ -1138,7 +1267,7 @@ fn stream_experts_completion(
                     continue;
                 }
                 let regs = expert_regions(&p.entry, false);
-                let bytes = read_regions_with_retry(r, &regs)?;
+                let bytes = read_regions_with_retry(Some(r), &regs)?;
                 let slab = pack_slab_from(&p.entry, bytes)?;
                 forwarded[k] = true;
                 if !forward(k, slab) {
@@ -1315,7 +1444,13 @@ pub fn moe_forward_concurrent(
     let cache_hint = &cache_hint;
     let use_direct = ctx.direct; // O_DIRECT streaming (page-cache-bypassing); Copy bool
     let reactors = ctx.reactors;
-    if reactors.is_empty() {
+    // No rings is a legitimate configuration, not a broken one: the `pread`
+    // engine reads through plain positioned reads and `load_streaming` therefore
+    // builds no reactors for it. That is what lets this engine run on a host
+    // with no io_uring at all — an older kernel, `kernel.io_uring_disabled=2`,
+    // or a container whose seccomp profile blocks `io_uring_setup`. It is still
+    // fatal for the engines that genuinely need a ring.
+    if reactors.is_empty() && engine_needs_rings() {
         return Err(Error::Format("streaming mode without io_uring reactors".into()));
     }
     let hidden = cfg.hidden as usize;
@@ -1492,7 +1627,10 @@ pub fn moe_forward_concurrent(
         claim_groups.iter().map(|_| AtomicUsize::new(0)).collect();
     // Home-ring assignment and per-group claim sizes, hoisted out of the thread
     // scope: scoped spawns may only borrow what outlives the scope itself.
-    let n_rings = reactors.len().max(1);
+    // Lanes, not rings: with `pread` there are no reactors, but the claim
+    // geometry (home groups, steal order, batch sizes) must stay identical, so
+    // the lane count falls back to what `io_rings()` would have built.
+    let n_rings = if reactors.is_empty() { crate::model::io_rings() } else { reactors.len() }.max(1);
     let group_sizes: Vec<usize> = claim_groups.iter().map(|g| g.len()).collect();
     let homes = ring_homes(&group_sizes, n_rings);
     let rings_in: Vec<usize> = (0..claim_groups.len())
@@ -1562,7 +1700,10 @@ pub fn moe_forward_concurrent(
         // duty 24% -> 90%. Under device-pure groups the same arithmetic runs
         // per group against the rings homed on it, for the same reason (the
         // group/home/batch tables are hoisted above the scope for lifetimes).
-        for (ri, ring) in reactors.iter().enumerate() {
+        // One thread per ring, or — when the engine needs none — one per lane the
+        // rings would have occupied, so both engines steal work the same way.
+        for ri in 0..n_rings {
+            let ring = reactors.get(ri);
             let job_tx = job_tx.clone();
             let res_tx = res_tx.clone();
             let home = homes.get(ri).copied().unwrap_or(0);
@@ -1649,6 +1790,11 @@ pub fn moe_forward_concurrent(
                         // locks rings only between forwards. `add_io` spans the
                         // reap loop here, so io duty includes the per-expert
                         // forwarding — accepted semantics shift vs the wave.
+                        // `completion` implies `IoEngine::Uring`, which implies
+                        // `load_streaming` built rings, so this lane has one.
+                        // Ending the lane rather than unwrapping keeps the
+                        // impossible case harmless instead of loud.
+                        let Some(ring) = ring else { break };
                         let mut r = ring.lock(); // this ring, uncontended (owned by this thread)
                         if !use_direct && fadvise_main_enabled() {
                             // Hint the NEXT claim window of this group while
@@ -1692,8 +1838,11 @@ pub fn moe_forward_concurrent(
                     // whole claim; admission still runs on the worker
                     // (`Job::Stream`), unified with the completion lane.
                     let slabs = {
-                        let mut r = ring.lock(); // this ring, uncontended (owned by this thread)
-                        read_experts_batched(&mut r, &chunk_plans, use_direct)
+                        // `None` on the pread engine: `read_experts_batched`
+                        // needs no ring there, and holding one would only
+                        // serialize lanes that are not sharing anything.
+                        let mut guard = ring.map(|rg| rg.lock());
+                        read_experts_batched(guard.as_deref_mut(), &chunk_plans, use_direct)
                     };
                     if let Some(t) = timings_ref {
                         t.add_io(t_io.elapsed().as_micros() as u64);
@@ -2162,7 +2311,7 @@ pub fn prefetch_item(
 /// (one batched submit) — the exact bytes the I/O lane would read, so a later hit
 /// is bit-identical.
 pub fn prefetch_read(reactor: &mut Reactor, item: &PrefetchItem, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
-    read_expert(reactor, &item.entry, direct)
+    read_expert(Some(reactor), &item.entry, direct)
 }
 
 /// One expert queued for a page-cache *hint* (`fadvise(WILLNEED)`): its six
@@ -2451,6 +2600,60 @@ mod tests {
         Ok(())
     }
 
+    /// The whole point of the pread engine is that it needs no ring. Prove the
+    /// ring-free path returns the same bytes, because a host with no io_uring
+    /// has nothing to fall back to if this is wrong — and nothing on this box
+    /// exercises it, since this box *has* io_uring.
+    ///
+    /// Deliberately calls the ring-free helpers directly rather than going
+    /// through `io_engine()`: that resolves into a `OnceLock` latched by
+    /// whichever test ran first, so an env-var-driven test of engine selection
+    /// would pass or fail depending on test order.
+    #[test]
+    fn the_ring_free_read_path_returns_the_same_bytes() -> Result<(), Error> {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("peregrine_noring_{}", std::process::id()));
+        let regions_src: Vec<Vec<u8>> = (0..4usize).map(|i| vec![(i as u8).wrapping_mul(37); 1024 + i * 97]).collect();
+        {
+            let mut f = std::fs::File::create(&path)?;
+            for r in &regions_src {
+                f.write_all(r)?;
+            }
+            f.flush()?;
+        }
+        let rf = std::fs::File::open(&path)?;
+        let fd = rf.as_raw_fd();
+        let mut off = 0u64;
+        let mut regions: Vec<(RawFd, u64, usize)> = Vec::new();
+        for r in &regions_src {
+            regions.push((fd, off, r.len()));
+            off += r.len() as u64;
+        }
+
+        // No reactor anywhere in this call.
+        let got = read_regions_with_retry(None, &regions)?;
+        assert_eq!(got.len(), regions_src.len());
+        for (i, (g, want)) in got.iter().zip(regions_src.iter()).enumerate() {
+            assert_eq!(&g[..], &want[..], "region {i} differs on the ring-free path");
+        }
+
+        // `complete_short_read` is the piece that has to loop to a full buffer
+        // when a positioned read comes back short; check it fills exactly.
+        let mut buf = vec![0u8; regions_src[2].len()];
+        complete_short_read(None, fd, regions[2].1, &mut buf)?;
+        assert_eq!(&buf[..], &regions_src[2][..], "short-read completion filled wrong bytes");
+
+        // The hints are advisory, but they must not error on a healthy fd —
+        // a failure here would spam the advisory log on every claim.
+        assert!(
+            peregrine_io::fadvise_many(&regions, peregrine_io::FADV_WILLNEED).is_ok(),
+            "willneed on a healthy fd should succeed"
+        );
+
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
     #[test]
     fn read_expert_batched_bytes_identical() -> Result<(), Error> {
         // Six regions (gate/up/down × weight+scale) laid into one file; the batched
@@ -2500,7 +2703,7 @@ mod tests {
                 return Ok(());
             }
         };
-        let slab = read_expert(&mut reactor, &entry, false)?;
+        let slab = read_expert(Some(&mut reactor), &entry, false)?;
         // slab regions are `Bytes`; compare their exposed byte slices to the source
         assert_eq!(&slab[0].0[..], &regions[0][..]);
         assert_eq!(&slab[0].1[..], &regions[1][..]);
@@ -2573,7 +2776,7 @@ mod tests {
                 return Ok(());
             }
         };
-        let slab = read_expert(&mut reactor, &entry, false)?;
+        let slab = read_expert(Some(&mut reactor), &entry, false)?;
         // gate/up/down, each paired with its own scale — the split has to undo
         // the alphabetical on-disk ordering.
         assert_eq!(&slab[0].0[..], &regions[4][..], "gate weight");
@@ -2674,8 +2877,8 @@ mod tests {
             }
         };
         // Oracle first: the wave path (untouched code) on the same entries.
-        let want_a = read_expert(&mut reactor, &entry_a, false)?;
-        let want_b = read_expert(&mut reactor, &entry_b, false)?;
+        let want_a = read_expert(Some(&mut reactor), &entry_a, false)?;
+        let want_b = read_expert(Some(&mut reactor), &entry_b, false)?;
 
         let eplans = [eplan(0, entry_a), eplan(1, entry_b)];
         let plan_refs: Vec<&EPlan> = eplans.iter().collect();
@@ -2696,7 +2899,7 @@ mod tests {
         }
         // The lane must leave the ring clean: the legacy wave path (which
         // refuses to run while owned reads are in flight) works right after.
-        let again = read_expert(&mut reactor, &entry_a, false)?;
+        let again = read_expert(Some(&mut reactor), &entry_a, false)?;
         for (g, w) in again.iter().zip(want_a.iter()) {
             assert_eq!(&g.0[..], &w.0[..]);
             assert_eq!(&g.1[..], &w.1[..]);
@@ -2730,7 +2933,7 @@ mod tests {
         assert!(!all, "a gone consumer must report Ok(false), not success");
         assert_eq!(forwards, 1, "the stream must stop at the refusing forward");
         // Ring must be clean for the next claim on this lane.
-        let want_a = read_expert(&mut reactor, &entry_a, false)?;
+        let want_a = read_expert(Some(&mut reactor), &entry_a, false)?;
         assert_eq!(want_a[0].0.len(), entry_a.plans[0].w_len);
         std::fs::remove_file(&path)?;
         Ok(())

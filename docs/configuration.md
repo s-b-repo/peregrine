@@ -104,7 +104,7 @@ Error: ... 6.8 GB short, so the kernel would OOM-kill this run part-way through 
 |---|---|---|
 | `COLI_IO_RINGS` | 4 | io_uring rings, each on its own thread — [note](#coli_io_rings) |
 | `COLI_IO_BATCH` | 16 | **upper bound** on experts claimed per ring — [note](#coli_io_batch) |
-| `COLI_IO_ENGINE` | `uring` | `uring` \| `pread` \| `regbuf` — [note](#coli_io_engine) |
+| `COLI_IO_ENGINE` | auto | `uring` \| `pread` \| `regbuf`; unset probes io_uring and falls back to `pread` — [note](#coli_io_engine) |
 | `COLI_IO_COMPLETION` | on | forward each expert as its own reads complete (uring only); `0` restores the blocking whole-wave submit — [note](#coli_io_completion) |
 | `COLI_SQPOLL` | off | kernel submission-polling thread on the streaming rings: no enter syscall per submit — [note](#coli_sqpoll) |
 | `COLI_SQPOLL_IDLE_MS` | 2000 | how long the SQPOLL kthread busy-polls before sleeping (the next submit wakes it transparently) |
@@ -151,6 +151,21 @@ token** (measured 24 % io duty across 4 rings). Fixing that took decode
 blocking `pread`, bypassing io_uring), or `regbuf` (io_uring through pre-registered
 fixed buffers). **Output is byte-identical across all three** — same regions, same
 offsets, only the syscall shape changes.
+
+**Unset is not the same as `uring`.** Left unset, the engine probes io_uring once
+and resolves to `pread` if it cannot create a ring — an older kernel,
+`kernel.io_uring_disabled=2`, or a container whose seccomp profile blocks
+`io_uring_setup` (Docker's default profile does). The probe prints one line when
+it fails, and streaming then runs with **zero rings** rather than refusing to
+load, which is what it used to do. Setting `COLI_IO_ENGINE=uring` *explicitly*
+keeps the old strict behaviour: a benchmark arm that asked for io_uring should
+fail loudly rather than quietly become a `pread` arm and publish its number under
+the wrong name.
+
+One consequence worth knowing: **`pread` cannot do O_DIRECT.** O_DIRECT needs
+block-aligned buffers and only the ring path has them (`read_direct_aligned`),
+so `COLI_DIRECT=1` on a ringless host is reported as off rather than failing
+every read with `EINVAL`.
 
 `pread` exists to test the dm-crypt hypothesis, and **that test has run and does
 not support it.** At the shipped 4 rings over 5 reps: `uring` **1.12 GB/s** vs
@@ -658,7 +673,7 @@ MTP draft step is a full sparse-MoE layer at `s_n = 1` — on the streaming
 container ~300 MB of SSD per step, with none of the batch-union amortization
 the verify forward gets. This is a backward `memcmp` over the token log. So
 when it matches it is not marginally cheaper, it is free; and
-[`ideas-from-colibri.md`](../ideas-from-colibri.md) records why that matters
+[`ideas-from-colibri.md`](ideas-from-colibri.md) records why that matters
 more here than elsewhere — on a disk-bound engine speculation only *loses* when
 drafts are rejected, so a source whose acceptance approaches 1 sidesteps the
 failure mode both engines measured.
@@ -1069,6 +1084,7 @@ Nothing here is on the forward path; all of it prints at shutdown or on `/metric
 | `COLI_UNION_STATS` | off | batch-union sharing — [note](#coli_union_stats) |
 | `COLI_PREDICT_EVAL` | off | predictor scoreboard — [note](#coli_predict_eval) |
 | `COLI_PREDICT_EVAL_N` | `topk` | candidates per arm the scoreboard scores, so recall is comparable with a real routing decision's width |
+| `COLI_IO_LATENCY` | off | per-read submit→complete **distribution** plus the thread's page-fault delta — [note](#coli_io_latency) |
 | `COLI_CALIB_CAPTURE` | unset | path to write an activation-importance trace to, for `peregrine-requantize --calib`. Read per model load rather than latched, so it can co-run with `COLI_PREDICT_EVAL` in one instrumented pass; `peregrine calib-capture` is the standalone subcommand |
 
 ### `COLI_PERF_COUNTERS`
@@ -1117,3 +1133,39 @@ Deep dives on what the knobs actually steer:
 [Prefetch & caching](prefetch-and-caching.md) ·
 [I/O & storage](io-and-storage.md) · [GPU](gpu-cuda.md) ·
 [Serving](serving.md) · [Tools](tools.md).
+
+### `COLI_IO_LATENCY`
+
+Records a **histogram** of per-read submit→complete times on the streaming
+rings, plus this thread's minor/major page-fault delta over the same window.
+Printed at shutdown as `[latency] expert-read: …`.
+
+**Deliberately a histogram and not an EWMA.** Every other I/O figure this engine
+publishes is a mean or a steady-state aggregate — GB/s in `iobench`, tok/s in
+`bench`, per-lane wall-time in `telemetry.rs` — and *a mean is exactly the
+statistic an SSD garbage-collection tail survives*. Periodic
+multi-hundred-millisecond stalls would move a mean by a few percent while
+dominating the tail. `IoTuner` smooths that signal by design, so a second EWMA
+would have inherited the blindness it was added to remove. Nothing here decays.
+
+Sampling is **per completion**, not per wave: a wave mean would average away the
+single slow read being hunted.
+
+**Reading the output.**
+
+- The tail figure is **p99/p50**, not p99/mean. The first version used the mean
+  and was wrong in the only case that matters: one large outlier drags the mean
+  *above* p99, so a fat tail reported as a ratio below 1 and read as flat. The
+  median is not moved by the outliers being hunted.
+- `max/p50` is reported beside it, because **p99 structurally cannot resolve
+  fewer than `count/100` stalls** — one stall in a hundred reads reports flat,
+  correctly. A window where p99 is flat but `max` is not is reported as "rare
+  stalls p99 cannot resolve at this sample count", not as "no tail".
+- An undersampled quantile prints `p99=n/a(20<100)` rather than a number. A p99
+  from twenty samples is the slowest of twenty wearing the name.
+- **This is not a device measurement.** Submit→complete includes queueing behind
+  the ring's own depth cap and io-wq scheduling; the report says so rather than
+  letting a fat tail read as "the drive stalled".
+
+Off by default: a tail hunt is a diagnostic run, not something the steady-state
+path should pay an `Instant::now()` per completion for.

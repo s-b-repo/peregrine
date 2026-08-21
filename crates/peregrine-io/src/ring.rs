@@ -126,6 +126,49 @@ pub fn pread_many_threaded(reqs: &mut [ReadReq], threads: usize) -> Vec<i64> {
     out
 }
 
+/// `POSIX_FADV_WILLNEED` — start readahead on a range.
+pub const FADV_WILLNEED: i32 = 3;
+/// `POSIX_FADV_DONTNEED` — drop a range from the page cache.
+pub const FADV_DONTNEED: i32 = 4;
+
+/// `posix_fadvise(2)` over a batch of regions, without a ring.
+///
+/// [`Reactor`] issues these as `IORING_OP_FADVISE`, which is unavailable in
+/// exactly the situation the `pread` engine exists for. The hints are pure
+/// optimization — bytes returned are identical with or without them — but they
+/// are worth keeping off the ring path, because the buffered engine leans on
+/// readahead to overlap NVMe queue depth with the next submit.
+///
+/// Best-effort by construction: the first failing region is reported and the
+/// rest are still attempted, since one bad fd should not cancel the readahead
+/// for every other expert in the claim.
+pub fn fadvise_many(regions: &[(RawFd, u64, usize)], advice: i32) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut first_err = None;
+        for &(fd, off, len) in regions {
+            // SAFETY: `posix_fadvise` takes no pointers and only advises the
+            // kernel about a range of an fd the caller owns; it cannot alias or
+            // free anything, and an invalid fd is reported as an errno.
+            let rc = unsafe { libc::posix_fadvise(fd, off as libc::off_t, len as libc::off_t, advice) };
+            // Unlike most libc calls this returns the errno directly rather than
+            // setting `errno` and returning -1.
+            if rc != 0 && first_err.is_none() {
+                first_err = Some(std::io::Error::from_raw_os_error(rc));
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (_regions, _advice) = (regions, advice); // documented no-op off-Linux
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod uring {
     use super::{OwnedReadReq, ReadReq, RegionDone};
@@ -163,6 +206,14 @@ mod uring {
         tag: u64,
         idx: usize,
         buf: LandingBuf,
+        /// When this read was submitted, if `COLI_IO_LATENCY` is on.
+        ///
+        /// The **owned-completion** lane is the default streaming path, so a
+        /// histogram wired only into `read_many` collected nothing on a real
+        /// run — it reported `no samples` while the engine did 7593 disk reads.
+        /// An instrument that is off on the path it was built for is worse than
+        /// no instrument, because its silence reads as a result.
+        submitted: Option<std::time::Instant>,
     }
 
     impl InFlight {
@@ -201,6 +252,13 @@ mod uring {
         /// last [`Reactor::take_sq_full`]. Queue-pressure signal for the
         /// adaptive io-wq tuner.
         sq_full: u64,
+        /// Per-completion submit->complete latency, when `COLI_IO_LATENCY` is
+        /// set. `None` on the default path so the steady-state read costs
+        /// nothing: a tail hunt is a diagnostic run.
+        ///
+        /// A histogram rather than a running mean on purpose — the EWMAs that
+        /// drive `IoTuner` are precisely what a GC stall hides behind.
+        latency: Option<Box<crate::latency::FaultWindow>>,
         /// fds registered with the kernel (index = fixed-file slot). A read whose
         /// fd is here uses `IOSQE_FIXED_FILE`, skipping per-op fd lookup/refcount.
         registered: Vec<RawFd>,
@@ -348,6 +406,7 @@ mod uring {
                 force_async: !sqpoll_active,
                 sqpoll: sqpoll_active,
                 sq_full: 0,
+                latency: crate::latency::enabled().then(|| Box::new(crate::latency::FaultWindow::new())),
                 registered: Vec::new(),
                 registered_bufs: Vec::new(),
                 slab: SlabPool::new(ALIGN, 1),
@@ -397,6 +456,25 @@ mod uring {
         pub fn take_sq_full(&mut self) -> u64 {
             std::mem::take(&mut self.sq_full)
         }
+
+        /// The latency distribution accumulated so far, if sampling is on.
+        ///
+        /// Borrowed rather than taken: a caller that drained it would reset the
+        /// tail every time it looked, which for a rare-stall hunt is the one
+        /// access pattern guaranteed to miss.
+        pub fn latency(&self) -> Option<&crate::latency::FaultWindow> {
+            self.latency.as_deref()
+        }
+
+        /// Fold this thread's page-fault delta into the window and rearm.
+        /// Called at wave boundaries so faults are attributed to the reads that
+        /// took them rather than to whatever ran next.
+        pub fn latency_checkpoint(&mut self) {
+            if let Some(l) = self.latency.as_deref_mut() {
+                l.checkpoint();
+            }
+        }
+
 
         /// Push one submission entry, counting a queue-full rejection into
         /// [`Self::take_sq_full`]'s counter before surfacing the error.
@@ -927,6 +1005,13 @@ mod uring {
                     return Err(err);
                 }
                 self.ring.submit_and_wait(pushed)?;
+                // One timestamp per wave, read at each completion. Every entry
+                // in a wave is pushed within microseconds of the others, so
+                // this is submit->complete per request to within the push loop
+                // — and crucially it is per REQUEST, not per wave: a wave mean
+                // would smooth away exactly the single slow read being hunted.
+                let wave_start = self.latency.is_some().then(std::time::Instant::now);
+                let mut completed_us: Vec<u64> = Vec::new();
                 let mut got = 0;
                 while got < pushed {
                     let mut progressed = false;
@@ -941,6 +1026,9 @@ mod uring {
                         match usize::try_from(ud).ok().and_then(|k| results.get_mut(k)) {
                             Some(slot) => {
                                 *slot = Some(cqe.result() as i64);
+                                if let Some(t) = wave_start {
+                                    completed_us.push(t.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+                                }
                                 got += 1;
                                 progressed = true;
                             }
@@ -961,6 +1049,18 @@ mod uring {
                             )));
                         }
                         self.ring.submit_and_wait(pushed - got)?;
+                    }
+                }
+                // Fold the wave's samples in after the borrow of `results` ends.
+                // Faults are checkpointed at the same boundary so they are
+                // attributed to the reads that took them rather than to
+                // whatever the thread does next.
+                if !completed_us.is_empty() {
+                    if let Some(l) = self.latency.as_deref_mut() {
+                        for us in &completed_us {
+                            l.hist.record(*us);
+                        }
+                        l.checkpoint();
                     }
                 }
                 i = end;
@@ -1248,6 +1348,7 @@ mod uring {
                         tag: r.tag,
                         idx,
                         buf: LandingBuf::Aligned(buf),
+                        submitted: self.latency.is_some().then(std::time::Instant::now),
                     }
                 } else {
                     InFlight {
@@ -1261,6 +1362,7 @@ mod uring {
                         tag: r.tag,
                         idx,
                         buf: LandingBuf::Plain(vec![0u8; r.len]),
+                        submitted: self.latency.is_some().then(std::time::Instant::now),
                     }
                 };
                 if u32::try_from(inf.a_len).is_err() {
@@ -1432,6 +1534,12 @@ mod uring {
                 }
                 inf.done += n as usize;
                 if inf.done >= inf.need {
+                    // Sample before `finish()` consumes it. Recorded per
+                    // completed region, which is what the streaming lane calls
+                    // a read.
+                    if let (Some(t), Some(l)) = (inf.submitted, self.latency.as_deref_mut()) {
+                        l.hist.record_duration(t.elapsed());
+                    }
                     out.push(inf.finish());
                     reaped += 1;
                 } else if matches!(inf.buf, LandingBuf::Aligned(_)) && !inf.done.is_multiple_of(ALIGN) {
@@ -1614,6 +1722,14 @@ impl Reactor {
     pub fn is_registered(&self, _fd: RawFd) -> bool {
         false
     }
+    /// API parity with the Linux path: this platform has no io_uring, so there
+    /// is no submit->complete to sample.
+    pub fn latency(&self) -> Option<&crate::latency::FaultWindow> {
+        None
+    }
+
+    pub fn latency_checkpoint(&mut self) {}
+
     pub fn slab_in_use(&self) -> usize {
         0
     }
@@ -1685,8 +1801,19 @@ pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     let len = f.metadata()?.len() as usize;
     let mut buf = vec![0u8; len];
     if len > 0 {
-        let mut reactor = Reactor::new(1)?;
-        reactor.read_exact(f.as_raw_fd(), 0, &mut buf)?;
+        match Reactor::new(1) {
+            Ok(mut reactor) => reactor.read_exact(f.as_raw_fd(), 0, &mut buf)?,
+            // No io_uring on this host. These are the small metadata files
+            // (`config.json` and friends) and a whole-file read has an exact
+            // portable equivalent, so there is no reason for the absence of a
+            // ring to stop a model loading. Reported rather than swallowed:
+            // this runs a handful of times at load, and "why is this host on
+            // pread?" should be answerable from the log.
+            Err(e) => {
+                crate::note_advisory_err("io_uring unavailable for whole-file read (using pread)", &e);
+                std::os::unix::fs::FileExt::read_exact_at(&f, &mut buf, 0)?
+            }
+        }
     }
     Ok(buf)
 }

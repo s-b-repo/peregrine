@@ -206,6 +206,55 @@ reads clear the threshold, a runtime check costs per-token work and skips nothin
 a loose bound is not a partial win, it is zero wins plus overhead. So the tightness
 measurement is the deliverable, and touching `read_regions` is gated on it.
 
+## `peregrine-basisfit`
+
+Cross-expert factorization (`W_e = B + Δ_e`), priced as **rate–distortion on
+activations**. Fits a shared basis across each layer's routed experts, holds it
+resident, and measures what the engine would actually pay. Measures only — no
+container is written.
+
+```bash
+peregrine calib-capture <model-dir> calib.json 512 --text corpus.txt
+peregrine-basisfit <model-dir> --calib calib.json --rank 2 --groups 8 \
+    --residual int2-g64 --control
+```
+
+**Why it does not measure reconstruction error.** `‖W − (B + Δ)‖_F` is minimized
+*by construction* when `B` is the group mean and `Δ` is stored exactly. That
+experiment cannot fail, and its success says nothing about the container: a
+basis can lower Frobenius error while making the residual **high-entropy and
+hostile to the int4/block quantization it then has to survive**. Weight-space
+error is structurally blind to that, because it never quantizes anything.
+
+So the residual is actually quantized — through the same `quant_*` producer and
+`QtView` consumer the loader uses, because an independently written "simulated"
+quantizer would be measuring itself — and the error is weighted by calibrated
+per-channel `mean|x|`.
+
+**Both arms default to the same precision**, one rung below the container, so
+streamed bytes are identical and the only variable is whether the residual
+quantizes better than the weight. The resident basis is charged separately and
+**both charges are always printed**: once (if it stays resident) and per token
+(if it is evicted and re-read). At a 0.6 % warm-cache hit rate the second is the
+likelier one, and quoting only the first assumes the favourable answer.
+
+**`--control` is not optional in spirit.** It compares the learned grouping
+against **four** shuffled partitions at equal rank. One draw is not enough: on
+the demo container a single draw reported the grouping "load-bearing" at a
+6.87 % margin, and against the best of four the same container reads 2.56 %
+against a 4.63 % spread — a negative. The floor is `max(15 %, spread)`.
+
+**Limitations it prints for you.** Distortion is a *diagonal* approximation of
+`E_x‖(W−Ŵ)x‖²` (channels weighted independently; cross-channel structure
+invisible). `down_proj` has **no** activation signal at all — the sidecar covers
+hidden channels at the MoE input and `down_proj` is indexed by the intermediate
+width — so it is scored unweighted and named in the caveats. And distortion is
+not flip rate: gate the winning arm with `peregrine flip-rate` before believing
+any of it.
+
+Proposed by `orionzion` (2026-08-21). The sweep on real GLM-5.2 weights is still
+owed; the harness is validated on fixtures only.
+
 ## Related pages
 
 [Layout tools](layout-tools.md) · [Serving](serving.md) ·
