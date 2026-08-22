@@ -25,7 +25,7 @@ For a decode block with 3 VRAM + 2 RAM + 3 disk experts:
   single lane, not the sum.
 
 The full design rationale, milestones, and C-source cross-references live in
-[`DESIGN.md`](../DESIGN.md).
+[`DESIGN.md`](DESIGN.md).
 
 ## Workspace map
 
@@ -84,6 +84,10 @@ residency into three lanes that run as concurrent actors:
 
 - **GPU lane** — batched `expert_group` calls on a persistent non-blocking
   CUDA stream, double-buffered pinned staging so H2D(n+1) ∥ kernel(n) ∥ D2H(n−1).
+  Weight *upload* runs the same way: an int4-resident expert is read by io_uring
+  straight into a `cudaHostRegister`'d aligned buffer and copied to VRAM
+  asynchronously, so the disk→GPU path is two DMAs with no userspace copy
+  (`COLI_GPU_PINNED`).
 - **CPU lane** — a persistent worker pool (`peregrine-par`); each worker runs
   one expert's SwiGLU (fused gate+up → silu·up → down → weighted scatter), with
   inner row tiling staying SIMD.
@@ -99,9 +103,17 @@ completion order.
 
 ## The five layers of concurrency
 
-1. **All I/O is io_uring** — config, safetensors headers, and all weight
-   loading go through the reactor; per-token expert streaming is the hot path.
-   Only `tokenizer.json` and `/proc/meminfo` are read synchronously (one-time).
+1. **All I/O is io_uring** — and as of the 2026-08-22 pass this is literal
+   rather than aspirational. Config, safetensors headers, all weight loading,
+   `tokenizer.json`, every optional JSON artifact, the KV-checkpoint reads *and
+   writes*, `write_atomic`, and the `/proc`+`/sys` probes all go through the
+   reactor; per-token expert streaming is the hot path. The ring gained write,
+   fsync and read-until-EOF ops to make the write and synthetic-file halves
+   possible. Two documented exceptions remain, both because io_uring has no such
+   opcode: directory enumeration (`read_dir`) and `readlink`. The synthetic-file
+   half is reversible with `COLI_IO_PROCFS=direct`, because it is the one place
+   the invariant costs rather than saves — see
+   [configuration](configuration.md#coli_io_procfs).
 2. **The streaming MoE lane** is N parallel io_uring rings with lock-free
    work-stealing, a CPU worker pool consuming as bytes land, an optional GPU
    lane, and one deterministic reduce (`peregrine-model/src/concurrent.rs`).

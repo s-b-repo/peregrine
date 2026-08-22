@@ -207,7 +207,7 @@ fn run() -> Result<(), Error> {
             // plan that looked complete while quietly dropping a section.
             let read_json = |name: &str| -> Result<Option<serde_json::Value>, Error> {
                 let path = dirp.join(name);
-                let bytes = match std::fs::read(&path) {
+                let bytes = match peregrine_io::read_file(&path) {
                     Ok(b) => b,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                     Err(e) => return Err(Error::Io(e)).ctx(|| format!("read {}", path.display())),
@@ -743,7 +743,8 @@ struct ReferenceDump {
 }
 
 fn load_reference_dump(path: &Path) -> Result<ReferenceDump, Error> {
-    let bytes = std::fs::read(path).map_err(|e| Error::Format(format!("read {}: {e}", path.display())))?;
+    let bytes =
+        peregrine_io::read_file(path).map_err(|e| Error::Format(format!("read {}: {e}", path.display())))?;
     let v: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| Error::Format(format!("{}: {e}", path.display())))?;
     let ids = |key: &str| -> Result<Vec<i32>, Error> {
@@ -894,13 +895,14 @@ fn run_candidate_arm(dir: &str, toks: &[i32], env: &[(String, String)]) -> Resul
 /// `flip-rate` grew a `--text` for this in 2026-08; `dump-routes` did not, and
 /// every `route-stats` number taken from a synthetic trace measured the corpus.
 fn encode_text_corpus(dir: &str, path: &str, n_tokens: usize, who: &str) -> Result<Vec<i32>, Error> {
-    let raw = std::fs::read_to_string(Path::new(path))
+    let raw = peregrine_io::read_file(Path::new(path))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
         .map_err(|e| Error::Format(format!("{who}: read {path}: {e}")))?;
     // The tokenizer travels with the container, so the ids are the ones that
     // container was converted from.
     let tj = Path::new(dir).join("tokenizer.json");
-    let json =
-        std::fs::read(&tj).map_err(|e| Error::Format(format!("{who}: --text needs {}: {e}", tj.display())))?;
+    let json = peregrine_io::read_file(&tj)
+        .map_err(|e| Error::Format(format!("{who}: --text needs {}: {e}", tj.display())))?;
     let mut tk = peregrine_token::GigaTokenizer::from_hf_json_bytes(&json)
         .map_err(|e| Error::Format(format!("{who}: tokenizer: {e}")))?;
     // encode_into + in-place widen: one buffer, not encode's Vec<u32> plus a

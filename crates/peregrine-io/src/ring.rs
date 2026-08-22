@@ -16,6 +16,16 @@ pub struct ReadReq<'a> {
     pub tag: u64,
 }
 
+/// One positioned write out of a caller-owned buffer — the write twin of
+/// [`ReadReq`].
+pub struct WriteReq<'a> {
+    pub fd: RawFd,
+    pub offset: u64,
+    pub buf: &'a [u8],
+    /// caller tag echoed back; not used by the writer
+    pub tag: u64,
+}
+
 /// One positioned read whose landing buffer the [`Reactor`] owns until its
 /// completion is reaped (the owned-completion lane, [`Reactor::submit_owned`]).
 /// Unlike [`ReadReq`] there is no borrowed buffer: the reactor allocates the
@@ -56,6 +66,29 @@ pub fn pread_many(reqs: &mut [ReadReq]) -> Vec<i64> {
             // duration of this call; we only read from it.
             let file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(r.fd) });
             match file.read_at(r.buf, r.offset) {
+                Ok(n) => n as i64,
+                Err(e) => -(e.raw_os_error().unwrap_or(5) as i64),
+            }
+        })
+        .collect()
+}
+
+/// Portable fallback: one `pwrite` per request. Returns per-request byte counts
+/// (or a negative errno). The correctness oracle for [`Reactor::write_many`],
+/// exactly as [`pread_many`] is for [`Reactor::read_many`].
+pub fn pwrite_many(reqs: &[WriteReq]) -> Vec<i64> {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::FromRawFd;
+    reqs.iter()
+        .map(|r| {
+            // Borrow the caller's fd for a positioned write without taking
+            // ownership: `ManuallyDrop` stops `File`'s Drop from closing a
+            // descriptor we don't own.
+            // SAFETY: `r.fd` is a live descriptor the caller keeps open for the
+            // duration of this call; we only write to it.
+            let file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(r.fd) });
+            match file.write_at(r.buf, r.offset) {
                 Ok(n) => n as i64,
                 Err(e) => -(e.raw_os_error().unwrap_or(5) as i64),
             }
@@ -171,7 +204,7 @@ pub fn fadvise_many(regions: &[(RawFd, u64, usize)], advice: i32) -> std::io::Re
 
 #[cfg(target_os = "linux")]
 mod uring {
-    use super::{OwnedReadReq, ReadReq, RegionDone};
+    use super::{OwnedReadReq, ReadReq, RegionDone, WriteReq};
     use crate::slab::{align_down, align_up, AlignedBuf, Bytes, SlabHandle, SlabPool, ALIGN};
     use io_uring::{opcode, squeue, types, IoUring};
     use std::collections::{HashMap, VecDeque};
@@ -1077,6 +1110,244 @@ mod uring {
             Ok(out)
         }
 
+        /// Submit all `reqs` (chunked to the ring depth) and wait for every
+        /// completion. Returns per-request result codes in `reqs` order — the
+        /// write twin of [`Reactor::read_many`], with the same chunking, the same
+        /// fixed-file handling and the same drain-on-push-failure contract, so a
+        /// write batch and a read batch fail the same way.
+        pub fn write_many(&mut self, reqs: &[WriteReq]) -> io::Result<Vec<i64>> {
+            // Same reason as `read_many`: `submit_and_wait(pushed)` counts *any*
+            // completion, so owned-lane traffic in flight would satisfy the wait
+            // in place of a write.
+            if !self.owned_idle() {
+                return Err(Self::err_owned_busy("write_many"));
+            }
+            let mut results: Vec<Option<i64>> = vec![None; reqs.len()];
+            let mut i = 0;
+            while i < reqs.len() {
+                let end = (i + self.cap).min(reqs.len());
+                let mut pushed = 0usize;
+                let mut push_err = None;
+                for (j, req) in reqs.iter().enumerate().take(end).skip(i) {
+                    // A single op cannot carry more than u32 bytes; truncating
+                    // would silently issue a short write and report success for
+                    // bytes that never reached the file.
+                    let Ok(len32) = u32::try_from(req.buf.len()) else {
+                        push_err = Some(io::Error::other(format!(
+                            "write request {j} is {} bytes; io_uring writes are limited to {} per op",
+                            req.buf.len(),
+                            u32::MAX
+                        )));
+                        break;
+                    };
+                    let ptr = req.buf.as_ptr();
+                    let off = req.offset;
+                    let fixed = self.registered.iter().position(|&f| f == req.fd);
+                    let mut e = match fixed {
+                        Some(idx) => opcode::Write::new(types::Fixed(idx as u32), ptr, len32).offset(off).build(),
+                        None => opcode::Write::new(types::Fd(req.fd), ptr, len32).offset(off).build(),
+                    }
+                    .user_data(j as u64);
+                    if self.force_async {
+                        e = e.flags(squeue::Flags::ASYNC);
+                    }
+                    // SAFETY: `req.buf` outlives the op — write_many blocks until
+                    // every completion for this chunk is reaped, including on the
+                    // error paths below, which drain before returning.
+                    match unsafe { self.push_counted(&e) } {
+                        Ok(()) => pushed += 1,
+                        Err(e) => {
+                            push_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(err) = push_err {
+                    // An abandoned SQE is visible to the kernel and points at a
+                    // buffer the caller is about to drop — drain before surfacing
+                    // the error, exactly as the read path does.
+                    if let Err(drain_err) = self.drain_pushed(pushed) {
+                        crate::note_advisory_err("io_uring drain after failed write submit", &drain_err);
+                    }
+                    return Err(err);
+                }
+                self.ring.submit_and_wait(pushed)?;
+                let mut got = 0;
+                while got < pushed {
+                    let mut progressed = false;
+                    for cqe in self.ring.completion() {
+                        let ud = cqe.user_data();
+                        if ud & Self::ADVISORY_TAG != 0 {
+                            // stray advisory completion — not a write result
+                            self.advisory_inflight = self.advisory_inflight.saturating_sub(1);
+                            progressed = true;
+                            continue;
+                        }
+                        match usize::try_from(ud).ok().and_then(|k| results.get_mut(k)) {
+                            Some(slot) => {
+                                *slot = Some(cqe.result() as i64);
+                                got += 1;
+                                progressed = true;
+                            }
+                            None => {
+                                return Err(io::Error::other(format!(
+                                    "io_uring completion for unknown write request {ud}"
+                                )))
+                            }
+                        }
+                    }
+                    if got < pushed {
+                        if !progressed {
+                            return Err(io::Error::other(format!(
+                                "io_uring returned {got} completions for {pushed} submitted writes"
+                            )));
+                        }
+                        self.ring.submit_and_wait(pushed - got)?;
+                    }
+                }
+                i = end;
+            }
+            let mut out = Vec::with_capacity(results.len());
+            for (j, r) in results.into_iter().enumerate() {
+                match r {
+                    Some(v) => out.push(v),
+                    None => {
+                        return Err(io::Error::other(format!(
+                            "io_uring completion missing for write request {j}"
+                        )))
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        /// Write exactly `buf.len()` bytes at `off` to `fd`, looping to complete
+        /// a short write (a positioned write may legally write fewer bytes).
+        /// Errors on a negative completion code or on a write that makes no
+        /// progress — never a partial success, never a fallback. The write twin
+        /// of [`Reactor::read_exact`].
+        pub fn write_all(&mut self, fd: RawFd, off: u64, buf: &[u8]) -> io::Result<()> {
+            let total = buf.len();
+            let mut done = 0usize;
+            while done < total {
+                let n = {
+                    let reqs = [WriteReq { fd, offset: off + done as u64, buf: &buf[done..], tag: 0 }];
+                    self.write_many(&reqs)?[0]
+                };
+                if n < 0 {
+                    return Err(Self::errno_from_result(n));
+                }
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!("io_uring write made no progress after {done} of {total} bytes"),
+                    ));
+                }
+                done += n as usize;
+            }
+            Ok(())
+        }
+
+        /// `fsync(2)` through the ring — full file-integrity sync.
+        ///
+        /// **Ordering matters and the ring does not provide it.** io_uring's own
+        /// documentation is explicit that a write followed by an fsync in the
+        /// submission queue execute in parallel: the fsync may reach the device
+        /// before the write is even issued. This is safe only because
+        /// [`Reactor::write_all`] blocks until every one of its completions is
+        /// reaped, so by the time this is submitted the writes are done. Anyone
+        /// pipelining writes and syncs on one ring must add an explicit link.
+        pub fn fsync(&mut self, fd: RawFd) -> io::Result<()> {
+            self.fsync_inner(fd, types::FsyncFlags::empty(), "fsync")
+        }
+
+        /// `fdatasync(2)` through the ring — file data only, metadata not forced.
+        /// Same ordering caveat as [`Reactor::fsync`].
+        pub fn fdatasync(&mut self, fd: RawFd) -> io::Result<()> {
+            self.fsync_inner(fd, types::FsyncFlags::DATASYNC, "fdatasync")
+        }
+
+        fn fsync_inner(&mut self, fd: RawFd, flags: types::FsyncFlags, what: &str) -> io::Result<()> {
+            if !self.owned_idle() {
+                return Err(Self::err_owned_busy(what));
+            }
+            let fixed = self.registered.iter().position(|&f| f == fd);
+            let e = match fixed {
+                Some(idx) => opcode::Fsync::new(types::Fixed(idx as u32)),
+                None => opcode::Fsync::new(types::Fd(fd)),
+            }
+            .flags(flags)
+            .build()
+            .user_data(0);
+            // SAFETY: an Fsync SQE carries no user buffer, and the fd outlives
+            // this call, which blocks until the completion is reaped.
+            unsafe { self.push_counted(&e) }?;
+            self.ring.submit_and_wait(1)?;
+            let mut res: Option<i64> = None;
+            while res.is_none() {
+                let mut progressed = false;
+                for cqe in self.ring.completion() {
+                    let ud = cqe.user_data();
+                    if ud & Self::ADVISORY_TAG != 0 {
+                        self.advisory_inflight = self.advisory_inflight.saturating_sub(1);
+                        progressed = true;
+                        continue;
+                    }
+                    res = Some(cqe.result() as i64);
+                    progressed = true;
+                }
+                if res.is_none() {
+                    // An advisory completion can satisfy the wait in place of the
+                    // sync; wait again rather than reporting a lost completion.
+                    if !progressed {
+                        return Err(io::Error::other(format!("io_uring returned no completion for {what}")));
+                    }
+                    self.ring.submit_and_wait(1)?;
+                }
+            }
+            match res {
+                Some(n) if n < 0 => Err(Self::errno_from_result(n)),
+                _ => Ok(()),
+            }
+        }
+
+        /// Read a whole file whose size `stat` does not report — the shape
+        /// `/proc` and `/sys` need, where `metadata().len()` is 0 and
+        /// [`read_file`]'s size-then-read shape would return empty. Issues
+        /// positioned reads at an advancing offset until one returns 0.
+        pub fn read_to_end(&mut self, fd: RawFd) -> io::Result<Vec<u8>> {
+            // Synthetic files are small; 8 KiB takes almost all of them in one
+            // read, and the loop covers the rest rather than guessing bigger.
+            const CHUNK: usize = 8 * 1024;
+            // Bounds a pathological grower (a file that never reports EOF) so a
+            // telemetry read can never eat the box's memory.
+            const MAX: usize = 64 * 1024 * 1024;
+            let mut out: Vec<u8> = Vec::new();
+            let mut off = 0u64;
+            loop {
+                let base = out.len();
+                if base >= MAX {
+                    return Err(io::Error::other(format!(
+                        "sequential ring read exceeded {MAX} bytes without reaching EOF"
+                    )));
+                }
+                out.resize(base + CHUNK, 0);
+                let n = {
+                    let mut reqs = [ReadReq { fd, offset: off, buf: &mut out[base..], tag: 0 }];
+                    self.read_many(&mut reqs)?[0]
+                };
+                if n < 0 {
+                    return Err(Self::errno_from_result(n));
+                }
+                let got = n as usize;
+                out.truncate(base + got);
+                if got == 0 {
+                    return Ok(out);
+                }
+                off += got as u64;
+            }
+        }
+
         /// Size the internal aligned-buffer pool used by [`Reactor::read_direct_many`].
         /// `buf_cap` should be the largest region streamed directly; `max_bufs`
         /// bounds total pool RAM. Call once before enabling the O_DIRECT path.
@@ -1739,6 +2010,21 @@ impl Reactor {
     pub fn read_exact(&mut self, _fd: RawFd, _off: u64, _buf: &mut [u8]) -> std::io::Result<()> {
         Self::unsupported()
     }
+    pub fn write_many(&mut self, _reqs: &[WriteReq]) -> std::io::Result<Vec<i64>> {
+        Self::unsupported()
+    }
+    pub fn write_all(&mut self, _fd: RawFd, _off: u64, _buf: &[u8]) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn fsync(&mut self, _fd: RawFd) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn fdatasync(&mut self, _fd: RawFd) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn read_to_end(&mut self, _fd: RawFd) -> std::io::Result<Vec<u8>> {
+        Self::unsupported()
+    }
     pub fn register_read_buffers(&mut self, _bufs: Vec<Vec<u8>>) -> std::io::Result<()> {
         Self::unsupported()
     }
@@ -1816,6 +2102,97 @@ pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
         }
     }
     Ok(buf)
+}
+
+/// Write a whole file through io_uring (create -> one ring-backed exact write ->
+/// ring-backed `fsync`). The write twin of [`read_file`], and the same fallback
+/// rule for the same reason: these are small metadata artifacts, a whole-file
+/// write has an exact portable equivalent, and the absence of a ring should not
+/// stop one being saved. Reported rather than swallowed.
+pub fn write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::create(path)?;
+    match Reactor::new(1) {
+        Ok(mut reactor) => {
+            if !bytes.is_empty() {
+                reactor.write_all(f.as_raw_fd(), 0, bytes)?;
+            }
+            // Ordering is safe here only because `write_all` has already reaped
+            // every write completion — see the note on [`Reactor::fsync`].
+            reactor.fsync(f.as_raw_fd())?;
+        }
+        Err(e) => {
+            crate::note_advisory_err("io_uring unavailable for whole-file write (using pwrite)", &e);
+            if !bytes.is_empty() {
+                std::os::unix::fs::FileExt::write_all_at(&f, bytes, 0)?;
+            }
+            f.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+/// Read at most `max` bytes at `offset` through the ring, returning however many
+/// the file actually had there (so a short file yields a short `Vec`).
+///
+/// [`read_file`] and [`read_file_seq`] cover whole files; this is the shape a
+/// header or index probe needs, where the file itself is far too large to read
+/// and the wanted region is a few dozen bytes at a known place. Callers that
+/// require the full `max` should check the returned length — this deliberately
+/// does not error on a short read, because "the file ends here" is the answer a
+/// probe is asking for.
+pub fn read_region(path: &std::path::Path, offset: u64, max: usize) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; max];
+    let got = match Reactor::new(1) {
+        Ok(mut reactor) => {
+            let n = {
+                let mut reqs = [ReadReq { fd: f.as_raw_fd(), offset, buf: &mut buf, tag: 0 }];
+                reactor.read_many(&mut reqs)?[0]
+            };
+            if n < 0 {
+                return Err(match n.checked_neg().and_then(|e| i32::try_from(e).ok()) {
+                    Some(e) => std::io::Error::from_raw_os_error(e),
+                    None => std::io::Error::other(format!("io_uring returned an unrepresentable result code {n}")),
+                });
+            }
+            n as usize
+        }
+        // Same rule as `read_file`: a probe is a handful of bytes with an exact
+        // portable equivalent, so a missing ring must not stop it.
+        Err(e) => {
+            crate::note_advisory_err("io_uring unavailable for region read (using pread)", &e);
+            std::os::unix::fs::FileExt::read_at(&f, &mut buf, offset)?
+        }
+    };
+    buf.truncate(got);
+    Ok(buf)
+}
+
+/// Read a whole file whose `stat` size cannot be trusted. `/proc` and `/sys`
+/// report 0 bytes, so [`read_file`]'s size-then-read shape returns empty for
+/// them; this reads through the ring until EOF instead.
+///
+/// Note what it costs. procfs and sysfs are synthetic: the kernel cannot take
+/// io_uring's non-blocking fast path on them, so every read here is punted to an
+/// io-wq worker, which is strictly more work than the `read(2)` it replaces. It
+/// exists so "all I/O is io_uring" holds without exception. Callers on a warm
+/// path should go through [`crate::read_proc_string`], which honours
+/// `COLI_IO_PROCFS=direct`.
+pub fn read_file_seq(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    let mut f = std::fs::File::open(path)?;
+    match Reactor::new(1) {
+        Ok(mut reactor) => reactor.read_to_end(f.as_raw_fd()),
+        Err(e) => {
+            crate::note_advisory_err("io_uring unavailable for sequential read (using read)", &e);
+            let mut out = Vec::new();
+            f.read_to_end(&mut out)?;
+            Ok(out)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2570,6 +2947,182 @@ mod tests {
             (0..20u64).map(|i| ((i * 1409) % 28000, 21 + (i as usize % 300))).collect();
         owned_roundtrip_asserts(&mut sq, fd, &cases, &data)?;
         std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// A skipped io_uring test and a passing one are indistinguishable in a
+    /// normal `cargo test` run — `docs/testing-and-quality.md` names this as the
+    /// gap that makes the whole io_uring story unfalsifiable on a green suite.
+    /// `COLI_REQUIRE_URING=1` turns a skip into a failure, so a machine the
+    /// claim is meant to hold on can prove these actually ran.
+    fn skip_or_fail(what: &str, e: &dyn std::fmt::Display) {
+        assert!(
+            std::env::var_os("COLI_REQUIRE_URING").is_none(),
+            "COLI_REQUIRE_URING=1 but {what} could not run: {e}"
+        );
+        eprintln!("skipping {what}: io_uring unavailable: {e}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uring_write_many_matches_pwrite() -> std::io::Result<()> {
+        // The write engine must be a performance decision and nothing else, so
+        // a ring-written file has to be byte-identical to a pwrite-written one,
+        // with the same per-request counts — the mirror of the read oracle test.
+        use std::os::unix::io::AsRawFd;
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let p_ring = dir.join(format!("peregrine_wr_ring_{pid}"));
+        let p_pw = dir.join(format!("peregrine_wr_pw_{pid}"));
+        let ring_f = std::fs::File::create(&p_ring)?;
+        let pw_f = std::fs::File::create(&p_pw)?;
+
+        // 20 writes at scattered, non-overlapping offsets, > ring depth 8 so the
+        // chunking loop is exercised.
+        let payloads: Vec<Vec<u8>> = (0..20usize).map(|k| vec![(k as u8).wrapping_mul(37); 64 + k]).collect();
+        let offs: Vec<u64> = (0..20u64).map(|k| k * 4096).collect();
+
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(e) => {
+                skip_or_fail("uring_write_many_matches_pwrite", &e);
+                let _ = std::fs::remove_file(&p_ring);
+                let _ = std::fs::remove_file(&p_pw);
+                return Ok(());
+            }
+        };
+        let mk = |fd| -> Vec<WriteReq> {
+            payloads
+                .iter()
+                .enumerate()
+                .map(|(k, b)| WriteReq { fd, offset: offs[k], buf: b.as_slice(), tag: k as u64 })
+                .collect()
+        };
+        let res_ring = reactor.write_many(&mk(ring_f.as_raw_fd()))?;
+        let res_pw = pwrite_many(&mk(pw_f.as_raw_fd()));
+
+        assert_eq!(res_ring, res_pw, "byte counts must match the pwrite oracle");
+        for (k, want) in payloads.iter().enumerate() {
+            assert_eq!(res_ring[k], want.len() as i64, "write {k} short");
+        }
+        ring_f.sync_all()?;
+        pw_f.sync_all()?;
+        assert_eq!(std::fs::read(&p_ring)?, std::fs::read(&p_pw)?, "ring and pwrite must produce the same file");
+        std::fs::remove_file(&p_ring)?;
+        std::fs::remove_file(&p_pw)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uring_write_all_then_read_exact_round_trips() -> std::io::Result<()> {
+        // write_all must complete short writes, and the bytes it lands must be
+        // exactly what read_exact reads back — both legs through the ring.
+        use std::os::unix::io::AsRawFd;
+        let path = std::env::temp_dir().join(format!("peregrine_wr_all_{}", std::process::id()));
+        let mut data = Vec::new();
+        while data.len() < 300_000 {
+            data.extend_from_slice(b"peregrine-write-all-payload-");
+        }
+        data.truncate(300_000);
+
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(e) => {
+                skip_or_fail("uring_write_all_then_read_exact_round_trips", &e);
+                return Ok(());
+            }
+        };
+        {
+            let f = std::fs::File::create(&path)?;
+            reactor.write_all(f.as_raw_fd(), 0, &data)?;
+            reactor.fsync(f.as_raw_fd())?;
+        }
+        assert_eq!(std::fs::read(&path)?, data, "write_all must land every byte");
+
+        let rf = std::fs::File::open(&path)?;
+        let mut back = vec![0u8; data.len()];
+        reactor.read_exact(rf.as_raw_fd(), 0, &mut back)?;
+        assert_eq!(back, data, "read_exact must read back what write_all wrote");
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn write_file_matches_std_fs_write() -> std::io::Result<()> {
+        // `write_file` falls back to pwrite with no ring, so this one asserts on
+        // every host rather than skipping: either lane must produce the file
+        // `std::fs::write` would have.
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        for (n, payload) in [(0usize, Vec::new()), (1, vec![7u8]), (2, vec![0xABu8; 100_000])] {
+            let a = dir.join(format!("peregrine_wf_a_{pid}_{n}"));
+            let b = dir.join(format!("peregrine_wf_b_{pid}_{n}"));
+            write_file(&a, &payload)?;
+            std::fs::write(&b, &payload)?;
+            assert_eq!(std::fs::read(&a)?, std::fs::read(&b)?, "case {n}: write_file must match std::fs::write");
+            assert_eq!(std::fs::read(&a)?, payload, "case {n}: contents");
+            std::fs::remove_file(&a)?;
+            std::fs::remove_file(&b)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn write_file_then_read_file_round_trips() -> std::io::Result<()> {
+        // The pair that config/artifact callers use: whatever write_file lands,
+        // read_file must return.
+        let path = std::env::temp_dir().join(format!("peregrine_wf_rt_{}", std::process::id()));
+        let payload: Vec<u8> = (0..50_000u32).map(|k| (k % 251) as u8).collect();
+        write_file(&path, &payload)?;
+        assert_eq!(read_file(&path)?, payload);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_file_seq_matches_read_on_procfs() -> std::io::Result<()> {
+        // The reason read_file_seq exists: procfs reports size 0, so the
+        // size-then-read shape of `read_file` returns empty for it. Assert both
+        // halves — that the sequential reader gets the content, and that the
+        // sized reader is the one that cannot.
+        let path = std::path::Path::new("/proc/self/statm");
+        let want = std::fs::read_to_string(path)?;
+        assert!(!want.is_empty(), "/proc/self/statm is unexpectedly empty");
+        assert!(
+            read_file(path)?.is_empty(),
+            "read_file is expected to return nothing for a size-0 synthetic file; \
+             if this now works, read_file_seq's reason for existing has changed"
+        );
+
+        let got = read_file_seq(path)?;
+        // The kernel regenerates these between the two reads, so the field
+        // *count* is the stable comparison, not the byte string.
+        let got = String::from_utf8_lossy(&got).into_owned();
+        assert!(!got.is_empty(), "read_file_seq returned nothing for /proc/self/statm");
+        assert_eq!(
+            got.split_whitespace().count(),
+            want.split_whitespace().count(),
+            "read_file_seq: {got:?} vs read_to_string {want:?}"
+        );
+        assert!(got.split_whitespace().all(|f| f.parse::<u64>().is_ok()), "statm fields must parse: {got:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn read_proc_string_agrees_on_both_lanes() -> std::io::Result<()> {
+        // The knob must only change the syscall shape. `procfs_via_ring` latches
+        // in a OnceLock, so this compares the two readers directly rather than
+        // trying to flip the env mid-process.
+        let path = "/proc/self/statm";
+        let direct = std::fs::read_to_string(path)?;
+        let ringed = crate::read_proc_string(path)?;
+        assert_eq!(
+            ringed.split_whitespace().count(),
+            direct.split_whitespace().count(),
+            "COLI_IO_PROCFS lanes disagree: {ringed:?} vs {direct:?}"
+        );
         Ok(())
     }
 }

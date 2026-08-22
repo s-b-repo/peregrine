@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 use peregrine_core::config::Cfg;
 use peregrine_core::{durable, note_advisory_err, Context, Error};
 use peregrine_model::{KvDtype, KvExport, KvLayerExport, Model, SeqKv};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -92,7 +92,7 @@ fn common_prefix(a: &[i32], b: &[i32]) -> usize {
 /// to keep that theoretical.)
 fn container_fingerprint(dir: &Path) -> Result<u64, Error> {
     let cfg_path = dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).ctx(|| format!("read {}", cfg_path.display()))?;
+    let cfg_bytes = peregrine_io::read_file(&cfg_path).ctx(|| format!("read {}", cfg_path.display()))?;
     let mut h = fnv1a64(FNV_OFFSET, &cfg_bytes);
     let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)
         .ctx(|| format!("scan {}", dir.display()))?
@@ -106,10 +106,11 @@ fn container_fingerprint(dir: &Path) -> Result<u64, Error> {
         }
         let meta = std::fs::metadata(&shard).ctx(|| format!("stat {}", shard.display()))?;
         h = fnv1a64(h, &meta.len().to_le_bytes());
-        let mut head = vec![0u8; 4096];
-        let mut f = std::fs::File::open(&shard).ctx(|| format!("open {}", shard.display()))?;
-        let got = f.read(&mut head).ctx(|| format!("read header of {}", shard.display()))?;
-        h = fnv1a64(h, &head[..got]);
+        // A shard is multi-gigabyte, so this reads the header page only —
+        // through the ring, and short for a shard smaller than a page.
+        let head = peregrine_io::read_region(&shard, 0, 4096)
+            .ctx(|| format!("read header of {}", shard.display()))?;
+        h = fnv1a64(h, &head);
     }
     Ok(h)
 }
@@ -135,6 +136,68 @@ fn dtype_from_tag(t: u32) -> Option<KvDtype> {
 struct HashingWriter<W: Write> {
     w: W,
     h: u64,
+}
+
+/// A `std::io::Write` sink whose bytes reach the file through io_uring.
+///
+/// Two things `Write` does not give us and this has to carry itself. Positioned
+/// writes need an explicit offset, so the sink owns its cursor. And a checkpoint
+/// is emitted as a long run of small `write_all`s (one per header field, one per
+/// payload element), which is why the old code wrapped a `BufWriter` — so the
+/// sink keeps that coalescing and issues one `Reactor::write_all` per full
+/// chunk.
+///
+/// Bounded staging rather than one whole-frame write is deliberate: a
+/// 2k-token checkpoint is ~350 MB, and materializing it to submit a single
+/// write would double the writer thread's peak RSS on a box that already needs
+/// an RSS guard.
+struct RingSink {
+    reactor: peregrine_io::Reactor,
+    fd: std::os::unix::io::RawFd,
+    /// Next file offset to write at — `Write` carries no position of its own.
+    off: u64,
+    buf: Vec<u8>,
+}
+
+impl RingSink {
+    /// Staging size. Large enough that the per-op cost disappears against the
+    /// payload, small enough to be invisible next to the checkpoint itself.
+    const CHUNK: usize = 8 << 20;
+
+    fn new(reactor: peregrine_io::Reactor, fd: std::os::unix::io::RawFd) -> RingSink {
+        RingSink { reactor, fd, off: 0, buf: Vec::with_capacity(Self::CHUNK) }
+    }
+
+    fn drain(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        self.reactor.write_all(self.fd, self.off, &self.buf)?;
+        self.off += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Flush anything staged, then force it to the device. Ordering is safe only
+    /// because `write_all` reaps every write completion before this submits the
+    /// sync — io_uring does not order a write against a following fsync.
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.drain()?;
+        self.reactor.fsync(self.fd)
+    }
+}
+
+impl Write for RingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        if self.buf.len() >= Self::CHUNK {
+            self.drain()?;
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.drain()
+    }
 }
 
 impl<W: Write> Write for HashingWriter<W> {
@@ -315,9 +378,15 @@ impl KvSessionStore {
     /// file that belongs to a different container or dtype.
     fn read_header(&self, path: &Path) -> Result<Option<(Vec<i32>, u64)>, Error> {
         let bytes = std::fs::metadata(path).ctx(|| format!("stat {}", path.display()))?.len();
-        let mut f = std::fs::File::open(path).ctx(|| format!("open {}", path.display()))?;
-        let mut fixed = [0u8; 4 + 4 + 8 + 4 + 4 + 4 + 4 + 4];
-        f.read_exact(&mut fixed).ctx(|| format!("read header of {}", path.display()))?;
+        // Two positioned reads rather than one batched submit: the token list's
+        // length is parsed out of the fixed header, so the second read cannot be
+        // sized until the first has landed.
+        const FIXED: usize = 4 + 4 + 8 + 4 + 4 + 4 + 4 + 4;
+        let fixed = peregrine_io::read_region(path, 0, FIXED)
+            .ctx(|| format!("read header of {}", path.display()))?;
+        if fixed.len() < FIXED {
+            return Err(Error::Format(format!("{}: truncated header", path.display())));
+        }
         let (magic, rest) = fixed.split_at(4);
         if magic != MAGIC {
             return Err(Error::Format(format!("{}: not a PGKV file", path.display())));
@@ -337,8 +406,12 @@ impl KvSessionStore {
         if n_layers != self.cfg.n_layers as usize {
             return Ok(None);
         }
-        let mut tok_bytes = vec![0u8; n_tokens.saturating_mul(4)];
-        f.read_exact(&mut tok_bytes).ctx(|| format!("read tokens of {}", path.display()))?;
+        let want = n_tokens.saturating_mul(4);
+        let tok_bytes = peregrine_io::read_region(path, FIXED as u64, want)
+            .ctx(|| format!("read tokens of {}", path.display()))?;
+        if tok_bytes.len() < want {
+            return Err(Error::Format(format!("{}: truncated token list", path.display())));
+        }
         let tokens = tok_bytes.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         Ok(Some((tokens, bytes)))
     }
@@ -405,7 +478,7 @@ impl KvSessionStore {
     /// prompt match against the *file's* tokens (the index is a cache of
     /// them), rebuild the KV, and narrow it to the matched prefix.
     fn read_entry(&self, path: &Path, prompt: &[i32], cap: usize) -> Result<Option<(SeqKv, usize)>, Error> {
-        let bytes = std::fs::read(path).ctx(|| format!("read {}", path.display()))?;
+        let bytes = peregrine_io::read_file(path).ctx(|| format!("read {}", path.display()))?;
         if bytes.len() < 8 {
             return Err(Error::Format(format!("{}: truncated", path.display())));
         }
@@ -524,6 +597,44 @@ impl KvSessionStore {
         }
     }
 
+    /// Emit the checkpoint frame and its FNV-1a-64 trailer. Generic over the
+    /// sink so the ring path and the no-ring fallback produce byte-identical
+    /// files — the on-disk format is a compatibility surface (a checkpoint
+    /// written by one build must load in the other), so there is exactly one
+    /// place that decides its bytes.
+    fn serialize_entry<W: Write>(
+        w: &mut HashingWriter<W>,
+        ctx: &WriterCtx,
+        tokens: &[i32],
+        export: &KvExport,
+    ) -> Result<(), Error> {
+        let n = tokens.len();
+        w.write_all(&MAGIC).ctx(|| "kvstore header".to_string())?;
+        w.write_all(&VERSION.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
+        w.write_all(&ctx.fingerprint.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
+        w.write_all(&dtype_tag(ctx.dtype).to_le_bytes()).ctx(|| "kvstore header".to_string())?;
+        for dim in [ctx.cfg.n_layers as u32, ctx.cfg.kv_lora as u32, ctx.cfg.qk_rope as u32, n as u32] {
+            w.write_all(&dim.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
+        }
+        for &t in tokens {
+            w.write_all(&(t as u32).to_le_bytes()).ctx(|| "kvstore tokens".to_string())?;
+        }
+        for le in &export.layers {
+            w.write_all(&(le.ix_width as u32).to_le_bytes()).ctx(|| "kvstore layer".to_string())?;
+            for len in [le.lc.len() as u64, le.rc.len() as u64, le.ix.len() as u64] {
+                w.write_all(&len.to_le_bytes()).ctx(|| "kvstore layer".to_string())?;
+            }
+            for stream in [&le.lc, &le.rc, &le.ix] {
+                for v in stream.iter() {
+                    w.write_all(&v.to_le_bytes()).ctx(|| "kvstore payload".to_string())?;
+                }
+            }
+        }
+        let trailer = w.h;
+        w.write_all(&trailer.to_le_bytes()).ctx(|| "kvstore trailer".to_string())?;
+        Ok(())
+    }
+
     fn write_entry(ctx: &WriterCtx, tokens: &[i32], export: &KvExport) -> Result<IndexEntry, Error> {
         let n = tokens.len();
         let mut name_hash = FNV_OFFSET;
@@ -535,33 +646,26 @@ impl KvSessionStore {
         let tmp = durable::temp_sibling(&path)?;
         {
             let f = std::fs::File::create(&tmp).ctx(|| format!("create {}", tmp.display()))?;
-            let mut w = HashingWriter { w: std::io::BufWriter::new(f), h: FNV_OFFSET };
-            w.write_all(&MAGIC).ctx(|| "kvstore header".to_string())?;
-            w.write_all(&VERSION.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
-            w.write_all(&ctx.fingerprint.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
-            w.write_all(&dtype_tag(ctx.dtype).to_le_bytes()).ctx(|| "kvstore header".to_string())?;
-            for dim in [ctx.cfg.n_layers as u32, ctx.cfg.kv_lora as u32, ctx.cfg.qk_rope as u32, n as u32] {
-                w.write_all(&dim.to_le_bytes()).ctx(|| "kvstore header".to_string())?;
-            }
-            for &t in tokens {
-                w.write_all(&(t as u32).to_le_bytes()).ctx(|| "kvstore tokens".to_string())?;
-            }
-            for le in &export.layers {
-                w.write_all(&(le.ix_width as u32).to_le_bytes()).ctx(|| "kvstore layer".to_string())?;
-                for len in [le.lc.len() as u64, le.rc.len() as u64, le.ix.len() as u64] {
-                    w.write_all(&len.to_le_bytes()).ctx(|| "kvstore layer".to_string())?;
+            match peregrine_io::Reactor::new(8) {
+                Ok(reactor) => {
+                    use std::os::unix::io::AsRawFd;
+                    let mut w = HashingWriter { w: RingSink::new(reactor, f.as_raw_fd()), h: FNV_OFFSET };
+                    Self::serialize_entry(&mut w, ctx, tokens, export)?;
+                    w.w.finish().ctx(|| format!("fsync {}", tmp.display()))?;
                 }
-                for stream in [&le.lc, &le.rc, &le.ix] {
-                    for v in stream.iter() {
-                        w.write_all(&v.to_le_bytes()).ctx(|| "kvstore payload".to_string())?;
-                    }
+                // A checkpoint is an optimization, so a host without io_uring
+                // must still be able to save one — the same rule the whole-file
+                // helpers in `peregrine-io` follow. Both sinks emit the identical
+                // frame; only the syscall shape differs.
+                Err(e) => {
+                    note_advisory_err("io_uring unavailable for checkpoint write (using buffered write)", &e);
+                    let mut w = HashingWriter { w: std::io::BufWriter::new(f), h: FNV_OFFSET };
+                    Self::serialize_entry(&mut w, ctx, tokens, export)?;
+                    w.flush().ctx(|| "kvstore flush".to_string())?;
+                    let f = w.w.into_inner().map_err(|e| Error::Format(format!("kvstore buffered write: {e}")))?;
+                    f.sync_all().ctx(|| format!("fsync {}", tmp.display()))?;
                 }
             }
-            let trailer = w.h;
-            w.write_all(&trailer.to_le_bytes()).ctx(|| "kvstore trailer".to_string())?;
-            w.flush().ctx(|| "kvstore flush".to_string())?;
-            let f = w.w.into_inner().map_err(|e| Error::Format(format!("kvstore buffered write: {e}")))?;
-            f.sync_all().ctx(|| format!("fsync {}", tmp.display()))?;
         }
         durable::commit_atomic(&tmp, &path)?;
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);

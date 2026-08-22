@@ -53,6 +53,18 @@ mod ffi {
             o: c_int,
             device: c_int,
         ) -> c_int;
+        pub fn coli_cuda_tensor_upload_async(
+            tensor: *mut *mut ColiCudaTensor,
+            weights: *const c_void,
+            scales: *const f32,
+            fmt: c_int,
+            i: c_int,
+            o: c_int,
+            device: c_int,
+        ) -> c_int;
+        pub fn coli_cuda_host_register(ptr: *mut c_void, bytes: usize) -> c_int;
+        pub fn coli_cuda_host_unregister(ptr: *mut c_void) -> c_int;
+        pub fn coli_cuda_stream_sync(device: c_int) -> c_int;
         pub fn coli_cuda_tensor_free(tensor: *mut ColiCudaTensor);
         pub fn coli_cuda_shared_mlp_w4a16(
             gate: *mut ColiCudaTensor,
@@ -273,7 +285,7 @@ pub fn mem_info(_device: i32) -> Result<(usize, usize), Error> {
 /// Largest single VRAM allocation that currently succeeds on `device`, found by
 /// binary-searching real `cudaMalloc` probes (~13 of them on a 12 GB card, 2 MB
 /// grain). `free − largest` from [`mem_info`] is the fragmentation the defrag-pool
-/// question (`todo.md` §2) turns on. Diagnostic only: every probe is a live
+/// question (`docs/todo.md` §2) turns on. Diagnostic only: every probe is a live
 /// allocation, so never call this on a forward path.
 #[cfg(feature = "cuda")]
 pub fn largest_free_block(device: i32) -> Result<usize, Error> {
@@ -384,6 +396,58 @@ impl GpuExpert {
         };
         Ok(GpuExpert { gate: g, up: u, down: d })
     }
+
+    /// Async twin of [`Self::upload_int4`] — the GPU end of the disk→GPU lane.
+    ///
+    /// Identical bytes and identical device state, but the three H2D copies are
+    /// queued on the device's managed stream and **not waited on**, so a batch of
+    /// uploads overlaps the host work that produces the next one instead of
+    /// stalling on each in turn.
+    ///
+    /// Two obligations come with that, and both are the caller's:
+    ///
+    /// 1. Call [`stream_sync`] on `device` before any kernel reads these weights.
+    /// 2. Keep `gate`/`up`/`down` alive and unmodified until that sync returns —
+    ///    the DMA reads them after this function has already come back.
+    ///
+    /// The payoff only lands if the byte slices are **pinned** (see
+    /// [`pin_host`]). An async copy from pageable memory is legal but the driver
+    /// must bounce it through its own staging buffer, which serializes the very
+    /// thing this exists to overlap.
+    pub fn upload_int4_async(
+        device: i32,
+        gate: (&[u8], &[f32]),
+        up: (&[u8], &[f32]),
+        down: (&[u8], &[f32]),
+        hidden: usize,
+        inter: usize,
+    ) -> Result<GpuExpert, Error> {
+        let ok = |b: &[u8], s: &[f32], o: usize, i: usize| b.len() == o * i.div_ceil(2) && s.len() == o;
+        if !ok(gate.0, gate.1, inter, hidden) || !ok(up.0, up.1, inter, hidden) || !ok(down.0, down.1, hidden, inter) {
+            return Err(Error::Format("gpu int4 async expert upload: byte/scale length mismatch".into()));
+        }
+        let g = upload_tensor_i4_async(device, gate.0, gate.1, hidden, inter)?;
+        let u = match upload_tensor_i4_async(device, up.0, up.1, hidden, inter) {
+            Ok(t) => t,
+            Err(e) => {
+                // The failed call left nothing queued, but `g`'s copy may still be
+                // in flight; drain before freeing its device memory.
+                let _ = stream_sync(device);
+                free_tensor(g);
+                return Err(e);
+            }
+        };
+        let d = match upload_tensor_i4_async(device, down.0, down.1, inter, hidden) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = stream_sync(device);
+                free_tensor(g);
+                free_tensor(u);
+                return Err(e);
+            }
+        };
+        Ok(GpuExpert { gate: g, up: u, down: d })
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -462,6 +526,195 @@ fn upload_tensor_i4(device: i32, w: &[u8], scales: &[f32], i: usize, o: usize) -
     } else {
         free_tensor(t);
         Err(Error::Format(format!("cuda int4 tensor_upload failed (i={i}, o={o})")))
+    }
+}
+
+/// Live pinning state — what the disk→GPU lane actually got, not what it asked
+/// for. See [`pin_host`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PinStats {
+    pub buffers: usize,
+    pub bytes: u64,
+    pub declined: usize,
+}
+
+/// Buffers below this are declined by policy. `cudaHostRegister` walks and pins
+/// page tables, far too expensive to pay on a small allocation that will never
+/// be an H2D source; the expert slabs this lane exists for are ~18.9 MB.
+const MIN_PIN_BYTES: usize = 1 << 20;
+
+static PINNED_BUFS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PINNED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PIN_DECLINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current pinning counters.
+///
+/// `declined` is the number that matters when the lane underperforms: a high
+/// count with `buffers` near zero means the lane is nominally on and doing
+/// nothing, and every upload is quietly bouncing through the driver's own
+/// staging buffer.
+///
+/// Note it is **not** `RLIMIT_MEMLOCK` that refuses these. `cudaHostRegister`
+/// pins through the NVIDIA driver, which does its own accounting: measured on
+/// this box, it registers 256 MB happily with `ulimit -l` at 8192 KB. That
+/// limit binds `IORING_REGISTER_BUFFERS` (see `concurrent.rs`), which is a
+/// different mechanism on the same lane — do not chase the wrong knob. Real
+/// refusals here mean host memory pressure or a driver that will not pin the
+/// range.
+pub fn pin_stats() -> PinStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    PinStats {
+        buffers: PINNED_BUFS.load(Relaxed),
+        bytes: PINNED_BYTES.load(Relaxed),
+        declined: PIN_DECLINED.load(Relaxed),
+    }
+}
+
+/// Pin an aligned host allocation so io_uring can DMA disk bytes into it and
+/// CUDA can then DMA those same bytes to the device, with no copy in between.
+/// Returns whether the pin took.
+///
+/// **This is a `peregrine_io::set_pin_hook` callback and nothing else.** It is a
+/// safe `fn` because that hook's type is a safe fn pointer; its actual contract
+/// is the hook's contract — `peregrine_io::AlignedBuf` calls it with the base
+/// and length of an allocation it has just made, and calls [`unpin_host`] with
+/// the same pair from its own `Drop`, while the pages are still mapped. Calling
+/// it with anything else is unsound. It lives here rather than in
+/// `peregrine-model` because that crate denies `unsafe`, and this is FFI.
+///
+/// Failure is ordinary rather than exceptional, which is why it returns `bool`
+/// instead of an error: a declined buffer costs the pinned lane and nothing
+/// else — the pageable upload path still works. See [`pin_stats`] for what does
+/// and does not cause a refusal.
+pub fn pin_host(ptr: *mut u8, len: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len < MIN_PIN_BYTES {
+        return false; // declined by policy, not by the driver — not counted
+    }
+    // SAFETY: the hook contract above — a live, still-mapped allocation of
+    // exactly `len` bytes at `ptr`, unregistered before it is freed.
+    if unsafe { host_register(ptr, len) } {
+        PINNED_BUFS.fetch_add(1, Relaxed);
+        PINNED_BYTES.fetch_add(len as u64, Relaxed);
+        true
+    } else {
+        PIN_DECLINED.fetch_add(1, Relaxed);
+        false
+    }
+}
+
+/// Undo a [`pin_host`]. Same contract: a `peregrine_io::set_pin_hook` callback,
+/// called from `AlignedBuf::drop` while the pages are still mapped.
+pub fn unpin_host(ptr: *mut u8, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // SAFETY: the hook contract — a pointer `pin_host` returned true for, still
+    // mapped.
+    if unsafe { host_unregister(ptr) } {
+        PINNED_BUFS.fetch_sub(1, Relaxed);
+        PINNED_BYTES.fetch_sub(len as u64, Relaxed);
+    } else {
+        eprintln!("[peregrine advisory] cudaHostUnregister failed; pinned pages leaked");
+    }
+}
+
+/// Pin an existing host allocation with `cudaHostRegister`, so io_uring can DMA
+/// disk bytes into it and CUDA can then DMA those same bytes to the device with
+/// no copy in between. Returns whether the pin took.
+///
+/// **Failure is ordinary, not exceptional**, which is why this returns `bool`
+/// rather than an `Error`: the caller keeps a pageable buffer and the blocking
+/// upload path still works. Host memory pressure and a driver that will not pin
+/// the range are the real causes; `RLIMIT_MEMLOCK` is not one of them, despite
+/// the folklore — see [`pin_stats`].
+///
+/// # Safety
+/// `ptr` must point to `bytes` of live host memory that stays mapped, and at the
+/// same address, until [`host_unregister`] is called on it.
+#[cfg(feature = "cuda")]
+pub unsafe fn host_register(ptr: *mut u8, bytes: usize) -> bool {
+    // SAFETY: forwarded caller contract — a live mapping of `bytes` at `ptr`.
+    unsafe { ffi::coli_cuda_host_register(ptr as *mut c_void, bytes) == 1 }
+}
+
+/// Undo a [`host_register`]. Must run while the pages are still mapped:
+/// unregistering a freed pointer is undefined.
+///
+/// # Safety
+/// `ptr` must be a pointer a previous [`host_register`] returned `true` for, and
+/// its memory must still be mapped.
+#[cfg(feature = "cuda")]
+pub unsafe fn host_unregister(ptr: *mut u8) -> bool {
+    // SAFETY: forwarded caller contract — a still-mapped, previously registered
+    // pointer.
+    unsafe { ffi::coli_cuda_host_unregister(ptr as *mut c_void) == 1 }
+}
+
+#[cfg(not(feature = "cuda"))]
+/// # Safety
+/// Never dereferences `ptr`; the no-CUDA build has nothing to pin.
+pub unsafe fn host_register(_ptr: *mut u8, _bytes: usize) -> bool {
+    false
+}
+
+#[cfg(not(feature = "cuda"))]
+/// # Safety
+/// Never dereferences `ptr`; the no-CUDA build has nothing to unpin.
+pub unsafe fn host_unregister(_ptr: *mut u8) -> bool {
+    false
+}
+
+/// Drain `device`'s managed stream — the completion boundary for a batch of
+/// [`GpuExpert::upload_int4_async`] calls. Until this returns, none of those
+/// weights may be read by a kernel and none of their host source buffers may be
+/// freed or reused.
+#[cfg(feature = "cuda")]
+pub fn stream_sync(device: i32) -> Result<(), Error> {
+    // SAFETY: plain FFI call taking a device ordinal; validated C-side.
+    if unsafe { ffi::coli_cuda_stream_sync(device as c_int) } == 1 {
+        Ok(())
+    } else {
+        Err(Error::Format(format!("cuda stream_sync failed on device {device}")))
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn stream_sync(_device: i32) -> Result<(), Error> {
+    Ok(())
+}
+
+/// Async twin of [`upload_tensor_i4`]: same bytes, same conversion, but issued
+/// on the device's managed stream and *not* waited on. The caller owes a
+/// [`stream_sync`] before any kernel reads the result and before `w`/`scales`
+/// are dropped.
+#[cfg(feature = "cuda")]
+fn upload_tensor_i4_async(
+    device: i32,
+    w: &[u8],
+    scales: &[f32],
+    i: usize,
+    o: usize,
+) -> Result<*mut ffi::ColiCudaTensor, Error> {
+    let mut t: *mut ffi::ColiCudaTensor = std::ptr::null_mut();
+    // SAFETY: `w` holds o*ceil(i/2) packed bytes and `scales` holds `o` f32;
+    // fmt=2 requires non-null scales. The copies are queued on the device's
+    // stream and complete no later than the caller's `stream_sync`, which the
+    // caller must issue while `w` and `scales` are still alive.
+    let ok = unsafe {
+        ffi::coli_cuda_tensor_upload_async(
+            &mut t,
+            w.as_ptr() as *const c_void,
+            scales.as_ptr(),
+            2,
+            i as c_int,
+            o as c_int,
+            device as c_int,
+        )
+    };
+    if ok == 1 && !t.is_null() {
+        Ok(t)
+    } else {
+        free_tensor(t);
+        Err(Error::Format(format!("cuda int4 tensor_upload_async failed (i={i}, o={o})")))
     }
 }
 
@@ -1149,7 +1402,7 @@ mod gpu_tests {
         Ok(())
     }
 
-    /// The measurement `todo.md` §2's defrag-pool item asked for instead of the
+    /// The measurement `docs/todo.md` §2's defrag-pool item asked for instead of the
     /// pool. The engine's VRAM workload is exactly two block sizes (`int4_bytes`,
     /// `f32_bytes`); this reproduces the worst churn `reheat`'s precision ladder
     /// can produce — interleaved frees with every gap refilled at the *other*
@@ -1997,6 +2250,128 @@ mod gpu_tests {
             }
         }
         Ok(())
+    }
+
+    /// The async lane must land the **same device state** as the blocking one.
+    ///
+    /// This is the gate on the one genuinely risky part of the disk→GPU lane:
+    /// `coli_cuda_tensor_upload_async` moves the `offset_to_signed_s4` int4
+    /// conversion kernel from the default stream onto `ctx->stream`. Get that
+    /// wrong and the kernel is unordered against the copy feeding it, so it
+    /// converts nibbles that have not arrived — which this repo has already
+    /// shipped once, in the other direction, and which no timing harness
+    /// notices. Byte-exact equality of the two paths' outputs is what catches
+    /// it: both read the same weights through the same kernel, so any
+    /// difference is the ordering.
+    #[test]
+    fn the_async_int4_upload_lands_what_the_blocking_one_does() -> Result<(), Error> {
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        let (hidden, inter, s_n) = (256usize, 512usize, 3usize);
+        let mut r = Lcg(0xA5EED);
+        let gatef: Vec<f32> = (0..inter * hidden).map(|_| r.f() * 0.1).collect();
+        let upf: Vec<f32> = (0..inter * hidden).map(|_| r.f() * 0.1).collect();
+        let downf: Vec<f32> = (0..hidden * inter).map(|_| r.f() * 0.1).collect();
+        let (gq, gs) = quant_i4(&gatef, inter, hidden);
+        let (uq, us) = quant_i4(&upf, inter, hidden);
+        let (dq, ds) = quant_i4(&downf, hidden, inter);
+        let x: Vec<f32> = (0..s_n * hidden).map(|_| r.f()).collect();
+
+        let blocking = GpuExpert::upload_int4(0, (&gq, &gs), (&uq, &us), (&dq, &ds), hidden, inter)?;
+        let want = dense_mlp_w4a16(&blocking, &x, s_n, hidden)?;
+        drop(blocking);
+
+        let async_e = GpuExpert::upload_int4_async(0, (&gq, &gs), (&uq, &us), (&dq, &ds), hidden, inter)?;
+        // The caller's obligation: nothing may read these weights, and the host
+        // buffers may not be dropped, until the stream drains.
+        stream_sync(0)?;
+        let got = dense_mlp_w4a16(&async_e, &x, s_n, hidden)?;
+
+        assert_eq!(got.len(), want.len());
+        for (k, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "element {k}: async upload {g} != blocking upload {w} — \
+                 the same weights through the same kernel must be bit-identical, \
+                 so a difference here is the int4 conversion running unordered \
+                 against its copy"
+            );
+        }
+        Ok(())
+    }
+
+    /// `stream_sync` on an idle stream must succeed rather than error — the
+    /// drain path calls it unconditionally at the end of a generation, including
+    /// generations that queued nothing.
+    #[test]
+    fn stream_sync_on_an_idle_stream_succeeds() -> Result<(), Error> {
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        stream_sync(0)?;
+        stream_sync(0)?;
+        Ok(())
+    }
+
+    /// `pin_host` must pin a page-aligned buffer and `unpin_host` must release
+    /// it, with the counters moving together. A refusal (small `RLIMIT_MEMLOCK`)
+    /// is a legitimate outcome on some hosts and must be reported as declined
+    /// rather than counted as pinned.
+    #[test]
+    fn pin_host_registers_and_releases_an_aligned_buffer() -> Result<(), Error> {
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        const LEN: usize = 4 << 20; // over MIN_PIN_BYTES, and page-aligned below
+        let Ok(layout) = std::alloc::Layout::from_size_align(LEN, 4096) else {
+            return Ok(());
+        };
+        // SAFETY: non-zero size, power-of-two alignment; freed exactly once below.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Ok(());
+        }
+        let before = pin_stats();
+        let pinned = pin_host(ptr, LEN);
+        let after = pin_stats();
+        if pinned {
+            assert_eq!(after.buffers, before.buffers + 1, "a pinned buffer must be counted");
+            assert_eq!(after.bytes, before.bytes + LEN as u64, "its bytes must be counted");
+            unpin_host(ptr, LEN);
+            let end = pin_stats();
+            assert_eq!(end.buffers, before.buffers, "unpin must give the count back");
+            assert_eq!(end.bytes, before.bytes, "unpin must give the bytes back");
+        } else {
+            // The honest failure: RLIMIT_MEMLOCK too small for a 4 MB pin.
+            assert_eq!(after.declined, before.declined + 1, "a refusal must be counted as declined");
+            assert_eq!(after.buffers, before.buffers, "a refused buffer must not be counted as pinned");
+            eprintln!(
+                "note: cudaHostRegister refused 4 MB, so the pinned lane is not exercised here. \
+                 This is NOT `ulimit -l`: the NVIDIA driver pins through its own accounting \
+                 (measured registering 256 MB with `ulimit -l` at 8192 KB)."
+            );
+        }
+        // SAFETY: same pointer and layout as the allocation, freed once, and
+        // already unregistered above if it was ever registered.
+        unsafe { std::alloc::dealloc(ptr, layout) };
+        Ok(())
+    }
+
+    /// A buffer under the policy floor must be declined without ever reaching
+    /// the driver: `cudaHostRegister` is a page-table walk, far too expensive to
+    /// pay on an allocation that will never be an H2D source.
+    #[test]
+    fn pin_host_declines_small_buffers_without_calling_the_driver() {
+        let before = pin_stats();
+        let mut small = [0u8; 64];
+        assert!(!pin_host(small.as_mut_ptr(), small.len()), "a 64-byte buffer must be declined");
+        let after = pin_stats();
+        assert_eq!(after, before, "a policy refusal must not touch the driver or the counters");
     }
 }
 

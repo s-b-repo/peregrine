@@ -898,7 +898,7 @@ pub struct Verified {
 
 /// `MemAvailable` from `/proc/meminfo`, in bytes (0 if unreadable). The host's view.
 fn host_mem_available_bytes() -> u64 {
-    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return 0 };
+    let Ok(s) = peregrine_io::read_proc_string("/proc/meminfo") else { return 0 };
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
             let kb: u64 = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -950,7 +950,7 @@ fn cgroup_available_bytes() -> Option<u64> {
             }
         }
     };
-    if let Some(rel) = std::fs::read_to_string("/proc/self/cgroup")
+    if let Some(rel) = peregrine_io::read_proc_string("/proc/self/cgroup")
         .ok()
         .as_deref()
         .and_then(self_cgroup_v2_rel)
@@ -988,7 +988,7 @@ fn cgroup_available_bytes() -> Option<u64> {
 /// (`COLI_DEBUG=1` surfaces it): the host's own `MemAvailable` still stands, so
 /// the run continues with the figure it would have used anyway.
 fn read_cgroup_file(path: &str) -> Option<String> {
-    match std::fs::read_to_string(path) {
+    match peregrine_io::read_proc_string(path) {
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
@@ -1851,7 +1851,7 @@ fn route_stats_persist_enabled() -> bool {
 /// reason.
 fn read_optional_artifact(dir: &std::path::Path, file: &str) -> Option<serde_json::Value> {
     let path = dir.join(file);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match peregrine_io::read_file(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
@@ -2009,7 +2009,7 @@ fn load_layout_schedule(dir: &std::path::Path) -> Option<Vec<Vec<u32>>> {
     if matches!(std::env::var("COLI_LAYOUT_SCHEDULE").as_deref(), Ok("0") | Ok("false")) {
         return None;
     }
-    let bytes = std::fs::read(dir.join("schedule.json")).ok()?;
+    let bytes = peregrine_io::read_file(&dir.join("schedule.json")).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     parse_schedule_value(&v)
 }
@@ -3478,13 +3478,37 @@ impl Model {
         // Optional GPU VRAM tier (opt-in via COLI_GPU): dequantize as many experts
         // as fit to f32 and upload. Reserve 2 GB headroom for activations/context.
         let gpu = if std::env::var("COLI_GPU").is_ok() {
+            // Open the disk→GPU lane before anything allocates an aligned
+            // buffer. `cudaHostRegister` pins pages in place, so it can only
+            // catch allocations made after the hook is installed — installing
+            // late gives a lane that silently only half works. This is ahead of
+            // both the tier's own weight loads and the streaming pool.
+            if crate::pinned::install() {
+                eprintln!("peregrine: disk->GPU lane pinned (io_uring DMAs into cudaHostRegister'd pages)");
+            }
             // Last session's routing heat, if any, so the residency knapsack has
             // something to rank by (empty → deterministic round-robin placement).
             let warm_heat = peek_persisted_heat(dir, &cfg);
             let tier = GpuTier::build(&st, &cfg, 2 * 1024 * 1024 * 1024, &warm_heat)?;
             if let Some(t) = &tier {
                 let src = if warm_heat.is_empty() { "cold" } else { "heat-ranked" };
+                let pin = crate::pinned::stats();
+                let (async_up, blocking_up) = crate::gpu::upload_lane_counts();
                 eprintln!("peregrine: GPU tier holds {} experts in VRAM ({src})", t.len());
+                // Say which lane the uploads actually took. A tier that pinned
+                // nothing loads fine, computes the right answer, and prints the
+                // same line as one that did — the only difference is speed,
+                // against a baseline nobody has. So state it rather than leave
+                // it to be inferred.
+                if async_up > 0 || blocking_up > 0 {
+                    eprintln!(
+                        "peregrine: expert uploads {async_up} pinned-async / {blocking_up} blocking; \
+                         pinned staging {} buffers / {:.1} MB ({} refused)",
+                        pin.buffers,
+                        pin.bytes as f64 / (1024.0 * 1024.0),
+                        pin.declined,
+                    );
+                }
             }
             tier
         } else {
@@ -5123,7 +5147,7 @@ impl Model {
     /// a model load.
     fn try_load_kernel_tuning(&self, dir: &std::path::Path) {
         let Some(gpu) = self.gpu.as_ref() else { return };
-        let Ok(bytes) = std::fs::read(dir.join("kernel_tuning.json")) else { return };
+        let Ok(bytes) = peregrine_io::read_file(&dir.join("kernel_tuning.json")) else { return };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
         gpu.restore_tuning(&v);
     }

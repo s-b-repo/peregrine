@@ -106,6 +106,7 @@ Error: ... 6.8 GB short, so the kernel would OOM-kill this run part-way through 
 | `COLI_IO_BATCH` | 16 | **upper bound** on experts claimed per ring — [note](#coli_io_batch) |
 | `COLI_IO_ENGINE` | auto | `uring` \| `pread` \| `regbuf`; unset probes io_uring and falls back to `pread` — [note](#coli_io_engine) |
 | `COLI_IO_COMPLETION` | on | forward each expert as its own reads complete (uring only); `0` restores the blocking whole-wave submit — [note](#coli_io_completion) |
+| `COLI_IO_PROCFS` | ring | whether `/proc` and `/sys` reads go through the ring; `direct` restores a plain `read(2)` — [note](#coli_io_procfs) |
 | `COLI_SQPOLL` | off | kernel submission-polling thread on the streaming rings: no enter syscall per submit — [note](#coli_sqpoll) |
 | `COLI_SQPOLL_IDLE_MS` | 2000 | how long the SQPOLL kthread busy-polls before sleeping (the next submit wakes it transparently) |
 | `COLI_SQPOLL_CPU` | unset | pin the SQPOLL kthread to this CPU |
@@ -144,6 +145,31 @@ token** (measured 24 % io duty across 4 rings). Fixing that took decode
 **21.83 → 16.08 s/tok** and duty **24 % → 84 %**. Prefill is unaffected — its
 ~69-expert union still yields the full 16. Detail:
 [the concurrent scheduler](concurrent-scheduler.md#the-three-lanes).
+
+### `COLI_IO_PROCFS`
+
+The one place where "all I/O is io_uring" costs something rather than saving it,
+which is why it is the one place with a switch.
+
+`/proc` and `/sys` are synthetic filesystems. Two consequences: `stat` reports a
+size of 0, so the ordinary `read_file` shape (size, then one exact read) returns
+nothing for them — `read_file_seq` reads until EOF instead; and the kernel cannot
+take io_uring's non-blocking fast path on a synthetic file, so **every such read
+is punted to an io-wq worker thread**. That is strictly more work than the
+`read(2)` it replaces.
+
+Two callers are on warm paths and are the reason the escape hatch exists: the RSS
+guard reads `/proc/self/statm` every few tokens
+(`peregrine-model/src/ram.rs`), and the joules-per-token metric reads RAPL
+`energy_uj` per sample (`peregrine-io/src/sensors.rs`). The remainder
+(`/proc/meminfo`, `/proc/self/cgroup`, `/proc/self/status`, the NUMA/PCI/block
+probes) are read once at startup and cost nothing either way.
+
+`ring` (default) makes the invariant literally true with no exception. `direct`
+(or `0`) restores `std::fs::read_to_string`. **The parsed values are identical
+either way** — the knob changes the syscall shape and nothing else, which is what
+`read_proc_string_agrees_on_both_lanes` asserts. Latched in a `OnceLock` at first
+use, so it must be set before the process starts, not mid-run.
 
 ### `COLI_IO_ENGINE`
 
@@ -957,6 +983,8 @@ on a CPU-only binary.
 | `COLI_GPU_F32_FRAC` | unset | adaptive per-expert precision: hottest fraction of residents promoted to f32 |
 | `COLI_GPU_TIER_SWAP` | `replan` | VRAM residency policy for `reheat` — [note](#coli_gpu_tier_swap) |
 | `COLI_PCIE_BUDGET_MB` | unlimited | cap on bytes one `reheat` generation may upload; the coldest deferred to the next |
+| `COLI_GPU_PINNED` | on | the disk→GPU lane: io_uring DMAs weights into `cudaHostRegister`'d pages and the H2D copy is async — [note](#coli_gpu_pinned) |
+| `COLI_GPU_UPLOAD_DEPTH` | 4 | experts whose upload may be in flight before the lane drains; this is where the overlap comes from — [note](#coli_gpu_pinned) |
 | `COLI_CUDA_ASYNC` | **on** | async H2D/kernel/D2H; `=0` forces synchronous (`cuda/backend_cuda.cu`) |
 | `COLI_CUDA_TC_INT4` | off | int4 Tensor Core arm; one legal WMMA shape, 8×8×32 — [note](#kernel-arm-selection) |
 | `COLI_CUDA_TC_MIN_ROWS` | 8 | every group must have ≥ this many rows or the int4 TC arm is skipped |
@@ -995,6 +1023,60 @@ nothing" may simply have failed a precondition — the backend reports which arm
 > `COLI_W4A16_TILES` (emits the three template instantiations),
 > `COLI_CUDA_GRAPH_CACHE` (16) and `COLI_CUDA_MAX_DEVICES` (16). Setting them in the
 > environment does nothing.
+
+### `COLI_GPU_PINNED`
+
+The lane between the kernel and the GPU. With it off, a weight bound for VRAM
+goes `NVMe →(io_uring)→ pageable Vec →(blocking cudaMemcpy)→ VRAM`, and that
+second hop costs twice: CUDA cannot DMA out of pageable memory, so the driver
+stages every byte through an internal pinned bounce buffer, and the blocking form
+means the caller waits out the whole transfer with nothing overlapping it.
+
+With it on, the trip is two DMAs and no userspace copy:
+
+```
+NVMe ──(io_uring, O_DIRECT)──▶ pinned host page ──(cudaMemcpyAsync)──▶ VRAM
+```
+
+`peregrine_io::AlignedBuf` already allocates page-aligned and already owns its
+allocation's lifetime, so `cudaHostRegister` pins it **in place** — no second
+allocator, no change to the read path, and an exactly-matched unpin in the
+buffer's own `Drop`. `peregrine-io` holds a function-pointer pair and knows
+nothing about CUDA; `peregrine-model/src/pinned.rs` fills it in, and must do so
+before any aligned buffer exists (pinning is not retroactive).
+
+**Only the int4-resident path gets the full chain.** Those bytes reach VRAM
+verbatim, so io_uring lands them directly in the H2D source. An expert that is
+dequantized to f32 on the host cannot: the bytes the GPU receives are *computed*,
+not read, so no read can land in a pinned buffer. That path keeps the historical
+shape.
+
+`COLI_GPU_UPLOAD_DEPTH` is where the overlap actually comes from — expert N's
+copy to VRAM runs while expert N+1's weights are still being read off disk.
+Depth 1 is queue-then-immediately-wait, i.e. the blocking path with extra steps.
+The cost is host memory: each in-flight expert holds ~18.9 MB of pinned landing
+buffer until its copy completes. `reheat` and the incremental swap path run at
+depth 1 regardless, because each of their iterations frees the victim's VRAM and
+that must not race a live copy.
+
+Off restores the historical pageable, blocking path exactly, which makes it the
+A/B control. The boot line reports what the lane actually got:
+
+```
+peregrine: disk->GPU lane pinned (io_uring DMAs into cudaHostRegister'd pages)
+peregrine: pinned staging 37 buffers / 699.0 MB (0 declined)
+```
+
+A high `declined` with `buffers` near zero means the lane is nominally on and
+doing nothing. It is **not** `RLIMIT_MEMLOCK` that refuses these —
+`cudaHostRegister` pins through the NVIDIA driver's own accounting, measured on
+this box registering 256 MB with `ulimit -l` at 8192 KB. That limit binds
+`IORING_REGISTER_BUFFERS`, a different mechanism on the same lane.
+
+**What io_uring cannot do here.** There is no io_uring path that DMAs NVMe
+directly into VRAM. That is GPUDirect Storage (`nvidia-fs` + `libcufile`), a
+separate API with its own async submit and its own filesystem support matrix, not
+an io_uring opcode. The chain above is the io_uring-native optimum.
 
 ### `COLI_GPU_TIER_SWAP`
 

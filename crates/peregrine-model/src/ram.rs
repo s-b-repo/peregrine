@@ -349,7 +349,7 @@ mod tests {
 /// `/proc/self/statm` field 2 is resident pages. Cheap enough to call every few
 /// tokens — one small read, no allocation beyond the line.
 pub fn read_rss_bytes() -> u64 {
-    let s = match std::fs::read_to_string("/proc/self/statm") {
+    let s = match peregrine_io::read_proc_string("/proc/self/statm") {
         Ok(s) => s,
         // A masked or absent `/proc` disables the guard rather than failing the
         // run. Named explicitly (not swallowed) because the two cases differ:
@@ -366,9 +366,11 @@ pub fn read_rss_bytes() -> u64 {
     let Some(res_pages) = s.split_whitespace().nth(1).and_then(|f| f.parse::<u64>().ok()) else {
         return 0;
     };
-    // `sysconf(_SC_PAGESIZE)` is 4096 on every platform this engine targets;
-    // hard-coding it keeps this dependency-free and allocation-free.
-    res_pages.saturating_mul(4096)
+    // `statm` counts *kernel* pages, so the multiplier has to be the kernel's
+    // page size and not a constant: an aarch64 or ppc64le box with 64 KB pages
+    // would otherwise report 1/16th of its true RSS and the guard below would
+    // never fire on the one class of machine most likely to need it.
+    res_pages.saturating_mul(peregrine_io::page_size() as u64)
 }
 
 /// Tolerance before the guard acts: 2% of budget plus 300 MB.

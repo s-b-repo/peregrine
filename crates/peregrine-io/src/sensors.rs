@@ -20,7 +20,7 @@ pub fn max_temp_c() -> Option<i32> {
             if !name.starts_with("thermal_zone") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(e.path().join("temp")) else { continue };
+            let Ok(text) = crate::read_proc_string(e.path().join("temp")) else { continue };
             let Ok(mdeg) = text.trim().parse::<i64>() else { continue };
             max_mdeg = Some(max_mdeg.map_or(mdeg, |m: i64| m.max(mdeg)));
         }
@@ -54,11 +54,11 @@ pub fn energy_uj() -> Option<u64> {
             // `intel-rapl:1` is `psys`, a whole-platform domain that already
             // includes package-0 — summing both roughly doubles the reported
             // energy and silently skews every watt-derived decision.
-            let Ok(domain) = std::fs::read_to_string(e.path().join("name")) else { continue };
+            let Ok(domain) = crate::read_proc_string(e.path().join("name")) else { continue };
             if !domain.trim().starts_with("package") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(e.path().join("energy_uj")) else { continue };
+            let Ok(text) = crate::read_proc_string(e.path().join("energy_uj")) else { continue };
             let Ok(uj) = text.trim().parse::<u64>() else { continue };
             sum = Some(sum.unwrap_or(0).saturating_add(uj));
         }

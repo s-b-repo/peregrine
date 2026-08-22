@@ -34,12 +34,50 @@ pub const fn align_up_usize(x: usize, a: usize) -> usize {
     (x + (a - 1)) & !(a - 1)
 }
 
+/// Optional host-memory pin hook, installed once at process start by a backend
+/// that needs these buffers DMA-able by something other than the kernel. Today
+/// that is `peregrine-model`, which registers them with CUDA
+/// (`cudaHostRegister`) so an io_uring O_DIRECT landing buffer *is* the H2D
+/// source — no copy sits between the disk and the GPU.
+///
+/// A function-pointer pair rather than a trait object, so `peregrine-io` keeps
+/// zero knowledge of CUDA and gains no dependency. Unset (the default) means
+/// every buffer behaves exactly as it did before this existed.
+///
+/// The hook is called on **every** allocation, including the one-off buffers
+/// `read_direct_aligned` makes when the pool is empty, so it owns its own
+/// throttling: `cudaHostRegister` walks and pins page tables and is far too
+/// expensive to run per read. Returning `false` declines a buffer, and a
+/// declined buffer is never passed to `unpin`.
+type PinHook = (fn(*mut u8, usize) -> bool, fn(*mut u8, usize));
+static PIN_HOOK: std::sync::OnceLock<PinHook> = std::sync::OnceLock::new();
+
+/// Install the [`PIN_HOOK`]. Returns `false` if one was already installed (the
+/// first wins) — it is set once at startup, before any worker pool spawns, so a
+/// second caller is a bug rather than a race.
+/// `unpin` receives the same length `pin` was given, so a backend can keep
+/// live-pinned-bytes accounting without a side table keyed by address.
+pub fn set_pin_hook(pin: fn(*mut u8, usize) -> bool, unpin: fn(*mut u8, usize)) -> bool {
+    PIN_HOOK.set((pin, unpin)).is_ok()
+}
+
+/// Whether a pin hook is installed — lets a caller report the lane it actually
+/// got instead of the one it asked for.
+pub fn pin_hook_installed() -> bool {
+    PIN_HOOK.get().is_some()
+}
+
 /// A heap buffer whose base address and length are both multiples of [`ALIGN`].
 /// RAII: frees its allocation on drop.
 pub struct AlignedBuf {
     ptr: NonNull<u8>,
     len: usize, // multiple of ALIGN
     layout: Layout,
+    /// Whether [`PIN_HOOK`]'s `pin` accepted this allocation, and therefore
+    /// whether `unpin` must run before the `dealloc` in [`Drop`]. Unregistering
+    /// has to happen while the pages are still mapped, and only for buffers the
+    /// hook actually took.
+    pinned: bool,
 }
 
 // SAFETY: `AlignedBuf` uniquely owns its heap allocation (no interior aliasing,
@@ -84,8 +122,21 @@ impl AlignedBuf {
                 crate::mem::bind_local_if_enabled(ptr.as_ptr(), len);
             }
         }
-        Some(AlignedBuf { ptr, len, layout })
+        // Pin last: after the hugepage and NUMA advice, so the hook registers the
+        // pages the kernel is actually going to back this range with.
+        let pinned = match PIN_HOOK.get() {
+            Some((pin, _)) => pin(ptr.as_ptr(), len),
+            None => false,
+        };
+        Some(AlignedBuf { ptr, len, layout, pinned })
     }
+
+    /// Whether this buffer is registered with the [`PIN_HOOK`] backend — i.e.
+    /// whether it can be the source of an async device copy without a bounce.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
 
     /// The usable capacity in bytes (a multiple of [`ALIGN`]).
     pub fn capacity(&self) -> usize {
@@ -108,6 +159,13 @@ impl AlignedBuf {
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
+        // Unregister before freeing: the backend's unpin needs the pages still
+        // mapped, and a `cudaHostUnregister` of a freed pointer is undefined.
+        if self.pinned {
+            if let Some((_, unpin)) = PIN_HOOK.get() {
+                unpin(self.ptr.as_ptr(), self.len);
+            }
+        }
         // SAFETY: `ptr` came from `alloc_zeroed` with exactly `self.layout` and is
         // freed exactly once here.
         unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
@@ -173,6 +231,21 @@ impl Bytes {
             Bytes::Aligned { buf, .. } => buf.capacity(),
             Bytes::Shared(a) => a.len(),
             Bytes::View { len, .. } => *len,
+        }
+    }
+
+    /// Whether these bytes sit in memory the pin hook registered — i.e. whether
+    /// they can be the source of an async device copy without the driver
+    /// bouncing them through its own staging buffer. Only an aligned region can
+    /// be: a `Vec` is never offered to the hook, and a shared region may be read
+    /// by other holders.
+    ///
+    /// This is the exact question, as against "is the pointer 4096-aligned",
+    /// which a plain `Vec` can answer yes to by luck.
+    pub fn is_pinned(&self) -> bool {
+        match self {
+            Bytes::Aligned { buf, .. } => buf.is_pinned(),
+            Bytes::Vec(_) | Bytes::Shared(_) | Bytes::View { .. } => false,
         }
     }
 
@@ -532,5 +605,66 @@ mod tests {
         // a read larger than buf_cap cannot be served by this pool
         assert!(p.checkout(9000).is_none());
         Ok(())
+    }
+
+    /// The pin hook must fire exactly once per accepted allocation and unpin
+    /// exactly once when that allocation is freed — a leaked `cudaHostRegister`
+    /// would pin pages for the life of the process, and an unpin of a freed
+    /// pointer is undefined behaviour.
+    ///
+    /// `PIN_HOOK` is process-global and set-once, so this test claims it for the
+    /// whole test binary. It only accepts one distinctive capacity, which makes
+    /// every other test's buffers a cheap declined call rather than a behaviour
+    /// change.
+    #[test]
+    fn pin_hook_pins_and_unpins_each_accepted_buffer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // 5 pages: no other allocation in this crate's tests asks for exactly this.
+        const OWNED: usize = 5 * ALIGN;
+        static PINS: AtomicUsize = AtomicUsize::new(0);
+        static UNPINS: AtomicUsize = AtomicUsize::new(0);
+
+        fn pin(_p: *mut u8, len: usize) -> bool {
+            if len != OWNED {
+                return false; // declined: not ours, and never passed to unpin
+            }
+            PINS.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        fn unpin(_p: *mut u8, _len: usize) {
+            UNPINS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        if !super::set_pin_hook(pin, unpin) {
+            eprintln!("skipping: a pin hook was already installed in this process");
+            return;
+        }
+        assert!(super::pin_hook_installed());
+
+        let before = (PINS.load(Ordering::SeqCst), UNPINS.load(Ordering::SeqCst));
+        {
+            // An allocation failure is an environment problem, not a defect in
+            // the hook, and there is nothing to assert about pinning without a
+            // buffer. Skip rather than panic (the crate forbids panics).
+            let Some(b) = AlignedBuf::with_capacity(OWNED) else {
+                eprintln!("skipping: allocation of {OWNED} bytes failed");
+                return;
+            };
+            assert!(b.is_pinned(), "the hook accepted this size, so the buffer must record it");
+            assert_eq!(PINS.load(Ordering::SeqCst), before.0 + 1, "pin ran once");
+            assert_eq!(UNPINS.load(Ordering::SeqCst), before.1, "unpin must not run while the buffer lives");
+        }
+        assert_eq!(UNPINS.load(Ordering::SeqCst), before.1 + 1, "unpin ran exactly once on drop");
+
+        // A declined buffer must never reach unpin.
+        let unpins = UNPINS.load(Ordering::SeqCst);
+        {
+            let Some(b) = AlignedBuf::with_capacity(ALIGN) else {
+                eprintln!("skipping: allocation of {ALIGN} bytes failed");
+                return;
+            };
+            assert!(!b.is_pinned(), "the hook declined this size");
+        }
+        assert_eq!(UNPINS.load(Ordering::SeqCst), unpins, "a declined buffer must not be unpinned");
     }
 }

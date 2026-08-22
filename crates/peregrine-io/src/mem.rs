@@ -227,7 +227,7 @@ pub fn wire_resident() -> Wired {
 /// say how much it locked.
 #[cfg(target_os = "linux")]
 fn vm_locked_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let status = crate::read_proc_string("/proc/self/status").ok()?;
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmLck:") {
             let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;

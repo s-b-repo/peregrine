@@ -20,6 +20,9 @@ peregrine-model = { path = "../peregrine-model" }
 # engine -> sched -> model is acyclic; model -> sched would not be.
 peregrine-sched = { path = "../peregrine-sched" }
 peregrine-core = { path = "../peregrine-core" }
+# Whole-file loads go through the io_uring helpers, like every other read the
+# engine does; the crate is already in the tree via peregrine-model.
+peregrine-io = { path = "../peregrine-io" }
 peregrine-tools = { path = "../peregrine-tools" }
 # `flip-rate` measures a lossy container against its source on real text, and
 # random token ids are not real text — see the subcommand's note.

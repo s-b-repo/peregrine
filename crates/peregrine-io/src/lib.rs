@@ -27,6 +27,36 @@ pub fn note_advisory_err(op: &str, err: &dyn std::fmt::Display) {
     }
 }
 
+/// Whether `/proc` and `/sys` reads go through the ring (`COLI_IO_PROCFS`,
+/// default `ring`; `direct` or `0` restores a plain `read(2)`).
+///
+/// The knob exists because this is the one place where "all I/O is io_uring" is
+/// a cost rather than a win. procfs and sysfs files are synthetic — `stat`
+/// reports 0 bytes and the kernel cannot take io_uring's non-blocking fast path
+/// on them, so every such read is punted to an io-wq worker. Two callers are on
+/// warm paths (the RSS guard reads `/proc/self/statm` every few tokens, the
+/// energy meter reads RAPL per sample), which is exactly where that extra
+/// thread hand-off is worth being able to switch off and measure.
+pub fn procfs_via_ring() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !matches!(std::env::var("COLI_IO_PROCFS").as_deref(), Ok("direct") | Ok("0")))
+}
+
+/// Read a `/proc` or `/sys` file as a `String`, honouring [`procfs_via_ring`].
+/// The single entry point every synthetic-file reader in the workspace uses, so
+/// the knob has one meaning everywhere.
+pub fn read_proc_string(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let path = path.as_ref();
+    if procfs_via_ring() {
+        let bytes = ring::read_file_seq(path)?;
+        // Synthetic files are kernel-formatted ASCII; a lossy decode cannot
+        // change a parse that already only looks at digits and field names.
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    } else {
+        std::fs::read_to_string(path)
+    }
+}
+
 pub mod geometry;
 pub mod cache;
 pub mod latency;
@@ -48,10 +78,14 @@ pub use mem::{
 pub use perf::PerfCounter;
 pub use sensors::{energy_uj, max_temp_c, EnergyMeter};
 pub use ring::{
-    fadvise_many, pread_many, pread_many_threaded, probe_direct, read_file, FADV_DONTNEED,
-    FADV_WILLNEED, OwnedReadReq, Reactor, ReadReq, RegionDone,
+    fadvise_many, pread_many, pread_many_threaded, probe_direct, pwrite_many, read_file,
+    read_file_seq, read_region, write_file, FADV_DONTNEED, FADV_WILLNEED, OwnedReadReq, Reactor, ReadReq,
+    RegionDone, WriteReq,
 };
-pub use slab::{align_down, align_up, AlignedBuf, Bytes, SlabHandle, SlabPool, ALIGN};
+pub use slab::{
+    align_down, align_up, pin_hook_installed, set_pin_hook, AlignedBuf, Bytes, SlabHandle, SlabPool,
+    ALIGN,
+};
 pub use tier::{decay, lfru_score, pick_lfru, pick_swap, Swap};
 pub use warmcache::{CacheHit, CompressedSlab, ExpertSlab, PreparedInsert, ResidencyHint, WarmCache};
 

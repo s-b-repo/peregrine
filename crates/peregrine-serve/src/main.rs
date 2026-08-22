@@ -1111,8 +1111,8 @@ fn sse_error(message: &str) -> Event {
 /// HF oracle as a dev-dependency); this only measures throughput. Numbers are
 /// local to this box; no docs-level claims.
 fn bench_tokenizer(model_dir: &std::path::Path, file: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let json = std::fs::read(model_dir.join("tokenizer.json"))?;
-    let text = std::fs::read_to_string(file)?;
+    let json = peregrine_io::read_file(&model_dir.join("tokenizer.json"))?;
+    let text = String::from_utf8_lossy(&peregrine_io::read_file(file)?).into_owned();
     let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
     let bytes: usize = lines.iter().map(|l| l.len()).sum();
     if lines.is_empty() {

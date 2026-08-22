@@ -46,7 +46,7 @@ pub fn numa_nodes() -> Vec<NumaNode> {
                 let Some(rest) = name.strip_prefix("node") else { continue };
                 let Ok(id) = rest.parse::<u32>() else { continue };
                 let list_path = e.path().join("cpulist");
-                let Ok(text) = std::fs::read_to_string(&list_path) else { continue };
+                let Ok(text) = crate::read_proc_string(&list_path) else { continue };
                 let cpus = parse_cpu_list(text.trim());
                 if !cpus.is_empty() {
                     nodes.push(NumaNode { id, cpus });
@@ -179,7 +179,7 @@ pub fn gpu_pcie_links() -> Vec<(String, PcieLink)> {
 /// silently reading as absent.
 #[cfg(target_os = "linux")]
 fn read_sysfs_opt(path: &Path) -> Option<String> {
-    match std::fs::read_to_string(path) {
+    match crate::read_proc_string(path) {
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {

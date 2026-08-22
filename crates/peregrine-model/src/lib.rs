@@ -16,6 +16,7 @@
 
 pub mod attention;
 pub mod gdn;
+pub mod pinned;
 pub mod ngram;
 pub mod tree;
 pub mod concurrent;

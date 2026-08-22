@@ -58,6 +58,25 @@ pub type DevMatrix = peregrine_cuda::GpuMatrix;
 #[cfg(not(feature = "cuda"))]
 pub type DevMatrix = std::convert::Infallible;
 
+
+/// The landing buffer for a quantized payload: page-aligned when the caller
+/// wants the GPU lane (see [`QtWeight::load_aligned`]), a plain `Vec` otherwise.
+///
+/// An aligned allocation that fails degrades to the `Vec`. Losing the pinned
+/// lane is a performance outcome; it must never fail a model load.
+fn landing(nb: usize, aligned: bool) -> Bytes {
+    if aligned {
+        if let Some(buf) = peregrine_io::AlignedBuf::with_capacity(nb) {
+            return Bytes::Aligned { buf, head: 0, len: nb };
+        }
+        peregrine_io::note_advisory_err(
+            "aligned landing buffer for the GPU lane",
+            &"allocation failed; using a pageable Vec",
+        );
+    }
+    Bytes::Vec(vec![0u8; nb])
+}
+
 /// One quantized weight matrix `[O, I]`.
 pub struct QtWeight {
     pub fmt: QuantFmt,
@@ -117,6 +136,26 @@ impl QtWeight {
 
     /// Load a container weight `[O, I]` (`name` + `name.qs`) from a model dir.
     pub fn load(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<QtWeight, Error> {
+        Self::load_into(st, name, o, i, false)
+    }
+
+    /// [`Self::load`], but the quantized payload lands in a **page-aligned**
+    /// buffer instead of a `Vec`.
+    ///
+    /// That single difference is the whole disk→GPU lane. An aligned buffer is
+    /// what [`crate::pinned`]'s hook registers with CUDA, so io_uring DMAs the
+    /// weight straight into memory the GPU can DMA out of: no userspace copy,
+    /// and no pageable bounce inside the driver. Pair it with
+    /// `GpuExpert::upload_int4_async`.
+    ///
+    /// Only worth asking for when the bytes are bound for VRAM as-is. A weight
+    /// that will be dequantized on the host gains nothing — the f32 the GPU
+    /// receives is computed, not read, so no read can land in the pinned buffer.
+    pub fn load_aligned(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<QtWeight, Error> {
+        Self::load_into(st, name, o, i, true)
+    }
+
+    fn load_into(st: &SafeTensors, name: &str, o: usize, i: usize, aligned: bool) -> Result<QtWeight, Error> {
         let info = QtInfo::detect(st, name, o as i64, i as i64);
         let fmt = match QuantFmt::from_qt(info.fmt) {
             Some(f) => f,
@@ -141,11 +180,30 @@ impl QtWeight {
             QuantFmt::Int3G64 => o * i.div_ceil(peregrine_core::pack::I3_GROUP) * peregrine_core::pack::I3_GROUP_BYTES,
             QuantFmt::Int2G64 => o * i.div_ceil(peregrine_core::pack::I2G_GROUP) * peregrine_core::pack::I2G_GROUP_BYTES,
         };
-        let mut q = vec![0u8; nb];
-        st.read_raw(name, &mut q)?;
+        let mut q = landing(nb, aligned);
+        {
+            // Both landing shapes are writable; `as_mut_slice` is `Option` only
+            // because the shared/view variants exist, and `landing` builds
+            // neither.
+            let Some(b) = q.as_mut_slice() else {
+                return Err(Error::Format(format!("weight '{name}': landing buffer is not writable")));
+            };
+            st.read_raw(name, b)?;
+        }
+        // The scales are a few KB against a multi-MB payload, so they stay a
+        // plain `Vec`: pinning them would cost a page-table walk to save a
+        // bounce the driver does in microseconds.
         let mut scale = vec![0f32; info.scale_count as usize];
         st.read_f32(&format!("{name}.qs"), &mut scale)?;
-        Ok(QtWeight { fmt, o, i, q: q.into(), scale, gs: info.gs as usize, dev: None })
+        Ok(QtWeight { fmt, o, i, q, scale, gs: info.gs as usize, dev: None })
+    }
+
+    /// Whether the quantized payload sits in pinned memory — i.e. whether it
+    /// can be the source of an async H2D copy. True only for a weight loaded
+    /// through [`Self::load_aligned`] on a build where the pin hook is installed
+    /// and the driver accepted the buffer.
+    pub fn is_pinned(&self) -> bool {
+        self.q.is_pinned()
     }
 
     /// Raw quantized payload: `(packed_bytes, per_row_scales)`. Lets the

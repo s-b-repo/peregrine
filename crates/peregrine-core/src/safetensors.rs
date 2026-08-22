@@ -120,7 +120,12 @@ pub struct SafeTensors {
     n_devices: usize,
     /// The io_uring lane every read goes through (interior mutability keeps the
     /// read methods `&self`). Serialized: one positioned read at a time.
-    reactor: Mutex<Reactor>,
+    ///
+    /// `None` on a host with no io_uring — an older kernel, `io_uring_disabled`,
+    /// or a seccomp-restricted container. Loading is a small number of large
+    /// positioned reads, so `pread` is an exact substitute here; it is the
+    /// streaming lane that cares which engine it gets.
+    reactor: Option<Mutex<Reactor>>,
 }
 
 impl SafeTensors {
@@ -148,26 +153,37 @@ impl SafeTensors {
         // plain retry on the buffered fd.
         if direct_load_enabled() {
             if let Some(dfd) = self.direct_files.get(file_idx).and_then(|f| f.as_ref()) {
-                let mut req = [peregrine_io::ReadReq { fd: dfd.as_raw_fd(), offset: off, buf, tag: 0 }];
-                let outcome = self.reactor.lock().read_direct_many(&mut req);
-                match outcome {
-                    Ok(res) if res.first().copied().unwrap_or(-1) >= 0 => return Ok(()),
-                    // Any direct failure falls through to the buffered path
-                    // below, which reads the same bytes from the same offsets.
-                    Ok(_) => peregrine_io::note_advisory_err(
-                        "O_DIRECT trunk read returned an error code (using buffered)",
-                        &"short or failed direct read",
-                    ),
-                    Err(e) => peregrine_io::note_advisory_err("O_DIRECT trunk read (using buffered)", &e),
+                // O_DIRECT alignment is applied by `read_direct_many`, so this
+                // path exists only when a ring does.
+                if let Some(reactor) = self.reactor.as_ref() {
+                    let mut req = [peregrine_io::ReadReq { fd: dfd.as_raw_fd(), offset: off, buf, tag: 0 }];
+                    let outcome = reactor.lock().read_direct_many(&mut req);
+                    match outcome {
+                        Ok(res) if res.first().copied().unwrap_or(-1) >= 0 => return Ok(()),
+                        // Any direct failure falls through to the buffered path
+                        // below, which reads the same bytes from the same offsets.
+                        Ok(_) => peregrine_io::note_advisory_err(
+                            "O_DIRECT trunk read returned an error code (using buffered)",
+                            &"short or failed direct read",
+                        ),
+                        Err(e) => peregrine_io::note_advisory_err("O_DIRECT trunk read (using buffered)", &e),
+                    }
                 }
             }
         }
         let fd = self.files[file_idx].as_raw_fd();
-        // parking_lot mutex does not poison, so the lock never fails
-        self.reactor
-            .lock()
-            .read_exact(fd, off, buf)
-            .ctx(|| format!("{}: io_uring read @ {off}", self.paths[file_idx].display()))
+        match self.reactor.as_ref() {
+            // parking_lot mutex does not poison, so the lock never fails
+            Some(r) => r
+                .lock()
+                .read_exact(fd, off, buf)
+                .ctx(|| format!("{}: io_uring read @ {off}", self.paths[file_idx].display())),
+            // `read_exact_at` is `pread` in a loop — the same bytes from the same
+            // offset, and it needs no ring and no lock (the fd is shared, but a
+            // positioned read carries its own offset and moves no file cursor).
+            None => std::os::unix::fs::FileExt::read_exact_at(&self.files[file_idx], buf, off)
+                .ctx(|| format!("{}: pread @ {off}", self.paths[file_idx].display())),
+        }
     }
 }
 
@@ -201,7 +217,9 @@ impl SafeTensors {
         let mut roots: Vec<PathBuf> = vec![dir.to_path_buf()];
         let paths_file = dir.join("model_paths.json");
         if paths_file.exists() {
-            let bytes = std::fs::read(&paths_file).ctx(|| paths_file.display().to_string())?;
+            // Before `self.reactor` exists, so this uses the per-call ring
+            // inside `read_file` rather than the loader's own.
+            let bytes = peregrine_io::read_file(&paths_file).ctx(|| paths_file.display().to_string())?;
             let v: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|e| Error::Format(format!("{}: {e}", paths_file.display())))?;
             let arr = v.get("paths").and_then(|p| p.as_array()).ok_or_else(|| {
@@ -252,7 +270,13 @@ impl SafeTensors {
 
         // one io_uring lane for every read: the shard headers here at open time
         // and all tensor data later. Depth covers a per-layer expert batch.
-        let mut reactor = Reactor::new(256).ctx(|| "io_uring reactor init".to_string())?;
+        let mut reactor = match Reactor::new(256) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                peregrine_io::note_advisory_err("io_uring reactor init (loading via pread)", &e);
+                None
+            }
+        };
 
         let mut tensors: Vec<TensorInfo> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
@@ -271,8 +295,16 @@ impl SafeTensors {
             // same `metadata` call the size check already needed.
             shard_devs.push(std::os::unix::fs::MetadataExt::dev(&meta));
             let fsz = meta.len();
-            let read = |reactor: &mut Reactor, off: u64, buf: &mut [u8]| -> Result<(), Error> {
-                reactor.read_exact(f.as_raw_fd(), off, buf).ctx(|| format!("{}: io_uring read @ {off}", path.display()))
+            let read = |reactor: Option<&mut Reactor>, off: u64, buf: &mut [u8]| -> Result<(), Error> {
+                match reactor {
+                    Some(r) => r
+                        .read_exact(f.as_raw_fd(), off, buf)
+                        .ctx(|| format!("{}: io_uring read @ {off}", path.display())),
+                    // A header read is one small positioned read; `pread` is the
+                    // exact same bytes from the same offset.
+                    None => std::os::unix::fs::FileExt::read_exact_at(&f, buf, off)
+                        .ctx(|| format!("{}: pread @ {off}", path.display())),
+                }
             };
 
             // Check the size before reading: an 8-byte read against a shorter
@@ -285,7 +317,7 @@ impl SafeTensors {
                 )));
             }
             let mut lenbuf = [0u8; 8];
-            read(&mut reactor, 0, &mut lenbuf)?;
+            read(reactor.as_mut(), 0, &mut lenbuf)?;
             let hlen = u64::from_le_bytes(lenbuf);
             if hlen > fsz - 8 || hlen > ST_MAX_HEADER {
                 return Err(Error::Format(format!(
@@ -295,7 +327,7 @@ impl SafeTensors {
             }
 
             let mut hdr = vec![0u8; hlen as usize];
-            read(&mut reactor, 8, &mut hdr)?;
+            read(reactor.as_mut(), 8, &mut hdr)?;
             let data_start: u64 = 8 + hlen;
             let root: Value = serde_json::from_slice(&hdr).ctx(|| format!("{}: header not JSON", path.display()))?;
             let obj = root
@@ -424,7 +456,7 @@ impl SafeTensors {
             paths: shard_paths,
             devices,
             n_devices,
-            reactor: Mutex::new(reactor),
+            reactor: reactor.map(Mutex::new),
         })
     }
 

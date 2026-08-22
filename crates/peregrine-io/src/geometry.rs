@@ -233,7 +233,7 @@ pub fn align_cost(g: &Geometry, regions: &[(u64, u64)]) -> AlignCost {
 /// Read one unsigned integer out of a sysfs queue attribute.
 fn sysfs_u64(dev: &str, attr: &str) -> Option<u64> {
     let path = format!("/sys/block/{dev}/queue/{attr}");
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = crate::read_proc_string(path).ok()?;
     text.trim().parse::<u64>().ok().filter(|v| *v > 0)
 }
 

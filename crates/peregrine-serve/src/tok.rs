@@ -29,7 +29,9 @@ impl TokenBackend {
     /// up). Non-BPE models are a hard boot error by design.
     pub fn load(dir: &std::path::Path) -> Result<TokenBackend, Error> {
         let path = dir.join("tokenizer.json");
-        let bytes = std::fs::read(&path).ctx(|| path.display().to_string())?;
+        // Through the ring like every other file the engine opens; the
+        // helper falls back to `pread` on a host without io_uring.
+        let bytes = peregrine_io::read_file(&path).ctx(|| path.display().to_string())?;
         match GigaTokenizer::from_hf_json_bytes(&bytes) {
             Ok(t) => {
                 eprintln!("[tokenizer] gigatoken BPE active, vocab={}", t.vocab_size());

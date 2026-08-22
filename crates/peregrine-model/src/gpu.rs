@@ -14,9 +14,16 @@
 //! empty stub otherwise, so the scheduler/`Model` stay feature-agnostic.
 
 #[cfg(feature = "cuda")]
-pub use real::{GpuDenseTier, GpuTier};
+pub use real::{upload_lane_counts, GpuDenseTier, GpuTier};
 #[cfg(not(feature = "cuda"))]
 pub use stub::{GpuDenseTier, GpuTier};
+
+/// `(pinned async, blocking)` expert uploads — always `(0, 0)` with no CUDA,
+/// since nothing uploads.
+#[cfg(not(feature = "cuda"))]
+pub fn upload_lane_counts() -> (usize, usize) {
+    (0, 0)
+}
 
 /// Choose which `(layer, expert)` pairs to hold VRAM-resident, given how many
 /// experts fit in `budget`. Spreads residency **round-robin across all sparse
@@ -1315,7 +1322,7 @@ mod real {
     /// a working configuration instead of a failure mode.
     ///
     /// **Deterministic by construction.** Layer `L` computes on the same device
-    /// for the whole run, so output does not depend on timing. `todo.md`'s
+    /// for the whole run, so output does not depend on timing. `docs/todo.md`'s
     /// closed "CPU/GPU split GEMM" negative was about splitting *one GEMM's
     /// rows* across devices, which made low-order bits a function of the
     /// scheduler; layer-granular placement is not that and is not covered by
@@ -1451,6 +1458,85 @@ mod real {
     /// upload error as "stop, keep what landed") — so one odd expert could cost
     /// every expert behind it. Residency is therefore mixed-format, which the byte
     /// accounting already models via the per-expert `precision` map.
+    /// Host buffers an async upload's DMA is still reading out of.
+    ///
+    /// The GPU keeps reading these *after* `upload_int4_async` has returned, so
+    /// freeing one before the stream drains hands the DMA engine freed memory.
+    /// `Drop` therefore drains as a backstop: [`drain_uploads`] is the fast path
+    /// that syncs a whole batch at once and marks these done, but any other way
+    /// out of the loop — an early return, an error, a `break` — still cannot get
+    /// this wrong.
+    struct HostStaging {
+        device: i32,
+        drained: bool,
+        _gate: QtWeight,
+        _up: QtWeight,
+        _down: QtWeight,
+    }
+
+    impl Drop for HostStaging {
+        fn drop(&mut self) {
+            if !self.drained {
+                if let Err(e) = peregrine_cuda::stream_sync(self.device) {
+                    peregrine_io::note_advisory_err("gpu upload drain on drop", &e);
+                }
+            }
+        }
+    }
+
+    /// Experts uploaded through the pinned async lane, and through the blocking
+    /// one, since process start.
+    ///
+    /// These exist because every other symptom of a dead lane is invisible. A
+    /// tier that pins nothing still loads, still computes the right answer, and
+    /// still prints the same boot line — it is only slower, and only against a
+    /// baseline nobody has. Reporting the split turns "is the lane on?" into a
+    /// number instead of an inference.
+    static UPLOADS_PINNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static UPLOADS_BLOCKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// `(pinned async, blocking)` expert uploads so far.
+    pub fn upload_lane_counts() -> (usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (UPLOADS_PINNED.load(Relaxed), UPLOADS_BLOCKING.load(Relaxed))
+    }
+
+    /// How many experts' uploads may be in flight before the lane drains
+    /// (`COLI_GPU_UPLOAD_DEPTH`, default 4).
+    ///
+    /// This is where the overlap actually comes from: expert N's H2D DMA runs
+    /// while expert N+1's weights are still being read off disk. Depth 1 is
+    /// queue-then-immediately-wait — the blocking path with extra steps. The
+    /// cost is host memory: each in-flight expert holds ~18.9 MB of pinned
+    /// landing buffer until its copy completes.
+    fn upload_depth() -> usize {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("COLI_GPU_UPLOAD_DEPTH")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .map_or(4, |d| d.clamp(1, 64))
+        })
+    }
+
+    /// Wait for every queued upload on `device`, then release the host buffers
+    /// they were reading. The order is the point: the sync must return before
+    /// the staging is dropped.
+    fn drain_uploads(device: i32, pending: &mut Vec<HostStaging>) -> Result<(), Error> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let res = peregrine_cuda::stream_sync(device);
+        // Mark drained whether or not the sync reported success: if it failed
+        // there is nothing a per-buffer drop can do better, and re-syncing once
+        // per buffer on the way out would just repeat the same failure.
+        for p in pending.iter_mut() {
+            p.drained = true;
+        }
+        pending.clear();
+        res
+    }
+
     fn upload_expert(
         st: &SafeTensors,
         cfg: &Cfg,
@@ -1458,21 +1544,57 @@ mod real {
         e: usize,
         device: i32,
         int4: bool,
-    ) -> Result<(GpuExpert, bool), Error> {
+    ) -> Result<(GpuExpert, bool, Option<HostStaging>), Error> {
         let hidden = cfg.hidden as usize;
         let inter = cfg.moe_inter as usize;
         let pe = |t: &str| format!("model.layers.{layer}.mlp.experts.{e}.{t}");
-        let gate = QtWeight::load(st, &pe("gate_proj.weight"), inter, hidden)?;
-        let up = QtWeight::load(st, &pe("up_proj.weight"), inter, hidden)?;
-        let down = QtWeight::load(st, &pe("down_proj.weight"), hidden, inter)?;
+        // Whether these bytes reach VRAM verbatim decides the landing buffer,
+        // and it has to be decided *before* the load. The int4 path uploads the
+        // payload as-is, so it wants a page-aligned buffer the pin hook has
+        // registered with CUDA — io_uring then DMAs disk bytes straight into the
+        // H2D source. The f32 path dequantizes on the host, so the bytes the GPU
+        // receives are computed rather than read and an aligned buffer buys
+        // nothing. `expert_is_per_row_int4` answers this from the index, without
+        // reading any payload.
+        let raw_to_vram =
+            int4 && crate::pinned::enabled() && expert_is_per_row_int4(st, cfg, layer, e);
+        let load = |name: String, o: usize, i: usize| {
+            if raw_to_vram {
+                QtWeight::load_aligned(st, &name, o, i)
+            } else {
+                QtWeight::load(st, &name, o, i)
+            }
+        };
+        let gate = load(pe("gate_proj.weight"), inter, hidden)?;
+        let up = load(pe("up_proj.weight"), inter, hidden)?;
+        let down = load(pe("down_proj.weight"), hidden, inter)?;
         use crate::weight::QuantFmt;
         let all_int4 = gate.fmt == QuantFmt::Int4 && up.fmt == QuantFmt::Int4 && down.fmt == QuantFmt::Int4;
         if int4 && all_int4 {
-            Ok((GpuExpert::upload_int4(device, gate.raw(), up.raw(), down.raw(), hidden, inter)?, true))
+            // Async only when the payload really landed in pinned memory. An
+            // async copy out of pageable memory is legal but the driver bounces
+            // it through its own staging buffer, so it serializes anyway — and
+            // it would still owe the sync. Not worth taking on the obligation
+            // for none of the benefit.
+            // Ask whether the payload really is pinned, not whether its pointer
+            // happens to be page-aligned — a plain `Vec` can be that by luck.
+            // Async out of pageable memory is legal but the driver bounces it, so
+            // it serializes anyway while still owing the caller a sync: all of
+            // the obligation, none of the benefit.
+            let pinned = raw_to_vram && gate.is_pinned() && up.is_pinned() && down.is_pinned();
+            if pinned {
+                let ex = GpuExpert::upload_int4_async(device, gate.raw(), up.raw(), down.raw(), hidden, inter)?;
+                UPLOADS_PINNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok((ex, true, Some(HostStaging { device, drained: false, _gate: gate, _up: up, _down: down })));
+            }
+            UPLOADS_BLOCKING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok((GpuExpert::upload_int4(device, gate.raw(), up.raw(), down.raw(), hidden, inter)?, true, None))
         } else {
+            UPLOADS_BLOCKING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok((
                 GpuExpert::upload(device, &gate.dequant(), &up.dequant(), &down.dequant(), hidden, inter)?,
                 false,
+                None,
             ))
         }
     }
@@ -1611,9 +1733,24 @@ mod real {
             // from int4 to f32 costs 8× what the placement budgeted for it, so a
             // few fallbacks would otherwise overrun VRAM.
             let mut used = 0usize;
+            // Uploads whose DMA is still running. Nothing here evicts, so the
+            // lane can run `upload_depth()` experts deep: expert N's copy to
+            // VRAM overlaps expert N+1's read off disk.
+            let mut pending: Vec<HostStaging> = Vec::new();
+            let depth = upload_depth();
             for (layer, e) in placement {
                 match upload_expert(st, cfg, layer, e, device, int4) {
-                    Ok((ge, landed_int4)) => {
+                    Ok((ge, landed_int4, staging)) => {
+                        if let Some(sg) = staging {
+                            pending.push(sg);
+                            if pending.len() >= depth {
+                                if let Err(e_s) = drain_uploads(device, &mut pending) {
+                                    peregrine_io::note_advisory_err("gpu upload drain (tier truncated)", &e_s);
+                                    capacity = experts.len();
+                                    break;
+                                }
+                            }
+                        }
                         let bytes = if landed_int4 { int4_bytes } else { f32_bytes };
                         if used.saturating_add(bytes) > budget {
                             // This one doesn't fit at its real size. Drop it and
@@ -1639,6 +1776,13 @@ mod real {
                         break;
                     }
                 }
+            }
+            // Before anything reads these weights or drops their host buffers.
+            // `HostStaging::drop` would cover the second on its own; doing it
+            // here covers the first as well, and does it in one sync instead of
+            // one per buffer.
+            if let Err(e_s) = drain_uploads(device, &mut pending) {
+                peregrine_io::note_advisory_err("gpu upload drain (final)", &e_s);
             }
 
             if experts.is_empty() {
@@ -1828,6 +1972,9 @@ mod real {
             // Unlimited by default, so this is bit-identical with the knob unset.
             let mut upload_quota = super::admit_uploads(&upload_costs, super::pcie_budget_bytes());
 
+            // At most one admission in flight here: each iteration frees the
+            // victim's VRAM, and that must not race a copy still running.
+            let mut pending: Vec<HostStaging> = Vec::new();
             for (layer, e) in want {
                 let key = (layer, e);
                 let want_int4 = precision_of.get(&key).copied().unwrap_or(self.int4);
@@ -1848,10 +1995,18 @@ mod real {
                 upload_quota -= 1;
                 // Re-upload on a format change (remove first so the old tensor's
                 // Drop frees its VRAM before the new allocation).
+                // Drain the previous admission before freeing any VRAM: the
+                // eviction below must not race a copy that is still running, and
+                // this is also what lets that copy overlap this iteration's
+                // planning work.
+                if let Err(e_s) = drain_uploads(self.device, &mut pending) {
+                    peregrine_io::note_advisory_err("gpu reheat upload drain", &e_s);
+                }
                 self.experts.remove(&key);
                 match upload_expert(st, cfg, layer, e, self.device, want_int4) {
                     // Record the format that actually landed, not the one asked for.
-                    Ok((ge, landed_int4)) => {
+                    Ok((ge, landed_int4, staging)) => {
+                        pending.extend(staging);
                         self.experts.insert(key, ge);
                         self.precision.insert(key, landed_int4);
                         if want_int4 && !landed_int4 {
@@ -1868,6 +2023,9 @@ mod real {
                         break;
                     }
                 }
+            }
+            if let Err(e_s) = drain_uploads(self.device, &mut pending) {
+                peregrine_io::note_advisory_err("gpu reheat upload drain (final)", &e_s);
             }
             Ok(self.experts.len())
         }
@@ -1921,6 +2079,9 @@ mod real {
             let unit = if self.int4 { self.expert_bytes.0 } else { self.expert_bytes.1 };
             let costs: Vec<usize> = swaps.iter().map(|_| unit).collect();
             let mut quota = super::admit_uploads(&costs, super::pcie_budget_bytes());
+            // One admission in flight, for the same reason as the re-plan above:
+            // each swap frees the victim's VRAM and must not race a live copy.
+            let mut pending: Vec<HostStaging> = Vec::new();
             for (victim, admit) in swaps {
                 if quota == 0 {
                     break;
@@ -1930,12 +2091,19 @@ mod real {
                 // admission allocates. Reversed, a tier sized to fill the budget
                 // would need one expert's worth of headroom it does not have,
                 // and every swap would fail on the last free byte.
+                // The previous admission's copy must finish before this
+                // eviction frees VRAM — see the ordering note above, which the
+                // async lane must not weaken.
+                if let Err(e_s) = drain_uploads(self.device, &mut pending) {
+                    peregrine_io::note_advisory_err("gpu swap upload drain", &e_s);
+                }
                 let evicted = self.experts.remove(&victim);
                 let victim_int4 = self.precision.remove(&victim).unwrap_or(self.int4);
                 self.forced_f32.remove(&victim);
                 drop(evicted);
                 match upload_expert(st, cfg, admit.0, admit.1, self.device, self.int4) {
-                    Ok((ge, landed_int4)) => {
+                    Ok((ge, landed_int4, staging)) => {
+                        pending.extend(staging);
                         self.experts.insert(admit, ge);
                         self.precision.insert(admit, landed_int4);
                         if self.int4 && !landed_int4 {
@@ -1961,6 +2129,9 @@ mod real {
                         break;
                     }
                 }
+            }
+            if let Err(e_s) = drain_uploads(self.device, &mut pending) {
+                peregrine_io::note_advisory_err("gpu swap upload drain (final)", &e_s);
             }
             Ok(self.experts.len())
         }

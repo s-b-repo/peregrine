@@ -821,6 +821,116 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     return 1;
 }
 
+/* ---- the disk -> GPU lane -------------------------------------------------
+ *
+ * `coli_cuda_tensor_upload` above is a blocking `cudaMemcpy` out of pageable
+ * memory. That is two avoidable costs on every weight byte: the driver has to
+ * stage pageable memory through its own internal pinned bounce buffer, and the
+ * caller stalls for the whole multi-megabyte transfer with nothing overlapping.
+ *
+ * The three entry points below replace that with the lane peregrine actually
+ * wants: io_uring DMAs disk bytes straight into host pages CUDA has pinned
+ * (`coli_cuda_host_register`, called on `peregrine_io::AlignedBuf` allocations,
+ * which are already 4096-aligned), then `coli_cuda_tensor_upload_async` issues
+ * the H2D on `ctx->stream` without waiting, and the caller drains a whole
+ * generation of uploads with one `coli_cuda_stream_sync`. Two DMAs, no
+ * userspace copy, and the PCIe traffic overlaps the host work that produced it.
+ */
+
+/* Pin an existing host allocation so it can be the source of an async H2D.
+ * `cudaHostRegisterPortable` so the pages stay pinned across every context, not
+ * only the one that happened to be current — the streaming lane's landing
+ * buffers are shared between devices.
+ *
+ * Failure is not fatal to anything: the caller keeps a pageable buffer and the
+ * blocking path still works. It is reported through the return value rather
+ * than `cuda_ok` because a host with a small `RLIMIT_MEMLOCK` will fail this
+ * routinely and it must not read as an error. */
+extern "C" int coli_cuda_host_register(void *ptr, size_t bytes) {
+    if (!ptr || !bytes) return 0;
+    cudaError_t e = cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
+    if (e != cudaSuccess) {
+        /* Clear the sticky error so an unrelated later call does not inherit it. */
+        cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int coli_cuda_host_unregister(void *ptr) {
+    if (!ptr) return 0;
+    cudaError_t e = cudaHostUnregister(ptr);
+    if (e != cudaSuccess) { cudaGetLastError(); return 0; }
+    return 1;
+}
+
+/* Drain a device's managed stream. The completion boundary for a batch of
+ * `coli_cuda_tensor_upload_async` calls: none of their weights may be read by a
+ * kernel, and none of their host source buffers may be reused or freed, until
+ * this returns. */
+extern "C" int coli_cuda_stream_sync(int device) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    return cuda_ok(cudaStreamSynchronize(ctx->stream), "stream sync");
+}
+
+/* Async twin of `coli_cuda_tensor_upload`: identical allocation, identical
+ * bytes, identical int4 conversion — but every copy is `cudaMemcpyAsync` on
+ * `ctx->stream` and nothing is waited on. The caller must call
+ * `coli_cuda_stream_sync(device)` before any kernel reads these weights and
+ * before it frees or reuses `weights`/`scales`.
+ *
+ * `weights` should be pinned (see `coli_cuda_host_register`). It is not
+ * required — an async copy from pageable memory is legal — but it is then
+ * silently synchronous-ish, because the driver must bounce it, so the whole
+ * point of this entry point is lost.
+ *
+ * Note the conversion kernel runs on `ctx->stream` here, not the default stream
+ * the blocking version uses. That is mandatory, not cosmetic: `ctx->stream` is
+ * `cudaStreamNonBlocking`, so a default-stream kernel is not ordered against
+ * the async copy feeding it, and it would read unconverted nibbles. The
+ * blocking version could get away with the default stream only because its copy
+ * had already completed. */
+extern "C" int coli_cuda_tensor_upload_async(ColiCudaTensor **tensor,
+                                             const void *weights, const float *scales,
+                                             int fmt, int I, int O, int device) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    size_t rb = row_bytes(fmt, I);
+    if (!rb || (fmt && !scales)) return 0;
+    if (*tensor) {
+        ColiCudaTensor *t = *tensor;
+        return t->fmt == fmt && t->I == I && t->O == O && t->device == device;
+    }
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
+    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
+        !cuda_ok(cudaMemcpyAsync(t->weights, weights, t->weight_bytes,
+                                 cudaMemcpyHostToDevice, ctx->stream), "async tensor upload")) {
+        coli_cuda_tensor_free(t);
+        return 0;
+    }
+    if (fmt == 2) {
+        offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256,0,ctx->stream>>>(
+            (uint8_t*)t->weights, t->weight_bytes);
+        if (!cuda_ok(cudaGetLastError(), "int4 weight conversion")) { coli_cuda_tensor_free(t); return 0; }
+    }
+    if (fmt) {
+        if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
+            !cuda_ok(cudaMemcpyAsync(t->scales, scales, (size_t)O * sizeof(float),
+                                     cudaMemcpyHostToDevice, ctx->stream), "async scale upload")) {
+            coli_cuda_tensor_free(t);
+            return 0;
+        }
+    }
+    t->tracked = 1;
+    ctx->tensor_count++;
+    ctx->tensor_bytes += t->weight_bytes + (fmt ? (size_t)O * sizeof(float) : 0);
+    *tensor = t;
+    return 1;
+}
+
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {

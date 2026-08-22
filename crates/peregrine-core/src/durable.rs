@@ -14,19 +14,16 @@
 //! filesystem), then `fsync` the directory so the rename itself is durable.
 
 use crate::{Context, Error};
-use std::io::Write;
 use std::path::Path;
 
 /// Replace `path` with `bytes`, atomically. Either the old contents or the new
 /// ones survive a crash — never a partial write.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let tmp = temp_sibling(path)?;
-    // Scoped so the file is closed (after fsync) before the rename.
-    {
-        let mut f = std::fs::File::create(&tmp).ctx(|| format!("create {}", tmp.display()))?;
-        f.write_all(bytes).ctx(|| format!("write {}", tmp.display()))?;
-        f.sync_all().ctx(|| format!("fsync {}", tmp.display()))?;
-    }
+    // create + ring write + ring fsync, and the file is closed before the
+    // rename. `write_file` carries the no-ring fallback (a positioned write and
+    // `sync_all`), so a host without io_uring still saves its artifacts.
+    peregrine_io::write_file(&tmp, bytes).ctx(|| format!("write {}", tmp.display()))?;
     finish_swap(&tmp, path)
 }
 
@@ -78,7 +75,15 @@ fn sync_parent_dir(path: &Path) {
     };
     match std::fs::File::open(dir) {
         Ok(f) => {
-            if let Err(e) = f.sync_all() {
+            use std::os::unix::io::AsRawFd;
+            let synced = match peregrine_io::Reactor::new(1) {
+                Ok(mut r) => r.fsync(f.as_raw_fd()),
+                Err(e) => {
+                    crate::note_advisory_err("io_uring unavailable for directory fsync (using fsync)", &e);
+                    f.sync_all()
+                }
+            };
+            if let Err(e) = synced {
                 crate::note_advisory_err("fsync parent directory after rename", &e);
             }
         }
@@ -89,6 +94,9 @@ fn sync_parent_dir(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The library no longer writes through `std::io::Write` (its writes go
+    // through the ring); the tests still build fixtures with it.
+    use std::io::Write;
 
     fn tmpdir(tag: &str) -> Result<std::path::PathBuf, Error> {
         let d = std::env::temp_dir().join(format!("peregrine_durable_{}_{}", std::process::id(), tag));

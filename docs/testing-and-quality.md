@@ -9,13 +9,21 @@ and the correctness philosophy behind the test suite.
 ## The gates
 
 ```bash
-cargo test --workspace                     # 604 tests, CPU-only, no GPU needed
-cargo clippy --workspace --all-targets     # clean
+cargo test --workspace                     # 765 tests, CPU-only, no GPU needed
+cargo clippy --workspace --all-targets     # 7 warnings (the documented baseline)
 scripts/audit-bad-patterns.sh --strict     # panic / UB / suppression / Cargo gate (CI)
 scripts/audit-reachability.py --list       # [R] shipped-but-unreachable pass
+scripts/test-aarch64.sh                    # CPU kernels as real ARM code under qemu
 cargo check --features cuda --all-targets -p peregrine-model -p peregrine-cuda
 cargo test -p peregrine-cuda --features cuda   # GPU-gated tests (NVIDIA host only)
 ```
+
+`test-aarch64.sh` is the one gate that needs setup beyond the toolchain
+(`rustup target add aarch64-unknown-linux-musl` plus a `qemu-aarch64` binary),
+and it is the only thing standing between the NEON kernels and shipping on
+reasoning: the scalar path is the token-exactness anchor, and a SIMD kernel that
+disagrees with it produces wrong tokens rather than a crash. See
+[portability.md](portability.md).
 
 Run all of them after any change to the streaming, scheduler, or serve paths.
 
@@ -176,13 +184,21 @@ The suite is built around **bit-identity anchors** rather than tolerances:
   round-trips; zstd and kblock layouts decode byte-identically;
   `apply_layout_is_bit_identical` gates the physical checkpoint rewrite with
   teacher-forcing equality.
-- **io_uring reads validated byte-for-byte vs `pread`** — *when the harness can
-  run them.* Every such test returns `Ok(())` on a kernel without io_uring or a
-  filesystem that rejects O_DIRECT (tmpfs, overlayfs, many CI containers), and
-  `cargo test` swallows the `eprintln!` skip notice without `--nocapture`.
-  Nothing asserts that at least one of them executed, so a green run is
-  compatible with this whole story never having been exercised. Check it
-  explicitly on any machine you intend to trust the claim on.
+- **io_uring reads and writes validated byte-for-byte vs `pread`/`pwrite`** —
+  *when the harness can run them.* Every such test returns `Ok(())` on a kernel
+  without io_uring or a filesystem that rejects O_DIRECT (tmpfs, overlayfs, many
+  CI containers), and `cargo test` swallows the `eprintln!` skip notice without
+  `--nocapture`. For the read tests nothing asserts that at least one of them
+  executed, so a green run is still compatible with that half of the story never
+  having been exercised — check it explicitly on any machine you intend to trust
+  the claim on.
+
+  The **write** tests added with the write/fsync opcodes close that hole for
+  themselves: `COLI_REQUIRE_URING=1` turns a skip into a failure, so
+  `COLI_REQUIRE_URING=1 cargo test -p peregrine-io` proves the ring path really
+  ran rather than merely not failing. Verified on the cortix box (kernel 7.1):
+  all six execute. Extending the same gate to the read tests is the obvious
+  follow-up.
 - **Tokenizer parity.** Id-for-id equality with the HF `tokenizers` oracle
   over an edge-case corpus (`crates/peregrine-serve/tests/tokenizer_parity.rs`);
   the HF crate exists *only* as this test oracle.
