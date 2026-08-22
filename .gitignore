@@ -1,5 +1,8 @@
 # Rust build output (workspace-shared target dir; Cargo.lock IS committed — binaries)
 /target
+# CUDA-feature build tree (same sources, --features cuda; kept separate so the
+# two feature sets don't churn each other's artifacts)
+/target-cuda
 **/*.rs.bk
 
 # Coverage / profiling artifacts
@@ -10,6 +13,9 @@ flamegraph.svg
 
 # Claude Code machine-local permission grants (shared config would go in .claude/settings.json)
 .claude/settings.local.json
+
+# Editor/tool local state, not project content
+/.zcode/
 
 # Editors / IDEs
 .idea/
@@ -22,19 +28,27 @@ flamegraph.svg
 .DS_Store
 Thumbs.db
 
-# Ad-hoc benchmark working dirs (curated results live in bench-data/)
+# Ad-hoc benchmark working dirs (curated results live in bench-data/).
+# `/out/` is the scratch target the harness writes to by default —
+# `scripts/bench-arms.sh out/rerun-$(date +%F)`, `bench-measure.sh out/union`
+# and friends, per docs/validation-runbook.md. One run had been committed into
+# it, which contradicted the convention; it now lives in
+# bench-data/2026-08-13-rerun/ and the directory itself is scratch again.
+/out/
 /bench-results/
 /b1-isolate/
 /b16-repeat/
 /bench-results.log
 /b1-isolate.log
 /b16-repeat.log
-# Long-run scratch logs. Their durable content is transcribed into todo.md and
-# docs/benchmarks.md as prose; the files themselves are one run's stdout.
-/int2g64-convert.log
-/flip-rate-smoke.log
-/flip-rate-int2g64.log
-/union-rerun.log
+# Long-run scratch logs, as one anchored rule rather than a growing list. Their
+# durable content is transcribed into docs/todo.md and docs/benchmarks.md as
+# prose; the files themselves are one run's stdout, and nine of them had already
+# accreted into git history before this rule existed.
+#
+# Anchored to the root ON PURPOSE: `bench-data/**/dump-*.log` is archived
+# evidence that a published measurement actually ran, and must stay committable.
+/*.log
 
 # Not peregrine. These live in this checkout for no better reason than that it
 # was the shell's working directory at the time, and they are ignored rather
@@ -55,3 +69,16 @@ __pycache__/
 
 # Claude Code agent worktrees are local build areas, never content
 .claude/worktrees/
+
+# git worktrees that were moved inside the main checkout. Git still has them
+# registered at /home/cortix/peregrine-wt-* (so `git worktree list` calls them
+# prunable), and while they sit here untracked every `git status` walks them.
+# Their `target/` dirs held 12.9 GB. The commits are safe independently of these
+# directories: `wt-ds4-import` and `wt-gpu-weights` are named branches, and the
+# third was a detached HEAD whose 156 commits are now on `rescue/actf32-detached`.
+/peregrine-wt-*/
+
+# KV session checkpoints are regenerable bench artifacts and routinely exceed
+# GitHub's 100 MB blob limit (one 2k-token entry is ~350 MB).
+bench-data/**/kvstore/
+*.pgkv
