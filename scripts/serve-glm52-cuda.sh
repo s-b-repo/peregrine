@@ -29,7 +29,14 @@ MAX_BATCH="${MAX_BATCH:-16}"
 # and was OOM-killed at 0/16 streams. Do NOT exceed ~half MemAvailable — a hit
 # that has been paged out is a page fault, and throughput collapses while the
 # cache's own hit rate keeps climbing.
-export COLI_ECACHE_GB="${COLI_ECACHE_GB:-8}"
+# 6, not the 8 that measured best on the old 3-drive layout: the fifth ring
+# above costs ~1.6 GB of stream buffer and this box has 29 GB available, so
+# something had to give. Trading cache for the ring is the right way round here
+# — the cache tops out at 5.7% hit rate even at 12.88 GB (one token routes
+# 10.85 GB, so nothing that fits in RAM changes the shape), whereas an unhomed
+# device is a whole drive contributing only opportunistically. Revisit if the
+# [ram] boot line shows headroom.
+export COLI_ECACHE_GB="${COLI_ECACHE_GB:-6}"
 
 # Speculation, floored. +37% at B=16 (0.060 -> 0.082 median, REPEATS=3) and
 # 22% fewer disk expert-reads (289059 vs 369955), docs/benchmarks.md:747.
@@ -81,17 +88,24 @@ export COLI_GPU_PINNED="${COLI_GPU_PINNED:-1}"
 export COLI_GPU_UPLOAD_DEPTH="${COLI_GPU_UPLOAD_DEPTH:-4}"
 
 # ── this layout specifically ──────────────────────────────────────────────────
-# Device-aware ring scheduling: claims are grouped per physical device with
-# cross-device work stealing, instead of one device-blind cursor.
-# UNMEASURED (no bench-data arm has ever run) — but this is the exact topology
-# it was written for: five devices spanning 91 MB/s to 669 MB/s. With a blind
-# cursor the 91 MB/s HDD straggles and holds up a wave; with stealing its work
-# migrates. A/B it with COLI_IO_DEVICE_SCHED=0 before trusting it.
-export COLI_IO_DEVICE_SCHED="${COLI_IO_DEVICE_SCHED:-1}"
-
-# 4 rings, not 8: 8 needs 21.1 GB of stream buffers and refuses to load on 46 GB
-# ("peak 36.3 GB / Error: 6.8 GB short"). Ring count is capped by RAM, not device.
-export COLI_IO_RINGS="${COLI_IO_RINGS:-4}"
+# Neither the ring count nor device-pure claims are set here, on purpose.
+#
+# As of 2026-08-22 the engine derives both from the shard->device map: claims are
+# grouped per physical device (default on whenever the shards span more than one
+# device), and the ring count defaults to ONE RING PER DEVICE. That second half
+# is what only matters once you have five drives: `ring_homes()` shares rings
+# across the per-device claim groups proportionally, so with 5 groups and the
+# historical 4 rings one group gets **zero home rings** and is reached only when
+# some other ring runs dry and steals from it — a whole drive running part-time.
+#
+# Setting COLI_IO_RINGS explicitly overrides the device count AND skips the RAM
+# back-off that walks it down when stream buffers would eat too much of
+# MemAvailable, so a hardcoded number here would silently defeat both. Read the
+#   [io] device-pure claims on (5 devices, N shard fds, one ring per device)
+# boot line instead — it says outright when a device did not get a home ring.
+#
+# Still UNMEASURED: no bench-data arm has run device-pure claims. A/B against
+# COLI_IO_DEVICE_SCHED=0 before believing it.
 
 # ── measured NOT to help: left off on purpose, with the disqualifying number ──
 # COLI_DIRECT=1        O_DIRECT measured 0.86 vs 1.12 GB/s buffered = -23%,

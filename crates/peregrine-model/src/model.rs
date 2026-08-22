@@ -1168,8 +1168,58 @@ pub fn io_rings() -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(4)
+        .unwrap_or(DEFAULT_IO_RINGS)
         .min(16)
+}
+
+/// The historical ring count, and the floor the device-aware sizing starts from.
+pub(crate) const DEFAULT_IO_RINGS: usize = 4;
+
+/// Ring count when the shard→device map is known — **one ring per device**.
+///
+/// Why this is not just [`io_rings`]'s constant. Under device-pure claims the
+/// I/O lane builds one claim group per physical device and
+/// [`crate::concurrent::ring_homes`] shares the rings across those groups
+/// *proportionally*. With fewer rings than devices at least one group gets
+/// **zero** home rings: it is never claimed from directly, only reached when
+/// some other ring has run its own group dry and steals. That device then
+/// contributes opportunistically instead of continuously — on a five-drive
+/// split with the historical four rings, a whole drive runs part-time.
+///
+/// An explicit `COLI_IO_RINGS` always wins, so every existing A/B arm keeps
+/// meaning exactly what it meant.
+///
+/// The back-off is the part that keeps this safe to make a default. Stream
+/// buffers scale with ring count, and this box has already had an 8-ring
+/// configuration refuse to load ("peak 36.3 GB / 6.8 GB short"). So the
+/// device-derived count is walked back down toward [`DEFAULT_IO_RINGS`] while
+/// its transient reserve would spend more than `RING_RESERVE_FRACTION` of
+/// MemAvailable on landing buffers alone. Raising ring count until the model
+/// stops loading would be a worse default than the one it replaces.
+pub(crate) fn io_rings_for(n_devices: usize, avail_bytes: u64, per_expert_bytes: usize) -> usize {
+    // Explicit setting wins outright — no device inference, no back-off.
+    if let Some(n) = std::env::var("COLI_IO_RINGS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n.min(16);
+    }
+    let want = n_devices.clamp(DEFAULT_IO_RINGS, 16);
+    if avail_bytes == 0 {
+        return want; // MemAvailable unreadable; the load-time verdict still gates it
+    }
+    /// Share of MemAvailable the streaming landing buffers may claim before the
+    /// device-derived ring count is walked back.
+    const RING_RESERVE_FRACTION: f64 = 0.40;
+    let budget = (avail_bytes as f64 * RING_RESERVE_FRACTION) as u64;
+    let mut n = want;
+    while n > DEFAULT_IO_RINGS
+        && stream_transient_reserve(n, default_workers(), 4 * per_expert_bytes) as u64 > budget
+    {
+        n -= 1;
+    }
+    n
 }
 
 /// Capacity for the O_DIRECT aligned slab pool: the largest single **read** the
@@ -3244,6 +3294,18 @@ impl Model {
             stream_experts
         };
 
+        // Ring count, device-aware: one per physical device the shards span, so
+        // every device gets a home ring under device-pure claims instead of one
+        // being served only by work stealing. Computed once here because the RAM
+        // projection below and the reactor construction further down must agree
+        // — projecting for four rings and then building six is how a load passes
+        // its own preflight and then gets OOM-killed.
+        let n_io_rings = if stream_experts {
+            io_rings_for(st.n_devices(), host_mem_available_bytes(), max_expert_region_bytes(&st))
+        } else {
+            io_rings()
+        };
+
         // Preflight: can this machine hold what is about to be loaded? Every byte
         // needed is already in the headers, so the verdict costs no extra I/O and
         // lands before the first allocation. Without it an over-large model is a
@@ -3265,7 +3327,7 @@ impl Model {
                 // Charging it anyway projected 10.2 GB of buffers for a model that
                 // fits whole in RAM, which refused the load outright.
                 stream_transient: if stream_experts {
-                    stream_transient_reserve(io_rings(), default_workers(), 4 * max_expert_region_bytes(&st)) as u64
+                    stream_transient_reserve(n_io_rings, default_workers(), 4 * max_expert_region_bytes(&st)) as u64
                 } else {
                     0
                 },
@@ -3350,7 +3412,7 @@ impl Model {
         // — each SQPOLL ring costs a polling kthread, worth it only on the
         // per-token critical path, and only when measured to win.
         let io_reactors: Vec<Mutex<Reactor>> = if stream_experts && crate::concurrent::engine_needs_rings() {
-            let n = io_rings();
+            let n = n_io_rings;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 let mut r =
@@ -3744,16 +3806,40 @@ impl Model {
         // claim grouping can differ from the blind cursor — streaming, >1 ring,
         // and shards genuinely on >1 device. The env read happens here at build
         // so two A/B arms in one process can never alias through a latch.
-        let fd_device_table = if stream_experts
-            && io_reactors.len() > 1
-            && std::env::var("COLI_IO_DEVICE_SCHED").is_ok_and(|v| v.trim() == "1")
-        {
+        // Default ON as of 2026-08-22, `COLI_IO_DEVICE_SCHED=0` to disable.
+        //
+        // It was opt-in while the only multi-device layout in the tree was two
+        // groups of similar speed, where a device-blind cursor costs little. A
+        // five-drive split spanning 91 MB/s to 669 MB/s is a different question:
+        // with one shared cursor a claim window mixes devices, so every deep
+        // submit reaps behind its slowest member and the HDD paces the SSDs.
+        // Device-pure groups are what stop that, and they are only built when
+        // they can actually differ (streaming, >1 ring, shards on >1 device),
+        // so turning them on by default cannot change a single-device box.
+        let device_sched = !std::env::var("COLI_IO_DEVICE_SCHED").is_ok_and(|v| {
+            let v = v.trim();
+            v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        });
+        let fd_device_table = if stream_experts && io_reactors.len() > 1 && device_sched {
             let table: std::collections::HashMap<std::os::unix::io::RawFd, u8> =
                 st.fd_devices().into_iter().collect();
             let devices = table.values().collect::<std::collections::BTreeSet<_>>().len();
             (devices > 1).then(|| {
+                // Say whether every device actually got a home ring. With
+                // fewer rings than devices one group is reachable only by
+                // stealing, and nothing else in the log would ever say so.
+                let homed = if io_reactors.len() >= devices {
+                    "one ring per device".to_string()
+                } else {
+                    format!(
+                        "{} rings for {devices} devices — {} device(s) served only by work stealing; \
+                         raise COLI_IO_RINGS",
+                        io_reactors.len(),
+                        devices - io_reactors.len()
+                    )
+                };
                 eprintln!(
-                    "peregrine: [io] device-pure claims on ({devices} devices, {} shard fds)",
+                    "peregrine: [io] device-pure claims on ({devices} devices, {} shard fds, {homed})",
                     table.len()
                 );
                 table
@@ -8357,6 +8443,74 @@ mod tests {
     }
 
     #[test]
+    /// One ring per device is the whole point of the device-aware sizing: with
+    /// fewer rings than device groups, `ring_homes` leaves at least one group
+    /// with no home ring, reachable only by a ring that has run dry.
+    ///
+    /// These read `COLI_IO_RINGS` through the real env, so they skip rather
+    /// than lie when a caller has pinned it — an explicit setting is documented
+    /// to win outright, and asserting the derived value against it would be
+    /// asserting the opposite of the contract.
+    #[test]
+    fn ring_count_follows_device_count() {
+        if std::env::var_os("COLI_IO_RINGS").is_some() {
+            eprintln!("skipping: COLI_IO_RINGS is pinned in this environment");
+            return;
+        }
+        let region = 19 << 20; // ~19 MB, one GLM-5.2 expert slab
+        let roomy = 512u64 << 30; // plenty, so the back-off never fires
+        assert_eq!(io_rings_for(5, roomy, region), 5, "five devices want five rings");
+        assert_eq!(io_rings_for(6, roomy, region), 6);
+        assert_eq!(
+            io_rings_for(1, roomy, region),
+            DEFAULT_IO_RINGS,
+            "a single-device box must be unchanged by this"
+        );
+        assert_eq!(
+            io_rings_for(2, roomy, region),
+            DEFAULT_IO_RINGS,
+            "fewer devices than the floor must not REDUCE the ring count"
+        );
+        assert_eq!(io_rings_for(64, roomy, region), 16, "capped like io_rings()");
+    }
+
+    /// The back-off is what makes this safe to enable by default. This box has
+    /// already had an 8-ring configuration refuse to load outright; raising the
+    /// ring count until the model stops loading would be a worse default than
+    /// the constant it replaces.
+    #[test]
+    fn ring_count_backs_off_when_buffers_would_not_fit() {
+        if std::env::var_os("COLI_IO_RINGS").is_some() {
+            return;
+        }
+        let region = 19 << 20;
+        // Deliberately tiny MemAvailable: the reserve for any ring count blows
+        // the 40% budget, so it must walk all the way back to the floor.
+        assert_eq!(
+            io_rings_for(8, 1 << 30, region),
+            DEFAULT_IO_RINGS,
+            "must not raise rings into an OOM"
+        );
+        // ...but never BELOW the floor, which is the historical behaviour and
+        // is separately gated by the load-time RAM verdict.
+        assert!(io_rings_for(8, 1, region) >= DEFAULT_IO_RINGS);
+        // Unreadable MemAvailable is not a reason to refuse the device count;
+        // the load-time verdict still gates it.
+        assert_eq!(io_rings_for(5, 0, region), 5);
+    }
+
+    /// The projection and the construction must use the SAME number. Projecting
+    /// for four rings and then building six is how a load passes its own
+    /// preflight and is killed minutes later.
+    #[test]
+    fn ring_reserve_grows_monotonically_with_the_derived_count() {
+        let region = 19 << 20;
+        let w = default_workers();
+        let a = stream_transient_reserve(DEFAULT_IO_RINGS, w, 4 * region);
+        let b = stream_transient_reserve(DEFAULT_IO_RINGS + 1, w, 4 * region);
+        assert!(b > a, "an extra ring must cost extra reserve, else the projection is blind to it");
+    }
+
     fn stream_transient_reserve_scales_with_lanes() {
         assert_eq!(stream_transient_reserve(4, 8, 1000), (4 * experts_per_batch() + 8) * 1000);
         assert_eq!(stream_transient_reserve(0, 0, 1000), 0); // no lanes → no reserve
