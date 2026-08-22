@@ -137,3 +137,43 @@ Bearer auth is mandatory: the script refuses to start without
 an unauthenticated endpoint at ~0.08 tok/s is exhausted by a single request.
 Ingress is path-restricted at the edge — `/metrics` is 404'd there, not merely
 unadvertised.
+
+## Using it for coding — read this before wiring up a client
+
+The endpoint is OpenAI-compatible (`/v1/chat/completions`, SSE streaming), so any
+OpenAI-shaped client works — aider, Continue, Cline, opencode:
+
+```bash
+export OPENAI_BASE_URL=https://glm.cybersec.org.za/v1
+export OPENAI_API_KEY=<the key in ~/.config/peregrine/glm52.env>
+```
+
+**But be honest about the speed before you build a workflow on it.** One token
+routes 10.85 GB of experts. At this box's 2.36 GB/s aggregate that is a **4.6 s
+floor per token from the drives alone** — before attention, before the router,
+before anything computes. Measured on *faster* storage than this (1.12 GB/s LUKS
+NVMe, a 9.7 s floor), the engine hit 0.064 tok/s at B=1 — **15.6 s/token**.
+Halving the floor should roughly halve that, so expect **~8 s/token** for a
+single stream here.
+
+That is **~40 minutes for a 300-token code edit**. Batching does not rescue
+interactive use: at B=16 the batch-union means 16 streams share one set of expert
+reads, so *aggregate* throughput rises 4.4× (0.064 → 0.280 tok/s) while each
+individual stream gets *slower* — roughly one token per 57 s. Batching is for
+serving many requests at once, not for making one request fast.
+
+So:
+
+- **Interactive coding assistant: no.** Not at 8 s/token. Nothing in the config
+  changes this, because it is the device floor, not the scheduler.
+- **Batch / async work: yes.** Submit a refactor or a review, come back later.
+  This is what the model is good for on this hardware, and B=16 is exactly right
+  for it.
+- **For interactive work, use the resident model instead.** Qwen3.8-27B is
+  already on this box and fits in VRAM+RAM without streaming — that is what
+  `qwen8b.cybersec.org.za` exists for, and it is the right tool for a coding loop.
+
+The one lever that *would* change this is **fewer bytes per token**, and every
+sub-int4 rung has failed its quality gate here (int2-g64 `flip_rate = 1.000`,
+asymmetric int3-g64 `0.447`). Until a rung passes, 10.85 GB/token is fixed and so
+is the floor.
