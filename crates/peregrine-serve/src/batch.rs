@@ -580,7 +580,7 @@ struct EngineShared {
 /// threaded through — never a process-wide `OnceLock`. Two reasons, both
 /// already paid for in this repo: an `OnceLock` latch voided the
 /// route-min-share A/B (both arms in one process read the first arm's value —
-/// `todo.md` §6), and the `spawn_fused`/`spawn_tuned`/`spawn_spec` ladder below
+/// `docs/todo.md` §6), and the `spawn_fused`/`spawn_tuned`/`spawn_spec` ladder below
 /// existed purely so tests could dodge the latch knob-by-knob. Tests now
 /// override fields on this struct instead; the parser functions keep their
 /// documentation and defaults and are called exactly once, from [`Self::from_env`].
@@ -1105,7 +1105,7 @@ fn adaptive_window_ratio() -> u64 {
 /// **Why this exists.** Admission is capped by a *count* (`--max-batch`,
 /// default 32) and nothing ever reads bytes, so at GLM-5.2 shapes
 /// (175.5 KiB/token of MLA KV) the default flags admit a worst case of ~53 GB
-/// of KV with no accounting — `todo.md` §12 flags the unbounded case and tracks
+/// of KV with no accounting — `docs/todo.md` §12 flags the unbounded case and tracks
 /// it nowhere else. It is also the link that breaks the whole KV-saving chain:
 /// halving KV bytes cannot raise concurrency while concurrency is a count, so
 /// every downstream KV optimization is worth exactly zero extra batch slots

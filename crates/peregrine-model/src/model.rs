@@ -345,6 +345,13 @@ pub struct Model {
     /// Routing-frequency accumulator driving heat-ranked VRAM residency; `Some`
     /// only when a GPU tier exists (bumped during the forward, read by `reheat`).
     heat: Option<HeatTable>,
+    /// Draft-path routing frequency for the MTP head's expert pool, and the size
+    /// of the pin set derived from it. `Some` whenever the checkpoint has an MTP
+    /// head; the pin *budgets* (`COLI_MTP_PIN_MB` / `COLI_MTP_PIN_VRAM_MB`)
+    /// decide whether anything is spent on it, not whether it is counted.
+    ///
+    /// Deliberately not a row of [`Self::heat`] — see [`crate::mtp::MtpPins`].
+    mtp_pins: Option<crate::mtp::MtpPins>,
     /// Deferred-spill log (`COLI_GPU_SPILL`): `(layer, expert)` pairs the lane
     /// balancer verdicted [`crate::lane::Placement::GpuSpill`] mid-forward.
     /// Acting on the verdict needs `&mut GpuTier`, which a forward holds by `&`,
@@ -1134,6 +1141,55 @@ fn mtp_heat() -> bool {
     matches!(std::env::var("COLI_MTP_HEAT").ok().as_deref(), Some("1") | Some("true"))
 }
 
+/// Warm-cache pin budget for the MTP head's hot experts, in bytes
+/// (`COLI_MTP_PIN_MB`). `0`/unset/invalid → off, which is the untouched
+/// behaviour.
+///
+/// **A byte budget rather than an expert count**, because what the operator is
+/// spending is RAM the main stream would otherwise cache with: the MTP layer's
+/// whole pool is ~4.8 GB at int4 and ~9.7 GB at the int8 rung GLM-5.2 still
+/// ships, and "32 experts" means either 0.6 GB or 1.2 GB depending on a
+/// container property nobody sets the knob while looking at.
+///
+/// Resolved once. Every arm of a two-arm measurement in one process must see the
+/// same value, and a per-call `env::var` on a path that runs once per draft round
+/// is also a syscall-shaped cost for a constant.
+fn mtp_pin_bytes() -> usize {
+    use std::sync::OnceLock;
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("COLI_MTP_PIN_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(0)
+    })
+}
+
+/// VRAM reserved for pinned MTP experts, in bytes (`COLI_MTP_PIN_VRAM_MB`).
+/// `0`/unset/invalid → off.
+///
+/// Separate from [`mtp_pin_bytes`] because the two tiers are separate budgets
+/// with different sizes and different opportunity costs — 46 GB of host RAM
+/// against 12 GB of VRAM on this box — and one number could not express both.
+///
+/// **Sized against the container's rung, not the plan's.** An int8 MTP expert
+/// cannot be int4-resident, so it uploads dequantized at ~151 MB against the
+/// 18.9 MB an int4 one would take. On a 12 GB card that is eight experts for
+/// what should hold sixty-four, which is why this is worth setting only after
+/// `peregrine-requantize --mtp-target int4` has actually run over the container.
+fn mtp_pin_vram_bytes() -> usize {
+    use std::sync::OnceLock;
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("COLI_MTP_PIN_VRAM_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(0)
+    })
+}
+
 /// Whether the DSA lightning indexer runs (`COLI_DSA`). Default **off**: the
 /// indexer selects a subset of cached keys, so it changes token values, and the
 /// laptop-converted container skipped the indexer tensors entirely — with no
@@ -1835,8 +1891,17 @@ fn prefetch_pays(issued: u64, used: u64) -> bool {
 /// Pack an eviction-protection score: predictor likelihood in the high bits, routing
 /// heat as a low-bits tiebreak, `+1` so any predicted expert outranks an unprotected
 /// slot (priority 0). Saturating — never wraps back to 0.
+///
+/// Clamped one below [`peregrine_io::PIN_PRIORITY`], which is `u32::MAX`. A
+/// maximally-scored, maximally-hot prediction reaches `u32::MAX` on its own
+/// (`0xFFFF << 16 | 0xFFFF` saturates there), and a prediction that *ties* a pin
+/// falls through to the recency tiebreak — i.e. the pin would be evicted or not
+/// depending on which slot was touched last, which is precisely the ordering a
+/// pin exists to remove. Reaching the top needs both components saturated, so
+/// this changes no score any predictor in the tree produces; it makes the
+/// separation structural instead of arithmetic luck.
 fn pack_prio(score: u32, heat: u32) -> u32 {
-    ((score.min(0xFFFF) << 16) | heat.min(0xFFFF)).saturating_add(1)
+    ((score.min(0xFFFF) << 16) | heat.min(0xFFFF)).saturating_add(1).min(peregrine_io::PIN_PRIORITY - 1)
 }
 
 /// A coarse fingerprint of the model's shape, stamped into a built automaton so an
@@ -3565,7 +3630,8 @@ impl Model {
                 if async_up > 0 || blocking_up > 0 {
                     eprintln!(
                         "peregrine: expert uploads {async_up} pinned-async / {blocking_up} blocking; \
-                         pinned staging {} buffers / {:.1} MB ({} refused)",
+                         pinned staging {} buffers ever, {} live / {:.1} MB ({} refused)",
+                        pin.ever,
                         pin.buffers,
                         pin.bytes as f64 / (1024.0 * 1024.0),
                         pin.declined,
@@ -3775,6 +3841,17 @@ impl Model {
             None
         };
 
+        // Pin table for the MTP head's expert pool. Built whenever there is a
+        // head to draft with, and **not** gated on the pin budgets: counting is
+        // one relaxed `fetch_add` per routed expert per draft step — eight, on a
+        // step that streams ~300 MB — so gating it would buy nothing and would
+        // make the budget a load-time latch, which is how an A/B arm ends up
+        // measuring the arm before it. What the budgets gate is the *spending*.
+        // A dense MTP layer (the Qwen family's) routes no expert at all, so its
+        // counts stay zero and every plan off them is empty by construction.
+        let mtp_pins = mtp
+            .is_some()
+            .then(|| crate::mtp::MtpPins::new(cfg.n_layers as usize, cfg.n_experts as usize));
         let model_n_layers = cfg.n_layers as usize; // read before `cfg` moves into the struct
         let model_topk = cfg.topk.max(1) as usize; // likewise
         // Resolve every routed expert's location and quantized format once, while
@@ -3902,6 +3979,7 @@ impl Model {
             gdn,
             gpu_dense,
             gpu,
+            mtp_pins,
             mtp,
             // `heat` is `Some` exactly when a GPU tier exists, which is also
             // the only world where a spill verdict can mean anything.
@@ -4631,6 +4709,135 @@ impl Model {
         }
     }
 
+    /// Re-establish the warm-cache pin set for the MTP head's hot experts.
+    ///
+    /// **What this closes.** The MTP layer is a sparse MoE layer that *only*
+    /// drafting executes, read in the worst regime the engine has: once per
+    /// draft step, at `s_n = 1`, with no batch-union amortization to spread the
+    /// cost over. Between two draft steps the main stack runs all `n_layers` of
+    /// its own routed unions through the same warm cache, so by the time the
+    /// next draft step asks for its experts they have been evicted by a sweep
+    /// that never wanted them — the layer re-streams from disk every step, for
+    /// the whole run. No existing mechanism could hold them: residency ranking
+    /// (`plan_residency`, `rank_by_heat`, `solve_residency_sized`,
+    /// `plan_precision_fitted`, `plan_swaps`) enumerates candidates over
+    /// `first_dense..n_layers`, **exclusive**, so layer `n_layers` was never a
+    /// candidate in any of them; and predictor protection (`protect_from`)
+    /// iterates the same half-open range. `COLI_MTP_HEAT` fills the heat row but
+    /// no planner reads that row, and the heat table does not exist at all
+    /// without a GPU tier — which is the deployment this matters most on.
+    ///
+    /// **Why a pin rather than a rank.** Everything else in this cache competes
+    /// for one budget on one score, and the MTP layer cannot win that comparison
+    /// honestly: it is read once per draft step against 78 layers read once per
+    /// token, so any frequency-ordered policy ranks it last however much each
+    /// read costs. The bytes it is worth are a *separate* budget the operator
+    /// sets, which is what `COLI_MTP_PIN_MB` is.
+    ///
+    /// Correctness-neutral, like the rest of this subsystem: a pin only reorders
+    /// eviction victims. A pinned expert produces the same bytes as a streamed
+    /// one, and the reduce is position-keyed, so nothing here can reach a token.
+    fn apply_mtp_pins(&self) {
+        self.apply_mtp_pins_with(mtp_pin_bytes());
+    }
+
+    /// [`Self::apply_mtp_pins`] against an explicit budget.
+    ///
+    /// Split out for the same reason `GpuTier::build_with` takes its `int4` and
+    /// `counts` explicitly: the budget is resolved through a `OnceLock`, so a
+    /// test that set it through the environment would latch it for every other
+    /// test in the process and make two arms of one measurement indistinguishable.
+    fn apply_mtp_pins_with(&self, budget: usize) {
+        let (Some(pins), Some(cache)) = (&self.mtp_pins, &self.ecache) else {
+            return;
+        };
+        if budget == 0 {
+            return; // VRAM-only configuration; `reheat` spends the other budget
+        }
+        let layer = pins.layer();
+        let counts = pins.snapshot();
+        if counts.iter().all(|&c| c == 0) {
+            // Nothing observed yet, so every plan off this table is empty and the
+            // sizing probe below would be work with no consumer. It is also the
+            // whole story for a **dense** MTP head (the Qwen family's), which
+            // routes no expert at all: without this the probe would ask
+            // `entry_for` for `mlp.experts.0` tensors that do not exist and note
+            // an advisory error once per refresh generation, for the life of the
+            // process, about a configuration that is simply not applicable.
+            return;
+        }
+        // Uniform within a layer: `peregrine-requantize` picks precision per
+        // layer, so expert 0 sizes the pool. Read off the resolved entry rather
+        // than computed from `Cfg` so a tiered container (this one — the MTP
+        // layer is the last int8 rung) is sized at its own rung, not the
+        // majority's.
+        let per_expert = match crate::concurrent::expert_slab_bytes(
+            self.expert_index.as_ref(),
+            &self.st,
+            &self.cfg,
+            layer,
+            0,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                peregrine_io::note_advisory_err("mtp pin sizing", &e);
+                return;
+            }
+        };
+        // Never let the pin set eat the cache it lives in — see
+        // `mtp::granted_pin_budget` for why half is the line.
+        let cache_budget = cache.lock().budget();
+        static CLAMPED: std::sync::Once = std::sync::Once::new();
+        let effective =
+            crate::mtp::granted_pin_budget("COLI_MTP_PIN_MB", "warm cache", budget, cache_budget, &CLAMPED);
+        let plan = crate::mtp::plan_pins(&counts, effective, |_| per_expert);
+        // Ascending expert id is ascending disk offset within one layer, and the
+        // warm enqueue below turns straight into io_uring submits — the same
+        // reason the draft `ForwardCtx` carries `expert_index` at all.
+        let mut ids = plan;
+        ids.sort_unstable();
+        if pins.note_applied(ids.len()) {
+            eprintln!(
+                "peregrine: [mtp-pin] holding {} of {} MTP experts resident ({:.2} GB of a {:.2} GB warm cache)",
+                ids.len(),
+                self.cfg.n_experts,
+                (ids.len() * per_expert) as f64 / (1u64 << 30) as f64,
+                cache_budget as f64 / (1u64 << 30) as f64,
+            );
+        }
+        // One lock hold: drop the previous generation's pins, re-pin whatever of
+        // this generation is already resident, and note the rest for warming.
+        // The set is re-derived rather than amended — see `WarmCache::clear_pins`.
+        let mut absent: Vec<usize> = Vec::new();
+        {
+            let mut c = cache.lock();
+            c.clear_pins();
+            for &e in &ids {
+                let key = (layer as u32, e as u32);
+                if c.contains(key) {
+                    c.set_priority(key, peregrine_io::PIN_PRIORITY);
+                } else {
+                    absent.push(e);
+                }
+            }
+        }
+        // Warming is an accelerant, not a requirement: without a prefetch lane a
+        // pinned expert simply gets its priority on the generation after the
+        // draft path streams it itself. That is why the priority pass above runs
+        // first and unconditionally.
+        let Some(pool) = &self.prefetch else { return };
+        let mut items = Vec::new();
+        for e in absent {
+            match crate::concurrent::prefetch_item(self.expert_index.as_ref(), &self.st, &self.cfg, layer, e) {
+                Ok(item) => items.push(item),
+                Err(err) => peregrine_io::note_advisory_err("mtp pin prefetch resolve", &err),
+            }
+        }
+        if !items.is_empty() && pool.lane(0).tx.send(PrefetchMsg::Warm(items, u64::MAX)).is_err() {
+            peregrine_io::note_advisory_err("mtp pin warm dispatch", &"prefetch lane is down");
+        }
+    }
+
     /// Whether runtime expert replication is enabled and the target replica set
     /// size from env (`COLI_REPLICATE_K`). Default `0` (off).
     fn replica_k() -> usize {
@@ -4860,6 +5067,8 @@ impl Model {
         // out of the model: `routing_entropy_ewma()` said "for telemetry
         // scrapes" and no telemetry structure carried it.
         telemetry.entropy_ewma = self.routing_entropy_ewma();
+        telemetry.mtp_pinned_cache = self.mtp_pins.as_ref().map_or(0, |p| p.applied());
+        telemetry.mtp_pinned_vram = self.gpu.as_ref().map_or(0, |g| g.pinned_count());
         *self.last_telemetry.lock() = telemetry;
         // Sensor governors: thermal / power / bandwidth, all writing the one
         // effective-worker knob with shrink-wins arbitration.
@@ -5589,6 +5798,7 @@ impl Model {
             gate_trace: self.gate_trace.as_ref(),
                 direct: *direct,
                 heat: heat.as_ref(),
+                pins: None, // the main stack never routes the MTP head's experts
                 spill: spill_log.as_ref(),
                 timings: Some(lane_timings.as_ref()),
                 balancer: balancer.as_ref(),
@@ -5952,6 +6162,7 @@ impl Model {
             gate_trace: self.gate_trace.as_ref(),
             direct: self.direct,
             heat: self.heat.as_ref(),
+            pins: None, // the main stack never routes the MTP head's experts
             // No balancer in this context, so no spill verdict can occur.
             spill: None,
             timings: None,
@@ -6300,6 +6511,7 @@ impl Model {
             gate_trace: self.gate_trace.as_ref(),
             direct: self.direct,
             heat: self.heat.as_ref(),
+            pins: None, // the main stack never routes the MTP head's experts
             spill: self.spill_log.as_ref(),
             timings: Some(self.lane_timings.as_ref()),
             balancer: balancer.as_ref(),
@@ -6380,8 +6592,28 @@ impl Model {
             let drained = std::mem::take(&mut *log.lock());
             merge_spills(&mut counts, &drained, self.cfg.n_experts as usize);
         }
+        // The MTP head's VRAM reservation, sized by `COLI_MTP_PIN_VRAM_MB`. The
+        // snapshot is taken here so the pin plan and the heat ranking describe
+        // the same instant, exactly as `snapshot_all` does for the three heat
+        // components — a reservation solved against a different generation's
+        // counts would take bytes away from a ranking that never saw why.
+        let pin_counts = self.mtp_pins.as_ref().map(|p| p.snapshot());
+        let pins = match (&self.mtp_pins, &pin_counts) {
+            (Some(p), Some(c)) => crate::gpu::PinRequest {
+                counts: c,
+                layer: p.layer(),
+                budget: mtp_pin_vram_bytes(),
+            },
+            // No head, or no pin table: byte-for-byte the pre-pin generation.
+            _ => crate::gpu::PinRequest::none(),
+        };
         if let Some(gpu) = self.gpu.as_mut() {
-            gpu.reheat(&self.st, &self.cfg, &crate::gpu::HeatView { counts: &counts, last: &last, clock })?;
+            gpu.reheat(
+                &self.st,
+                &self.cfg,
+                &crate::gpu::HeatView { counts: &counts, last: &last, clock },
+                &pins,
+            )?;
         }
         // Runtime expert replication: warm the top-K hottest resident experts
         // into the CPU warm cache too, so a bias shift toward CPU never pays
@@ -6564,9 +6796,13 @@ impl Model {
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
 
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft without an MTP head".into()))?;
+        // One round per draft *call*, not per step: a call is the unit a
+        // sequence's speculation window is measured in, and counting steps would
+        // make the refresh cadence a function of `g_draft`.
+        let pins_gen = mtp_pins.as_ref().is_some_and(|p| p.note_round());
         let ctx = ForwardCtx {
             st,
             absorb: *absorb,
@@ -6588,6 +6824,10 @@ impl Model {
             // main-stream signal to skew — the withholding rule that governs
             // every other field here does not reach it.
             heat: if mtp_heat() { heat.as_ref() } else { None },
+            // The pin counter, unlike `heat`, is unconditional: it is private to
+            // this layer, exists without a GPU tier, and is budgeted separately,
+            // so it takes nothing from the main stream to feed it.
+            pins: mtp_pins.as_ref(),
             spill: None, // drafts must not queue uploads for a speculative future
             timings: None, // drafts must not skew the main-stream lane balance
             balancer: None, // drafts run under the plain static residency policy
@@ -6649,6 +6889,14 @@ impl Model {
             draft.push(t2);
             tok = t2;
             h = hx; // next hidden = this MTP layer's output
+        }
+        // Re-derive the pin set every `PIN_REFRESH_ROUNDS` draft rounds. Here
+        // rather than in `Model::reheat` because `reheat` has exactly one caller
+        // — `peregrine-serve`'s batched engine — so a refresh riding it would
+        // leave the CLI speculative path permanently unpinned. `&self`
+        // throughout, so it composes with the borrows above.
+        if pins_gen {
+            self.apply_mtp_pins();
         }
         Ok(draft)
     }
@@ -6713,9 +6961,10 @@ impl Model {
         let vocab = self.cfg.vocab as usize;
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft_batched without an MTP head".into()))?;
+        let pins_gen = mtp_pins.as_ref().is_some_and(|p| p.note_round());
         // Identical withholding policy to the single-sequence path — see the
         // comments on `mtp_draft_with`'s context. Batching changes which rows
         // share a forward, not what a draft is allowed to influence.
@@ -6737,6 +6986,7 @@ impl Model {
             direct: *direct,
             // See the single-sequence twin above and [`mtp_heat`].
             heat: if mtp_heat() { heat.as_ref() } else { None },
+            pins: mtp_pins.as_ref(), // see the single-sequence twin above
             spill: None,
             timings: None,
             balancer: None,
@@ -6825,6 +7075,9 @@ impl Model {
                 }
             }
             active = still;
+        }
+        if pins_gen {
+            self.apply_mtp_pins(); // see the single-sequence twin above
         }
         Ok(out)
     }
@@ -8800,6 +9053,81 @@ mod tests {
         let mut one: [&mut SeqKv; 1] = [&mut on];
         m.forward_step_batched(&[7], &mut one, &[toks.len()], None)?;
         assert_eq!(on.len(), toks.len() + 1);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn drafting_feeds_the_mtp_pin_table_and_pins_what_it_routed() -> Result<(), peregrine_core::Error> {
+        // The pin set is only as good as the counter under it, and that counter
+        // is fed from the shared MoE bump site — the same place `heat` is bumped.
+        // Two properties have to hold there, and neither is visible from the
+        // plan: a *draft* must reach the table, and a *main-stack* forward must
+        // not. `MtpPins::bump` enforces the second by layer id; this is the
+        // end-to-end check that the wiring delivers the first, and that the plan
+        // it produces actually lands as protection in the cache.
+        //
+        // Streaming and the cache budget are forced rather than set through the
+        // environment: both are read through latches, and a test that set them
+        // process-wide would decide them for every other test in the binary.
+        let dir = tmp_model_dir("mtp_pin_bump")?;
+        let m = Model::load_streaming_ecache(&dir, true, 1 << 20)?;
+        let Some(pins) = m.mtp_pins.as_ref() else {
+            std::fs::remove_dir_all(&dir)?;
+            return Err(peregrine_core::Error::Format("tiny model has no MTP head".into()));
+        };
+        let layer = m.cfg.n_layers as usize;
+        assert_eq!(pins.layer(), layer, "the pin table describes the MTP layer");
+
+        // A main-stack forward first: it routes experts on every sparse layer,
+        // and must leave this table empty — a main-stack routing of expert `e`
+        // says nothing about the MTP head's expert `e`.
+        let d = m.cfg.hidden as usize;
+        let prompt = [1i32, 5, 9, 2];
+        let mut seq = SeqKv::new(&m.cfg);
+        let owner = vec![0usize; prompt.len()];
+        let pos: Vec<usize> = (0..prompt.len()).collect();
+        let mut refs: Vec<&mut SeqKv> = vec![&mut seq];
+        let (_lg, hidden) = m.forward_rows_batched_hidden(&prompt, &owner, &mut refs, &pos, None)?;
+        assert_eq!(
+            pins.snapshot().iter().sum::<u32>(),
+            0,
+            "a main-stack forward must not reach the MTP head's pin table"
+        );
+
+        // Now draft. The MTP layer is a sparse MoE layer in this fixture, so
+        // each step routes `topk` of its own experts.
+        let hlast = hidden[(prompt.len() - 1) * d..prompt.len() * d].to_vec();
+        let drafted = m.mtp_draft(6, 3, &hlast, 0.0)?;
+        assert!(!drafted.is_empty(), "the fixture must actually draft");
+        let counts = pins.snapshot();
+        assert_eq!(counts.len(), m.cfg.n_experts as usize);
+        let routed: Vec<usize> = (0..counts.len()).filter(|&e| counts[e] > 0).collect();
+        assert!(!routed.is_empty(), "drafting must accumulate MTP routing frequency");
+
+        // The plan off those counts is confined to the experts that were routed
+        // — the property that makes a cold pin set empty rather than arbitrary.
+        let mut plan = crate::mtp::plan_pins(&counts, usize::MAX, |_| 1);
+        plan.sort_unstable();
+        assert_eq!(plan, routed, "the plan is exactly the experts drafting routed");
+        assert!(crate::mtp::plan_pins(&counts, 0, |_| 1).is_empty(), "a zero budget spends nothing");
+
+        // And the application turns that plan into protection the evictor reads.
+        m.apply_mtp_pins_with(1 << 20);
+        let Some(cache) = m.ecache.as_ref() else {
+            std::fs::remove_dir_all(&dir)?;
+            return Err(peregrine_core::Error::Format("forced ecache budget produced no cache".into()));
+        };
+        {
+            let c = cache.lock();
+            for &e in &routed {
+                let key = (layer as u32, e as u32);
+                assert!(c.contains(key), "layer {layer} expert {e} streamed, so it is resident");
+                assert_eq!(c.priority(key), peregrine_io::PIN_PRIORITY, "and pinned");
+            }
+            // Main-stack experts are untouched by the pin pass.
+            assert_eq!(c.priority((1, 0)), 0, "pinning must not reach another layer");
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

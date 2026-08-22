@@ -99,6 +99,20 @@ pub struct ForwardCtx<'a> {
     /// per routed expert per layer so [`crate::gpu::GpuTier::reheat`] can migrate
     /// hot experts into VRAM. `None` disables accumulation (no GPU tier / drafts).
     pub heat: Option<&'a HeatTable>,
+    /// Draft-path routing frequency for the MTP head's own expert pool, used to
+    /// choose which of that layer's experts are **pinned** resident. `Some` only
+    /// on the two MTP draft paths; `None` everywhere else, including every main-
+    /// stack forward.
+    ///
+    /// Beside `heat` rather than folded into it because the two are not the same
+    /// signal wearing different names. `heat` exists only when a GPU tier does,
+    /// is shared with main-stream residency, and is withheld from drafts by
+    /// default for exactly that reason (`COLI_MTP_HEAT`). This is a private
+    /// counter for one layer that nothing but drafting executes, and it feeds a
+    /// separately-budgeted set the main stream's eviction order cannot reach —
+    /// see [`crate::mtp::MtpPins`]. It is safe to leave wired at the shared bump
+    /// site because [`crate::mtp::MtpPins::bump`] rejects any layer but its own.
+    pub pins: Option<&'a crate::mtp::MtpPins>,
     /// Per-lane wall-time accumulator: I/O, CPU, GPU, and reduce phases bump
     /// this from within `moe_forward_concurrent`. The Model reads and resets
     /// it between forwards so the `BubbleTuner` sees per-forward deltas.
@@ -2247,6 +2261,14 @@ pub fn moe_forward_concurrent(
             heat.bump(layer, e as usize);
         }
     }
+    // Same event, a different consumer: the MTP head's pin set. Only the draft
+    // paths supply this, and the table refuses any layer but its own, so a main-
+    // stack forward that ever acquired one still could not write to it.
+    if let Some(pins) = ctx.pins {
+        for &e in &uniq {
+            pins.bump(layer, e as usize);
+        }
+    }
 
     // Record this layer's routed set as the newest history frame so the prefetch
     // lane can predict the next token's experts. Single-threaded here (after the
@@ -2328,6 +2350,30 @@ impl HintItem {
     pub fn regions(&self) -> &[(RawFd, u64, usize)] {
         &self.regions
     }
+}
+
+/// Resident bytes one expert's slab occupies in the warm cache: its three weight
+/// regions plus their scales, exactly as the I/O lane reads them.
+///
+/// Read off the same [`ExpertEntry`] the streaming lane resolves, so it is the
+/// bytes that will actually land rather than a shape computed from `Cfg` — which
+/// on a precision-tiered container would be the wrong number for whichever
+/// layers the converter left at another rung, the MTP layer among them.
+///
+/// An **upper** bound under `COLI_CACHE_COMPRESS`, where a slab is admitted
+/// zstd-encoded and occupies less. Over-counting there costs a smaller pinned
+/// set than the budget could hold; under-counting would cost eviction of the
+/// pins the budget was set to keep, so the conservative direction is the right
+/// one.
+pub fn expert_slab_bytes(
+    index: Option<&ExpertIndex>,
+    st: &SafeTensors,
+    cfg: &Cfg,
+    layer: usize,
+    expert: usize,
+) -> Result<usize, Error> {
+    let e = entry_for(index, st, cfg, layer, expert)?;
+    Ok(e.plans.iter().map(|t| t.w_len + t.s_len).sum())
 }
 
 /// Build a [`HintItem`] for one expert's six regions. Uses the **buffered** fds:
@@ -2448,6 +2494,7 @@ mod tests {
             route_log_multi: None,
             direct: false,
             heat: None,
+            pins: None,
             spill: None,
             timings: None,
             balancer: None,

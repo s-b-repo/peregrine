@@ -461,6 +461,7 @@ mod tests {
             route_log_multi: None,
             direct: false,
             heat: None,
+            pins: None,
             spill: None,
             timings: None,
             balancer: None,

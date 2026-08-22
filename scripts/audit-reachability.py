@@ -24,7 +24,7 @@ regions. Zero remaining references means nothing but tests can reach it.
 
 Informational, not a hard gate: a workspace legitimately carries public API for
 its binaries and for future consumers, so a nonzero count is expected. The value
-is the *diff* — a symbol appearing here that a doc or todo.md calls shipped is
+is the *diff* — a symbol appearing here that a doc or docs/todo.md calls shipped is
 the bug. Run it when marking something complete.
 
 Usage: scripts/audit-reachability.py [--list]

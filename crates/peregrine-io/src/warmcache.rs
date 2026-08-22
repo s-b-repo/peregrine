@@ -7,7 +7,7 @@
 //! size. It stores the raw streamed *quantized* bytes verbatim (weight + scale for
 //! gate/up/down), so a hit reconstructs a **bit-identical** `QtWeight` — the cache
 //! only changes load timing, never the numeric output. Holding quantized (not
-//! dequantized) bytes also keeps the RAM footprint small (todo.txt "quantized RAM
+//! dequantized) bytes also keeps the RAM footprint small (docs/todo.txt "quantized RAM
 //! cache").
 
 use std::collections::HashMap;
@@ -382,6 +382,18 @@ pub struct WarmCache {
 /// that ended.
 const LFRU_DECAY_HITS: u64 = 4096;
 
+/// The reserved top of the eviction-protection scale: a slot at this priority is
+/// chosen as a victim only when nothing else is resident.
+///
+/// Distinct from the predictor's protection scores (`Model::pack_prio`), which
+/// are clamped to `PIN_PRIORITY - 1` so no prediction can ever tie with a pin.
+/// The two mechanisms answer different questions — a prediction says "this
+/// stream will probably want this expert next", a pin says "this expert is held
+/// for the process" — and a tie would resolve on recency, i.e. on whichever
+/// happened to be touched last, which is exactly the ordering a pin exists to
+/// take out of play.
+pub const PIN_PRIORITY: u32 = u32::MAX;
+
 impl WarmCache {
     /// A cache bounded to `budget_bytes` of resident expert slabs.
     pub fn new(budget_bytes: usize) -> WarmCache {
@@ -441,6 +453,17 @@ impl WarmCache {
     /// Override the `COLI_CACHE_SWEEP` gate, for the same reason as
     /// [`Self::with_lfru`]: the env is process-global and the test binary is
     /// threaded.
+    /// Override the negative-cache TTL (`COLI_CACHE_NEGATIVE_TTL`) explicitly.
+    ///
+    /// The sibling of [`Self::with_compression`] / [`Self::with_lfru`] /
+    /// [`Self::with_sweep`], and for the same reason: the constructor reads the
+    /// knob from the environment, so a test that wanted a TTL had to set a
+    /// process-wide variable that every other test in the binary would then see.
+    pub fn with_negative_ttl(mut self, ttl: u64) -> WarmCache {
+        self.negative_ttl = ttl;
+        self
+    }
+
     pub fn with_sweep(mut self, on: bool) -> WarmCache {
         self.sweep = on;
         self
@@ -914,11 +937,37 @@ impl WarmCache {
         }
     }
 
-    /// Reset every slot's protection score to 0 (called at sequence reset so a new
-    /// sequence starts from pure LRU until its predictor re-protects experts).
+    /// Reset every slot's *predictor* protection score to 0 (called at sequence
+    /// reset so a new sequence starts from pure LRU until its predictor
+    /// re-protects experts).
+    ///
+    /// [`PIN_PRIORITY`] slots are left alone. A pin is a residency decision that
+    /// outlives a sequence — it is derived from the draft path's own routing
+    /// frequency over the whole process, not from one stream's history — so
+    /// clearing it here would drop the pin set on every `Model::reset` and
+    /// re-stream it on the next refresh generation, which is the eviction churn
+    /// the pin exists to stop.
     pub fn clear_priorities(&mut self) {
         for slot in self.map.values_mut() {
-            slot.prio = 0;
+            if slot.prio != PIN_PRIORITY {
+                slot.prio = 0;
+            }
+        }
+    }
+
+    /// Drop every pin, so a caller can re-establish the whole pinned set from
+    /// scratch. Predictor protection scores are untouched.
+    ///
+    /// The pin set is re-derived, not amended, on each refresh: an expert that
+    /// cooled out of the plan has to lose its pin, and a differential update
+    /// would need the previous plan kept somewhere in sync with what actually
+    /// landed in the cache. Clearing and re-applying is one pass over a map the
+    /// caller is already locking.
+    pub fn clear_pins(&mut self) {
+        for slot in self.map.values_mut() {
+            if slot.prio == PIN_PRIORITY {
+                slot.prio = 0;
+            }
         }
     }
 
@@ -1530,6 +1579,51 @@ mod tests {
         assert!(c.contains((0, 0)), "protected slab must survive despite being LRU");
         assert!(!c.contains((0, 1)), "unprotected slab is the victim");
         assert!(c.contains((0, 2)));
+    }
+
+    #[test]
+    fn a_pin_outranks_the_highest_predictor_protection() {
+        // `Model::pack_prio` is clamped to `PIN_PRIORITY - 1`, so even a
+        // maximally-scored, maximally-hot prediction loses to a pin. Asserted
+        // here with the raw ceiling rather than through `pack_prio`, since the
+        // property the eviction order needs is about the two *scales*, not about
+        // any particular predictor.
+        let mut c = WarmCache::new(80);
+        c.insert((0, 0), slab(10, 2));
+        c.insert((0, 1), slab(10, 2));
+        c.set_priority((0, 0), PIN_PRIORITY);
+        c.set_priority((0, 1), PIN_PRIORITY - 1); // the best a prediction can be
+        c.insert((0, 2), slab(10, 2)); // over budget
+        assert!(c.contains((0, 0)), "the pin must survive");
+        assert!(!c.contains((0, 1)), "the maximally-protected prediction is the victim");
+    }
+
+    #[test]
+    fn a_pin_survives_a_sequence_reset_and_the_negative_cache() {
+        // Two mechanisms clear protection between sequences, and a pin must
+        // outlive both: `clear_priorities` (predictor protection is per-stream,
+        // a pin is per-process) and the negative-TTL sweep, which drops cold
+        // residents outright. A draft-path expert is cold *by construction*
+        // between draft steps — the whole main stack runs in between — so a pin
+        // that the TTL pass could take would be a pin that never held anything.
+        let mut c = WarmCache::new(1 << 20).with_negative_ttl(1);
+        c.insert((0, 0), slab(10, 2));
+        c.insert((0, 1), slab(10, 2));
+        c.set_priority((0, 0), PIN_PRIORITY);
+        c.set_priority((0, 1), 7);
+        c.clear_priorities();
+        assert_eq!(c.priority((0, 0)), PIN_PRIORITY, "a pin outlives a sequence reset");
+        assert_eq!(c.priority((0, 1)), 0, "predictor protection does not");
+        // Age everything well past the TTL, then force an eviction pass.
+        for _ in 0..8 {
+            c.insert((0, 2), slab(10, 2));
+        }
+        assert!(c.contains((0, 0)), "the negative-TTL sweep must skip pinned slabs");
+
+        // And `clear_pins` is the one thing that does drop them, so the set can
+        // shrink when an expert cools out of the plan.
+        c.clear_pins();
+        assert_eq!(c.priority((0, 0)), 0);
     }
 
     #[test]

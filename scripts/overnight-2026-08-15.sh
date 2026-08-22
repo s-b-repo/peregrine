@@ -10,7 +10,7 @@
 #   0. preflight: asymmetric dry-run + free-space check on the stripe
 #   1. the conversion itself: experts to int3-g64, down_proj kept, last 6
 #      expert layers (incl. the MTP row) untouched — the ds4 recipe, the one
-#      untested point on the sub-int4 ladder after todo.md §13 closed every
+#      untested point on the sub-int4 ladder after docs/todo.md §13 closed every
 #      uniform rung
 #   2. flip-rate quality gate vs the int4 source (same corpus as the 08-13
 #      gate; uniform int3-g64 measured 0.514 there). FLIP_MAX only gates
@@ -72,7 +72,7 @@ if nice -n 10 ionice -c3 ./target/release/peregrine-requantize "$COLI_MODEL" "$C
     COLI_MODEL="$CAND" REPEATS=1 MAX_TOKENS=32 PORT=8143 nice -n 5 scripts/bench-serve-batch.sh \
       "$DATA/serve-cand" 1 16 || stamp "stage 3b FAILED (continuing)"
   else
-    stamp "stage 2: flip_rate ${rate:-unparseable} > $FLIP_MAX — skipping stage 3; contingency is --keep-last-layers 12, else todo.md §13 gains another closed rung"
+    stamp "stage 2: flip_rate ${rate:-unparseable} > $FLIP_MAX — skipping stage 3; contingency is --keep-last-layers 12, else docs/todo.md §13 gains another closed rung"
   fi
 else
   stamp "stage 1 conversion FAILED — skipping the gate and stage 3"

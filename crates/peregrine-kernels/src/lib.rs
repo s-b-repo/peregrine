@@ -38,5 +38,28 @@ pub fn cpu_kernel_tier() -> &'static str {
             return "x86_64 AVX2 (maddubs)";
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return "aarch64 NEON+dotprod (sdot)";
+        }
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return "aarch64 NEON (smull)";
+        }
+    }
     "portable scalar"
+}
+
+#[cfg(test)]
+mod tests {
+    /// A SIMD kernel that is never reached is worse than none — it looks like
+    /// coverage. On aarch64 the dispatcher must land on a vector path, so that
+    /// an equivalence test passing cannot mean "both sides ran the scalar
+    /// reference".
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_does_not_silently_fall_back_to_scalar() {
+        let b = super::cpu_kernel_tier();
+        assert!(b.starts_with("aarch64"), "expected a NEON backend on aarch64, got {b:?}");
+    }
 }

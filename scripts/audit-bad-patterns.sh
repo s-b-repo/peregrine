@@ -154,7 +154,7 @@ echo "[Q] Cargo.toml hygiene          (STRICT): $Q_TOTAL"
 # live, and no production path reaches it. Grep cannot see this class; it needs a
 # definition/reference pass, so it lives in a companion script. Informational: a
 # workspace legitimately exposes API its binaries don't call. The signal is a
-# symbol here that a doc or todo.md calls shipped. See docs/BAD_PATTERNS.md [R].
+# symbol here that a doc or docs/todo.md calls shipped. See docs/BAD_PATTERNS.md [R].
 R_TOTAL=0
 if command -v python3 >/dev/null 2>&1 && [ -x scripts/audit-reachability.py ]; then
   R_LINE="$(scripts/audit-reachability.py $([ "$STRICT" -eq 0 ] && echo --list))"

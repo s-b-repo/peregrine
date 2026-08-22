@@ -87,7 +87,7 @@ pub use slab::{
     ALIGN,
 };
 pub use tier::{decay, lfru_score, pick_lfru, pick_swap, Swap};
-pub use warmcache::{CacheHit, CompressedSlab, ExpertSlab, PreparedInsert, ResidencyHint, WarmCache};
+pub use warmcache::{CacheHit, CompressedSlab, ExpertSlab, PreparedInsert, ResidencyHint, WarmCache, PIN_PRIORITY};
 
 /// Cap glibc's per-thread malloc arenas (`M_ARENA_MAX=2`) so the many worker
 /// threads streaming ~18.9 MB expert buffers don't inflate RSS through arena

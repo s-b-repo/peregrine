@@ -84,6 +84,17 @@ export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export COLI_GPU="${COLI_GPU:-1}"
 # Disk -> pinned host page -> VRAM, two DMAs and no userspace copy (2026-08-22).
 # Default on; set explicitly so the A/B control is visible.
+# int4-resident VRAM experts, ~8x denser than the f32 dequant path (18.9 MB vs
+# ~151 MB each). WITHOUT this the tier silently uploads every expert dequantised
+# to f32 and holds ~59 of them; with it, ~450. It needs per-row int4 sources and
+# this container is exactly that (verified 4.00 bits/param with per-row scales) —
+# a grouped-int4 or int8 expert falls back to f32 on its own rather than failing
+# the tier, so it is safe on a mixed container too.
+#
+# It is also what engages the pinned disk->GPU lane: only the int4 path uploads
+# the payload verbatim, so only it can have io_uring DMA the bytes straight into
+# the H2D source. On the f32 path those bytes are computed, not read.
+export COLI_GPU_INT4="${COLI_GPU_INT4:-1}"
 export COLI_GPU_PINNED="${COLI_GPU_PINNED:-1}"
 export COLI_GPU_UPLOAD_DEPTH="${COLI_GPU_UPLOAD_DEPTH:-4}"
 

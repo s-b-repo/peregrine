@@ -48,6 +48,17 @@ pub fn dot_i8i8(w: &[i8], x: &[i8], n: usize) -> i32 {
             return unsafe { x86::dot_i8i8_avx2(w, x, n) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: each branch calls a target_feature fn only after detecting the
+        // exact features it requires at runtime.
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return unsafe { aarch64::dot_i8i8_dotprod(w, x, n) };
+        }
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { aarch64::dot_i8i8_neon(w, x, n) };
+        }
+    }
     dot_i8i8_scalar(w, x, n)
 }
 
@@ -59,6 +70,16 @@ pub fn dot_i4i8(w4: &[u8], x: &[i8], n: usize) -> i32 {
         // SAFETY: the avx2 kernel is only called after detecting avx2 at runtime.
         if std::is_x86_feature_detected!("avx2") {
             return unsafe { x86::dot_i4i8_avx2(w4, x, n) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: as above — detection precedes each target_feature call.
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return unsafe { aarch64::dot_i4i8_dotprod(w4, x, n) };
+        }
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { aarch64::dot_i4i8_neon(w4, x, n) };
         }
     }
     dot_i4i8_scalar(w4, x, n)
@@ -133,7 +154,236 @@ pub fn dot_i2i8(w2: &[u8], x: &[i8], n: usize) -> i32 {
             return unsafe { x86::dot_i2i8_avx2(w2, x, n) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // No plain-NEON int2 twin: int2 is a closed negative on this engine
+        // (uniform int2-g64 measured `flip_rate` 1.000), so the format is a
+        // completeness case rather than a hot path. `sdot` costs nothing extra
+        // once the unpack is written; a second hand-rolled variant would be risk
+        // without a caller.
+        // SAFETY: detection precedes the target_feature call.
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return unsafe { aarch64::dot_i2i8_dotprod(w2, x, n) };
+        }
+    }
     dot_i2i8_scalar(w2, x, n)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64 {
+    //! NEON (`smull`/`sadalp`) and ARMv8.2 dot-product (`sdot`) kernels — the
+    //! ARM twins of the AVX2 and AVX-VNNI paths above, and written to the same
+    //! contract: process vector-width chunks, fall through to the scalar tail,
+    //! produce the **identical** i32 accumulator.
+    //!
+    //! `sdot` is the direct analogue of VNNI's `vpdpbusd`, and easier to use:
+    //! it is signed×signed→i32, so none of the `maddubs` sign-trick ceremony is
+    //! needed. Each instruction consumes 4 int8 pairs per 32-bit lane.
+    //!
+    //! NEON is architecturally mandatory on ARMv8-A, so the `neon` kernels are
+    //! the real floor here; the scalar reference is reached only if feature
+    //! detection somehow reports no NEON at all.
+    use super::{dot_i2i8_scalar, dot_i4i8_scalar, dot_i8i8_scalar};
+    use std::arch::aarch64::*;
+
+    /// `sdot acc.4s, a.16b, b.16b` — four int8 products summed into each of the
+    /// four i32 lanes.
+    ///
+    /// Written as inline assembly rather than `vdotq_s32` because that intrinsic
+    /// is still nightly-only (`stdarch_neon_dotprod`, rust-lang/rust#117224) and
+    /// this workspace is stable-only. `asm!` *is* stable, so the instruction is
+    /// reachable without a nightly toolchain; the equivalence tests below pin the
+    /// result against the scalar reference either way.
+    ///
+    /// # Safety
+    /// The CPU must support NEON and the dot-product extension.
+    #[inline]
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        let mut out = acc;
+        core::arch::asm!(
+            "sdot {out:v}.4s, {a:v}.16b, {b:v}.16b",
+            out = inout(vreg) out,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack)
+        );
+        out
+    }
+
+    /// Unpack 16 packed-int4 bytes into 32 int8 values in element order,
+    /// biased into `[-8, 7]`. Returns `(elems 0..15, elems 16..31)`.
+    ///
+    /// `vzip1q_u8`/`vzip2q_u8` are the NEON spelling of `_mm_unpacklo_epi8` /
+    /// `_mm_unpackhi_epi8`: element `i` is the low nibble of byte `i/2` for even
+    /// `i` and the high nibble for odd `i`, so zipping the low-nibble and
+    /// high-nibble vectors restores element order exactly.
+    ///
+    /// # Safety
+    /// Caller must have NEON, and `by` must be a valid 16-byte load.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn unpack_i4(by: uint8x16_t) -> (int8x16_t, int8x16_t) {
+        let m4 = vdupq_n_u8(0x0F);
+        let b8 = vdupq_n_s8(8);
+        let lo = vandq_u8(by, m4);
+        let hi = vshrq_n_u8::<4>(by);
+        let n0 = vzip1q_u8(lo, hi);
+        let n1 = vzip2q_u8(lo, hi);
+        (
+            vsubq_s8(vreinterpretq_s8_u8(n0), b8),
+            vsubq_s8(vreinterpretq_s8_u8(n1), b8),
+        )
+    }
+
+    /// int8·int8 via ARMv8.2 `sdot`.
+    ///
+    /// Two accumulators for the same reason the AVX2 kernel uses two: `sdot` has
+    /// multi-cycle latency and one accumulator serializes the loop on it.
+    /// Bit-identical regardless — integer addition is associative.
+    ///
+    /// # Safety
+    /// The CPU must support NEON and the dot-product extension. [`super::dot_i8i8`]
+    /// checks both with `is_aarch64_feature_detected!` before calling.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn dot_i8i8_dotprod(w: &[i8], x: &[i8], n: usize) -> i32 {
+        let mut acc0 = vdupq_n_s32(0);
+        let mut acc1 = vdupq_n_s32(0);
+        let mut i = 0usize;
+        while i + 32 <= n {
+            acc0 = sdot(acc0, vld1q_s8(w.as_ptr().add(i)), vld1q_s8(x.as_ptr().add(i)));
+            acc1 = sdot(acc1, vld1q_s8(w.as_ptr().add(i + 16)), vld1q_s8(x.as_ptr().add(i + 16)));
+            i += 32;
+        }
+        while i + 16 <= n {
+            acc0 = sdot(acc0, vld1q_s8(w.as_ptr().add(i)), vld1q_s8(x.as_ptr().add(i)));
+            i += 16;
+        }
+        let mut sum = vaddvq_s32(vaddq_s32(acc0, acc1));
+        if i < n {
+            sum += dot_i8i8_scalar(&w[i..], &x[i..], n - i);
+        }
+        sum
+    }
+
+    /// int8·int8 on plain NEON, for ARMv8.0/8.1 without the dot-product
+    /// extension: `smull` widens i8×i8 to i16, `sadalp` pairwise-accumulates
+    /// into i32. Products are bounded by 128·128, so no intermediate saturates.
+    ///
+    /// # Safety
+    /// The CPU must support NEON.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_i8i8_neon(w: &[i8], x: &[i8], n: usize) -> i32 {
+        let mut acc = vdupq_n_s32(0);
+        let mut i = 0usize;
+        while i + 16 <= n {
+            let wv = vld1q_s8(w.as_ptr().add(i));
+            let xv = vld1q_s8(x.as_ptr().add(i));
+            acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(wv), vget_low_s8(xv)));
+            acc = vpadalq_s16(acc, vmull_high_s8(wv, xv));
+            i += 16;
+        }
+        let mut sum = vaddvq_s32(acc);
+        if i < n {
+            sum += dot_i8i8_scalar(&w[i..], &x[i..], n - i);
+        }
+        sum
+    }
+
+    /// packed-int4·int8 via `sdot`. This is GLM-5.2's hot path: every routed
+    /// expert weight is int4 with group scales, and [`super::dot_i4i8_grouped`]
+    /// reaches it once per group.
+    ///
+    /// # Safety
+    /// The CPU must support NEON and the dot-product extension.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn dot_i4i8_dotprod(w4: &[u8], x: &[i8], n: usize) -> i32 {
+        let mut acc0 = vdupq_n_s32(0);
+        let mut acc1 = vdupq_n_s32(0);
+        let mut i = 0usize;
+        while i + 32 <= n {
+            let (w0, w1) = unpack_i4(vld1q_u8(w4.as_ptr().add(i >> 1)));
+            acc0 = sdot(acc0, w0, vld1q_s8(x.as_ptr().add(i)));
+            acc1 = sdot(acc1, w1, vld1q_s8(x.as_ptr().add(i + 16)));
+            i += 32;
+        }
+        let mut sum = vaddvq_s32(vaddq_s32(acc0, acc1));
+        if i < n {
+            // `i` is a multiple of 32, so `i >> 1` lands on a byte boundary and
+            // the tail's nibble parity is preserved.
+            sum += dot_i4i8_scalar(&w4[i >> 1..], &x[i..], n - i);
+        }
+        sum
+    }
+
+    /// packed-int4·int8 on plain NEON, without the dot-product extension.
+    ///
+    /// # Safety
+    /// The CPU must support NEON.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn dot_i4i8_neon(w4: &[u8], x: &[i8], n: usize) -> i32 {
+        let mut acc = vdupq_n_s32(0);
+        let mut i = 0usize;
+        while i + 32 <= n {
+            let (w0, w1) = unpack_i4(vld1q_u8(w4.as_ptr().add(i >> 1)));
+            let x0 = vld1q_s8(x.as_ptr().add(i));
+            let x1 = vld1q_s8(x.as_ptr().add(i + 16));
+            acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w0), vget_low_s8(x0)));
+            acc = vpadalq_s16(acc, vmull_high_s8(w0, x0));
+            acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(w1), vget_low_s8(x1)));
+            acc = vpadalq_s16(acc, vmull_high_s8(w1, x1));
+            i += 32;
+        }
+        let mut sum = vaddvq_s32(acc);
+        if i < n {
+            sum += dot_i4i8_scalar(&w4[i >> 1..], &x[i..], n - i);
+        }
+        sum
+    }
+
+    /// packed-int2·int8 via `sdot`. 16 bytes carry 64 elements, so one load
+    /// feeds four `sdot`s.
+    ///
+    /// The 4-way interleave restores element order: byte `k` holds elements
+    /// `4k..4k+3` in its four 2-bit fields, so zipping `(f0,f1)` and `(f2,f3)`
+    /// as bytes and then zipping *those* as 16-bit lanes lands
+    /// `f0[k],f1[k],f2[k],f3[k]` consecutively.
+    ///
+    /// # Safety
+    /// The CPU must support NEON and the dot-product extension.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn dot_i2i8_dotprod(w2: &[u8], x: &[i8], n: usize) -> i32 {
+        let m2 = vdupq_n_u8(0x03);
+        let b2 = vdupq_n_s8(2);
+        let mut acc0 = vdupq_n_s32(0);
+        let mut acc1 = vdupq_n_s32(0);
+        let mut i = 0usize;
+        while i + 64 <= n {
+            let by = vld1q_u8(w2.as_ptr().add(i >> 2));
+            let f0 = vandq_u8(by, m2);
+            let f1 = vandq_u8(vshrq_n_u8::<2>(by), m2);
+            let f2 = vandq_u8(vshrq_n_u8::<4>(by), m2);
+            let f3 = vshrq_n_u8::<6>(by);
+            let a0 = vreinterpretq_u16_u8(vzip1q_u8(f0, f1));
+            let a1 = vreinterpretq_u16_u8(vzip2q_u8(f0, f1));
+            let b0 = vreinterpretq_u16_u8(vzip1q_u8(f2, f3));
+            let b1 = vreinterpretq_u16_u8(vzip2q_u8(f2, f3));
+            let z0 = vsubq_s8(vreinterpretq_s8_u16(vzip1q_u16(a0, b0)), b2);
+            let z1 = vsubq_s8(vreinterpretq_s8_u16(vzip2q_u16(a0, b0)), b2);
+            let z2 = vsubq_s8(vreinterpretq_s8_u16(vzip1q_u16(a1, b1)), b2);
+            let z3 = vsubq_s8(vreinterpretq_s8_u16(vzip2q_u16(a1, b1)), b2);
+            acc0 = sdot(acc0, z0, vld1q_s8(x.as_ptr().add(i)));
+            acc1 = sdot(acc1, z1, vld1q_s8(x.as_ptr().add(i + 16)));
+            acc0 = sdot(acc0, z2, vld1q_s8(x.as_ptr().add(i + 32)));
+            acc1 = sdot(acc1, z3, vld1q_s8(x.as_ptr().add(i + 48)));
+            i += 64;
+        }
+        let mut sum = vaddvq_s32(vaddq_s32(acc0, acc1));
+        if i < n {
+            sum += dot_i2i8_scalar(&w2[i >> 2..], &x[i..], n - i);
+        }
+        sum
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -642,6 +892,18 @@ mod tests {
                     assert_eq!(unsafe { x86::dot_i8i8_vnni(&w, &x, n) }, reference, "vnni n={n}");
                 }
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Both ARM kernels, not just the one dispatch picks: a box
+                // without `dotprod` runs the `smull` path and nothing else would
+                // ever check it.
+                if std::arch::is_aarch64_feature_detected!("neon") {
+                    assert_eq!(unsafe { aarch64::dot_i8i8_neon(&w, &x, n) }, reference, "neon n={n}");
+                }
+                if std::arch::is_aarch64_feature_detected!("dotprod") {
+                    assert_eq!(unsafe { aarch64::dot_i8i8_dotprod(&w, &x, n) }, reference, "sdot n={n}");
+                }
+            }
             assert_eq!(dot_i8i8(&w, &x, n), reference, "dispatch n={n}");
         }
     }
@@ -704,6 +966,12 @@ mod tests {
                     assert_eq!(unsafe { x86::dot_i2i8_avx2(&w2, &x, n) }, reference, "avx2 i2 n={n}");
                 }
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("dotprod") {
+                    assert_eq!(unsafe { aarch64::dot_i2i8_dotprod(&w2, &x, n) }, reference, "sdot i2 n={n}");
+                }
+            }
             assert_eq!(dot_i2i8(&w2, &x, n), reference, "dispatch i2 n={n}");
         }
     }
@@ -723,6 +991,15 @@ mod tests {
             {
                 if std::is_x86_feature_detected!("avx2") {
                     assert_eq!(unsafe { x86::dot_i4i8_avx2(&w4, &x, n) }, reference, "avx2 i4 n={n}");
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("neon") {
+                    assert_eq!(unsafe { aarch64::dot_i4i8_neon(&w4, &x, n) }, reference, "neon i4 n={n}");
+                }
+                if std::arch::is_aarch64_feature_detected!("dotprod") {
+                    assert_eq!(unsafe { aarch64::dot_i4i8_dotprod(&w4, &x, n) }, reference, "sdot i4 n={n}");
                 }
             }
             assert_eq!(dot_i4i8(&w4, &x, n), reference, "dispatch i4 n={n}");

@@ -559,6 +559,12 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
             "hits": h, "misses": m, "disk_reads": d, "prefetch_reads": t.prefetch_reads,
         })),
         "routing_entropy_ewma": t.runtime.entropy_ewma,
+        // The MTP head's pinned residency (`COLI_MTP_PIN_MB` /
+        // `COLI_MTP_PIN_VRAM_MB`). Both `0` with the knobs unset. Read these
+        // against `ecache.disk_reads`: the pin is worth its bytes exactly when
+        // holding N of that layer's experts stops N experts' worth of re-reads
+        // per draft step, and nothing else in this scrape can say whether it did.
+        "mtp_pinned": { "cache": t.runtime.mtp_pinned_cache, "vram": t.runtime.mtp_pinned_vram },
         // What the expert reads above actually bought. Delta these against
         // `ecache` across two scrapes for the metric this engine is ultimately
         // tuned on — SSD bytes per *accepted* token:

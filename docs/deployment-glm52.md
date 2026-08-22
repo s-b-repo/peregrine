@@ -148,30 +148,31 @@ export OPENAI_BASE_URL=https://glm.cybersec.org.za/v1
 export OPENAI_API_KEY=<the key in ~/.config/peregrine/glm52.env>
 ```
 
-**But be honest about the speed before you build a workflow on it.** One token
-routes 10.85 GB of experts. At this box's 2.36 GB/s aggregate that is a **4.6 s
-floor per token from the drives alone** — before attention, before the router,
-before anything computes. Measured on *faster* storage than this (1.12 GB/s LUKS
-NVMe, a 9.7 s floor), the engine hit 0.064 tok/s at B=1 — **15.6 s/token**.
-Halving the floor should roughly halve that, so expect **~8 s/token** for a
-single stream here.
+**Measured on this box, 2026-08-22, after the migration:** a 24-token completion
+took **453 s — 18.9 s/token**, prefill included. That is not an estimate; it is
+the number the deployed stack produced. One decode step moves **11.12 GB** and
+splits `io 8.7 s wall (43.5 s summed across the 5 rings) / cpu 2.8 s / gpu 0.016 s
+/ reduce 0.17 s`. The device is ~75 % of the step, exactly as the floor predicts.
 
-That is **~40 minutes for a 300-token code edit**. Batching does not rescue
+(An earlier draft of this page predicted ~8 s/token by halving a figure measured
+on the old storage. That was optimistic by more than 2x. 18.9 s/token is the
+measured one.)
+
+That is **~95 minutes for a 300-token code edit**. Batching does not rescue
 interactive use: at B=16 the batch-union means 16 streams share one set of expert
-reads, so *aggregate* throughput rises 4.4× (0.064 → 0.280 tok/s) while each
-individual stream gets *slower* — roughly one token per 57 s. Batching is for
-serving many requests at once, not for making one request fast.
+reads, so *aggregate* throughput rises 4.4x while each individual stream gets
+*slower*. Batching is for serving many requests at once, not for making one
+request fast.
 
 So:
 
-- **Interactive coding assistant: no.** Not at 8 s/token. Nothing in the config
-  changes this, because it is the device floor, not the scheduler.
+- **Interactive coding assistant: no.** Not at 18.9 s/token. No knob changes
+  this, because it is the device floor and not the scheduler — `gpu_us` is
+  0.016 s against `io_us` of 8.7 s wall.
 - **Batch / async work: yes.** Submit a refactor or a review, come back later.
-  This is what the model is good for on this hardware, and B=16 is exactly right
-  for it.
-- **For interactive work, use the resident model instead.** Qwen3.8-27B is
-  already on this box and fits in VRAM+RAM without streaming — that is what
-  `qwen8b.cybersec.org.za` exists for, and it is the right tool for a coding loop.
+  This is what the model is good for on this hardware, and B=16 is right for it.
+- **For interactive work, use a resident model instead.** Anything that fits in
+  VRAM+RAM without streaming will be two to three orders of magnitude faster.
 
 The one lever that *would* change this is **fewer bytes per token**, and every
 sub-int4 rung has failed its quality gate here (int2-g64 `flip_rate = 1.000`,

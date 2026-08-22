@@ -16,7 +16,7 @@
 //! **Why it matters more here than on a compute-bound engine.** Both peregrine
 //! and colibrì measured naive speculation as a net loss on streamed experts,
 //! and for the same reason: a *rejected* draft still pays for its verify row's
-//! expert reads. `ideas-from-colibri.md` states the corollary — speculation on
+//! expert reads. `docs/ideas-from-colibri.md` states the corollary — speculation on
 //! a disk-bound engine only loses when drafts are rejected, so a draft source
 //! whose acceptance approaches 1 sidesteps the failure mode entirely. A
 //! literal repeat from context is that source.

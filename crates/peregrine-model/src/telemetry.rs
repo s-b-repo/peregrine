@@ -37,6 +37,16 @@ pub struct RuntimeTelemetry {
     /// and reachable by nothing. The underlying EWMA was always live; only the
     /// way out was missing.
     pub entropy_ewma: f32,
+    /// MTP-head experts currently pinned in the warm cache (`COLI_MTP_PIN_MB`)
+    /// and in VRAM (`COLI_MTP_PIN_VRAM_MB`). Both `0` when the knobs are unset,
+    /// and both `0` before the first refresh generation.
+    ///
+    /// Reported because a pin set that never forms is indistinguishable from an
+    /// inert mechanism otherwise: the layer still computes, still returns the
+    /// same tokens, and still prints the same boot line — it is only slower, and
+    /// only against a baseline nobody has.
+    pub mtp_pinned_cache: usize,
+    pub mtp_pinned_vram: usize,
 }
 
 /// PCIe-side observables for the GPU expert lane, mirrored out of
@@ -174,6 +184,9 @@ impl PlanOptimizer {
             // The optimizer has no view of routing; `Model::publish_lane_timings`
             // fills this from `routing_entropy_ewma()` after the snapshot.
             entropy_ewma: 0.0,
+            // Likewise: residency is the model's, not the optimizer's.
+            mtp_pinned_cache: 0,
+            mtp_pinned_vram: 0,
         }
     }
 }

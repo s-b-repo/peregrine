@@ -4,9 +4,13 @@
 
 ## Prerequisites
 
-- **Linux.** io_uring is the I/O backbone; a reasonably modern kernel
-  (5.11+ for the registered-file ring features; ≥ 5.13 if you opt into
-  unprivileged `COLI_SQPOLL=1`) is assumed.
+- **Linux.** io_uring is the I/O backbone and a modern kernel gets the best of
+  it (5.11+ for the registered-file ring features; ≥ 5.13 if you opt into
+  unprivileged `COLI_SQPOLL=1`) — but it is **no longer required**. When no ring
+  can be created, the engine probes once, says so, and falls back to the `pread`
+  engine for loading and streaming alike. See
+  [portability.md](portability.md) for what that costs and what else varies
+  across machines.
 - **Stable Rust** (edition 2021 workspace; no nightly features anywhere).
 - **Optional — NVIDIA GPU + CUDA toolkit** (`nvcc`) for the GPU lane. The
   default build is CPU-only and the entire test suite runs without a GPU.
@@ -15,7 +19,7 @@
 
 ```bash
 cargo build --release                    # optimized (fat LTO)
-cargo test --workspace                   # 452 tests, CPU-only
+cargo test --workspace                   # 764 tests, CPU-only
 cargo clippy --workspace --all-targets   # clean
 scripts/audit-bad-patterns.sh --strict   # quality gate (see docs/BAD_PATTERNS.md)
 

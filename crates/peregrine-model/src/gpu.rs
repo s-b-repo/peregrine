@@ -209,6 +209,33 @@ impl HeatTable {
 /// one instant and a `clock` read at another produce ages that are quietly wrong
 /// rather than obviously wrong, and nothing downstream can detect it. Build one
 /// with [`HeatTable::snapshot_all`].
+/// One residency generation's view of the MTP head's **pin** request.
+///
+/// Beside [`HeatView`] rather than folded into it because the two are different
+/// kinds of claim on the same VRAM. A heat view is a *ranking*: everything in it
+/// competes, and `reheat` decides how much of the budget each layer wins. A pin
+/// request is a *reservation*: its bytes come off the top, and what is left is
+/// what the ranking gets to spend. Merging them would mean expressing "hold this
+/// regardless of rank" as a very large count, which is the same mistake as
+/// ranking a draft-path layer against a main-stack one — see
+/// [`crate::mtp::plan_pins`].
+pub struct PinRequest<'a> {
+    /// Draft-routing frequency for `layer`'s experts, indexed by expert id.
+    pub counts: &'a [u32],
+    /// The layer those counts describe — `cfg.n_layers`, the MTP head's.
+    pub layer: usize,
+    /// VRAM the pinned set may occupy, before the half-the-tier clamp.
+    pub budget: usize,
+}
+
+impl PinRequest<'_> {
+    /// No pins: what every caller without an MTP head, or with the knob unset,
+    /// passes. Byte-for-byte the pre-pin behaviour.
+    pub fn none() -> PinRequest<'static> {
+        PinRequest { counts: &[], layer: 0, budget: 0 }
+    }
+}
+
 pub struct HeatView<'a> {
     /// Routing frequency, row-major `[layer * n_experts + expert]`.
     pub counts: &'a [u32],
@@ -1050,7 +1077,8 @@ mod gpu_residency_tests {
         let n_experts = cfg.n_experts as usize;
         let mut counts = vec![0u32; cfg.n_layers as usize * n_experts];
         counts[2 * n_experts] = 99; // make (layer 2, expert 0) the hottest
-        let after = tier.reheat(&st, &cfg, &super::HeatView::frequency_only(&counts))?;
+        let after =
+            tier.reheat(&st, &cfg, &super::HeatView::frequency_only(&counts), &super::PinRequest::none())?;
         std::fs::remove_dir_all(&dir)?;
         assert!(before > 0, "tiny experts must fit VRAM");
         assert_eq!(after, before, "reheat at full capacity keeps the resident count");
@@ -1434,6 +1462,17 @@ mod real {
         /// expert is evicted and re-uploaded (a full ~151 MB host dequantize plus
         /// PCIe transfer) every 256 decode steps forever.
         forced_f32: std::collections::HashSet<(usize, usize)>,
+        /// Experts held resident regardless of rank — the MTP head's, chosen by
+        /// [`super::PinRequest`]. Their bytes come off the budget before the
+        /// heat plan is solved, and they are added to every generation's wanted
+        /// set so the eviction pass cannot take them.
+        ///
+        /// Kept as state rather than recomputed inline because eviction needs to
+        /// know what *was* pinned: an expert that cools out of the plan has to
+        /// lose its slot, and `self.experts` alone cannot say whether a resident
+        /// at layer `n_layers` is there because it was pinned or because it was
+        /// pinned last generation and should not be any more.
+        pinned: HashSet<(usize, usize)>,
         /// MoE intermediate dim — the `I` of every expert's `KernelShape`. Held
         /// on the tier because `compute` has no `Cfg` and a shape keyed on the
         /// wrong `I` would merge two genuinely different kernels into one row.
@@ -1818,6 +1857,13 @@ mod real {
                     adaptive_f32_frac,
                     precision,
                     forced_f32,
+                    // Empty at build, and not for want of trying: the pin
+                    // counter is fed by drafting, so at load it is all zeros and
+                    // `plan_pins` on a cold table is empty by design. The tier's
+                    // first pins arrive at the first `reheat` after the first
+                    // draft rounds — which is also when their ranking first
+                    // means anything.
+                    pinned: HashSet::new(),
                     inter: cfg.moe_inter as usize,
                     // A *second* opt-in on top of `COLI_CUDA_TC_W4A16`: the tile
                     // only reaches that arm, so tuning without it would record
@@ -1849,16 +1895,53 @@ mod real {
         /// newly-hot ones. Reuses [`Self::build`]'s dequantize+upload path. Called
         /// between forwards with `&mut self`, so residency adapts to the workload
         /// without a rewrite. Returns the resident count after re-selection.
-        pub fn reheat(&mut self, st: &SafeTensors, cfg: &Cfg, heat: &super::HeatView) -> Result<usize, Error> {
-            let counts = heat.counts;
+        pub fn reheat(
+            &mut self,
+            st: &SafeTensors,
+            cfg: &Cfg,
+            heat: &super::HeatView,
+            pins: &super::PinRequest,
+        ) -> Result<usize, Error> {
+            // Pins first, and outside the policy branch: they are a reservation,
+            // not a rank, so every swap policy has to see the same reserved set.
+            // It also has to happen before the budget is read — `sync_pins` may
+            // upload, and the re-plan must solve against the VRAM that is left
+            // afterwards, not the VRAM that existed before.
+            let pinned_bytes = self.sync_pins(st, cfg, heat, pins);
             // Incremental policies run instead of the re-plan, not before it:
             // both decide the same thing (which experts are resident next
             // generation) and running one after the other would let the re-plan
             // immediately undo every swap.
             match super::swap_policy() {
                 super::SwapPolicy::Replan => {}
-                policy => return self.reheat_incremental(st, cfg, heat, policy),
+                // `plan_swaps` enumerates candidates and victims over
+                // `first_dense..n_layers`, exclusive, so a pin at layer
+                // `n_layers` is outside its universe entirely — it can neither
+                // be swapped in nor chosen as a victim. Nothing further to do
+                // for pins here beyond the sync above.
+                policy => return self.reheat_incremental(st, cfg, heat, policy, pinned_bytes),
             }
+            self.reheat_replan(st, cfg, heat, pinned_bytes)
+        }
+
+        /// The re-plan half of [`Self::reheat`]: re-rank every candidate against
+        /// the budget the reservation left and migrate residency to match.
+        ///
+        /// Split out of `reheat` so it has a name the incremental path can call.
+        /// It used to fall back by calling `reheat` itself, which re-entered the
+        /// policy branch that had just dispatched *to* it — `COLI_GPU_TIER_SWAP`
+        /// set to a swap policy together with `COLI_GPU_F32_FRAC` was unbounded
+        /// mutual recursion, i.e. a stack overflow on the first residency
+        /// generation. The two knobs are individually exercised and the
+        /// combination apparently never was.
+        fn reheat_replan(
+            &mut self,
+            st: &SafeTensors,
+            cfg: &Cfg,
+            heat: &super::HeatView,
+            pinned_bytes: usize,
+        ) -> Result<usize, Error> {
+            let counts = heat.counts;
             // Re-read free VRAM each generation: another process may have taken
             // some since load, and the budget must reflect what is available now
             // (plus what this tier already holds, which it is free to reuse).
@@ -1878,6 +1961,10 @@ mod real {
                     self.budget_bytes
                 }
             };
+            // What the ranking may spend: the tier's budget less the reservation.
+            // `held` above already counts the pinned residents, so this is the
+            // one place their bytes are taken out of the ranking's reach.
+            let budget = budget.saturating_sub(pinned_bytes);
             let (int4_bytes, f32_bytes) = self.expert_bytes;
             // Per-expert precision for this residency generation.
             let (want, precision_of): ResidencyGeneration =
@@ -1942,7 +2029,11 @@ mod real {
                         (want.into_iter().take(fit).collect(), prec)
                     }
                 };
-            let want_set: HashSet<(usize, usize)> = want.iter().copied().collect();
+            let mut want_set: HashSet<(usize, usize)> = want.iter().copied().collect();
+            // The reservation joins the *set* but not the upload list: `sync_pins`
+            // has already uploaded them, and this is what stops the eviction pass
+            // below from taking a pin that no heat ranking ever proposed.
+            want_set.extend(self.pinned.iter().copied());
             // evict experts that cooled off — their `Drop` frees the VRAM slot
             self.experts.retain(|k, _| want_set.contains(k));
             self.precision.retain(|k, _| want_set.contains(k));
@@ -2030,6 +2121,165 @@ mod real {
             Ok(self.experts.len())
         }
 
+        /// Bring VRAM residency of the MTP head's experts in line with `req`,
+        /// and return the bytes the pinned set now occupies.
+        ///
+        /// **Why the pinned set needs its own pass at all.** Every residency
+        /// planner in this module — `plan_residency`, `rank_by_heat`,
+        /// `solve_residency_sized`, `plan_precision_fitted`, `plan_swaps` —
+        /// enumerates candidates over `first_dense..n_layers`, **exclusive**. The
+        /// MTP head is layer `n_layers`. It has therefore never been a candidate
+        /// in any of them, no matter what its heat row said, which is why
+        /// `COLI_MTP_HEAT` could fill that row and change nothing about VRAM: the
+        /// row was read by a ranking that never enumerated it.
+        ///
+        /// Failures here are advisory. A pin that cannot upload is a residency
+        /// loss, not a correctness one — the expert streams from the CPU lane,
+        /// producing the same bytes — so a bad generation leaves the tier
+        /// consistent and the next one retries.
+        fn sync_pins(
+            &mut self,
+            st: &SafeTensors,
+            cfg: &Cfg,
+            heat: &super::HeatView,
+            req: &super::PinRequest,
+        ) -> usize {
+            static CLAMPED: std::sync::Once = std::sync::Once::new();
+            let budget = crate::mtp::granted_pin_budget(
+                "COLI_MTP_PIN_VRAM_MB",
+                "GPU tier",
+                req.budget,
+                self.budget_bytes,
+                &CLAMPED,
+            );
+            let (int4_bytes, f32_bytes) = self.expert_bytes;
+            // Sized per expert exactly as `build` sizes its placement: an int8 or
+            // grouped-int4 source cannot be int4-resident and uploads dequantized
+            // at ~8x. Sizing the plan from the *request* instead would plan N
+            // experts and upload 8N worth — the same defect the `raw_int4` split
+            // in `build_with` exists to prevent, and the MTP layer is precisely
+            // the layer a GLM-5.2 container leaves at the other rung.
+            let bytes_of = |e: usize| {
+                if self.int4 && expert_is_per_row_int4(st, cfg, req.layer, e) {
+                    int4_bytes
+                } else {
+                    f32_bytes
+                }
+            };
+            let want: HashSet<(usize, usize)> = crate::mtp::plan_pins(req.counts, budget, bytes_of)
+                .into_iter()
+                .map(|e| (req.layer, e))
+                .collect();
+            // Unpin what cooled out of the plan. Dropping the tensor frees the
+            // VRAM before anything below allocates, which is the same ordering
+            // the swap path documents.
+            for k in std::mem::take(&mut self.pinned) {
+                if !want.contains(&k) {
+                    self.experts.remove(&k);
+                    self.precision.remove(&k);
+                    self.forced_f32.remove(&k);
+                }
+            }
+            // Ascending expert id is ascending offset within a layer, so the
+            // uploads read the container forwards.
+            let mut order: Vec<(usize, usize)> = want.iter().copied().collect();
+            order.sort_unstable();
+            // Make room before uploading, and make it in *heat order*.
+            //
+            // Without this the reservation could never establish itself on a
+            // tier that is doing its job: `build` fills the budget, so the first
+            // generation with a pin budget set finds no free VRAM, every pin
+            // upload fails, and — since each generation retries identically —
+            // the tier stays exactly as it was, forever, while the log fills
+            // with advisories. Evicting here rather than leaving it to the
+            // re-plan below is what makes the pins work under the incremental
+            // swap policies too, which hold the resident *set size* fixed and so
+            // can never free room for a reservation on their own.
+            //
+            // The victims are the coldest non-pinned residents, which is the same
+            // order the re-plan would drop them in, so this is not extra churn —
+            // it is the same eviction, moved early enough to be useful.
+            let need: usize = order
+                .iter()
+                .filter(|k| !self.experts.contains_key(k))
+                .map(|&(_, e)| bytes_of(e))
+                .sum();
+            self.evict_coldest_for(need, heat, cfg.n_experts as usize);
+            let mut bytes = 0usize;
+            let mut pending: Vec<HostStaging> = Vec::new();
+            for key in order {
+                if self.experts.contains_key(&key) {
+                    // Already resident, in whatever format it landed in. A pin is
+                    // not a precision request, so a resident pin is never
+                    // re-uploaded to chase a format.
+                    bytes += if self.precision.get(&key).copied().unwrap_or(self.int4) { int4_bytes } else { f32_bytes };
+                    self.pinned.insert(key);
+                    continue;
+                }
+                match upload_expert(st, cfg, key.0, key.1, self.device, self.int4) {
+                    Ok((ge, landed_int4, staging)) => {
+                        pending.extend(staging);
+                        self.experts.insert(key, ge);
+                        self.precision.insert(key, landed_int4);
+                        if self.int4 && !landed_int4 {
+                            self.forced_f32.insert(key);
+                        }
+                        self.pinned.insert(key);
+                        bytes += if landed_int4 { int4_bytes } else { f32_bytes };
+                    }
+                    Err(e_up) => {
+                        peregrine_io::note_advisory_err("gpu mtp pin upload (expert left streaming)", &e_up);
+                        self.precision.remove(&key);
+                        break;
+                    }
+                }
+            }
+            if let Err(e_s) = drain_uploads(self.device, &mut pending) {
+                peregrine_io::note_advisory_err("gpu mtp pin upload drain", &e_s);
+            }
+            bytes
+        }
+
+        /// Evict the coldest **non-pinned** residents until `need` more bytes fit
+        /// inside the tier's budget. Returns nothing: a tier that cannot make the
+        /// room simply ends up with fewer pins, which the upload loop already
+        /// degrades to correctly.
+        ///
+        /// Ranked by the same heat view the re-plan ranks by, and tie-broken on
+        /// the key, so a victim here is a victim there — the two passes cannot
+        /// disagree about which expert is worth least and swap it back and forth
+        /// between generations.
+        fn evict_coldest_for(&mut self, need: usize, heat: &super::HeatView, n_experts: usize) {
+            if need == 0 {
+                return;
+            }
+            let size_of = |k: &(usize, usize), me: &Self| {
+                if me.precision.get(k).copied().unwrap_or(me.int4) { me.expert_bytes.0 } else { me.expert_bytes.1 }
+            };
+            let held: usize = self.experts.keys().map(|k| size_of(k, self)).sum();
+            let mut over = (held + need).saturating_sub(self.budget_bytes);
+            if over == 0 {
+                return;
+            }
+            // Coldest first, deterministic on ties.
+            let mut victims: Vec<(usize, usize)> =
+                self.experts.keys().copied().filter(|k| !self.pinned.contains(k)).collect();
+            let heat_of = |&(l, e): &(usize, usize)| {
+                heat.counts.get(l.saturating_mul(n_experts).saturating_add(e)).copied().unwrap_or(0)
+            };
+            victims.sort_by_key(|k| (heat_of(k), *k));
+            for k in victims {
+                if over == 0 {
+                    break;
+                }
+                let freed = size_of(&k, self);
+                self.experts.remove(&k);
+                self.precision.remove(&k);
+                self.forced_f32.remove(&k);
+                over = over.saturating_sub(freed);
+            }
+        }
+
         /// [`Self::reheat`] under an incremental [`SwapPolicy`]: hold the
         /// resident *set size* fixed and move at most one expert per layer.
         ///
@@ -2057,6 +2307,7 @@ mod real {
             cfg: &Cfg,
             heat: &super::HeatView,
             policy: super::SwapPolicy,
+            pinned_bytes: usize,
         ) -> Result<usize, Error> {
             if self.adaptive_f32_frac.is_some() {
                 peregrine_io::note_advisory_err(
@@ -2064,7 +2315,10 @@ mod real {
                      (the two decide the same thing); using replan",
                     &format!("{policy:?}"),
                 );
-                return self.reheat(st, cfg, heat);
+                // The re-plan body directly, not `reheat` — `reheat` is what
+                // dispatched here, and calling it back is the recursion
+                // `reheat_replan`'s doc describes. The pins are already synced.
+                return self.reheat_replan(st, cfg, heat, pinned_bytes);
             }
             let swaps = super::plan_swaps(
                 heat,
@@ -2134,6 +2388,12 @@ mod real {
                 peregrine_io::note_advisory_err("gpu swap upload drain (final)", &e_s);
             }
             Ok(self.experts.len())
+        }
+
+        /// How many MTP-head experts the tier currently holds as a reservation
+        /// (`COLI_MTP_PIN_VRAM_MB`). `0` when the knob is unset.
+        pub fn pinned_count(&self) -> usize {
+            self.pinned.len()
         }
 
         /// Whether expert `e` of `layer` is resident in VRAM.
@@ -2444,6 +2704,10 @@ mod stub {
         ) -> Result<Option<GpuTier>, Error> {
             Ok(None)
         }
+        pub fn pinned_count(&self) -> usize {
+            0
+        }
+
         pub fn has(&self, _layer: usize, _e: usize) -> bool {
             false
         }
@@ -2467,7 +2731,13 @@ mod stub {
         ) -> Result<Vec<f32>, Error> {
             Err(Error::Format("gpu tier not built (no cuda feature)".into()))
         }
-        pub fn reheat(&mut self, _st: &SafeTensors, _cfg: &Cfg, _heat: &super::HeatView) -> Result<usize, Error> {
+        pub fn reheat(
+            &mut self,
+            _st: &SafeTensors,
+            _cfg: &Cfg,
+            _heat: &super::HeatView,
+            _pins: &super::PinRequest,
+        ) -> Result<usize, Error> {
             Ok(0)
         }
         pub fn tuning_json(&self) -> Option<serde_json::Value> {

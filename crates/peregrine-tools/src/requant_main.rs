@@ -25,7 +25,7 @@ fn usage() -> i32 {
          options:\n\
          \x20 --target <scheme>    int8 | int4 | int4-g<N> | int3-g64 | int2-g64 | int2\n\
          \x20                      (default int2 — per-row, effectively ternary; see\n\
-         \x20                      todo.md §13 first: every *uniform* sub-int4 rung is a\n\
+         \x20                      docs/todo.md §13 first: every *uniform* sub-int4 rung is a\n\
          \x20                      measured negative on GLM-5.2 — int2-g64 flip_rate\n\
          \x20                      1.000, int3-g64 flip_rate 0.514. The asymmetric\n\
          \x20                      recipe below is the open question)\n\

@@ -488,6 +488,8 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_SPEC_UNION_MAX` | 0 | ceiling on a tick's projected routed-expert union, in expert-read requests — [note](#coli_spec_union_max) |
 | `COLI_DRAFT_TREE` | off | verify both draft sources as a token tree instead of choosing one — [note](#coli_draft_tree) |
 | `COLI_MTP_HEAT` | off | let the MTP head's experts accumulate residency heat — [note](#coli_mtp_heat) |
+| `COLI_MTP_PIN_MB` | 0 | hold the MTP head's hottest experts in the warm cache, outside the main stream's eviction order — [note](#coli_mtp_pin_mb--coli_mtp_pin_vram_mb) |
+| `COLI_MTP_PIN_VRAM_MB` | 0 | the same reservation in VRAM — [note](#coli_mtp_pin_mb--coli_mtp_pin_vram_mb) |
 | `X-Peregrine-Priority` | (HTTP header) | `high`/`1`/`true` → drained ahead of normal-priority requests |
 | `COLI_KV_STORE_DIR` | unset | disk-persisted KV sessions: completed prefixes ≥256 tokens checkpoint here (fingerprint + checksum + full-token compare) and a restarted server restores them instead of re-prefilling. The in-memory prefix cache's disk extension |
 | `COLI_KV_STORE_MB` | unset | byte cap on that store; the LRU trims to fit |
@@ -853,6 +855,63 @@ losing it, out of the same 12 GB. Output-neutral on the CPU path; on a GPU build
 it changes which arm computes an expert — a residency decision, not a value one,
 but the reason this is opt-in rather than assumed. Inert without a GPU tier,
 where no heat table is built at all.
+
+### `COLI_MTP_PIN_MB` / `COLI_MTP_PIN_VRAM_MB`
+
+Hold the MTP head's hottest experts resident — in the warm cache and in VRAM
+respectively — as a **reservation** rather than as a rank. Both default `0`
+(off).
+
+**What was in the way.** The MTP head is layer index `n_layers`, and every
+residency planner in the engine enumerates candidates over
+`first_dense..n_layers`, *exclusive*: `plan_residency`, `rank_by_heat`,
+`solve_residency_sized`, `plan_precision_fitted`, `plan_swaps`, and
+`Model::protect_from`. The layer was therefore not a candidate in any of them.
+[`COLI_MTP_HEAT`](#coli_mtp_heat) fills that layer's heat row, but no planner
+reads it and no heat table exists at all without a GPU tier — which is the
+deployment where a draft step is most expensive. Pinning could never have been a
+flipped flag; it needed a residency mechanism that is not the heat table.
+
+**Why a reservation and not a rank.** Everything else in these tiers competes for
+one budget on one score, and the MTP layer cannot win that comparison honestly:
+it is read once per *draft step* against 78 layers read once per *token*, so any
+frequency-ordered policy ranks it last however much each of its reads costs. Its
+own routed union is ~300 MB on the streaming container at topk=8, at `s_n = 1`,
+with no batch-union amortization — and between two draft steps the whole main
+stack sweeps the same cache, so by the next step the layer has been evicted by a
+pass that never wanted it. The bytes it is worth are a separate budget, which is
+what these two knobs are.
+
+**Byte budgets, not expert counts**, because what is being spent is bytes the
+main stream would otherwise use: the layer's whole pool is ~4.8 GB at int4 and
+~9.7 GB at the int8 rung a GLM-5.2 container still ships, so "32 experts" means
+either 0.6 GB or 1.2 GB depending on a container property nobody sets a knob
+while looking at. Each budget is clamped to **half its tier** and says so once
+when it clamps: neither evictor refuses to evict a pinned entry, so a tier that
+is mostly pins does not hold them all — it starves everything else first and
+then evicts among the pins on recency anyway.
+
+**The pinned set is chosen by drafting, and starts empty.** A private per-expert
+counter for that one layer (`mtp::MtpPins`) is bumped at the same site the heat
+table is, and re-planned every 64 draft rounds. Experts with no observed routing
+are never pinned: a cold table says nothing about which eighth of a 256-expert
+pool matters, so ranking it would spend the whole budget on expert ids `0..K`.
+An empty pin set is a correct pin set. The counter accumulates only when experts
+stream — a resident model already holds them all — and it is deliberately *not*
+a row of the heat table, so pinning takes nothing from main-stream residency and
+composes with `COLI_MTP_HEAT` rather than duplicating it.
+
+`COLI_MTP_PIN_VRAM_MB` is worth setting only **after**
+[`--mtp-target int4`](tools.md#--mtp-target-the-one-rung-on-this-ladder-with-no-quality-gate)
+has run over the container: an int8 expert cannot be int4-resident, so it uploads
+dequantized at ~151 MB against the 18.9 MB an int4 one takes — eight experts on a
+12 GB card for what should hold sixty-four.
+
+Correctness-neutral on both tiers. A pin only reorders eviction victims; a pinned
+expert produces the same bytes as a streamed one and the reduce is position-keyed,
+so nothing here can reach a token. `/metrics` reports `mtp_pinned.cache` and
+`mtp_pinned.vram` — read them against `ecache.disk_reads`, which is the only way
+to say whether the reservation bought the re-reads it was set to stop.
 
 ### `COLI_KV_DTYPE`
 

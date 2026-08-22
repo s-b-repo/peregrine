@@ -533,9 +533,15 @@ fn upload_tensor_i4(device: i32, w: &[u8], scales: &[f32], i: usize, o: usize) -
 /// for. See [`pin_host`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PinStats {
+    /// Buffers registered **right now**. Staging buffers are freed as soon as
+    /// their DMA drains, so at rest this is legitimately 0 even on a run where
+    /// the lane did all the work — read [`PinStats::ever`] for that.
     pub buffers: usize,
     pub bytes: u64,
     pub declined: usize,
+    /// Buffers pinned since process start. This is the one that answers "did
+    /// the pinned lane run at all", which the live gauge cannot.
+    pub ever: usize,
 }
 
 /// Buffers below this are declined by policy. `cudaHostRegister` walks and pins
@@ -546,6 +552,7 @@ const MIN_PIN_BYTES: usize = 1 << 20;
 static PINNED_BUFS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static PINNED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PIN_DECLINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PINNED_EVER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Current pinning counters.
 ///
@@ -567,6 +574,7 @@ pub fn pin_stats() -> PinStats {
         buffers: PINNED_BUFS.load(Relaxed),
         bytes: PINNED_BYTES.load(Relaxed),
         declined: PIN_DECLINED.load(Relaxed),
+        ever: PINNED_EVER.load(Relaxed),
     }
 }
 
@@ -596,6 +604,7 @@ pub fn pin_host(ptr: *mut u8, len: usize) -> bool {
     if unsafe { host_register(ptr, len) } {
         PINNED_BUFS.fetch_add(1, Relaxed);
         PINNED_BYTES.fetch_add(len as u64, Relaxed);
+        PINNED_EVER.fetch_add(1, Relaxed);
         true
     } else {
         PIN_DECLINED.fetch_add(1, Relaxed);

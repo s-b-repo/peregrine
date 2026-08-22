@@ -40,6 +40,7 @@ pub struct PinStats {
     pub buffers: usize,
     pub bytes: u64,
     pub declined: usize,
+    pub ever: usize,
 }
 
 /// Current pinning counters — how many aligned buffers are registered with

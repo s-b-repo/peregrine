@@ -44,7 +44,7 @@ fn the_flip_rate_gate_detects_loss_and_only_loss() -> Result<(), peregrine_core:
 
     // Non-zero direction. Per-row int2 is the strongest loss this fixture can
     // express: `amax / 1` makes the `-2` level unreachable, so the format is
-    // effectively ternary (see todo.md §13), and the tiny model's expert
+    // effectively ternary (see docs/todo.md §13), and the tiny model's expert
     // projections are too narrow for the grouped variants to be legal.
     peregrine_tools::requant::requantize(
         &base,

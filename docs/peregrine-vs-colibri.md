@@ -80,12 +80,12 @@ I/O-lane-depth gap to close before it beats the C engine at raw single-box strea
 > layout tool, a real `perf_event_open` LLC-miss counter, idle-tick background recompression of
 > cold cache slots, and per-workload-class prefetch breadth. All new subsystems are env-gated
 > (defaulting to the historical behavior in most cases) and bit-identical when off. Re-running
-> this study with those knobs live is the next benchmarking pass — see [`todo.md`](../todo.md)
+> this study with those knobs live is the next benchmarking pass — see [`todo.md`](todo.md)
 > A completion sweep then closed every non-hardware item (sensor governors, entropy-adaptive
 > prefetch, NUMA allocation + hierarchical dispatch, expert fusion + hypergraph scheduling,
 > macro-states, the `galactic` pass, Hilbert/2-opt/tier layouts, physical checkpoint self-rewrite,
 > online bandit/Q-learning schedulers, per-shape dispatch specialization, kblock layout
-> auto-conversion, and the `compile-plan` execution plan) — see [`todo.md`](../todo.md) for the
+> auto-conversion, and the `compile-plan` execution plan) — see [`todo.md`](todo.md) for the
 > per-item state (now ~87% strict / ~88% weighted across 95 tracked items; every open item is
 > hardware-gated). The serve layer additionally gained a **vendored gigatoken BPE tokenizer**
 > (marcelroed/gigatoken, MIT — stable-toolchain subset in `peregrine-token`): id-for-id
@@ -136,7 +136,7 @@ GLM‑5.2 (as shipped in the int4 container both engines consume) is a DeepSeek�
 - **colibrì** — the C baseline: [github.com/JustVugg/colibri](https://github.com/JustVugg/colibri).
   Single-file engine, zero runtime deps, CPU + optional CUDA/Metal, `pin`/`LRU`/`disk` expert tiers,
   learned auto-pin (`.coli_usage`), MTP speculation, DSA, io_uring (`URING=1`).
-- **peregrine** — the Rust rewrite ([`DESIGN.md`](../DESIGN.md)): Linux + NVIDIA, a concurrent
+- **peregrine** — the Rust rewrite ([`DESIGN.md`](DESIGN.md)): Linux + NVIDIA, a concurrent
   3-lane (CPU∥GPU∥SSD) MoE scheduler, io_uring reactor, warm cache, look-ahead prefetch, and a
   memory-safe kernel/loader stack validated by 604 tests.
 
@@ -183,7 +183,7 @@ to the sequential path (guarded by the `streamed_experts_match_resident` test). 
 | Speculation | MTP (int8 head) + grammar-forced drafts | **not reachable end to end.** `speculative_sample` is implemented and statistically validated, but `generate_speculative` is called by no binary — there is no `--draft` flag or `DRAFT` knob — so no request can use it. colibrì also measures MTP a net loss on disk-bound MoE decode |
 | Dense on GPU | `CUDA_DENSE=1` (+30.8 %) | (future) |
 | Backends | CPU, CUDA, **Metal** (Apple) | CPU, CUDA |
-| Platforms | Linux, macOS, Windows (MinGW) | Linux + NVIDIA |
+| Platforms | Linux, macOS, Windows (MinGW) | Linux (any arch; io_uring optional since 2026-08-21 — see [portability.md](portability.md)), NVIDIA optional |
 
 ---
 
@@ -569,7 +569,7 @@ Ordered by leverage on a single box, informed directly by this study:
   benchmarks, CUDA/Metal sections), `docs/experiments/glm52-6x5090-2026-07-12.md`,
   `docs/METAL-M5MAX-PERF-REPORT.md`, `c/glm.c:2922` (the phased-loop waste comment), `c/uring.h`,
   `c/tier.h`.
-- peregrine: [`DESIGN.md`](../DESIGN.md), [`README.md`](../README.md);
+- peregrine: [`DESIGN.md`](DESIGN.md), [`README.md`](../README.md);
   `crates/peregrine-model/src/concurrent.rs` (scheduler), `crates/peregrine-io/src/warmcache.rs`
   (A1), `crates/peregrine-io/src/ring.rs` (io_uring, C1/C2/C3), `crates/peregrine-model/src/gpu.rs`
   (B1).
