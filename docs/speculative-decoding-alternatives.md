@@ -36,6 +36,7 @@ rows below were mis-scored.
 | Non-autoregressive generation | Yes | Potentially enormous | **Not buildable here** — needs a NAR checkpoint |
 | Mask-predict / iterative refinement | Yes | Potentially high | **Not buildable here.** Nearest in-tree analogue is RLM (`rlm.rs`), which already refines a hidden without appending KV |
 | Diffusion LLM decoding | Yes | Potentially huge | **Different model family** — [sized below](#closed-here-and-why), not dismissed |
+| Block-diffusion drafting (DFlash) | Yes | High on the **resident** track | Not built. The whole verify block drafted in one forward. **A published draft checkpoint exists for Qwen3.5-27B and not for GLM-5.2**, which inverts it from where the value is — [`dflash.md`](dflash.md) |
 | Discrete diffusion / masked generation | Yes | Potentially huge | Same |
 | Blockwise parallel decoding | Partially | High | `COLI_DRAFT` *is* a width-1 block, and `CandidateTree::chain` is that block in the tree substrate's terms |
 | Token-tree execution | Partially | High | Same mechanism; `COLI_DRAFT_TREE` |
@@ -114,6 +115,17 @@ All four are fixable and all four are output-neutral. (1)–(2) especially:
 argmax, so degrading the draft head cannot change a served token** — it can only
 change the acceptance rate. Requantizing that one layer to int4 therefore needs
 no flip-rate gate, just an assertion that the gate still reads 0.000.
+
+### What DFlash contributed, and what it could not
+
+[z-lab/dflash](https://github.com/z-lab/dflash) was cross-read in 2026-08-22.
+Three of its mechanisms are now shipping here — a draft's `q` stored at its
+support, `top_k`, and a truncation that stopped being a full vocabulary sort
+(4.8–5.1× on decode-shaped rows). Its headline, block-diffusion parallel
+drafting, is **not** portable to an autoregressive MTP head, and the reason the
+usual "no checkpoint" closure below does *not* settle it is that DFlash publishes
+one for Qwen3.5-27B. Full accounting, with the numbers and the two rejected
+designs, in [`dflash.md`](dflash.md).
 
 ### Closed here, and why
 

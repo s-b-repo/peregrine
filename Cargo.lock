@@ -1471,6 +1471,7 @@ name = "peregrine-engine"
 version = "0.1.0"
 dependencies = [
  "peregrine-core",
+ "peregrine-io",
  "peregrine-model",
  "peregrine-sched",
  "peregrine-token",

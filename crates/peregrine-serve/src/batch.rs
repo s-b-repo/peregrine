@@ -1229,7 +1229,11 @@ struct SeqState {
     /// the distribution the draft *was* sampled from — re-deriving it from the
     /// draft head at verify time would recompute a forward, and recomputing it
     /// from anything else would be a different distribution wearing its name.
-    draft_q: Vec<Vec<f32>>,
+    ///
+    /// Held at its support ([`peregrine_model::DraftDist`]), not as a vector per
+    /// vocabulary entry: at GLM-5.2's 154 880-token vocabulary the dense form was
+    /// ~620 KB per draft position per sequence, resident for a whole tick.
+    draft_q: Vec<peregrine_model::DraftDist>,
     /// Pre-final-norm hidden at this sequence's last committed position: what
     /// the next draft continues from. Empty until the first verify produces it.
     hlast: Vec<f32>,

@@ -105,6 +105,13 @@ struct ChatRequest {
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
+    /// Rank cutoff, the companion of `top_p`. Not an OpenAI field, but the one
+    /// every client that talks to a Qwen or GLM endpoint sends, because those
+    /// model cards publish `top_k` alongside `top_p` in their recommended
+    /// settings. Accepting and ignoring it would have answered a different
+    /// question than the caller asked.
+    #[serde(default)]
+    top_k: Option<u32>,
     #[serde(default)]
     stream: bool,
     /// Tool schemas, in OpenAI shape. Rendered into the system turn for the
@@ -354,6 +361,19 @@ fn seed() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x9E3779B9)
 }
 
+/// One request's sampling configuration, resolved and clamped.
+///
+/// A struct rather than three positional floats: `submit_request` and
+/// `resolve_params` both carry it end to end, and a `(f32, f32, usize)` tuple is
+/// exactly the shape a caller silently transposes.
+#[derive(Clone, Copy, Debug)]
+struct Sampling {
+    temperature: f32,
+    top_p: f32,
+    /// `0` is off — see [`peregrine_model::Sampler::with_top_k`].
+    top_k: usize,
+}
+
 /// Submit a request to the batch engine and return its token-id stream. The
 /// caller decodes ids to text — incrementally for streaming, in one shot
 /// otherwise — so the engine stays tokenizer-free and both paths share it.
@@ -361,8 +381,7 @@ fn submit_request(
     state: &AppState,
     ids: &[u32],
     max_new: usize,
-    temperature: f32,
-    top_p: f32,
+    sampling: Sampling,
     priority: Priority,
     class: peregrine_model::TokenClass,
 ) -> Result<mpsc::UnboundedReceiver<EngineOut>, ApiError> {
@@ -373,7 +392,7 @@ fn submit_request(
     // still paces the client.
     let (tx, rx) = mpsc::unbounded_channel::<EngineOut>();
     let prompt: Vec<i32> = ids.iter().map(|&x| x as i32).collect();
-    let sampler = Sampler::new(temperature, top_p, seed());
+    let sampler = Sampler::new(sampling.temperature, sampling.top_p, seed()).with_top_k(sampling.top_k);
     state
         .inner
         .engine
@@ -425,7 +444,7 @@ fn priority_from_header(v: Option<&str>) -> Priority {
 }
 
 /// Resolve + validate common generation params against the server caps.
-async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>, usize, f32, f32), ApiError> {
+async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>, usize, Sampling), ApiError> {
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
@@ -451,7 +470,12 @@ async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>
     let max_new = req.max_tokens.unwrap_or(256).min(state.inner.args.max_tokens).max(1);
     let temperature = req.temperature.unwrap_or(0.0).clamp(0.0, 2.0);
     let top_p = req.top_p.unwrap_or(0.95).clamp(0.0, 1.0);
-    Ok((ids, max_new, temperature, top_p))
+    // `0` is "no rank cutoff", which is both the historical behaviour and what
+    // vLLM/SGLang mean by `top_k: 0` or `-1`. A negative value cannot arrive —
+    // the field is unsigned — so the only clamp needed is the vocabulary's own,
+    // and `Sampler` applies that itself.
+    let top_k = req.top_k.unwrap_or(0) as usize;
+    Ok((ids, max_new, Sampling { temperature, top_p, top_k }))
 }
 
 /// A header value as UTF-8, treating a non-UTF-8 value as absent — the lax
@@ -673,7 +697,7 @@ async fn chat_completions(
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
     check_auth(&state, &headers)?;
-    let (ids, max_new, temperature, top_p) = resolve_params(&state, &req).await?;
+    let (ids, max_new, sampling) = resolve_params(&state, &req).await?;
     let model_id = state.inner.args.model_id.clone();
     let priority = priority_from_header(headers.get("x-peregrine-priority").and_then(header_utf8));
     let class = classify_request(&req.messages);
@@ -687,10 +711,11 @@ async fn chat_completions(
     // the key is the complete request semantics, so a one-token or one-option change
     // misses. A hit is answered here — before `submit_request` — so it never enters
     // the engine, never occupies a batch slot and never publishes KV state.
-    let memo_key = memo::MemoKey::eligible(temperature).then(|| memo::MemoKey {
+    let memo_key = memo::MemoKey::eligible(sampling.temperature).then(|| memo::MemoKey {
         ids: ids.clone(),
         max_new,
-        top_p_bits: top_p.to_bits(),
+        top_p_bits: sampling.top_p.to_bits(),
+        top_k: sampling.top_k,
         model: model_id.clone(),
     });
     if let Some(key) = &memo_key {
@@ -719,7 +744,7 @@ async fn chat_completions(
         }
     }
 
-    let mut rx = submit_request(&state, &ids, max_new, temperature, top_p, priority, class)?;
+    let mut rx = submit_request(&state, &ids, max_new, sampling, priority, class)?;
 
     if req.stream {
         // SSE: an async task decodes engine token ids into text deltas and pushes

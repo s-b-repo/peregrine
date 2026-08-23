@@ -1087,6 +1087,67 @@ mod gpu_residency_tests {
     }
 
     #[test]
+    fn a_swap_policy_with_adaptive_precision_does_not_recurse() -> Result<(), Error> {
+        // Regression guard for unbounded mutual recursion between `reheat` and
+        // `reheat_incremental`, which was reachable whenever a swap policy and
+        // adaptive f32 residency were configured **together**: `reheat`
+        // dispatched to `reheat_incremental`, which refuses adaptive precision
+        // and "fell back to replan" by calling `reheat` — which re-entered the
+        // same dispatch. Each knob was exercised alone and the pair apparently
+        // never was.
+        //
+        // **This test cannot fail politely on the old code.** A stack overflow
+        // is SIGSEGV, so the pre-fix behaviour kills the whole test binary
+        // rather than reporting one red test. That is the honest shape for it:
+        // the assertion is "this returns at all".
+        //
+        // Both knobs are set here rather than plumbed as parameters because the
+        // recursion lived in the dispatch that *reads* them, so a parameterized
+        // twin would not exercise the path that was broken. `gpu_guard` is what
+        // keeps the process-wide env from reaching a concurrent GPU test.
+        let _g = gpu_guard();
+        let dir = std::env::temp_dir().join(format!("peregrine_swap_adaptive_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        build_tiny_model(&dir)?;
+        let st = SafeTensors::open(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+
+        // `COLI_GPU_F32_FRAC` is read by `build_with`, `COLI_GPU_TIER_SWAP` by
+        // `reheat` — so both have to be live across the pair, and both are
+        // cleared before any assertion can leave the function early.
+        std::env::set_var("COLI_GPU_F32_FRAC", "0.5");
+        std::env::set_var("COLI_GPU_TIER_SWAP", "lfru");
+        let built = GpuTier::build_with(&st, &cfg, 0, true, &[]);
+        let out = built.and_then(|tier| match tier {
+            None => Ok(None), // no CUDA device on this host → skip
+            Some(mut tier) => {
+                let n_experts = cfg.n_experts as usize;
+                let mut counts = vec![0u32; (cfg.n_layers as usize + 1) * n_experts];
+                counts[2 * n_experts] = 99;
+                let view = super::HeatView::frequency_only(&counts);
+                // The call that used to never return.
+                tier.reheat(&st, &cfg, &view, &super::PinRequest::none()).map(Some)
+            }
+        });
+        std::env::remove_var("COLI_GPU_F32_FRAC");
+        std::env::remove_var("COLI_GPU_TIER_SWAP");
+        std::fs::remove_dir_all(&dir)?;
+
+        match out? {
+            None => Ok(()), // skipped: no device
+            Some(resident) => {
+                // The adaptive path re-plans, so it keeps a resident set rather
+                // than emptying the tier — a `0` here would mean it returned by
+                // collapsing residency instead of by doing the work.
+                assert!(resident > 0, "the replan fallback must keep experts resident");
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
     fn int4_tier_builds_on_per_row_int4() -> Result<(), Error> {
         // The tiny model's experts are per-row int4, so an int4 tier (8× denser than
         // f32) must build and span the sparse layers — the density path end to end.

@@ -20,6 +20,7 @@ pub mod pinned;
 pub mod ngram;
 pub mod tree;
 pub mod concurrent;
+pub mod draftdist;
 pub mod dsa;
 pub mod gpu;
 pub mod iotune;
@@ -90,7 +91,8 @@ pub use workload::{classify_str, TokenClass};
 pub use predeval::{ArmReport, PredictEval, Separation, CONTROL_ARM};
 pub use predict::{phase_boost, Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
 pub use rlm::{rlm_enabled, rlm_layers, rlm_margin, rlm_max_depth, RLMController};
-pub use mtp::speculative_sample;
+pub use draftdist::DraftDist;
+pub use mtp::{speculative_sample, speculative_sample_at};
 pub use router::{
     batch_union, gate_share_below, gate_stats_snapshot, route, union_low_gate_snapshot, union_stats_snapshot, Routed,
     RouterCfg,

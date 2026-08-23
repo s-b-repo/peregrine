@@ -60,6 +60,7 @@ except that `messages` must be non-empty; unknown fields are ignored):
 | `max_tokens` | int | `256` | clamped to `[1, --max-tokens]` |
 | `temperature` | float | `0.0` (greedy) | clamped to `[0.0, 2.0]`; note the default differs from OpenAI's `1.0` |
 | `top_p` | float | `0.95` | clamped to `[0.0, 1.0]` |
+| `top_k` | int | `0` (off) | rank cutoff, applied **before** `top_p` and renormalized — the order DFlash and the Qwen/GLM model cards use. Not an OpenAI field; accepted because every client talking to those model families sends it. `0` is off, as in vLLM/SGLang |
 | `stream` | bool | `false` | SSE streaming when `true` |
 
 `model`, `n`, `stop`, `seed`, `logprobs`, penalties,
@@ -180,8 +181,8 @@ that re-send an unchanged conversation.
 Three rules keep it from being a correctness hazard.
 
 - **The key is the complete request semantics** — prompt token ids, `max_tokens`,
-  `top_p` (by bit pattern) and the model id — **compared field-by-field, never
-  hashed.** Same rule as the prefix cache, same reason: a hash collision would serve
+  `top_p` (by bit pattern), `top_k` and the model id — **compared field-by-field,
+  never hashed.** Same rule as the prefix cache, same reason: a hash collision would serve
   one caller another caller's answer, silently and unboundedly.
 - **Only `temperature == 0` is eligible.** Sampling draws against a clock-derived
   seed; replaying a stored draw would quietly turn a sampling endpoint into a

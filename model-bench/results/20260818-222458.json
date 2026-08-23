@@ -1,0 +1,168 @@
+{
+  "run_id": "20260818-222458",
+  "timestamp": "2026-08-18T22:24:58.572359",
+  "servers": {
+    "peregrine_serve_8132": {
+      "results": [
+        {
+          "text": "The answer is **4**.",
+          "latency_ms": 8071,
+          "error": null,
+          "test_name": "arithmetic",
+          "prompt": "What is 2+2?"
+        },
+        {
+          "text": "Logic flows in silent streams,\nA",
+          "latency_ms": 8650,
+          "error": null,
+          "test_name": "poetry",
+          "prompt": "Write a 3-line poem about code"
+        },
+        {
+          "text": "To find the value of $x +",
+          "latency_ms": 9836,
+          "error": null,
+          "test_name": "reasoning",
+          "prompt": "If x=5, y=3, what is x+y?"
+        }
+      ],
+      "metrics_before": {
+        "active": 0,
+        "bias": "Balanced",
+        "cache_hit_rate": null,
+        "ecache": null,
+        "gpu": {
+          "calls": 0,
+          "experts": 0,
+          "graph_captures": 0,
+          "graph_invalidations": 0,
+          "graph_replays": 0,
+          "graph_uncacheable": 0,
+          "rows": 0,
+          "transfer_fraction": null
+        },
+        "io_ewma_us": 0,
+        "io_slab_in_use": null,
+        "io_sq_full": 0,
+        "kvstore": null,
+        "lane_ewma": {
+          "cpu_bytes": 0,
+          "cpu_us": 0,
+          "gpu_us": 0,
+          "io_us": 0,
+          "reduce_us": 0
+        },
+        "lane_last": {
+          "cpu_bytes": 0,
+          "cpu_us": 0,
+          "gpu_us": 0,
+          "io_us": 0,
+          "reduce_us": 0
+        },
+        "memo": {
+          "bytes": 0,
+          "entries": 0,
+          "hits": 0,
+          "misses": 0
+        },
+        "moe_engine": "concurrent",
+        "pending": 0,
+        "prefetch_accuracy": null,
+        "rlm": {
+          "passes": 0,
+          "tokens_recursed": 0
+        },
+        "routing_entropy_ewma": 0.0,
+        "spec": {
+          "accept_rate": 0.0,
+          "accepted": 0,
+          "conf_stops": 0,
+          "proposed": 0
+        },
+        "steps": 0
+      },
+      "metrics_after": {
+        "active": 0,
+        "bias": "Balanced",
+        "cache_hit_rate": null,
+        "ecache": null,
+        "gpu": {
+          "calls": 0,
+          "experts": 0,
+          "graph_captures": 0,
+          "graph_invalidations": 0,
+          "graph_replays": 0,
+          "graph_uncacheable": 0,
+          "rows": 0,
+          "transfer_fraction": null
+        },
+        "io_ewma_us": 0,
+        "io_slab_in_use": null,
+        "io_sq_full": 0,
+        "kvstore": null,
+        "lane_ewma": {
+          "cpu_bytes": 0,
+          "cpu_us": 0,
+          "gpu_us": 0,
+          "io_us": 0,
+          "reduce_us": 0
+        },
+        "lane_last": {
+          "cpu_bytes": 0,
+          "cpu_us": 0,
+          "gpu_us": 0,
+          "io_us": 0,
+          "reduce_us": 0
+        },
+        "memo": {
+          "bytes": 573,
+          "entries": 3,
+          "hits": 0,
+          "misses": 3
+        },
+        "moe_engine": "concurrent",
+        "pending": 0,
+        "prefetch_accuracy": null,
+        "rlm": {
+          "passes": 0,
+          "tokens_recursed": 0
+        },
+        "routing_entropy_ewma": 0.5,
+        "spec": {
+          "accept_rate": 0.0,
+          "accepted": 0,
+          "conf_stops": 0,
+          "proposed": 0
+        },
+        "steps": 20
+      }
+    },
+    "llama_server_8080": {
+      "results": [
+        {
+          "text": "",
+          "latency_ms": 0,
+          "error": "<urlopen error [Errno 111] Connection refused>",
+          "test_name": "arithmetic",
+          "prompt": "What is 2+2?"
+        },
+        {
+          "text": "",
+          "latency_ms": 0,
+          "error": "<urlopen error [Errno 111] Connection refused>",
+          "test_name": "poetry",
+          "prompt": "Write a 3-line poem about code"
+        },
+        {
+          "text": "",
+          "latency_ms": 0,
+          "error": "<urlopen error [Errno 111] Connection refused>",
+          "test_name": "reasoning",
+          "prompt": "If x=5, y=3, what is x+y?"
+        }
+      ],
+      "metrics_before": {},
+      "metrics_after": {}
+    }
+  }
+}

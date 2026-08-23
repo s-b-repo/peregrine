@@ -1,7 +1,7 @@
 # peregrine — cargo workspace.
 #
 # A Rust MoE inference engine (spin-off of colibrì) that drives CPU, GPU, SSD,
-# and RAM concurrently. See DESIGN.md. Crates:
+# and RAM concurrently. See docs/DESIGN.md. Crates:
 #   peregrine-core     formats: Cfg, safetensors index, QT quant, dtype
 #   peregrine-kernels  std::arch int4/int8/int2 + f32 matmul (token-exact)
 #   peregrine-io       io_uring reactor (registered files), LRU/LFRU tiers

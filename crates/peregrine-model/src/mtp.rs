@@ -38,6 +38,70 @@ pub fn speculative_sample(p: &[f32], q: &[f32], drafted: usize, u_accept: f64, u
     resid.len() - 1
 }
 
+/// The same acceptance rule against a draft distribution held **at its
+/// support** — the form the engine actually carries between ticks.
+///
+/// [`speculative_sample`] above is the reference: dense `p`, dense `q`, and the
+/// rule written the way it is stated. This is the same rule with `q` in the
+/// representation DFlash's `_rejection_sample` uses
+/// ([z-lab/dflash](https://github.com/z-lab/dflash), `dflash/model.py`), where
+/// the draft's distribution arrives as `(draft_indices, draft_probs)` over a
+/// top-k and the two quantities the rule needs are read out of it directly:
+///
+/// ```text
+/// q(drafted)  =  (draft_probs * (draft_indices == drafted)).sum(-1)
+/// residual    =  target_probs.scatter_add_(0, draft_indices, -draft_probs).clamp_min_(0)
+/// ```
+///
+/// It is a change of representation and nothing else — `q` is zero off its
+/// support, so `q(t)` and `(p − q)+` are the same numbers either way, and the
+/// arithmetic here is deliberately performed in the same order and the same
+/// precision as the reference so the results agree bit for bit. That equality is
+/// a test (`sparse_and_dense_acceptance_agree_token_for_token`), in the same
+/// spirit as the SIMD integer-dot kernels being checked against their scalar
+/// reference rather than merely believed.
+///
+/// A `drafted` token that the support does not contain reads as `q = 0` and is
+/// therefore always accepted, exactly as a dense `q` with a zero at that index
+/// is. It cannot arise from a draft that was really drawn from `q`, and if it
+/// somehow does, accepting it is the branch that keeps the emitted distribution
+/// equal to `p`.
+pub fn speculative_sample_at(
+    p: &[f32],
+    q: &crate::draftdist::DraftDist,
+    drafted: usize,
+    u_accept: f64,
+    u_resample: f64,
+) -> usize {
+    let qd = f64::from(q.prob_of(drafted).max(1e-20));
+    let pd = f64::from(p.get(drafted).copied().unwrap_or(0.0));
+    if u_accept < (pd / qd).min(1.0) {
+        return drafted;
+    }
+    // rejected → sample from the residual (p - q)+, renormalized. Subtracted in
+    // `f32` and clamped in `f32` before widening, because that is what the dense
+    // reference does; doing the subtraction in `f64` would be defensible and
+    // would also make this a second algorithm rather than a second encoding.
+    let mut resid_f32 = p.to_vec();
+    q.subtract_from(&mut resid_f32);
+    let mut resid: Vec<f64> = resid_f32.iter().map(|&x| f64::from(x.max(0.0))).collect();
+    let mut tot: f64 = resid.iter().sum();
+    if tot <= 1e-12 {
+        // degenerate (q dominates p everywhere) — fall back to sampling p
+        resid = p.iter().map(|&x| f64::from(x)).collect();
+        tot = resid.iter().sum();
+    }
+    let target = u_resample * tot;
+    let mut cum = 0.0;
+    for (i, &r) in resid.iter().enumerate() {
+        cum += r;
+        if cum >= target {
+            return i;
+        }
+    }
+    resid.len().saturating_sub(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +152,75 @@ mod tests {
         for i in 0..v {
             let freq = hist[i] as f64 / n as f64;
             assert!((freq - p[i] as f64).abs() < 0.02, "token {i}: freq {freq:.3} vs p {}", p[i]);
+        }
+    }
+
+    /// A truncated `q` written densely and written at its support must decide
+    /// every draft the same way.
+    ///
+    /// The sparse form exists to stop carrying ~620 KB per draft step, and the
+    /// only thing that makes it safe to do is that it is the *same rule*. So
+    /// this is the same gate the SIMD integer-dot kernels get: the scalar form
+    /// is the reference, and the faster encoding is checked against it rather
+    /// than argued for. Token for token, on the same uniforms.
+    #[test]
+    fn sparse_and_dense_acceptance_agree_token_for_token() {
+        const V: usize = 64;
+        let mut rng = Lcg(0x5EED_1234);
+        for round in 0..500 {
+            // A target over the whole vocabulary; a draft distribution truncated
+            // to a support that varies from one entry to most of them, which is
+            // the range a nucleus produces across a real decode.
+            let raw: Vec<f32> = (0..V).map(|_| rng.u01() as f32 + 1e-3).collect();
+            let tot: f32 = raw.iter().sum();
+            let p: Vec<f32> = raw.iter().map(|&x| x / tot).collect();
+
+            let k = 1 + round % (V - 1);
+            let mut support: Vec<u32> = (0..V as u32).collect();
+            // Rotate the support so it is not always a prefix of the vocabulary.
+            support.rotate_left(round % V);
+            support.truncate(k);
+            let qraw: Vec<f32> = (0..k).map(|_| rng.u01() as f32 + 1e-3).collect();
+            let qtot: f32 = qraw.iter().sum();
+            let pairs: Vec<(u32, f32)> = support.iter().zip(qraw.iter()).map(|(&i, &x)| (i, x / qtot)).collect();
+            let sparse = crate::draftdist::DraftDist::sparse(V, pairs);
+            let dense = sparse.to_dense();
+
+            // Draw from `q` the way a drafter would, then judge the same draft
+            // with the same two uniforms through both encodings.
+            let drafted = sample_from(&dense, rng.u01());
+            let (ua, ur) = (rng.u01(), rng.u01());
+            assert_eq!(
+                speculative_sample(&p, &dense, drafted, ua, ur),
+                speculative_sample_at(&p, &sparse, drafted, ua, ur),
+                "round {round}: the encoding of q changed the emitted token"
+            );
+        }
+    }
+
+    /// And the property the whole mechanism is for still holds through the
+    /// sparse encoding: the emitted token is distributed as `p`, not as `q`.
+    ///
+    /// The equivalence test above would pass for two identically *wrong*
+    /// implementations. This one would not.
+    #[test]
+    fn sparse_acceptance_still_emits_the_target_distribution() {
+        let p = [0.4f32, 0.1, 0.2, 0.25, 0.05];
+        // A draft that cannot even reach two of the five tokens — the case a
+        // truncated `q` creates and a dense one hides behind stored zeros.
+        let q = crate::draftdist::DraftDist::sparse(5, [(1u32, 0.5f32), (0, 0.3), (4, 0.2)]);
+        let qd = q.to_dense();
+        let mut rng = Lcg(0x0DDBA11);
+        let n = 60_000;
+        let mut hist = vec![0u32; p.len()];
+        for _ in 0..n {
+            let drafted = sample_from(&qd, rng.u01());
+            let tok = speculative_sample_at(&p, &q, drafted, rng.u01(), rng.u01());
+            hist[tok] += 1;
+        }
+        for (i, &pi) in p.iter().enumerate() {
+            let freq = f64::from(hist[i]) / f64::from(n);
+            assert!((freq - f64::from(pi)).abs() < 0.02, "token {i}: freq {freq:.3} vs p {pi}");
         }
     }
 }

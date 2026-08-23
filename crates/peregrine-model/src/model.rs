@@ -17,6 +17,7 @@ use crate::attention::{
     mla_attention, mla_attention_absorb, mla_attention_dsa_indexed, mla_attention_rows, AttnWeights, KvDtype,
     LayerKv, RowLayout,
 };
+use crate::draftdist::DraftDist;
 use crate::dsa::IndexerWeights;
 use crate::concurrent::{default_workers, experts_per_batch, moe_forward_dispatch, ForwardCtx};
 use crate::gpu::{GpuTier, HeatTable};
@@ -834,8 +835,8 @@ pub fn accept_run(rows: &[f32], vocab: usize, drafts: &[i32]) -> (usize, i32) {
 ///
 /// `rows` is `[1 + drafts.len(), vocab]` exactly as in [`accept_run`], and
 /// `draft_q[k]` is the distribution draft `k` was actually drawn from
-/// ([`Model::mtp_draft_sampled`]). Returns how many drafts were accepted and the
-/// token to emit after them.
+/// ([`Model::mtp_draft_sampled`]), held at its support. Returns how many drafts
+/// were accepted and the token to emit after them.
 ///
 /// **The emitted sequence is not the one an unspeculated sampled request would
 /// have produced, and cannot be.** `accept_run`'s guarantee is *sequence*
@@ -853,25 +854,33 @@ pub fn accept_run_sampled(
     rows: &[f32],
     vocab: usize,
     drafts: &[i32],
-    draft_q: &[Vec<f32>],
+    draft_q: &[DraftDist],
     sampler: &mut Sampler,
 ) -> (usize, i32) {
     let row = |k: usize| rows.get(k * vocab..(k + 1) * vocab);
     let mut k = 0usize;
     while k < drafts.len() {
-        // A missing row or a missing/short `q` is a shape fault, not a
+        // A missing row or a missing/mismatched `q` is a shape fault, not a
         // rejection: fall through to sampling row `k` normally, which is what
         // this round would have emitted with no speculation at all. Guessing a
-        // uniform `q` instead would feed `speculative_sample` a ratio computed
+        // uniform `q` instead would feed `speculative_sample_at` a ratio computed
         // against a distribution nothing was drawn from.
         let (Some(r), Some(q)) = (row(k), draft_q.get(k)) else { break };
-        let drafted = match usize::try_from(drafts[k]).ok().filter(|&d| d < vocab && d < q.len()) {
+        if q.vocab() != vocab {
+            break; // a `q` over a different vocabulary scores nothing here
+        }
+        let drafted = match usize::try_from(drafts[k]).ok().filter(|&d| d < vocab) {
             Some(d) => d,
             None => break, // out-of-vocab draft: cannot be scored, so reject it
         };
-        let p = sampler.distribution(r).to_vec();
+        // Uniforms **first**, then the distribution. `Sampler::distribution`
+        // borrows the sampler, and drawing after it forced a `to_vec()` of the
+        // whole vocabulary — ~620 KB allocated and copied per draft position per
+        // round, purely to release the borrow. The two draws consume no
+        // distribution, so moving them ahead leaves the RNG stream identical.
         let (u_accept, u_resample) = (sampler.uniform(), sampler.uniform());
-        let emitted = crate::speculative_sample(&p, q, drafted, u_accept, u_resample);
+        let p = sampler.distribution(r);
+        let emitted = crate::speculative_sample_at(p, q, drafted, u_accept, u_resample);
         if emitted != drafted {
             // Rejected: the residual sample replaces the draft and terminates
             // the run. (`speculative_sample` only resamples when `p/q < 1`, and
@@ -6751,12 +6760,18 @@ impl Model {
     /// entirely reasonable. `pick_with_distribution` draws and describes in one
     /// call precisely so the two cannot come apart.
     ///
-    /// **Cost, stated because it is not obvious**: `q` is dense over the
-    /// vocabulary, so a depth-`g` draft holds `g * vocab` floats per sequence
-    /// between ticks — ~2.4 MB per sequence at GLM-5.2's vocab and `g = 4`. The
-    /// nucleus zeroes most of it; a sparse form would trade that for a second
-    /// representation of the same distribution, and getting *those* out of sync
-    /// is the failure this function exists to prevent.
+    /// **Cost, which used to be the objection to fixing it**: a dense `q` is one
+    /// float per vocabulary entry, so a depth-`g` draft held `g * vocab` floats
+    /// per sequence between ticks — ~2.4 MB per sequence at GLM-5.2's vocab and
+    /// `g = 4`, nearly all of it zeros the nucleus had already cut. The reason
+    /// given for keeping it was that a sparse form alongside a dense one is two
+    /// representations of the same distribution, and the two coming apart is
+    /// precisely the failure this function exists to prevent.
+    ///
+    /// [`DraftDist`] answers that by making the support the *only* form — the
+    /// shape DFlash's `_rejection_sample` uses — so there is no dense twin to
+    /// drift from, and `pick_with_draft_dist` still draws and describes in one
+    /// call. Same ~2.4 MB becomes a few kilobytes; see [`crate::draftdist`].
     pub fn mtp_draft_sampled(
         &self,
         next_tok: i32,
@@ -6764,10 +6779,10 @@ impl Model {
         hlast: &[f32],
         conf_floor: f32,
         sampler: &mut Sampler,
-    ) -> Result<(Vec<i32>, Vec<Vec<f32>>), Error> {
-        let mut qs: Vec<Vec<f32>> = Vec::with_capacity(g_draft);
+    ) -> Result<(Vec<i32>, Vec<DraftDist>), Error> {
+        let mut qs: Vec<DraftDist> = Vec::with_capacity(g_draft);
         let drafts = self.mtp_draft_with(next_tok, g_draft, hlast, conf_floor, |lo| {
-            let (t, q) = sampler.pick_with_distribution(lo);
+            let (t, q) = sampler.pick_with_draft_dist(lo);
             qs.push(q);
             t as i32
         })?;
@@ -7787,7 +7802,7 @@ mod tests {
             let mut drafts = Vec::with_capacity(G);
             let mut qs = Vec::with_capacity(G);
             for _ in 0..G {
-                let (t, q) = drafter.pick_with_distribution(&proposal);
+                let (t, q) = drafter.pick_with_draft_dist(&proposal);
                 drafts.push(t as i32);
                 qs.push(q);
             }
@@ -7815,7 +7830,7 @@ mod tests {
         const VOCAB: usize = 4;
         let target = [1.0f32, 0.0, 0.0, 0.0];
         let rows: Vec<f32> = (0..3).flat_map(|_| target.iter().copied()).collect();
-        let q: Vec<f32> = Sampler::new(1.0, 1.0, 1).distribution(&target).to_vec();
+        let q = crate::DraftDist::dense(Sampler::new(1.0, 1.0, 1).distribution(&target).to_vec());
 
         // Two drafts, one `q`: the second cannot be scored against anything, so
         // the run must stop rather than invent a distribution for it.

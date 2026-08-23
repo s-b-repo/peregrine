@@ -47,7 +47,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 
 ## Faster decoding: designs and open ideas
 
-Nineteen pages of design notes on breaking strict one-token-at-a-time
+Twenty pages of design notes on breaking strict one-token-at-a-time
 generation and on moving fewer bytes per token. Most are proposals, not shipped
 work — [Speculative decoding alternatives](speculative-decoding-alternatives.md)
 is the index of the first group and carries the per-approach status, the
@@ -62,6 +62,7 @@ take.
 | [Expert decomposition](expert-decomposition.md) · [Token-equivalence adaptive precision](token-equivalence-adaptive-precision.md) · [Residual algebra](residual-algebra.md) · [Speed vs bytes](speed-vs-bytes.md) | moving fewer bytes at the representation level |
 | [Expert address prediction](expert-address-prediction.md) · [Compute before read](compute-before-read.md) · [Geometric cache](geometric-cache.md) · [Physical checkpoint](physical-checkpoint.md) | prediction, staging and layout |
 | [Three most promising ideas](three-most-promising-ideas.md) · [Advanced optimization directions](advanced-optimization-directions.md) | the two summary pages |
+| [What peregrine took from DFlash](dflash.md) | the 2026-08-22 cross-read of [z-lab/dflash](https://github.com/z-lab/dflash): three mechanisms shipped (sparse draft distributions, `top_k`, a truncation that is no longer a full vocabulary sort), the measurements, and why block-diffusion drafting is buildable on the *resident* track and not the streaming one |
 
 ## Long-form working documents
 

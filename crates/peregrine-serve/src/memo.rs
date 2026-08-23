@@ -45,6 +45,11 @@ pub struct MemoKey {
     /// `top_p` by its exact bits. A float key compared by bit pattern is deliberate:
     /// `0.95` from two requests is the same answer only when it is the same number.
     pub top_p_bits: u32,
+    /// The rank cutoff, `0` for none. Like `top_p`, it cannot change a *greedy*
+    /// answer — and only greedy requests are eligible — but the key is the whole
+    /// request semantics rather than the subset that happens to matter today, so
+    /// a request that names a different cutoff gets a different entry.
+    pub top_k: usize,
     pub model: String,
 }
 
@@ -158,7 +163,7 @@ mod tests {
     use super::*;
 
     fn key(ids: &[u32], max_new: usize) -> MemoKey {
-        MemoKey { ids: ids.to_vec(), max_new, top_p_bits: 0.95f32.to_bits(), model: "m".into() }
+        MemoKey { ids: ids.to_vec(), max_new, top_p_bits: 0.95f32.to_bits(), top_k: 0, model: "m".into() }
     }
 
     #[test]
@@ -185,6 +190,9 @@ mod tests {
         let mut other_top_p = key(&[1, 2, 3], 16);
         other_top_p.top_p_bits = 0.9f32.to_bits();
         assert_eq!(m.get(&other_top_p), None, "a changed top_p");
+        let mut other_top_k = key(&[1, 2, 3], 16);
+        other_top_k.top_k = 40;
+        assert_eq!(m.get(&other_top_k), None, "a changed top_k");
         let mut other_model = key(&[1, 2, 3], 16);
         other_model.model = "n".into();
         assert_eq!(m.get(&other_model), None, "a different model id");
