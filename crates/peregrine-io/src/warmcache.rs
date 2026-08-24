@@ -321,6 +321,14 @@ pub struct WarmCache {
     pub prefetch_used: u64,
     /// prefetched slabs evicted before ever being hit (the prefetch was wasted).
     pub prefetch_wasted: u64,
+    /// Critical-path disk reads that re-fetched a key **evicted earlier in this
+    /// process** — the byte-ledger column this cache historically could not
+    /// source. Attribution rule: a key enters [`Self::evicted_since_load`] only
+    /// via eviction (never via `clear`/`remove_corrupt`), and leaves when its
+    /// re-read is counted, so each cycle counts once and a key read twice
+    /// before any eviction stays unlabelled. Under-counts by construction;
+    /// never presented as exact.
+    pub rereads_after_eviction: u64,
     /// speculative warm items the prefetch lane discarded *before* reading, because
     /// the layer window they were emitted for had already passed by the time the
     /// lane dequeued them (the stale-drop gate, `COLI_PREFETCH_STALE_DROP`). Each
@@ -372,6 +380,20 @@ pub struct WarmCache {
     /// *recent* popularity rather than a lifetime total — without it, a slot that
     /// was hot early becomes unevictable no matter how cold it goes.
     hits_since_decay: u64,
+    /// Whether victim ranking includes the co-firing survival bonus
+    /// (`COLI_JOINT_EVICTION=1`). Fixed at construction; pairs arrive live via
+    /// [`Self::set_joint_pairs`]. Off = the historical tuple, bit-for-bit.
+    joint_eviction: bool,
+    /// Co-firing pair counts `(layer, lo, hi) -> count`, published by the model
+    /// from its `CoActivation` tracker. Read-only from eviction's perspective;
+    /// replaced wholesale by [`Self::set_joint_pairs`].
+    joint_pairs: std::collections::HashMap<(u32, u32, u32), u32>,
+    /// Keys evicted since process start (or the last [`Self::clear`]) and not
+    /// yet re-read. Membership is exactly "the next disk read of this key is a
+    /// **re-read after eviction**"; see [`WarmCache::rereads_after_eviction`].
+    /// Bounded by cache churn, and entries leave on their re-read, so this
+    /// cannot grow without the corresponding reads happening.
+    evicted_since_load: std::collections::HashSet<(u32, u32)>,
 }
 
 /// Hits between `tier::decay` sweeps under `COLI_CACHE_LFRU`. A constant rather
@@ -381,6 +403,16 @@ pub struct WarmCache {
 /// stable hot experts, short enough that a phase change is not outvoted by one
 /// that ended.
 const LFRU_DECAY_HITS: u64 = 4096;
+
+/// Minimum co-firing count for a pair to earn a joint-survival bonus. Same
+/// spirit as `CoActivation::fused_pairs`' 8-frame noise guard: below this a
+/// pair is coincidence, not coupling.
+const JOINT_PAIR_MIN_COUNT: u32 = 8;
+
+/// Cap on one slot's joint-survival bonus. Below an LFRU score's frequency
+/// quantum (`heat << 8`), so the bonus reorders within a recency/heat class
+/// but never outranks genuine heat.
+const JOINT_BONUS_CAP: u32 = 255;
 
 /// The reserved top of the eviction-protection scale: a slot at this priority is
 /// chosen as a victim only when nothing else is resident.
@@ -404,9 +436,12 @@ impl WarmCache {
         let compress = matches!(std::env::var("COLI_CACHE_COMPRESS").as_deref(), Ok("1") | Ok("true"));
         let lfru = matches!(std::env::var("COLI_CACHE_LFRU").as_deref(), Ok("1") | Ok("true"));
         let sweep = matches!(std::env::var("COLI_CACHE_SWEEP").as_deref(), Ok("1") | Ok("true"));
+        let joint = matches!(std::env::var("COLI_JOINT_EVICTION").as_deref(), Ok("1") | Ok("true"));
         WarmCache {
             lfru,
             sweep,
+            joint_eviction: joint,
+            joint_pairs: HashMap::new(),
             hits_since_decay: 0,
             budget: budget_bytes,
             used: 0,
@@ -430,6 +465,8 @@ impl WarmCache {
             compress_on_admit: compress,
             uncompressed_bytes_seen: 0,
             compressed_bytes_seen: 0,
+            rereads_after_eviction: 0,
+            evicted_since_load: std::collections::HashSet::new(),
         }
     }
 
@@ -447,6 +484,13 @@ impl WarmCache {
     /// policy for every other test running beside it.
     pub fn with_lfru(mut self, on: bool) -> WarmCache {
         self.lfru = on;
+        self
+    }
+
+    /// Override the `COLI_JOINT_EVICTION` gate, for the same reason as
+    /// [`Self::with_lfru`]: the env is process-global.
+    pub fn with_joint(mut self, on: bool) -> WarmCache {
+        self.joint_eviction = on;
         self
     }
 
@@ -697,7 +741,12 @@ impl WarmCache {
 
     /// Record that a miss streamed one expert from disk at `layer`. Kept separate
     /// from `misses` so a test can distinguish "not resident" from "bytes fetched".
-    pub fn note_disk_read(&mut self, layer: u32) {
+    /// If this key was evicted earlier in the process, it is also counted as a
+    /// **re-read after eviction** — see [`Self::rereads_after_eviction`].
+    pub fn note_disk_read(&mut self, layer: u32, key: (u32, u32)) {
+        if self.evicted_since_load.remove(&key) {
+            self.rereads_after_eviction += 1;
+        }
         self.disk_reads += 1;
         let li = layer as usize;
         if li >= self.disk_reads_by_layer.len() {
@@ -781,6 +830,11 @@ impl WarmCache {
         self.fadvise_hints = 0;
         self.verify_mismatch = 0;
         self.bloom_skips = 0;
+        self.rereads_after_eviction = 0;
+        // `clear()` is a test/sequence-reset, not an eviction: the re-read
+        // attribution window closes here rather than counting every resident
+        // key as "evicted".
+        self.evicted_since_load.clear();
     }
 
     /// Insert (or refresh) an expert slab streamed on the **critical path**,
@@ -937,6 +991,61 @@ impl WarmCache {
         }
     }
 
+    /// Whether the joint-eviction victim bonus is compiled into this cache's
+    /// policy (the `COLI_JOINT_EVICTION` gate, fixed at construction). Lets a
+    /// publisher skip building a pair table nobody will read.
+    pub fn joint_eviction_enabled(&self) -> bool {
+        self.joint_eviction
+    }
+
+    /// A copy of the current co-firing pair table. Called by the model's
+    /// affinity rebuild while it already holds the tracker lock.
+    fn pairs_snapshot(&self) -> std::collections::HashMap<(u32, u32, u32), u32> {
+        self.joint_pairs.clone()
+    }
+
+    /// Publish the co-activation pair table used by [`Self::joint_survival_bonus`].
+    ///
+    /// Called by the model right where it already rebuilds affinity hints
+    /// (`rebuild_affinity`, every 64 forwards), so the eviction policy sees the
+    /// same snapshot cadence as prefetch. Replaces the map wholesale — the
+    /// tracker's counts are cumulative and monotone within a decay window.
+    pub fn set_joint_pairs(&mut self, pairs: std::collections::HashMap<(u32, u32, u32), u32>) {
+        self.joint_pairs = pairs;
+    }
+
+    /// The joint-survival bonus for one candidate victim.
+    ///
+    /// Nonzero only when this expert is co-firing with another **resident**
+    /// expert of the same layer above `JOINT_PAIR_MIN_COUNT`: evicting it would
+    /// very plausibly force that partner's reload, so the pair's expected cost
+    /// is charged to this slot rather than split between two independent
+    /// recency scores. The bonus is capped so no realistic count can push a
+    /// slot past an LFRU score's frequency range (`heat << 8`) — the mechanism
+    /// reorders *within* a class; it does not outrank genuine heat.
+    fn joint_survival_bonus(&self, layer: u32, expert: u32) -> u32 {
+        let mut bonus = 0u32;
+        for (&(l, lo, hi), &c) in &self.joint_pairs {
+            if l != layer || c < JOINT_PAIR_MIN_COUNT {
+                continue;
+            }
+            let partner = if lo == expert {
+                hi
+            } else if hi == expert {
+                lo
+            } else {
+                continue;
+            };
+            // Only pairs whose other half is actually resident earn the bonus:
+            // protecting an expert whose partner was already evicted buys
+            // nothing — the reload it prevents cannot happen twice.
+            if self.map.contains_key(&(layer, partner)) {
+                bonus = bonus.saturating_add(c).min(JOINT_BONUS_CAP);
+            }
+        }
+        bonus
+    }
+
     /// Reset every slot's *predictor* protection score to 0 (called at sequence
     /// reset so a new sequence starts from pure LRU until its predictor
     /// re-protects experts).
@@ -1035,6 +1144,9 @@ impl WarmCache {
                 if let Some(s) = self.map.remove(&k) {
                     self.used -= s.bytes;
                     self.hint.remove(k);
+                    // The negative-TTL pass is an eviction too: a re-read of this
+                    // key counts against the ledger's re-read column.
+                    self.evicted_since_load.insert(k);
                     if s.from_prefetch && !s.ever_hit {
                         self.prefetch_wasted += 1;
                     }
@@ -1075,6 +1187,7 @@ impl WarmCache {
             let lfru = self.lfru;
             let sweep = self.sweep;
             let clock = self.clock as u32;
+            let joint = self.joint_eviction;
             let victim = self
                 .map
                 .iter()
@@ -1087,6 +1200,22 @@ impl WarmCache {
                         ((u32::MAX - k.0) as u64, s.used)
                     } else if lfru {
                         (crate::tier::lfru_score(s.heat, s.used as u32, clock), 0)
+                    } else if joint {
+                        // Joint survival (`COLI_JOINT_EVICTION`): the base rank —
+                        // recency, or LFRU when that knob is also on — is raised
+                        // by the slot's co-firing bonus, so an expert coupled to
+                        // another *resident* expert survives a pass that would
+                        // otherwise evict one half and force its partner's
+                        // reload. Priority stays primary; this only reorders
+                        // within an unprotected class.
+                        let base = if lfru {
+                            crate::tier::lfru_score(s.heat, s.used as u32, clock)
+                        } else {
+                            s.used
+                        };
+                        // Victims are chosen by MINIMUM rank, so the bonus makes
+                        // the coupled slot *less* attractive as a victim.
+                        (base.saturating_add(u64::from(self.joint_survival_bonus(k.0, k.1))), s.used)
                     } else {
                         (s.used, 0)
                     };
@@ -1097,6 +1226,9 @@ impl WarmCache {
             if let Some(s) = self.map.remove(&vk) {
                 self.used -= s.bytes;
                 self.hint.remove(vk);
+                // The ledger's re-read column keys off this set: a later disk
+                // read of `vk` is then counted as a re-read after eviction.
+                self.evicted_since_load.insert(vk);
                 if s.from_prefetch && !s.ever_hit {
                     self.prefetch_wasted += 1;
                 }
@@ -1754,12 +1886,91 @@ mod tests {
     #[test]
     fn per_layer_disk_reads() {
         let mut c = WarmCache::new(1 << 20);
-        c.note_disk_read(0);
-        c.note_disk_read(2);
-        c.note_disk_read(2);
+        c.note_disk_read(0, (0, 0));
+        c.note_disk_read(2, (2, 0));
+        c.note_disk_read(2, (2, 0));
         assert_eq!(c.disk_reads, 3);
         assert_eq!(c.disk_reads_for_layer(0), 1);
         assert_eq!(c.disk_reads_for_layer(2), 2);
         assert_eq!(c.disk_reads_for_layer(1), 0);
+        // No evictions happened, so nothing is a re-read.
+        assert_eq!(c.rereads_after_eviction, 0);
+    }
+
+    /// The ledger's re-read-after-eviction column: a disk read of a key that was
+    /// evicted earlier counts once as a re-read; a read of a key never resident
+    /// does not; and `clear()` closes the attribution window.
+    #[test]
+    fn rereads_are_counted_only_after_a_real_eviction() {
+        let mut c = WarmCache::new(16);
+        c.insert((0, 0), slab(10, 2));
+        c.insert((0, 1), slab(10, 2)); // budget 16 → (0,0) is evicted
+        assert!(!c.contains((0, 0)));
+        // First read after eviction: the re-read column moves.
+        c.note_disk_read(0, (0, 0));
+        assert_eq!(c.rereads_after_eviction, 1);
+        // A second read of the same key is not another re-read — it left the set.
+        c.note_disk_read(0, (0, 0));
+        assert_eq!(c.rereads_after_eviction, 1);
+        // A read of a key that was never evicted is not labelled either.
+        c.note_disk_read(3, (3, 9));
+        assert_eq!(c.rereads_after_eviction, 1);
+        // clear() resets the window like every other counter.
+        c.clear();
+        c.note_disk_read(0, (0, 0));
+        assert_eq!(c.rereads_after_eviction, 0);
+    }
+
+    /// Joint eviction (`COLI_JOINT_EVICTION`): an LRU slot co-firing with a
+    /// *resident* partner survives a pass that plain recency would have chosen
+    /// it for; the uncoupled LRU slot is taken instead. With no pairs published
+    /// the policy is bit-for-bit the historical tuple.
+    #[test]
+    fn joint_eviction_spares_the_coupled_half_of_a_resident_pair() {
+        let mut off = WarmCache::new(108).with_lfru(false).with_joint(false);
+        let mut on = WarmCache::new(108).with_lfru(false).with_joint(true);
+        // Fill both caches to exactly budget with three slots of one layer
+        // (slab(10,2) is a 36-byte footprint: 3 × (10 + 2)).
+        for c in [&mut off, &mut on] {
+            c.insert((5, 0), slab(10, 2)); // will become the coupled LRU slot
+            c.insert((5, 1), slab(10, 2));
+            c.insert((5, 2), slab(10, 2));
+        }
+        assert_eq!(off.used(), 108);
+        assert_eq!(on.used(), 108);
+        // Publish the pair BEFORE any eviction pass runs — evictions happen
+        // inside `insert`, not at the end.
+        let mut pairs = std::collections::HashMap::new();
+        pairs.insert((5u32, 0u32, 1u32), JOINT_PAIR_MIN_COUNT);
+        on.set_joint_pairs(pairs);
+
+        // One more slot forces a victim. Plain recency takes the oldest slot,
+        // regardless of coupling; joint spares it and takes the next-oldest
+        // uncoupled one instead.
+        off.insert((5, 9), slab(10, 2));
+        on.insert((5, 9), slab(10, 2));
+        assert!(!off.contains((5, 0)), "LRU takes the coupled slot when the knob is off");
+        // Joint: BOTH halves of the pair are protected — the point is keeping
+        // coupled experts together — so the oldest *uncoupled* slot goes.
+        assert!(on.contains((5, 0)), "the co-firing slot must survive");
+        assert!(on.contains((5, 1)), "…and so must its resident partner");
+        assert!(!on.contains((5, 2)), "the uncoupled next-oldest slot is the victim instead");
+    }
+
+    /// A pair whose partner has already been evicted earns no bonus: protecting
+    /// that half cannot prevent a reload that already happened.
+    #[test]
+    fn joint_eviction_ignores_pairs_whose_partner_is_not_resident() {
+        let mut on = WarmCache::new(32).with_lfru(false);
+        on.insert((7, 0), slab(10, 2));
+        on.get((7, 0));
+        on.insert((7, 1), slab(10, 2));
+        on.insert((7, 2), slab(10, 2));
+        let mut pairs = std::collections::HashMap::new();
+        // Partner (7,9) is not resident — the bonus must not fire.
+        pairs.insert((7u32, 0u32, 9u32), JOINT_PAIR_MIN_COUNT);
+        on.set_joint_pairs(pairs);
+        on.insert((7, 3), slab(10, 2)); // over budget → one victim
+        assert!(!on.contains((7, 0)), "an unpartnered LRU slot gets no survival bonus");
     }
 }

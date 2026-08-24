@@ -2013,7 +2013,7 @@ pub fn moe_forward_concurrent(
                                     if let Some(t) = timings_ref {
                                         t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
                                     }
-                                    g.note_disk_read(layer as u32);
+                                    g.note_disk_read(layer as u32, (layer as u32, expert as u32));
                                     g.insert_prepared((layer as u32, expert as u32), prepared);
                                     (idx, shared)
                                 } else {
@@ -2022,7 +2022,7 @@ pub fn moe_forward_concurrent(
                                     if let Some(t) = timings_ref {
                                         t.add_cache_wait(t_lock.elapsed().as_micros() as u64);
                                     }
-                                    g.note_disk_read(layer as u32);
+                                    g.note_disk_read(layer as u32, (layer as u32, expert as u32));
                                     (idx, bytes)
                                 }
                             }

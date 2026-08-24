@@ -82,3 +82,8 @@ __pycache__/
 # GitHub's 100 MB blob limit (one 2k-token entry is ~350 MB).
 bench-data/**/kvstore/
 *.pgkv
+
+# Peregrine auto-improve loop watchdog state files (managed by loop-watchdog.sh + systemd timer)
+/.watchdog-start.time
+/auto-improve-loop.pid
+/scripts/loop-watchdog.sh

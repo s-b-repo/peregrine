@@ -5231,6 +5231,16 @@ impl Model {
         let co = self.coactivation.lock();
         let pairs = co.fused_pairs(threshold);
         let loose = co.fused_pairs(threshold * 0.5);
+        // Joint eviction (`COLI_JOINT_EVICTION`): publish the full pair table
+        // into the warm cache so its victim score can spare a coupled half.
+        // The cache applies it only when the knob is on; the publish rides a
+        // lock hold this rebuild already pays, every 64 forwards.
+            let joint_pairs: std::collections::HashMap<(u32, u32, u32), u32> =
+                if self.ecache.as_ref().is_some_and(|c| c.lock().joint_eviction_enabled()) {
+                    co.pairs.clone()
+                } else {
+                    std::collections::HashMap::new()
+                };
         drop(co);
         // Union-find per layer over the loose pairs → expert → component id.
         let mut groups: Vec<std::collections::HashMap<u32, u32>> = Vec::with_capacity(loose.len());
@@ -5266,6 +5276,9 @@ impl Model {
             groups.push(map);
         }
         *self.affinity.lock() = Arc::new(crate::concurrent::AffinityHints { pairs, groups });
+        if let Some(cache) = &self.ecache {
+            cache.lock().set_joint_pairs(joint_pairs);
+        }
     }
 
     /// The current affinity snapshot (cheap Arc clone).
