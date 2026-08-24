@@ -1,12 +1,71 @@
-//! Compile and link the existing, validated CUDA kernels (`cuda/backend_cuda.cu`)
+//! Compile and link the existing, validated GPU kernels (`cuda/backend_cuda.cu`)
 //! when the `cuda` feature is on. No-op otherwise, so the default workspace
 //! build needs neither nvcc nor a GPU. Mirrors `c/Makefile` (CUDA=1 path).
+//!
+//! **One kernel source, two vendors.** The kernels are written against the CUDA
+//! runtime API, which is also what ROCm's HIP targets: the same file compiles
+//! under `nvcc` (NVIDIA) or — after a mechanical `hipify-perl` pass — under
+//! `hipcc` (AMD). The host ABI (`backend_cuda.h`, every `coli_cuda_*` symbol) is
+//! identical either way, so the Rust FFI and everything above it are
+//! vendor-agnostic; only this script and the linked runtime library differ.
+//!
+//! Vendor selection:
+//! - `PEREGRINE_GPU_BACKEND=cuda|hip` forces one;
+//! - unset/`auto` prefers whatever toolchain is present (nvcc first);
+//! - `intel` is recognized and REJECTED here: no SYCL port of the kernels
+//!   exists yet (see `docs/gpu-vendors.md`), and silently building nothing
+//!   would read as support.
+
+use std::path::Path;
+use std::process::Command;
 
 fn main() {
     if std::env::var("CARGO_FEATURE_CUDA").is_err() {
         return; // feature off → pure-CPU build, nothing to do
     }
+    let Ok(out) = std::env::var("OUT_DIR") else {
+        // OUT_DIR is always set by cargo for build scripts; surface it as a warning
+        // rather than panicking if a non-cargo invocation ever omits it.
+        println!("cargo:warning=OUT_DIR unset; skipping GPU backend compile");
+        return;
+    };
 
+    let requested = std::env::var("PEREGRINE_GPU_BACKEND").unwrap_or_else(|_| "auto".to_string());
+    let linked = match requested.as_str() {
+        "cuda" => build_cuda(&out),
+        "hip" => build_hip(&out),
+        "auto" => {
+            if nvcc_present() {
+                build_cuda(&out)
+            } else {
+                build_hip(&out)
+            }
+        }
+        other => panic!(
+            "PEREGRINE_GPU_BACKEND={other} is not a backend this build can produce \
+             (cuda | hip; intel is designed but not ported — see docs/gpu-vendors.md)"
+        ),
+    };
+    write_backend_name(&out, linked);
+}
+
+/// Emit the compiled-backend identity for [`status()`] at runtime.
+fn write_backend_name(out: &str, linked: &str) {
+    let text =
+        format!("/// Written by build.rs — which vendor's runtime was actually linked.\npub const BACKEND: &str = {linked:?};\n");
+    let _ = std::fs::write(format!("{out}/vendor.rs"), text); // OUT_DIR was writable when we got this far
+}
+
+#[allow(clippy::needless_bool)]
+fn nvcc_present() -> bool {
+    let home = std::env::var("CUDA_HOME").unwrap_or_else(|_| detect_cuda_home());
+    Path::new(&format!("{home}/bin/nvcc")).exists()
+}
+
+// ---------------- NVIDIA: nvcc compiles the source directly ----------------
+
+/// Returns the linked backend name for the banner, or "" when nothing was.
+fn build_cuda(out: &str) -> &'static str {
     let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| detect_cuda_home());
     let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "native".to_string());
     // repo layout: rust/crates/peregrine-cuda/build.rs → ../../cuda/backend_cuda.cu
@@ -14,12 +73,6 @@ fn main() {
     println!("cargo:rerun-if-changed={src}");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
 
-    // OUT_DIR is always set by cargo for build scripts; surface it as a warning
-    // rather than panicking if a non-cargo invocation ever omits it.
-    let Ok(out) = std::env::var("OUT_DIR") else {
-        println!("cargo:warning=OUT_DIR unset; skipping CUDA backend compile");
-        return;
-    };
     let obj = format!("{out}/backend_cuda.o");
     let nvcc = format!("{cuda_home}/bin/nvcc");
 
@@ -32,12 +85,12 @@ fn main() {
     // Absent toolkit stays a warning (a pure-CPU host must still build the
     // workspace); a toolkit that is present and rejects the source is a hard
     // failure, because on that host it is a real compile error.
-    if !std::path::Path::new(&nvcc).exists() {
+    if !Path::new(&nvcc).exists() {
         println!("cargo:warning=nvcc not found at {nvcc}; CUDA backend NOT linked (build on an NVIDIA host with CUDA installed, or set CUDA_HOME)");
-        return;
+        return "";
     }
 
-    let status = std::process::Command::new(&nvcc)
+    let status = Command::new(&nvcc)
         .args([
             "-O3",
             "-std=c++17",
@@ -57,17 +110,7 @@ fn main() {
         Err(e) => panic!("{nvcc} exists but could not be executed: {e}"),
     }
 
-    let lib = format!("{out}/libcoli_cuda_backend.a");
-    // Same reasoning one step down: a failed `ar` leaves no archive, and the
-    // link below would then fail with undefined symbols naming the kernels
-    // rather than the archiver that never ran.
-    match std::process::Command::new("ar").args(["crus", &lib, &obj]).status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => panic!("ar crus {lib} failed ({s})"),
-        Err(e) => panic!("could not run ar to archive {obj}: {e}"),
-    }
-    println!("cargo:rustc-link-search=native={out}");
-    println!("cargo:rustc-link-lib=static=coli_cuda_backend");
+    archive(out, &obj);
     // cudart lives in `lib64` on standard installs and `targets/<triple>/lib`
     // on Arch (`lib64` is a symlink there, but emit both so a missing symlink
     // still links). Only existing dirs are emitted to avoid linker noise.
@@ -75,25 +118,26 @@ fn main() {
         format!("{cuda_home}/lib64"),
         format!("{cuda_home}/targets/x86_64-linux/lib"),
     ] {
-        if std::path::Path::new(&cand).exists() {
+        if Path::new(&cand).exists() {
             println!("cargo:rustc-link-search=native={cand}");
         }
     }
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
+    "CUDA (NVIDIA)"
 }
 
 /// Locate the CUDA toolkit root when `CUDA_HOME` is unset: prefer the
 /// conventional `/usr/local/cuda`, else derive it from `nvcc` on `PATH`
 /// (`<root>/bin/nvcc`), else fall back to the Arch default `/opt/cuda`.
 fn detect_cuda_home() -> String {
-    if std::path::Path::new("/usr/local/cuda/bin/nvcc").exists() {
+    if Path::new("/usr/local/cuda/bin/nvcc").exists() {
         return "/usr/local/cuda".to_string();
     }
-    if let Ok(out) = std::process::Command::new("which").arg("nvcc").output() {
+    if let Ok(out) = Command::new("which").arg("nvcc").output() {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout);
-            let nvcc = std::path::Path::new(p.trim());
+            let nvcc = Path::new(p.trim());
             // <root>/bin/nvcc → <root>
             if let Some(root) = nvcc.parent().and_then(|bin| bin.parent()) {
                 return root.to_string_lossy().into_owned();
@@ -101,4 +145,86 @@ fn detect_cuda_home() -> String {
         }
     }
     "/opt/cuda".to_string()
+}
+
+// ---------------- AMD: hipify-perl then hipcc, same source ----------------
+
+const HIPIFY: &str = "hipify-perl";
+
+fn build_hip(out: &str) -> &'static str {
+    let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
+    println!("cargo:rerun-if-changed=../../cuda/backend_cuda.cu");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=PEREGRINE_GPU_BACKEND");
+    println!("cargo:rerun-if-env-changed=HIPC_ARCH");
+
+    let hipcc = format!("{rocm}/bin/hipcc");
+    let hipify = format!("{rocm}/bin/{HIPIFY}");
+    let have_rocm = Path::new(&hipcc).exists();
+
+    // Same philosophy as the nvcc branch: an explicitly requested HIP build on a
+    // host without ROCm is a warning-and-no-backend (the workspace must keep
+    // building everywhere), never a silent "supported".
+    if !have_rocm {
+        println!(
+            "cargo:warning=hipcc not found at {hipcc}; AMD/HIP backend NOT linked \
+             (install ROCm or set ROCM_PATH)"
+        );
+        return "";
+    }
+    if !Path::new(&hipify).exists() {
+        println!(
+            "cargo:warning={hipify} not found in {rocm}/bin; AMD/HIP backend NOT linked \
+             (hipify-perl ships with ROCm's hip-extras)"
+        );
+        return "";
+    }
+
+    // 1. Mechanical CUDA→HIP translation of the kernel source into OUT_DIR —
+    //    the vendored file stays untouched.
+    let hip_src = format!("{out}/backend_hip.cpp");
+    let translated = Command::new(&hipify).args(["../../cuda/backend_cuda.cu", "-o", &hip_src]).status();
+    match translated {
+        Ok(s) if s.success() => {}
+        Ok(s) => panic!("{hipify} failed on ../../cuda/backend_cuda.cu ({s})"),
+        Err(e) => panic!("{hipify} exists but could not be executed: {e}"),
+    }
+
+    // 2. Compile the translated source for the local or named AMD target.
+    let obj = format!("{out}/backend_hip.o");
+    let arch = std::env::var("HIPC_ARCH").unwrap_or_else(|_| "native".to_string());
+    let offload = format!("--offload-arch={arch}");
+    let compiled = Command::new(&hipcc)
+        .args(["-O3", "-std=c++17", "-fPIC", &offload, "-c", &hip_src, "-o", &obj])
+        .status();
+    match compiled {
+        Ok(s) if s.success() => {}
+        Ok(s) => panic!("{hipcc} failed to compile {hip_src} ({s}) — ROCm is installed, so treat this as a compile error in the hipified source"),
+        Err(e) => panic!("{hipcc} exists but could not be executed: {e}"),
+    }
+
+    archive(out, &obj);
+    for cand in [format!("{rocm}/lib"), format!("{rocm}/lib64")] {
+        if Path::new(&cand).exists() {
+            println!("cargo:rustc-link-search=native={cand}");
+        }
+    }
+    println!("cargo:rustc-link-lib=dylib=amdhip64");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    "HIP (AMD ROCm)"
+}
+
+/// Archive one compiled object into the static lib the Rust FFI links.
+fn archive(out: &str, obj: &str) {
+    let lib = format!("{out}/libcoli_cuda_backend.a");
+    // A failed `ar` leaves no archive, and the link below would then fail with
+    // undefined symbols naming the kernels rather than the archiver that never
+    // ran — same reasoning as the nvcc branch.
+    match Command::new("ar").args(["crus", &lib, obj]).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => panic!("ar crus {lib} failed ({s})"),
+        Err(e) => panic!("could not run ar to archive {obj}: {e}"),
+    }
+    println!("cargo:rustc-link-search=native={out}");
+    println!("cargo:rustc-link-lib=static=coli_cuda_backend");
 }

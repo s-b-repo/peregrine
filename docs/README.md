@@ -77,6 +77,8 @@ top level.
 | [`todo.txt`](todo.txt) | the older plain-text predecessor of `todo.md`, kept for its early reasoning |
 | [`ideas-tokens-per-sec-2026-08-15.md`](ideas-tokens-per-sec-2026-08-15.md) | ranked throughput ideas, and the **closed negatives — do NOT re-propose** list |
 | [`ideas-from-colibri.md`](ideas-from-colibri.md) | what was worth taking from the predecessor engine |
+| [`ideas-github-issue-7-2026-08-23.md`](ideas-github-issue-7-2026-08-23.md) | upstream issue #7: the fifteen-technique survey (similarity routing, learned cache replacement, transition-aware placement, …) with its field papers, plus local status annotations |
+| [`ideas-github-issue-8-2026-08-23.md`](ideas-github-issue-8-2026-08-23.md) | upstream issue #8: the ten experiment-shaped streamed-bytes research candidates, byte-ledger instrumentation requirements, and the suggested first experiments |
 
 Elsewhere: [`README.md`](../README.md) (project overview) ·
 [`crates/peregrine-token/README.md`](../crates/peregrine-token/README.md)

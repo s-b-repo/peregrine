@@ -5,6 +5,14 @@
 //! GPU-resident experts of a layer in one batched `expert_group` call — running
 //! on its own thread, concurrently with the io_uring disk lane and the CPU pool.
 //!
+//! **Devices and vendors.** The tier spans every device
+//! [`crate::devices::selected_devices`] returns (`COLI_GPU_DEVICES`, default one
+//! CUDA device): residency is *partitioned* across them via an owner map, and a
+//! forward dispatches each device's group on its own thread in parallel, folding
+//! partials in fixed device order so output never depends on completion order.
+//! The kernels themselves are vendor-neutral C ABI — NVIDIA today, AMD/ROCm via
+//! hipcc of the same source (see `docs/gpu-vendors.md`).
+//!
 //! Numerics note: GPU experts compute in **f32** (more accurate than the CPU
 //! int4 path), so enabling the tier changes low-order bits versus a pure-CPU run
 //! — expected, and why the bit-exact determinism test stays CPU-only. The tier is
@@ -61,6 +69,7 @@ pub fn plan_residency(
 }
 
 use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Routing-frequency accumulator over `(layer, expert)` — the "heat" that drives
@@ -470,6 +479,68 @@ pub fn solve_residency_sized(
         used += bytes;
     }
     out
+}
+
+/// Split a heat-ordered placement across device budgets.
+///
+/// Takes `placement` in heat order (the order [`solve_residency_sized`] /
+/// [`rank_by_heat`] emit) and assigns each expert to the device index with the
+/// most budget left, ties breaking to the lowest index — best-fit-decreasing's
+/// opposite on purpose: the hottest experts are also the ones reheat will fight
+/// to keep, so they get the headroom, and balancing rather than packing keeps
+/// every card's resident set useful when budgets are lopsided. Returns `(key,
+/// device_index)` pairs for the prefix that fits; the first expert that fits no
+/// device stops the walk, because everything after it is colder and no more
+/// valuable (the same truncation rule the single-device upload loop always had).
+///
+/// Pure and deterministic: the same placement and budgets always produce the
+/// same owner map, which is what makes a 1-device vs 2-device A/B a *placement*
+/// difference only — the outputs must be identical either way.
+///
+/// Returns device **indices** into `budgets`, not vendor ordinals; the caller
+/// maps them once at upload time. Empty input → empty output; an all-zero
+/// budget assigns nothing.
+pub fn partition_placement(
+    placement: &[(usize, usize)],
+    budgets: &[usize],
+    bytes_of: impl Fn(&(usize, usize)) -> usize,
+) -> Vec<((usize, usize), usize)> {
+    let mut remaining = budgets.to_vec();
+    let mut out = Vec::with_capacity(placement.len());
+    for key in placement {
+        let bytes = bytes_of(key);
+        let Some(dev) = pick_device(&remaining, bytes) else { break };
+        remaining[dev] -= bytes;
+        out.push((*key, dev));
+    }
+    out
+}
+
+/// The device index with the most room for `bytes`, ties to the lowest index —
+/// the one-expert form of [`partition_placement`]'s rule, so build and reheat
+/// target devices identically. `None` when no device fits it.
+pub fn pick_device(remaining: &[usize], bytes: usize) -> Option<usize> {
+    remaining
+        .iter()
+        .enumerate()
+        .max_by_key(|&(i, &r)| (r, std::cmp::Reverse(i)))
+        .filter(|&(_, &r)| r >= bytes)
+        .map(|(i, _)| i)
+}
+
+/// One line describing an owner map: per-device resident counts in ascending
+/// device order (`device 0: 96, device 1: 94`). The startup banner wants "how
+/// did the split actually land" as one readable string.
+#[cfg(feature = "cuda")]
+fn owner_summary(owner: &HashMap<(usize, usize), i32>) -> String {
+    let mut counts: BTreeMap<i32, usize> = BTreeMap::new();
+    for d in owner.values() {
+        *counts.entry(*d).or_insert(0) += 1;
+    }
+    if counts.is_empty() {
+        return "nothing resident".to_string();
+    }
+    counts.iter().map(|(d, n)| format!("device {d}: {n}")).collect::<Vec<_>>().join(", ")
 }
 
 /// Bytes one resident expert actually occupies in VRAM.
@@ -1027,6 +1098,7 @@ mod gpu_residency_tests {
     use super::real::GpuTier;
     use crate::testkit::build_tiny_model;
     use peregrine_core::{Cfg, Error, SafeTensors};
+    use std::collections::HashSet;
 
     use crate::gpu_test_lock::gpu_guard;
 
@@ -1168,11 +1240,130 @@ mod gpu_residency_tests {
         assert!(tier.has(1, 0) || tier.has(2, 0), "int4 residency spans the sparse layers");
         Ok(())
     }
+
+    #[test]
+    fn owner_grouped_compute_matches_the_direct_dispatch() -> Result<(), Error> {
+        // The owner-grouped dispatch must be invisible: `compute` scatters
+        // per-expert outputs back into job order, so its result has to equal the
+        // direct `expert_group` call per expert, bit for bit, on any device
+        // count. Run on one device here; the two-device twin below covers the
+        // spread.
+        let _g = gpu_guard();
+        let dir = std::env::temp_dir().join(format!("peregrine_ownergroup_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        build_tiny_model(&dir)?;
+        let st = SafeTensors::open(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+        let tier = GpuTier::build(&st, &cfg, 0, &[])?;
+        let Some(tier) = tier else {
+            std::fs::remove_dir_all(&dir)?;
+            return Ok(()); // no CUDA device on this host → skip
+        };
+        let hidden = cfg.hidden as usize;
+        let layer = cfg.first_dense as usize; // first sparse layer: residents exist here
+        let mut r = Lcg(0x07E5);
+        let jobs: Vec<(usize, Vec<f32>)> = (0..cfg.n_experts as usize)
+            .filter(|&e| tier.has(layer, e))
+            .map(|e| {
+                // Two gathered rows per expert, so the row-splitting inside the
+                // group dispatch is exercised, not just the single-row case.
+                (e, (0..2 * hidden).map(|_| r.f()).collect())
+            })
+            .collect();
+        let got = tier.compute(layer, &jobs, hidden);
+        std::fs::remove_dir_all(&dir)?;
+        let got = got?;
+        assert_eq!(got.len(), jobs.len());
+        for ((e, xg), out) in jobs.iter().zip(&got) {
+            // Direct dispatch of this one expert — the pre-partitioning path.
+            let ge =
+                tier.expert_for_test(layer, *e).ok_or_else(|| Error::Format("resident vanished".into()))?;
+            let rows = (xg.len() / hidden) as i32;
+            let want = peregrine_cuda::expert_group(&[ge], &[rows], xg, hidden)?;
+            assert_eq!(
+                out.len(),
+                want.len(),
+                "expert {e}: grouped output must keep the direct path's shape"
+            );
+            assert_eq!(&want, out, "expert {e}: grouping must not change a single bit");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn two_devices_partition_residency_and_agree_bit_for_bit() -> Result<(), Error> {
+        // The scale-out-design §1 acceptance test, hardware-gated: across TWO
+        // devices the same heat table and budget must produce (a) a placement
+        // that actually spans both cards — different from the one-device shape —
+        // and (b) outputs identical to that device's own dispatch. Skips on any
+        // box with fewer than two usable devices rather than pretending.
+        //
+        // `gpu_guard` serializes against every other GPU test AND keeps the env
+        // write below process-local for their duration.
+        let _g = gpu_guard();
+        if peregrine_cuda::probe_device_count() < 2 {
+            return Ok(());
+        }
+        let dir = std::env::temp_dir().join(format!("peregrine_twodev_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        build_tiny_model(&dir)?;
+        let st = SafeTensors::open(&dir)?;
+        let cfg = Cfg::load(&dir)?;
+        let prev = std::env::var("COLI_GPU_DEVICES").ok();
+        std::env::set_var("COLI_GPU_DEVICES", "cuda:0,cuda:1");
+        let built = GpuTier::build(&st, &cfg, 0, &[]);
+        match prev {
+            Some(v) => std::env::set_var("COLI_GPU_DEVICES", v),
+            None => std::env::remove_var("COLI_GPU_DEVICES"),
+        }
+        let tier = built?;
+        std::fs::remove_dir_all(&dir)?;
+        let Some(tier) = tier else {
+            return Ok(()); // second device listed but not initializable → skip
+        };
+        let tier = &tier;
+        assert!(tier.devices().len() >= 2, "both requested devices must be initialized");
+        // (a) the partition is real: residents on both sides of the owner map.
+        let owners: HashSet<i32> = (cfg.first_dense as usize..cfg.n_layers as usize)
+            .flat_map(|l| (0..cfg.n_experts as usize).filter_map(move |e| tier.owner_of(l, e)))
+            .collect();
+        assert!(owners.len() >= 2, "residency must span both devices, got {owners:?}");
+        // (b) compute through the multi-device gather equals per-expert truth.
+        let hidden = cfg.hidden as usize;
+        let layer = cfg.first_dense as usize;
+        let mut r = Lcg(0x7EC0);
+        let jobs: Vec<(usize, Vec<f32>)> = (0..cfg.n_experts as usize)
+            .filter(|&e| tier.has(layer, e))
+            .map(|e| (e, (0..hidden).map(|_| r.f()).collect()))
+            .collect();
+        let outs = tier.compute(layer, &jobs, hidden)?;
+        for ((e, xg), out) in jobs.iter().zip(&outs) {
+            let ge =
+                tier.expert_for_test(layer, *e).ok_or_else(|| Error::Format("resident vanished".into()))?;
+            let rows = (xg.len() / hidden) as i32;
+            let want = peregrine_cuda::expert_group(&[ge], &[rows], xg, hidden)?;
+            assert_eq!(&want, out, "two-device gather must be bit-identical to direct dispatch");
+        }
+        Ok(())
+    }
+    /// Tiny deterministic RNG for test inputs (same shape as the fixtures in
+    /// `peregrine-cuda`'s own GPU tests).
+    struct Lcg(u64);
+    impl Lcg {
+        fn f(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        }
+    }
 }
 
 #[cfg(test)]
 mod placement_tests {
-    use super::plan_residency;
+    use super::{partition_placement, pick_device, plan_residency};
     use std::collections::BTreeSet;
 
     #[test]
@@ -1379,11 +1570,57 @@ mod placement_tests {
         let top = super::rank_by_heat(&counts, n_layers, first_dense, n_experts, 2);
         assert_eq!(top, vec![(5, 9), (3, 1)], "hottest experts must rank first");
     }
+
+    #[test]
+    fn partition_balances_by_most_room_and_breaks_ties_low() {
+        // Two equal budgets: the walk alternates, because after device 0 takes
+        // the first expert it has less room and device 1 wins the next pick.
+        let placement = [(0, 0), (0, 1), (1, 0), (1, 1)];
+        let assigned = partition_placement(&placement, &[300, 300], |_| 100);
+        assert_eq!(
+            assigned,
+            vec![((0, 0), 0), ((0, 1), 1), ((1, 0), 0), ((1, 1), 1)],
+            "equal budgets must alternate hottest-first"
+        );
+        // A bigger first budget keeps winning until its lead is spent.
+        let assigned = partition_placement(&placement, &[400, 200], |_| 100);
+        assert_eq!(assigned.iter().filter(|(_, d)| *d == 0).count(), 3, "the larger budget absorbs the skew");
+    }
+
+    #[test]
+    fn partition_truncates_at_the_first_non_fit_and_is_deterministic() {
+        // One big card, one small: both first experts land on the big one
+        // (most room), then the third needs more than either has left, so the
+        // walk stops there — later (colder) candidates must not be considered,
+        // which is exactly the single-device truncation rule generalized.
+        let placement = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let size = |&(_, e): &(usize, usize)| if e == 2 { 900 } else { 100 };
+        let assigned = partition_placement(&placement, &[200, 1000], size);
+        assert_eq!(
+            assigned,
+            vec![((0, 0), 1), ((0, 1), 1)],
+            "expert (0,2) fits nowhere at its real size, so the prefix stops at two"
+        );
+        // Same inputs, same owner map — the property a 1-vs-2-device A/B needs.
+        assert_eq!(assigned, partition_placement(&placement, &[200, 1000], size));
+        // Degenerate shapes.
+        assert!(partition_placement(&[], &[100], |_| 1).is_empty());
+        assert!(partition_placement(&placement, &[0, 0], |_| 1).is_empty());
+    }
+
+    #[test]
+    fn pick_device_takes_most_room_then_lowest_index() {
+        assert_eq!(pick_device(&[10, 20, 30], 5), Some(2));
+        assert_eq!(pick_device(&[10, 30, 30], 5), Some(1), "ties go to the lowest index");
+        assert_eq!(pick_device(&[10, 20, 30], 31), None, "nothing fits → None, never a wrong card");
+        assert_eq!(pick_device(&[], 0), None);
+        assert_eq!(pick_device(&[7], 7), Some(0), "an exact fit counts as a fit");
+    }
 }
 
 #[cfg(feature = "cuda")]
 mod real {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use peregrine_core::{Cfg, Error, SafeTensors};
     use peregrine_cuda::GpuExpert;
@@ -1499,14 +1736,24 @@ mod real {
     }
 
     pub struct GpuTier {
-        device: i32,
+        /// Every device this process initialized for the tier, in the order
+        /// [`super::devices::selected_devices`] listed them. One device is the
+        /// historical shape and behaves exactly as before; more than one turns
+        /// the tier into a partitioned residency (see `owner`).
+        devices: Vec<i32>,
         experts: HashMap<(usize, usize), GpuExpert>,
+        /// Which device holds each resident — the owner map from
+        /// `docs/scale-out-design.md` §1. The key set is exactly
+        /// [`Self::experts`]'s (they are inserted and removed together), so
+        /// residency questions go to `experts` and *placement* questions to this.
+        owner: HashMap<(usize, usize), i32>,
         capacity: usize,
-        /// VRAM the resident set may occupy. `capacity` alone could not express
-        /// this once adaptive precision existed: an f32-promoted expert is ~8×
-        /// its int4 size, so "N experts" silently became "up to 8N experts'
-        /// worth of VRAM" and `reheat` OOM'd every generation.
-        budget_bytes: usize,
+        /// VRAM each device's resident set may occupy, same order as
+        /// [`Self::devices`]. Per device, because VRAM is per device: an f32
+        /// promotion (~8× its int4 size) on card 0 cannot be paid out of card 1.
+        /// The sum is the aggregate a placement is solved against; the split is
+        /// what keeps it honest.
+        budgets: Vec<usize>,
         /// Per-expert footprint in each residency format, `(int4, f32)`.
         expert_bytes: (usize, usize),
         int4: bool,
@@ -1756,11 +2003,13 @@ mod real {
         }
 
         /// Build by uploading as many routed experts as fit `free VRAM − headroom`,
-        /// placed by the heat/bytes knapsack over `counts`. `int4` uploads per-row
-        /// int4 weights directly (~8× denser), falling back to dequantized f32 per
-        /// expert for sources that aren't per-row int4. `Ok(None)` when CUDA is
-        /// unavailable or nothing fits. Takes `int4` and `counts` explicitly so it
-        /// is testable without racing process env.
+        /// placed by the heat/bytes knapsack over `counts`, **partitioned across
+        /// every device** [`super::devices::selected_devices`] returns (one device
+        /// is the historical shape and behaves exactly as before). `int4` uploads
+        /// per-row int4 weights directly (~8× denser), falling back to dequantized
+        /// f32 per expert for sources that aren't per-row int4. `Ok(None)` when no
+        /// requested device can be initialized or nothing fits. Takes `int4` and
+        /// `counts` explicitly so it is testable without racing process env.
         pub fn build_with(
             st: &SafeTensors,
             cfg: &Cfg,
@@ -1768,11 +2017,20 @@ mod real {
             int4: bool,
             counts: &[u32],
         ) -> Result<Option<GpuTier>, Error> {
-            if peregrine_cuda::init(&[0]) < 1 {
+            let devices = crate::devices::selected_devices();
+            if devices.is_empty() {
+                eprintln!(
+                    "peregrine: COLI_GPU_DEVICES names no usable GPU — building without a VRAM tier \
+                     (see docs/gpu-vendors.md)"
+                );
                 return Ok(None);
             }
-            let device = 0;
-            let (free, _total) = peregrine_cuda::mem_info(device)?;
+            // All-or-nothing on the C side (`coli_cuda_init` resets to zero
+            // contexts if any listed device fails), so success here covers the
+            // whole list.
+            if peregrine_cuda::init(&devices) != 1 {
+                return Ok(None);
+            }
             let hidden = cfg.hidden as usize;
             let inter = cfg.moe_inter as usize;
             // The two possible per-expert costs; which one an expert actually
@@ -1790,7 +2048,7 @@ mod real {
             // whenever init partially fails, and that difference is exactly what
             // a "the GPU tier is smaller than I asked for" report needs.
             eprintln!(
-                "peregrine: CUDA contexts initialized: {} (device {device})",
+                "peregrine: CUDA contexts initialized: {} (devices {devices:?})",
                 peregrine_cuda::device_count()
             );
             if int4 && !raw_int4 {
@@ -1799,12 +2057,22 @@ mod real {
                      int4 — they upload dequantized to f32 (8x), so the VRAM plan is sized for f32"
                 );
             }
-            let budget = free.saturating_sub(headroom_bytes);
+            // Headroom is PER DEVICE: each card keeps its own slice for
+            // activations/context, so two cards reserve twice in absolute terms —
+            // which is the honest reading of what the knob always meant.
+            let mut budgets = Vec::with_capacity(devices.len());
+            for &d in &devices {
+                let (free, _total) = peregrine_cuda::mem_info(d)?;
+                budgets.push(free.saturating_sub(headroom_bytes));
+            }
+            let budget: usize = budgets.iter().sum();
 
             // Heat-density knapsack over the persisted routing counts. On a cold
             // table (no `route_stats.json`, or a fingerprint mismatch) this falls
             // back internally to the same round-robin `plan_residency` placement,
-            // so a first run is byte-for-byte what it always was.
+            // so a first run is byte-for-byte what it always was. Solved over the
+            // AGGREGATE budget; the device split happens next, in
+            // `partition_placement`.
             let placement = super::solve_residency_sized(
                 counts,
                 cfg.n_layers as usize,
@@ -1825,42 +2093,47 @@ mod real {
                     }
                 },
             );
-            let mut capacity = placement.len(); // expert-count view of the budget
+            // Split the heat-ordered placement across devices: hottest first,
+            // each to the device with the most room left. Pure and deterministic
+            // (ties break to the lowest index), so the same heat table and the
+            // same budgets always produce the same owner map — and when something
+            // stops fitting, truncation matches the single-device loop it
+            // replaces: everything after the first non-fit is colder anyway.
+            let assigned = super::partition_placement(&placement, &budgets, |(layer, e)| {
+                if int4 && expert_is_per_row_int4(st, cfg, *layer, *e) {
+                    int4_bytes
+                } else {
+                    f32_bytes
+                }
+            });
+            let mut capacity = assigned.len(); // expert-count view of the budget
             let mut experts = HashMap::new();
             let mut precision: HashMap<(usize, usize), bool> = HashMap::new();
             let mut forced_f32: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-            // Track bytes as uploaded, not as planned: an expert that falls back
-            // from int4 to f32 costs 8× what the placement budgeted for it, so a
-            // few fallbacks would otherwise overrun VRAM.
-            let mut used = 0usize;
-            // Uploads whose DMA is still running. Nothing here evicts, so the
-            // lane can run `upload_depth()` experts deep: expert N's copy to
-            // VRAM overlaps expert N+1's read off disk.
-            let mut pending: Vec<HostStaging> = Vec::new();
+            let mut owner: HashMap<(usize, usize), i32> = HashMap::with_capacity(capacity);
+            // Uploads whose DMA is still running, kept PER DEVICE —
+            // `stream_sync` drains one card, so a shared queue would wait on (and
+            // mark drained) the wrong one. Nothing here evicts, so each lane can
+            // run `upload_depth()` experts deep: expert N's copy to VRAM overlaps
+            // expert N+1's read off disk.
+            let mut pending: Vec<Vec<HostStaging>> = (0..devices.len()).map(|_| Vec::new()).collect();
             let depth = upload_depth();
-            for (layer, e) in placement {
+            for ((layer, e), dev_idx) in assigned {
+                let device = devices[dev_idx];
                 match upload_expert(st, cfg, layer, e, device, int4) {
                     Ok((ge, landed_int4, staging)) => {
                         if let Some(sg) = staging {
-                            pending.push(sg);
-                            if pending.len() >= depth {
-                                if let Err(e_s) = drain_uploads(device, &mut pending) {
+                            pending[dev_idx].push(sg);
+                            if pending[dev_idx].len() >= depth {
+                                if let Err(e_s) = drain_uploads(device, &mut pending[dev_idx]) {
                                     peregrine_io::note_advisory_err("gpu upload drain (tier truncated)", &e_s);
                                     capacity = experts.len();
                                     break;
                                 }
                             }
                         }
-                        let bytes = if landed_int4 { int4_bytes } else { f32_bytes };
-                        if used.saturating_add(bytes) > budget {
-                            // This one doesn't fit at its real size. Drop it and
-                            // stop — the placement is heat-ordered, so everything
-                            // after it is colder and no more valuable.
-                            capacity = experts.len();
-                            break;
-                        }
-                        used += bytes;
                         experts.insert((layer, e), ge);
+                        owner.insert((layer, e), device);
                         precision.insert((layer, e), landed_int4);
                         if int4 && !landed_int4 {
                             forced_f32.insert((layer, e)); // source can't be int4 — don't re-ask
@@ -1879,10 +2152,12 @@ mod real {
             }
             // Before anything reads these weights or drops their host buffers.
             // `HostStaging::drop` would cover the second on its own; doing it
-            // here covers the first as well, and does it in one sync instead of
-            // one per buffer.
-            if let Err(e_s) = drain_uploads(device, &mut pending) {
-                peregrine_io::note_advisory_err("gpu upload drain (final)", &e_s);
+            // here covers the first as well, and does it once per device instead
+            // of once per buffer.
+            for (idx, q) in pending.iter_mut().enumerate() {
+                if let Err(e_s) = drain_uploads(devices[idx], q) {
+                    peregrine_io::note_advisory_err("gpu upload drain (final)", &e_s);
+                }
             }
 
             if experts.is_empty() {
@@ -1908,11 +2183,17 @@ mod real {
                 // Registered before the value exists so the matching `Drop` can
                 // never run against a count that was not incremented.
                 LIVE_TIERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                eprintln!(
+                    "peregrine: GPU tier partitioned across {} device(s): {}",
+                    devices.len(),
+                    super::owner_summary(&owner)
+                );
                 Ok(Some(GpuTier {
-                    device,
+                    devices,
                     experts,
+                    owner,
                     capacity,
-                    budget_bytes: budget,
+                    budgets,
                     expert_bytes: (int4_bytes, f32_bytes),
                     int4,
                     adaptive_f32_frac,
@@ -2003,25 +2284,26 @@ mod real {
             pinned_bytes: usize,
         ) -> Result<usize, Error> {
             let counts = heat.counts;
-            // Re-read free VRAM each generation: another process may have taken
-            // some since load, and the budget must reflect what is available now
-            // (plus what this tier already holds, which it is free to reuse).
-            let held: usize = self
-                .experts
-                .keys()
-                .map(|k| {
-                    let int4 = self.precision.get(k).copied().unwrap_or(self.int4);
-                    if int4 { self.expert_bytes.0 } else { self.expert_bytes.1 }
-                })
-                .sum();
-            let budget = match peregrine_cuda::mem_info(self.device) {
-                Ok((free, _)) => self.budget_bytes.min(free.saturating_add(held)),
-                // Query failure: keep the load-time budget rather than guessing.
-                Err(e) => {
-                    peregrine_io::note_advisory_err("gpu mem_info during reheat", &e);
-                    self.budget_bytes
-                }
-            };
+            // Re-read free VRAM each generation, per device: another process may
+            // have taken some since load, and the budget must reflect what is
+            // available now (plus what this tier already holds there, which it is
+            // free to reuse). Summing per-device budgets is the aggregate the
+            // ranking is solved against; each device's own figure still governs
+            // where an upload lands (see the targeting below).
+            let mut budget = 0usize;
+            for &d in &self.devices {
+                let held = self.held_on(d);
+                let cap = self.budget_of(d);
+                budget += match peregrine_cuda::mem_info(d) {
+                    Ok((free, _)) => cap.min(free.saturating_add(held)),
+                    // Query failure: keep that device's load-time budget rather
+                    // than guessing.
+                    Err(e) => {
+                        peregrine_io::note_advisory_err("gpu mem_info during reheat", &e);
+                        cap
+                    }
+                };
+            }
             // What the ranking may spend: the tier's budget less the reservation.
             // `held` above already counts the pinned residents, so this is the
             // one place their bytes are taken out of the ranking's reach.
@@ -2097,6 +2379,7 @@ mod real {
             want_set.extend(self.pinned.iter().copied());
             // evict experts that cooled off — their `Drop` frees the VRAM slot
             self.experts.retain(|k, _| want_set.contains(k));
+            self.owner.retain(|k, _| want_set.contains(k));
             self.precision.retain(|k, _| want_set.contains(k));
             // `forced_f32` is a property of the *source*, not of residency, but
             // pruning it with the rest keeps it bounded by the resident set instead
@@ -2125,8 +2408,16 @@ mod real {
             let mut upload_quota = super::admit_uploads(&upload_costs, super::pcie_budget_bytes());
 
             // At most one admission in flight here: each iteration frees the
-            // victim's VRAM, and that must not race a copy still running.
-            let mut pending: Vec<HostStaging> = Vec::new();
+            // victim's VRAM, and that must not race a copy still running. The
+            // in-flight queue is per device for the same reason as at build.
+            let mut pending: Vec<Vec<HostStaging>> = (0..self.devices.len()).map(|_| Vec::new()).collect();
+            // Where each device's remaining room stood after the eviction pass:
+            // the upload target for every admission this generation, hottest
+            // expert first, each to the card with the most space left (the same
+            // rule `partition_placement` used at build, so residency migrates
+            // toward the split a cold rebuild would have chosen rather than
+            // drifting away from it).
+            let mut remaining: Vec<usize> = self.devices.iter().map(|&d| self.free_on(d)).collect();
             for (layer, e) in want {
                 let key = (layer, e);
                 let want_int4 = precision_of.get(&key).copied().unwrap_or(self.int4);
@@ -2144,6 +2435,14 @@ mod real {
                     // that stays non-resident simply streams from the CPU lane.
                     break;
                 }
+                let bytes = if want_int4 { int4_bytes } else { f32_bytes };
+                // Most-room-first targeting; ties to the lowest device index.
+                let Some(dev_idx) = super::pick_device(&remaining, bytes) else {
+                    // Nowhere left at this expert's real size. Same stop rule as
+                    // the byte budget above: later candidates are colder.
+                    break;
+                };
+                let device = self.devices[dev_idx];
                 upload_quota -= 1;
                 // Re-upload on a format change (remove first so the old tensor's
                 // Drop frees its VRAM before the new allocation).
@@ -2151,19 +2450,21 @@ mod real {
                 // eviction below must not race a copy that is still running, and
                 // this is also what lets that copy overlap this iteration's
                 // planning work.
-                if let Err(e_s) = drain_uploads(self.device, &mut pending) {
+                if let Err(e_s) = drain_uploads(device, &mut pending[dev_idx]) {
                     peregrine_io::note_advisory_err("gpu reheat upload drain", &e_s);
                 }
                 self.experts.remove(&key);
-                match upload_expert(st, cfg, layer, e, self.device, want_int4) {
+                match upload_expert(st, cfg, layer, e, device, want_int4) {
                     // Record the format that actually landed, not the one asked for.
                     Ok((ge, landed_int4, staging)) => {
-                        pending.extend(staging);
+                        pending[dev_idx].extend(staging);
                         self.experts.insert(key, ge);
+                        self.owner.insert(key, device);
                         self.precision.insert(key, landed_int4);
                         if want_int4 && !landed_int4 {
                             self.forced_f32.insert(key);
                         }
+                        remaining[dev_idx] = remaining[dev_idx].saturating_sub(bytes);
                     }
                     // Keep the generation that did upload instead of bailing with
                     // the tier holding fewer experts than it thinks and no record
@@ -2176,8 +2477,10 @@ mod real {
                     }
                 }
             }
-            if let Err(e_s) = drain_uploads(self.device, &mut pending) {
-                peregrine_io::note_advisory_err("gpu reheat upload drain (final)", &e_s);
+            for (idx, q) in pending.iter_mut().enumerate() {
+                if let Err(e_s) = drain_uploads(self.devices[idx], q) {
+                    peregrine_io::note_advisory_err("gpu reheat upload drain (final)", &e_s);
+                }
             }
             Ok(self.experts.len())
         }
@@ -2210,7 +2513,7 @@ mod real {
                 "COLI_MTP_PIN_VRAM_MB",
                 "GPU tier",
                 req.budget,
-                self.budget_bytes,
+                self.total_budget(),
                 &CLAMPED,
             );
             let (int4_bytes, f32_bytes) = self.expert_bytes;
@@ -2237,6 +2540,7 @@ mod real {
             for k in std::mem::take(&mut self.pinned) {
                 if !want.contains(&k) {
                     self.experts.remove(&k);
+                    self.owner.remove(&k);
                     self.precision.remove(&k);
                     self.forced_f32.remove(&k);
                 }
@@ -2265,7 +2569,19 @@ mod real {
                 .filter(|k| !self.experts.contains_key(k))
                 .map(|&(_, e)| bytes_of(e))
                 .sum();
-            self.evict_coldest_for(need, heat, cfg.n_experts as usize);
+            // Pins land on ONE device — the emptiest — rather than spreading:
+            // a reservation is a handful of experts, and keeping them together
+            // keeps the eviction that makes room on one card's ledger instead of
+            // spraying victims across every device for the same few bytes.
+            let target_idx = self
+                .devices
+                .iter()
+                .enumerate()
+                .max_by_key(|&(i, &d)| (self.free_on(d), std::cmp::Reverse(i)))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let target = self.devices[target_idx];
+            self.evict_coldest_for(need, target, heat, cfg.n_experts as usize);
             let mut bytes = 0usize;
             let mut pending: Vec<HostStaging> = Vec::new();
             for key in order {
@@ -2277,10 +2593,11 @@ mod real {
                     self.pinned.insert(key);
                     continue;
                 }
-                match upload_expert(st, cfg, key.0, key.1, self.device, self.int4) {
+                match upload_expert(st, cfg, key.0, key.1, target, self.int4) {
                     Ok((ge, landed_int4, staging)) => {
                         pending.extend(staging);
                         self.experts.insert(key, ge);
+                        self.owner.insert(key, target);
                         self.precision.insert(key, landed_int4);
                         if self.int4 && !landed_int4 {
                             self.forced_f32.insert(key);
@@ -2295,36 +2612,43 @@ mod real {
                     }
                 }
             }
-            if let Err(e_s) = drain_uploads(self.device, &mut pending) {
+            if let Err(e_s) = drain_uploads(target, &mut pending) {
                 peregrine_io::note_advisory_err("gpu mtp pin upload drain", &e_s);
             }
             bytes
         }
 
-        /// Evict the coldest **non-pinned** residents until `need` more bytes fit
-        /// inside the tier's budget. Returns nothing: a tier that cannot make the
-        /// room simply ends up with fewer pins, which the upload loop already
-        /// degrades to correctly.
+        /// Evict the coldest **non-pinned** residents **on `device`** until `need`
+        /// more bytes fit inside that device's budget. Returns nothing: a tier that
+        /// cannot make the room simply ends up with fewer pins, which the upload
+        /// loop already degrades to correctly.
         ///
-        /// Ranked by the same heat view the re-plan ranks by, and tie-broken on
-        /// the key, so a victim here is a victim there — the two passes cannot
-        /// disagree about which expert is worth least and swap it back and forth
-        /// between generations.
-        fn evict_coldest_for(&mut self, need: usize, heat: &super::HeatView, n_experts: usize) {
+        /// Victims come only from the device that must absorb the bytes: freeing
+        /// VRAM elsewhere does not help the upload that triggered this. Ranked by
+        /// the same heat view the re-plan ranks by, and tie-broken on the key, so
+        /// a victim here is a victim there — the two passes cannot disagree about
+        /// which expert is worth least and swap it back and forth between
+        /// generations.
+        fn evict_coldest_for(&mut self, need: usize, device: i32, heat: &super::HeatView, n_experts: usize) {
             if need == 0 {
                 return;
             }
             let size_of = |k: &(usize, usize), me: &Self| {
                 if me.precision.get(k).copied().unwrap_or(me.int4) { me.expert_bytes.0 } else { me.expert_bytes.1 }
             };
-            let held: usize = self.experts.keys().map(|k| size_of(k, self)).sum();
-            let mut over = (held + need).saturating_sub(self.budget_bytes);
+            let held: usize =
+                self.experts.keys().filter(|k| self.owner.get(*k) == Some(&device)).map(|k| size_of(k, self)).sum();
+            let mut over = (held + need).saturating_sub(self.budget_of(device));
             if over == 0 {
                 return;
             }
             // Coldest first, deterministic on ties.
-            let mut victims: Vec<(usize, usize)> =
-                self.experts.keys().copied().filter(|k| !self.pinned.contains(k)).collect();
+            let mut victims: Vec<(usize, usize)> = self
+                .experts
+                .keys()
+                .copied()
+                .filter(|k| !self.pinned.contains(k) && self.owner.get(k) == Some(&device))
+                .collect();
             let heat_of = |&(l, e): &(usize, usize)| {
                 heat.counts.get(l.saturating_mul(n_experts).saturating_add(e)).copied().unwrap_or(0)
             };
@@ -2335,6 +2659,7 @@ mod real {
                 }
                 let freed = size_of(&k, self);
                 self.experts.remove(&k);
+                self.owner.remove(&k);
                 self.precision.remove(&k);
                 self.forced_f32.remove(&k);
                 over = over.saturating_sub(freed);
@@ -2396,7 +2721,14 @@ mod real {
             let mut quota = super::admit_uploads(&costs, super::pcie_budget_bytes());
             // One admission in flight, for the same reason as the re-plan above:
             // each swap frees the victim's VRAM and must not race a live copy.
+            // Single queue plus a "which device it belongs to" tag: swaps are
+            // one-in-one-out and strictly ordered, so per-device queues would
+            // only ever hold one entry each.
             let mut pending: Vec<HostStaging> = Vec::new();
+            let mut pending_device: Option<i32> = None;
+            // Remaining room per device, kept current across the loop: a victim's
+            // eviction refunds its card before the admission picks its target.
+            let mut remaining: Vec<usize> = self.devices.iter().map(|&d| self.free_on(d)).collect();
             for (victim, admit) in swaps {
                 if quota == 0 {
                     break;
@@ -2408,22 +2740,44 @@ mod real {
                 // and every swap would fail on the last free byte.
                 // The previous admission's copy must finish before this
                 // eviction frees VRAM — see the ordering note above, which the
-                // async lane must not weaken.
-                if let Err(e_s) = drain_uploads(self.device, &mut pending) {
-                    peregrine_io::note_advisory_err("gpu swap upload drain", &e_s);
+                // async lane must not weaken. Drained on whichever device that
+                // admission targeted.
+                if let Some(d) = pending_device.take() {
+                    if let Err(e_s) = drain_uploads(d, &mut pending) {
+                        peregrine_io::note_advisory_err("gpu swap upload drain", &e_s);
+                    }
                 }
+                let victim_dev = self.owner.get(&victim).copied();
                 let evicted = self.experts.remove(&victim);
+                self.owner.remove(&victim);
                 let victim_int4 = self.precision.remove(&victim).unwrap_or(self.int4);
                 self.forced_f32.remove(&victim);
                 drop(evicted);
-                match upload_expert(st, cfg, admit.0, admit.1, self.device, self.int4) {
+                // The victim's card earns its bytes back before the targeting
+                // step below sees `remaining`.
+                if let Some(i) = victim_dev.and_then(|d| self.devices.iter().position(|&x| x == d)) {
+                    remaining[i] += unit;
+                }
+                // The admission lands on whichever device has the most room
+                // now (the victim just freed its card), not necessarily where
+                // the victim lived.
+                let Some(dev_idx) = super::pick_device(&remaining, unit) else {
+                    // No device fits even after the eviction — leave the slot
+                    // empty; the next reheat retries from a consistent state.
+                    break;
+                };
+                let device = self.devices[dev_idx];
+                match upload_expert(st, cfg, admit.0, admit.1, device, self.int4) {
                     Ok((ge, landed_int4, staging)) => {
                         pending.extend(staging);
+                        pending_device = Some(device);
                         self.experts.insert(admit, ge);
+                        self.owner.insert(admit, device);
                         self.precision.insert(admit, landed_int4);
                         if self.int4 && !landed_int4 {
                             self.forced_f32.insert(admit);
                         }
+                        remaining[dev_idx] = remaining[dev_idx].saturating_sub(unit);
                     }
                     // The victim is already gone and its bytes are already freed,
                     // so the tier is one expert short until the next generation
@@ -2445,7 +2799,7 @@ mod real {
                     }
                 }
             }
-            if let Err(e_s) = drain_uploads(self.device, &mut pending) {
+            if let Err(e_s) = pending_device.take().map_or(Ok(()), |d| drain_uploads(d, &mut pending)) {
                 peregrine_io::note_advisory_err("gpu swap upload drain (final)", &e_s);
             }
             Ok(self.experts.len())
@@ -2462,6 +2816,14 @@ mod real {
             self.experts.contains_key(&(layer, e))
         }
 
+        /// Test-only handle on one resident's device tensors, so equivalence
+        /// tests can dispatch an expert directly and compare against the
+        /// grouped path.
+        #[cfg(test)]
+        pub fn expert_for_test(&self, layer: usize, e: usize) -> Option<&GpuExpert> {
+            self.experts.get(&(layer, e))
+        }
+
         /// Number of experts resident (for logging).
         pub fn len(&self) -> usize {
             self.experts.len()
@@ -2472,14 +2834,67 @@ mod real {
             self.experts.is_empty()
         }
 
-        /// The device this tier lives on.
+        /// The first device this tier was built across — where the dense-MLP
+        /// tier and any single-device reporting live. Multi-device tiers use
+        /// [`Self::devices`] / the owner map.
         pub fn device(&self) -> i32 {
-            self.device
+            self.devices.first().copied().unwrap_or(0)
+        }
+
+        /// Every device the tier spans, in init order.
+        pub fn devices(&self) -> &[i32] {
+            &self.devices
+        }
+
+        /// Which device holds `(layer, expert)` — `None` when it is not resident.
+        pub fn owner_of(&self, layer: usize, e: usize) -> Option<i32> {
+            self.owner.get(&(layer, e)).copied()
+        }
+
+        /// The build-time planning budget of `device`.
+        fn budget_of(&self, device: i32) -> usize {
+            let idx = self.devices.iter().position(|&d| d == device).unwrap_or(0);
+            self.budgets.get(idx).copied().unwrap_or(0)
+        }
+
+        /// Bytes `device`'s residents occupy right now (per its owner map).
+        fn held_on(&self, device: i32) -> usize {
+            self.experts
+                .keys()
+                .filter(|k| self.owner.get(*k) == Some(&device))
+                .map(|k| {
+                    if self.precision.get(k).copied().unwrap_or(self.int4) {
+                        self.expert_bytes.0
+                    } else {
+                        self.expert_bytes.1
+                    }
+                })
+                .sum()
+        }
+
+        /// Budget minus held for `device` — what an upload there may spend.
+        fn free_on(&self, device: i32) -> usize {
+            self.budget_of(device).saturating_sub(self.held_on(device))
+        }
+
+        /// Sum of every device's budget — what a residency *ranking* competes
+        /// for. Per-device figures govern only where an upload lands.
+        fn total_budget(&self) -> usize {
+            self.budgets.iter().sum()
         }
 
         /// Compute a batch of this layer's GPU-resident experts. `jobs[k]` is
         /// `(expert index, gathered input rows [nr*hidden])`; returns each
         /// expert's SwiGLU output `[nr*hidden]`, in the same order.
+        ///
+        /// Jobs are grouped by **owner device** and the groups run in parallel —
+        /// one host thread per device, each touching only its own card, which is
+        /// what makes the concurrency safe (per-device contexts and a thread-local
+        /// current-device cache on the C side). One device ⇒ one group ⇒ the
+        /// historical single-call path with no threads at all. The results are
+        /// scattered back into job order, so no timing-dependent ordering can
+        /// reach `concurrent.rs`'s reduce: per-expert outputs are independent
+        /// buffers, never summed across devices here.
         pub fn compute(&self, layer: usize, jobs: &[(usize, Vec<f32>)], hidden: usize) -> Result<Vec<Vec<f32>>, Error> {
             if jobs.is_empty() {
                 return Ok(Vec::new());
@@ -2494,20 +2909,84 @@ mod real {
                     return Err(Error::Format("gpu compute: ragged gathered rows".into()));
                 }
             }
+            let groups = self.group_by_owner(layer, jobs);
+            let mut parts: Vec<Result<Vec<Vec<f32>>, Error>> = Vec::with_capacity(groups.len());
+            if groups.len() == 1 {
+                parts.push(self.compute_group(layer, jobs, &groups[0].1, hidden));
+            } else {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> =
+                        groups.iter().map(|(_, idxs)| s.spawn(move || self.compute_group(layer, jobs, idxs, hidden))).collect();
+                    for h in handles {
+                        match h.join() {
+                            Ok(r) => parts.push(r),
+                            // A worker panicked; resume its unwind rather than
+                            // inventing an error code for it.
+                            Err(e) => std::panic::resume_unwind(e),
+                        }
+                    }
+                });
+            }
+            // Assemble in job order. Parts were collected in ascending-device
+            // order, so even error selection is deterministic (first failing
+            // device wins).
+            let mut out = Vec::with_capacity(jobs.len());
+            for _ in jobs {
+                out.push(Vec::new());
+            }
+            for ((_, idxs), part) in groups.iter().zip(parts) {
+                let part = part?;
+                if part.len() != idxs.len() {
+                    return Err(Error::Format("gpu compute: group returned wrong arity".into()));
+                }
+                for (&job_i, res) in idxs.iter().zip(part) {
+                    out[job_i] = res;
+                }
+            }
+            Ok(out)
+        }
+
+        /// `jobs` grouped by owning device as `(device, job indices)` pairs in
+        /// ASCENDING device order — the order dispatch threads are spawned in and
+        /// partials are folded in, so nothing downstream can observe completion
+        /// order.
+        fn group_by_owner(&self, layer: usize, jobs: &[(usize, Vec<f32>)]) -> Vec<(i32, Vec<usize>)> {
+            let mut groups: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+            for (i, (e, _)) in jobs.iter().enumerate() {
+                groups.entry(self.owner_of(layer, *e).unwrap_or_else(|| self.device())).or_default().push(i);
+            }
+            groups.into_iter().collect()
+        }
+
+        /// One device's slice of [`Self::compute`]: format-partitioned dispatch
+        /// over `idxs` (indices into `jobs`), returning outputs aligned to those
+        /// indices.
+        fn compute_group(
+            &self,
+            layer: usize,
+            jobs: &[(usize, Vec<f32>)],
+            idxs: &[usize],
+            hidden: usize,
+        ) -> Result<Vec<Vec<f32>>, Error> {
+            if idxs.is_empty() {
+                return Ok(Vec::new());
+            }
             // One call per residency format: a single f32 resident in the group
             // would otherwise drop every expert in the call off the int4 fast
             // paths. A homogeneous group still makes exactly one call.
-            let fmt: Vec<bool> =
-                jobs.iter().map(|(e, _)| self.precision.get(&(layer, *e)).copied().unwrap_or(self.int4)).collect();
+            let fmt: Vec<bool> = idxs
+                .iter()
+                .map(|&i| self.precision.get(&(layer, jobs[i].0)).copied().unwrap_or(self.int4))
+                .collect();
             let classes = super::partition_by_format(&fmt);
 
             let mut per_class = Vec::with_capacity(classes.len());
-            for idxs in &classes {
-                let mut refs = Vec::with_capacity(idxs.len());
-                let mut rows = Vec::with_capacity(idxs.len());
+            for cls in &classes {
+                let mut refs = Vec::with_capacity(cls.len());
+                let mut rows = Vec::with_capacity(cls.len());
                 let mut x = Vec::new();
-                for &i in idxs {
-                    let (e, xg) = &jobs[i];
+                for &i in cls {
+                    let (e, xg) = &jobs[idxs[i]];
                     let ge = self
                         .experts
                         .get(&(layer, *e))
@@ -2517,7 +2996,7 @@ mod real {
                     x.extend_from_slice(xg);
                 }
                 let y = self.dispatch_tuned(&refs, &rows, &x, hidden)?;
-                let mut outs = Vec::with_capacity(idxs.len());
+                let mut outs = Vec::with_capacity(cls.len());
                 let mut off = 0usize;
                 for &r in &rows {
                     let n = r as usize * hidden;
@@ -2529,10 +3008,9 @@ mod real {
                 }
                 per_class.push(outs);
             }
-            // Back to job order: `concurrent.rs` zips the returned Vec positionally
-            // against its plans, and the reduce accumulates in that order — so the
-            // permutation must not escape this function.
-            super::scatter_by_index(jobs.len(), &classes, per_class)
+            // Back to job order within the group: the caller scatters by group
+            // index afterwards, so the permutation must not escape this function.
+            super::scatter_by_index(idxs.len(), &classes, per_class)
                 .ok_or_else(|| Error::Format("gpu compute: format partition is not a bijection".into()))
         }
 
@@ -2602,9 +3080,13 @@ mod real {
         /// contributions, instead of interleaving with them in batch-union
         /// order. Where a residency generation spans two formats,
         /// `partition_by_format` splits it again and the class partials are
-        /// added in class order. Both are fixed orders — repeat-stable, and
-        /// pinned as such by `fused_reduce_is_bit_stable_across_repeats` — but
-        /// neither is the host reduce's order, which is why this is a knob.
+        /// added in class order. And where it spans **devices**, each card
+        /// produces its own partial and the fold runs in ascending device order —
+        /// never completion order, which is the one way multi-GPU could make the
+        /// low-order bits a function of which card finished first (the exact
+        /// defect `docs/scale-out-design.md` §1 warns about). All three orders
+        /// are fixed, so repeats are bit-stable; none is the host reduce's order,
+        /// which is why this is a knob.
         pub fn compute_reduced(
             &self,
             layer: usize,
@@ -2643,16 +3125,67 @@ mod real {
             }
             job_at.push(running);
 
+            let groups = self.group_by_owner(layer, jobs);
+            let mut parts: Vec<Result<Vec<f32>, Error>> = Vec::with_capacity(groups.len());
+            if groups.len() == 1 {
+                parts.push(self.reduce_group(layer, jobs, &groups[0].1, hidden, dst, weights, &job_at, s_n));
+            } else {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = groups
+                        .iter()
+                        .map(|(_, idxs)| {
+                            let job_at = job_at.clone();
+                            s.spawn(move || self.reduce_group(layer, jobs, idxs, hidden, dst, weights, &job_at, s_n))
+                        })
+                        .collect();
+                    for h in handles {
+                        match h.join() {
+                            Ok(r) => parts.push(r),
+                            Err(e) => std::panic::resume_unwind(e),
+                        }
+                    }
+                });
+            }
+            // Fold in ASCENDING DEVICE order (`groups` is sorted by device), not
+            // in whichever order the cards finished. See the doc above.
+            for part in parts {
+                let part = part?;
+                if part.len() != acc.len() {
+                    return Err(Error::Format("gpu compute_reduced: short partial".into()));
+                }
+                for (a, p) in acc.iter_mut().zip(&part) {
+                    *a += p;
+                }
+            }
+            Ok(acc)
+        }
+
+        /// One device's slice of [`Self::compute_reduced`]: format-class partials
+        /// summed within the group, returning that group's `[s_n, hidden]` share.
+        #[allow(clippy::too_many_arguments)]
+        fn reduce_group(
+            &self,
+            layer: usize,
+            jobs: &[(usize, Vec<f32>)],
+            idxs: &[usize],
+            hidden: usize,
+            dst: &[usize],
+            weights: &[f32],
+            job_at: &[usize],
+            s_n: usize,
+        ) -> Result<Vec<f32>, Error> {
+            let mut acc = vec![0f32; s_n * hidden];
             let fmt: Vec<bool> =
-                jobs.iter().map(|(e, _)| self.precision.get(&(layer, *e)).copied().unwrap_or(self.int4)).collect();
-            for idxs in &super::partition_by_format(&fmt) {
-                let mut refs = Vec::with_capacity(idxs.len());
-                let mut rows = Vec::with_capacity(idxs.len());
+                idxs.iter().map(|&i| self.precision.get(&(layer, jobs[i].0)).copied().unwrap_or(self.int4)).collect();
+            for cls in &super::partition_by_format(&fmt) {
+                let mut refs = Vec::with_capacity(cls.len());
+                let mut rows = Vec::with_capacity(cls.len());
                 let mut x = Vec::new();
                 let mut cdst = Vec::new();
                 let mut crw = Vec::new();
-                for &i in idxs {
-                    let (e, xg) = &jobs[i];
+                for &i in cls {
+                    let job_i = idxs[i];
+                    let (e, xg) = &jobs[job_i];
                     let ge = self
                         .experts
                         .get(&(layer, *e))
@@ -2660,8 +3193,8 @@ mod real {
                     refs.push(ge);
                     rows.push((xg.len() / hidden) as i32);
                     x.extend_from_slice(xg);
-                    cdst.extend_from_slice(&dst[job_at[i]..job_at[i + 1]]);
-                    crw.extend_from_slice(&weights[job_at[i]..job_at[i + 1]]);
+                    cdst.extend_from_slice(&dst[job_at[job_i]..job_at[job_i + 1]]);
+                    crw.extend_from_slice(&weights[job_at[job_i]..job_at[job_i + 1]]);
                 }
                 let layout = peregrine_cuda::ReduceLayout::build(&cdst, s_n)
                     .ok_or_else(|| Error::Format("gpu compute_reduced: row destination out of range".into()))?;

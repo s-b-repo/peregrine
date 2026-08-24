@@ -1519,6 +1519,11 @@ fn run_bench(batch_args: &[String]) -> Result<(), Error> {
     if let Some(l) = model.io_latency_report() {
         print!("{l}");
     }
+    // Learned per-device bandwidth (COLI_SSD_AWARE_SCHED=1). Same rule: the
+    // scheduler consuming the model is not evidence of it; the numbers are.
+    if let Some(l) = model.ssd_clock_report() {
+        print!("{l}");
+    }
     Ok(())
 }
 

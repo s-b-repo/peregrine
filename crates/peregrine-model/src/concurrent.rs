@@ -481,6 +481,19 @@ fn expert_regions(e: &ExpertEntry, direct: bool) -> Vec<(RawFd, u64, usize)> {
     out
 }
 
+/// Total bytes [`expert_regions`] would read for one expert — the same merge
+/// branch without building the region vec. Used by the SSD-aware scheduler to
+/// price a plan; sizes are identical on the direct and buffered paths by
+/// construction (`w_len`/`s_len` do not depend on which fd serves them).
+fn expert_bytes(e: &ExpertEntry) -> u64 {
+    if expert_merge_enabled() {
+        if let (Some(w), Some(s)) = (e.w_run, e.s_run) {
+            return w.len as u64 + s.len as u64;
+        }
+    }
+    e.plans.iter().map(|t| t.w_len as u64 + t.s_len as u64).sum()
+}
+
 /// Rebuild an [`peregrine_io::ExpertSlab`] from whatever [`expert_regions`] asked
 /// for: either the six unmerged regions in order, or two coalesced extents that
 /// get carved into six refcounted windows.
@@ -1630,11 +1643,30 @@ pub fn moe_forward_concurrent(
     // own lock-free cursor; rings claim from their home group first and steal
     // device-pure windows from the others when it runs dry, so no expert is
     // read twice and no ring idles while any device still has work.
+    //
+    // SSD-aware scheduling (`COLI_SSD_AWARE_SCHED`) then reorders *inside* each
+    // group shortest-job-first by predicted service time, so a claim window's
+    // small experts complete while its large ones are still on the wire and the
+    // CPU pool starts earlier. Group membership is untouched.
+    let ssd_aware = crate::ssdclock::enabled() && ctx.fd_devices.is_some();
+    let plan_bytes: Vec<u64> = if ssd_aware {
+        plans.iter().map(|p| expert_bytes(&p.entry)).collect()
+    } else {
+        Vec::new()
+    };
     let claim_groups: Vec<Vec<usize>> = match ctx.fd_devices {
-        Some(table) if reactors.len() > 1 => device_claim_groups(
-            plans.iter().map(|p| p.entry.w_run.map_or(p.entry.plans[0].w_fd, |r| r.fd)),
-            table,
-        ),
+        Some(table) if reactors.len() > 1 => {
+            let mut groups = device_claim_groups(
+                plans.iter().map(|p| p.entry.w_run.map_or(p.entry.plans[0].w_fd, |r| r.fd)),
+                table,
+            );
+            if ssd_aware {
+                for g in &mut groups {
+                    crate::ssdclock::group_order_ssjf(g, &plan_bytes);
+                }
+            }
+            groups
+        }
         _ => vec![(0..plans.len()).collect()],
     };
     let group_cursors: Vec<AtomicUsize> =
@@ -1646,7 +1678,31 @@ pub fn moe_forward_concurrent(
     // the lane count falls back to what `io_rings()` would have built.
     let n_rings = if reactors.is_empty() { crate::model::io_rings() } else { reactors.len() }.max(1);
     let group_sizes: Vec<usize> = claim_groups.iter().map(|g| g.len()).collect();
-    let homes = ring_homes(&group_sizes, n_rings);
+    // Ring homes: proportional to claim **count** historically, to predicted
+    // **seconds** under the SSD-aware scheduler — a slow device earns more
+    // rings per byte. Identical weights until the clock has measured a spread,
+    // so the knob is neutral on cold start and adapts as windows land.
+    let home_weights: Vec<usize> = if ssd_aware {
+        match ctx.fd_devices {
+            Some(table) => claim_groups
+                .iter()
+                .map(|g| {
+                    let dev = g
+                        .first()
+                        .and_then(|&i| plans.get(i))
+                        .map(|p| p.entry.w_run.map_or(p.entry.plans[0].w_fd, |r| r.fd))
+                        .and_then(|fd| table.get(&fd).copied())
+                        .unwrap_or(u8::MAX);
+                    let ms = crate::ssdclock::group_weight_ms(g, &plan_bytes, crate::ssdclock::bw(dev));
+                    usize::try_from(ms).unwrap_or(usize::MAX)
+                })
+                .collect(),
+            None => group_sizes.clone(),
+        }
+    } else {
+        group_sizes.clone()
+    };
+    let homes = ring_homes(&home_weights, n_rings);
     let rings_in: Vec<usize> = (0..claim_groups.len())
         .map(|g| homes.iter().filter(|&&h| h == g).count())
         .collect();
@@ -1671,6 +1727,21 @@ pub fn moe_forward_concurrent(
     // default) admits everything.
     let heat_ref = ctx.heat;
     let admit_min_heat = cache_admit_min_heat();
+    // SSD-clock feed: price one completed claim window against its device.
+    // The span is submit→complete as seen by the claiming ring thread, queue
+    // wait included — a relative-speed signal, not device service time (the
+    // module doc says why that is still the right quantity to learn on).
+    let observe_window = |chunk: &[&EPlan], elapsed: std::time::Duration| {
+        if !ssd_aware {
+            return;
+        }
+        let Some(table) = ctx.fd_devices else { return };
+        let Some(p0) = chunk.first() else { return };
+        let fd = p0.entry.w_run.map_or(p0.entry.plans[0].w_fd, |r| r.fd);
+        let Some(&dev) = table.get(&fd) else { return };
+        let bytes: u64 = chunk.iter().map(|p| expert_bytes(&p.entry)).sum();
+        crate::ssdclock::observe(dev, bytes, elapsed);
+    };
     // Completion lane vs wave, resolved once: pread/regbuf are wave-shaped
     // measurement arms whose request shape *is* what they measure, so only the
     // uring engine streams per-expert. `COLI_IO_COMPLETION=0` is the escape
@@ -1834,6 +1905,7 @@ pub fn moe_forward_concurrent(
                         if let Some(t) = timings_ref {
                             t.add_io(t_io.elapsed().as_micros() as u64);
                         }
+                        observe_window(&chunk_plans, t_io.elapsed());
                         match streamed {
                             Ok(true) => continue,
                             // A dropped receiver means the collector saw an
@@ -1861,6 +1933,7 @@ pub fn moe_forward_concurrent(
                     if let Some(t) = timings_ref {
                         t.add_io(t_io.elapsed().as_micros() as u64);
                     }
+                    observe_window(&chunk_plans, t_io.elapsed());
                     let slabs: Vec<Bytes3> = match slabs {
                         Ok(s) => s,
                         Err(e) => {
@@ -2518,6 +2591,121 @@ mod tests {
         assert_eq!(blind.len(), grouped.len());
         for (i, (a, b)) in blind.iter().zip(&grouped).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "diverged at f32 index {i}");
+        }
+        std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// The same correctness argument for the SSD-aware scheduler: SJF claim
+    /// order inside device-pure groups plus seconds-weighted ring homing must
+    /// leave the token output **bit-identical** — claims may land in any
+    /// order because the reduce is `pos`-keyed.
+    ///
+    /// Both arms live in one test on purpose: `COLI_SSD_AWARE_SCHED` is read
+    /// per forward (not latched), and env is process-global state that two
+    /// concurrent tests would race. The clock may carry samples from other
+    /// tests running in this process; that is fine — the assertion is exactly
+    /// that *any* learned state leaves the output untouched.
+    #[test]
+    fn ssd_aware_scheduling_is_bit_identical_to_the_blind_cursor() -> Result<(), Error> {
+        use peregrine_core::Cfg;
+
+        let dir = std::env::temp_dir()
+            .join(format!("peregrine_ssdclock_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
+        }
+        crate::testkit::build_tiny_model_seeded(&dir, 0x55DCA)?;
+        let cfg = Cfg::load(&dir)?;
+        let st = SafeTensors::open(&dir)?;
+
+        let reactors = match (Reactor::new(32), Reactor::new(32)) {
+            (Ok(a), Ok(b)) => vec![Mutex::new(a), Mutex::new(b)],
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
+                return Ok(());
+            }
+        };
+        // Synthetic two-ordinal split: the fixture lives on one real device,
+        // so homing only bites if the table says otherwise.
+        let table: HashMap<RawFd, u8> = st
+            .fd_devices()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (fd, _))| (fd, (i % 2) as u8))
+            .collect();
+        assert!(table.values().any(|&d| d == 1));
+
+        let (hidden, e_n) = (cfg.hidden as usize, cfg.n_experts as usize);
+        let s_n = 3usize;
+        let layer = cfg.first_dense as usize;
+        let mut state = 0x5EED_C10Cu64;
+        let mut f = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        let x: Vec<f32> = (0..s_n * hidden).map(|_| f()).collect();
+        let router_w: Vec<f32> = (0..e_n * hidden).map(|_| f()).collect();
+        let router_bias: Vec<f32> = (0..e_n).map(|_| f() * 0.1).collect();
+
+        let ctx_of = |fd_devices| ForwardCtx {
+            gate_trace: None,
+            st: &st,
+            absorb: false,
+            dsa: false,
+            reactors: &reactors,
+            gpu: None,
+            gpu_dense: None,
+            workers: 2,
+            cfg: &cfg,
+            stream_experts: true,
+            ecache: None,
+            route_log: None,
+            calib: None,
+            route_log_multi: None,
+            direct: false,
+            heat: None,
+            pins: None,
+            spill: None,
+            timings: None,
+            balancer: None,
+            heat_counts: None,
+            layout_schedule: None,
+            affinity: None,
+            expert_index: None,
+            fd_devices,
+        };
+
+        // Seed the clock so the ON arm runs with a non-prior model: without
+        // this the two arms could agree for the boring reason that every
+        // device priced identically. Ordinal 0 gets the slow reading.
+        crate::ssdclock::observe(0, 50_000_000, std::time::Duration::from_secs(1));
+        crate::ssdclock::observe(1, 277_000_000, std::time::Duration::from_secs(1));
+
+        let blind =
+            moe_forward_concurrent(&ctx_of(None), layer, &x, &router_w, &router_bias, None, s_n)?;
+
+        // ON arm.
+        std::env::set_var("COLI_SSD_AWARE_SCHED", "1");
+        let scheduled = moe_forward_concurrent(
+            &ctx_of(Some(&table)),
+            layer,
+            &x,
+            &router_w,
+            &router_bias,
+            None,
+            s_n,
+        );
+        std::env::remove_var("COLI_SSD_AWARE_SCHED");
+        let scheduled = scheduled?;
+        assert_eq!(
+            blind.len(),
+            scheduled.len(),
+            "scheduling may not change how many outputs exist"
+        );
+        for (i, (a, b)) in blind.iter().zip(&scheduled).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "ssd-aware diverged at f32 index {i}");
         }
         std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
         Ok(())

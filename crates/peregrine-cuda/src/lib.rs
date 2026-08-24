@@ -1,10 +1,13 @@
-//! CUDA GPU lane (M3) — FFI to the validated kernels in `c/backend_cuda.cu`.
+//! GPU lane (M3) — FFI to the validated kernels in `c/backend_cuda.cu`.
 //!
-//! Behind the `cuda` feature, `build.rs` compiles the `.cu` with nvcc and links
-//! cudart, exposing the flat C ABI over an opaque `ColiCudaTensor` handle
-//! (`c/backend_cuda.h`). Reusing the proven kernels avoids re-validating GPU
-//! math. Without the feature (the default on hosts with no GPU/nvcc), this is a
-//! stub reporting the backend unavailable, so the workspace always builds.
+//! Behind the `cuda` feature, `build.rs` compiles the `.cu` with **whichever
+//! vendor toolchain the host has**: nvcc (NVIDIA) or hipify-perl + hipcc (AMD
+//! ROCm), selected by `PEREGRINE_GPU_BACKEND=auto|cuda|hip` — the kernel source
+//! and the host ABI (`backend_cuda.h`) are identical either way, so everything
+//! below this FFI is vendor-agnostic. Intel has no ported kernels yet; see
+//! `docs/gpu-vendors.md`. Without the feature (the default on hosts with no
+//! GPU/toolchain), this is a stub reporting the backend unavailable, so the
+//! workspace always builds.
 //!
 //! The GPU lane composes with the M4 scheduler exactly like the CPU/IO lanes:
 //! VRAM-resident experts are dispatched via [`expert_group`] while the io_uring
@@ -227,15 +230,26 @@ pub fn is_available() -> bool {
     probe_device_count() > 0
 }
 
+/// Which vendor's runtime build.rs actually linked — from `OUT_DIR/vendor.rs`,
+/// written on every `cuda`-feature build (empty string when no toolchain was
+/// found, which [`status`] renders as "not linked").
+#[cfg(feature = "cuda")]
+mod vendor {
+    include!(concat!(env!("OUT_DIR"), "/vendor.rs"));
+}
+
 /// Human-readable backend status for startup logging.
 pub fn status() -> &'static str {
     #[cfg(feature = "cuda")]
     {
-        "CUDA backend linked (c/backend_cuda.cu)"
+        match vendor::BACKEND {
+            "" => "GPU backend NOT linked — toolchain missing at build time (nvcc/hipcc; set CUDA_HOME or ROCM_PATH)",
+            other => other,
+        }
     }
     #[cfg(not(feature = "cuda"))]
     {
-        "CUDA backend not built — rebuild with `--features cuda` on an NVIDIA host"
+        "GPU backend not built — rebuild with `--features cuda` on a host with nvcc or hipcc"
     }
 }
 

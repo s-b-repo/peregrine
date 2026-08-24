@@ -448,6 +448,15 @@ impl CoActivation {
         self.frames = self.frames.saturating_add(1);
     }
 
+    /// A copy of the full `(layer, lo, hi) -> co-firing count` table.
+    ///
+    /// Exists for the joint-eviction publish (`COLI_JOINT_EVICTION`): the
+    /// warm cache's victim score wants raw counts, not the fused-pairs view,
+    /// and the field is private so callers cannot reach past this accessor.
+    pub fn pair_table(&self) -> HashMap<(u32, u32, u32), u32> {
+        self.pairs.clone()
+    }
+
     /// Pairs whose co-firing rate ≥ `min_rate`, grouped per layer (sorted for
     /// determinism). Empty until enough frames accumulated (`frames >= 8` guards
     /// against noise declaring fusions off two samples).

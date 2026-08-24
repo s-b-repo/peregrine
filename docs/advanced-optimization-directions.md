@@ -1,11 +1,14 @@
 # Advanced Optimization Directions
 
-> **Proposals, not shipped work.** The env-var names below (`COLI_JOINT_EVICTION`,
-> `COLI_SSD_AWARE_SCHED`) appear in imperative "gate behind X" form because these
-> are implementation sketches — **no code reads either of them**. The complete
-> list of knobs that exist is [configuration.md](configuration.md); anything not
-> in that reference is not implemented. Same for the `COLI_GDS` and
-> `COLI_VRAM_REPLICATE_K` named in [scale-out-design.md](scale-out-design.md).
+> **Proposals, not shipped work — with one exception.** The env-var names below
+> (`COLI_JOINT_EVICTION`, `COLI_SSD_AWARE_SCHED`) appear in imperative "gate
+> behind X" form because these were implementation sketches. Both have since
+> shipped: joint eviction reads its gate in `warmcache.rs`, and §16's SSD clock
+> is [`ssdclock.rs`](../crates/peregrine-model/src/ssdclock.rs) behind
+> `COLI_SSD_AWARE_SCHED` (off by default). The complete list of knobs that
+> exist is [configuration.md](configuration.md); anything not in that reference
+> is not implemented. Same for the `COLI_GDS` and `COLI_VRAM_REPLICATE_K`
+> named in [scale-out-design.md](scale-out-design.md).
 
 ## 14. Reverse cache eviction
 
@@ -101,6 +104,13 @@ That could make speculative inference much cheaper than naïvely running multipl
    branches are discarded.
 
 ## 16. Learn the SSD itself
+
+> **Status: shipped, gated off** (`COLI_SSD_AWARE_SCHED=1`). The clock learns a
+> per-device bandwidth EWMA from the claim windows the io lane already times;
+> consumers are shortest-job-first order inside each device-pure group and
+> ring homing weighted by predicted seconds. What is *not* built yet: the
+> queue-depth/address terms of `L`, and any cross-device claim ordering beyond
+> what device-pure groups already do.
 
 Peregrine already adapts its computation to telemetry. The next level would model
 storage latency as a function:

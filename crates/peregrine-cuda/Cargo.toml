@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "colibrì CUDA GPU lane: FFI to the validated ../c/backend_cuda.cu kernels (feature = cuda)"
+description = "GPU lane FFI to the validated ../c/backend_cuda.cu kernels (feature = cuda): nvcc for NVIDIA, hipify+hipcc for AMD ROCm"
 build = "build.rs"
 
 [features]

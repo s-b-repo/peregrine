@@ -1674,6 +1674,55 @@ fn router_lookahead_batch() -> bool {
     *ON.get_or_init(|| !matches!(std::env::var("COLI_ROUTER_LOOKAHEAD_BATCH").as_deref(), Ok("0") | Ok("false")))
 }
 
+/// How many layers ahead the router look-ahead reaches (`COLI_ROUTER_LOOKAHEAD_K`,
+/// default `1` — exactly the historical Δ=1 behaviour).
+///
+/// This is the multi-layer extension the upstream research issue asks for: at the
+/// end of layer `L`, layers `L+1 … L+k`' routers are all applied to layer `L`'s
+/// output and each ranking warms its own layer's window. The mechanism is already
+/// trusted one step out — the Δ=1 look-ahead beats every history statistic ~2× on
+/// recall (`router_lookahead`) — so the question is purely how recall *decays*
+/// with lead time, and the repo's own scoreboard arm prices that: `router-lookahead-2`
+/// exists because "at 93% io duty a Δ=1 warm often cannot finish before its layer
+/// executes … what Δ=2 buys is lead time". Deeper horizons trade residual-stream
+/// drift (the missing attention deltas accumulate) for schedule lead.
+///
+/// The budget does not multiply by `k`. Each further horizon halves the window —
+/// see [`lookahead_horizon_widths`] — because a wider deep guess displaces reads
+/// the engine actually needs, the exact failure `router_lookahead_width` documents
+/// at width 10. Waste is bounded twice over: by the decay itself and by the
+/// stale-drop gate aging speculative warms past their layer window.
+///
+/// Read per forward rather than `OnceLock`-latched, deliberately: the latch on the
+/// neighbouring knobs is about not flipping mid-process, and this knob wants an
+/// in-process A/B (`COLI_PREDICT_EVAL` arms run in one process too) more than it
+/// wants to save one env lookup per decode step.
+fn router_lookahead_k() -> usize {
+    std::env::var("COLI_ROUTER_LOOKAHEAD_K")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+/// Per-horizon window sizes for a look-ahead reaching `k` layers out with `width`
+/// slots at Δ=1: geometric halving, integer, no floor. `width / 2^(h-1)`, so the
+/// sequence hits zero on its own — a sticky minimum would let a large `k` keep
+/// issuing one-slot guesses forever, which is precisely the widening failure the
+/// budget exists to prevent. Horizon 1 always receives the full `width`, so `k == 1`
+/// reproduces today's behaviour slot-for-slot.
+///
+/// Pure so the decay policy is unit-testable without a model, and deterministic
+/// so two processes agree on what "horizon 3" means mid-run.
+fn lookahead_horizon_widths(width: usize, k: usize) -> Vec<usize> {
+    (0..k)
+        .scan(width, |w, _| {
+            let cur = *w;
+            *w /= 2;
+            Some(cur)
+        })
+        .collect()
+}
+
 /// The arms the predictor scoreboard compares, in the order the forward loop stashes
 /// them. See [`predict_eval_init`].
 const PREDICT_EVAL_ARMS: [&str; 5] = [
@@ -2602,6 +2651,13 @@ impl Model {
             (false, false) => "[latency] no fat tail in this window: p99 and max both within 10x of the median.\n",
         });
         Some(s)
+    }
+
+    /// What the SSD clock has learned this process (`COLI_SSD_AWARE_SCHED=1`),
+    /// or `None` before any claim window has been observed — a table with no
+    /// evidence behind it must not print like a measurement.
+    pub fn ssd_clock_report(&self) -> Option<String> {
+        crate::ssdclock::snapshot_report()
     }
 
     /// Rows this model has forwarded — the byte ledger's per-token denominator.
@@ -5237,7 +5293,7 @@ impl Model {
         // lock hold this rebuild already pays, every 64 forwards.
             let joint_pairs: std::collections::HashMap<(u32, u32, u32), u32> =
                 if self.ecache.as_ref().is_some_and(|c| c.lock().joint_eviction_enabled()) {
-                    co.pairs.clone()
+                    co.pair_table()
                 } else {
                     std::collections::HashMap::new()
                 };
@@ -5897,6 +5953,10 @@ impl Model {
             // recall against it would not be the number any of these predictors is
             // trying to hit.
             let eval = (s_n == 1).then_some(predict_eval.as_ref()).flatten();
+            // Multi-layer look-ahead: horizon widths decay geometrically from the
+            // full window, so horizon 1 is today's behaviour and each deeper layer
+            // spends half the slots. Zeros end the loop — the sequence halts itself.
+            let la_widths = lookahead_horizon_widths(la_width, router_lookahead_k());
             // Per-step carry for the Δ=2 eval arm: `deep[t]` is layer `t`'s
             // predicted set ranked two layers early. Fresh each forward step.
             let mut deep: Vec<Vec<i32>> =
@@ -5911,9 +5971,16 @@ impl Model {
                 // Emitted here, after this layer's own reads have been consumed and
                 // before the next layer's attention, because that gap is the whole
                 // resource being spent. `x` is this layer's output, which is the next
-                // layer's input.
+                // layer's input. Deeper horizons rank layers L+2… from the same
+                // state — advisory guesses whose recall decays with distance, spent
+                // out of a shrinking window.
                 if let Some(la) = &la {
-                    la.emit(layers, li + 1, &x, la_width);
+                    for (h, &w) in la_widths.iter().enumerate() {
+                        if w == 0 {
+                            break;
+                        }
+                        la.emit(layers, li + 1 + h, &x, w);
+                    }
                 }
                 if let (Some(eval), Some(rh)) = (eval, route_hist.as_ref()) {
                     // Score first, then predict. `forward_layer` has just pushed this
@@ -6564,6 +6631,7 @@ impl Model {
             0
         };
         let la = (la_width > 0).then(|| self.lookahead_ctx()).flatten();
+        let la_widths = lookahead_horizon_widths(la_width, router_lookahead_k());
         let layers: &[LayerW] = &self.layers;
         for (li, l) in layers.iter().enumerate() {
             self.sweep.tick();
@@ -6584,7 +6652,12 @@ impl Model {
             };
             forward_layer_batched(l, li, &mut caches, &mut gstates, rows_at, &ctx, &mut x)?;
             if let Some(la) = &la {
-                la.emit(layers, li + 1, &x, la_width);
+                for (h, &w) in la_widths.iter().enumerate() {
+                    if w == 0 {
+                        break;
+                    }
+                    la.emit(layers, li + 1 + h, &x, w);
+                }
             }
         }
         self.publish_lane_timings();
@@ -8723,7 +8796,6 @@ mod tests {
         assert_eq!(cap_ecache_budget(4 << 30, 2 << 30, 2 << 30, 1 << 30), 0);
     }
 
-    #[test]
     /// One ring per device is the whole point of the device-aware sizing: with
     /// fewer rings than device groups, `ring_homes` leaves at least one group
     /// with no home ring, reachable only by a ring that has run dry.
@@ -10244,6 +10316,55 @@ mod tests {
         // A short hidden state is refused rather than read out of bounds — the
         // look-ahead is advisory and must degrade, never panic.
         assert!(router_ranks_for(&m.layers[next], &m.cfg, &x[..2], 4).is_empty());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn lookahead_horizon_widths_decay_halve_and_terminate() {
+        // Horizon 1 is today's behaviour, slot-for-slot: any drift here would
+        // silently retune every existing deployment that relies on it.
+        assert_eq!(lookahead_horizon_widths(6, 1), vec![6]);
+        // Geometric halving, integer, no floor: 6 -> 3 -> 1 -> 0. The zero is
+        // the point — the sequence terminates on its own instead of sticking
+        // at one-slot guesses forever, which would let a large k keep paying
+        // reads after the recall is gone.
+        assert_eq!(lookahead_horizon_widths(6, 4), vec![6, 3, 1, 0]);
+        assert_eq!(lookahead_horizon_widths(8, 3), vec![8, 4, 2]);
+        // Monotone non-increasing: a deeper horizon never outranks a nearer
+        // one for slots, because near guesses have strictly better recall.
+        let w = lookahead_horizon_widths(7, 6);
+        for pair in w.windows(2) {
+            assert!(pair[0] >= pair[1], "widths must not grow with distance: {w:?}");
+        }
+        // A zero window stays zero however far it reaches.
+        assert_eq!(lookahead_horizon_widths(0, 4), vec![0, 0, 0, 0]);
+        // k == 0 reaches nowhere.
+        assert!(lookahead_horizon_widths(6, 0).is_empty());
+    }
+
+    #[test]
+    fn multi_layer_lookahead_is_bit_identical_to_the_single_layer_horizon() -> Result<(), Error> {
+        // The whole safety argument for the look-ahead, restated for the
+        // horizon: warms are advisory — the authoritative router still decides
+        // at each layer — so reaching two layers further may only change which
+        // speculative reads are issued, never a token. Both arms in ONE test:
+        // `COLI_ROUTER_LOOKAHEAD_K` is read per forward precisely so this A/B
+        // can flip it in-process without racing a latch.
+        let dir = tmp_model_dir("lookahead_horizon_bits")?;
+        let prompt = [3i32, 7, 1, 4];
+        std::env::set_var("COLI_ROUTER_LOOKAHEAD_K", "1");
+        let want = {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            m.generate(&prompt, 6, &mut Sampler::new(0.0, 0.9, 1))?
+        };
+        std::env::set_var("COLI_ROUTER_LOOKAHEAD_K", "3");
+        let got = {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            m.generate(&prompt, 6, &mut Sampler::new(0.0, 0.9, 1))?
+        };
+        std::env::remove_var("COLI_ROUTER_LOOKAHEAD_K");
+        assert_eq!(got, want, "a deeper advisory horizon must not change tokens");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

@@ -126,6 +126,8 @@ Error: ... 6.8 GB short, so the kernel would OOM-kill this run part-way through 
 | `COLI_MOE_ENGINE` | `concurrent` | `concurrent` (3-lane) or `sched` — [note](#coli_moe_engine) |
 | `COLI_IO_DEVICE_SCHED` | off | device-aware ring scheduling: claims are grouped per physical device instead of taken off one device-blind cursor, with cross-device work stealing. Built only when it can differ — streaming, >1 ring, shards genuinely on >1 device |
 | `COLI_IO_DEVICE_MAP` | probed | override the shard→device-ordinal mapping the above schedules on, for a topology the prober reads wrongly. Read once per model open, not latched |
+| `COLI_SSD_AWARE_SCHED` | off | learned SSD clock: per-device bandwidth EWMA from completed claim windows, then (a) shortest-job-first claim order **within** each device-pure group and (b) ring homes spread by predicted **seconds** instead of expert count — a slow device earns more rings per byte. Reorders queued work only; output is bit-identical (`ssd_aware_scheduling_is_bit_identical_to_the_blind_cursor`). Weights equal the historical ones until the clock has measured a spread |
+| `COLI_ROUTER_LOOKAHEAD_K` | 1 | how many layers ahead the router look-ahead reaches: at the end of layer `L`, layers `L+1…L+k`' routers are applied to `L`'s output and each ranking warms its own layer. Horizon 1 is the historical Δ=1 behaviour slot-for-slot; deeper horizons halve the window each step out (`6 → 3 → 1 → 0`), trading residual-stream drift for schedule lead, bounded by the stale-drop gate. Advisory only — cannot change a token |
 
 ### `COLI_IO_RINGS`
 
