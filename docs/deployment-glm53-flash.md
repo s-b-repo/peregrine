@@ -120,6 +120,9 @@ arithmetic or transplanted measurement, not a benchmark of this model — the
 byte ledger (`COLI_UNION_STATS=1`, now including the re-read-after-eviction
 column) is the instrument to replace them with real ones.
 
+Issue #9's full item-by-item triage lives in
+[ideas-github-issue-9-2026-08-27.md](ideas-github-issue-9-2026-08-27.md).
+
 ## Test coverage
 
 `glm5next_*` in `peregrine-model` (config parse/refusals, stack

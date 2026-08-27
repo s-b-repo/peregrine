@@ -80,6 +80,7 @@ top level.
 | [`ideas-from-colibri.md`](ideas-from-colibri.md) | what was worth taking from the predecessor engine |
 | [`ideas-github-issue-7-2026-08-23.md`](ideas-github-issue-7-2026-08-23.md) | upstream issue #7: the fifteen-technique survey (similarity routing, learned cache replacement, transition-aware placement, …) with its field papers, plus local status annotations |
 | [`ideas-github-issue-8-2026-08-23.md`](ideas-github-issue-8-2026-08-23.md) | upstream issue #8: the ten experiment-shaped streamed-bytes research candidates, byte-ledger instrumentation requirements, and the suggested first experiments |
+| [`ideas-github-issue-9-2026-08-27.md`](ideas-github-issue-9-2026-08-27.md) | upstream issue #9 ("path to 2 tok/s"): every item triaged against the tree after the GLM-5.3-Flash landing — shipped / partial / open / closed, and what to measure first when the checkpoint arrives |
 
 Elsewhere: [`README.md`](../README.md) (project overview) ·
 [`crates/peregrine-token/README.md`](../crates/peregrine-token/README.md)
