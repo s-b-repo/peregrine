@@ -104,20 +104,31 @@ For the quality gate, dump a teacher-forcing reference from transformers
 bf16/FP8 model resident, far beyond 32 GB RAM — it needs a big-RAM host or a
 layer-at-a-time offline comparer (future work).
 
-**4. Reshard across the four SSDs** (bandwidth-proportional, byte-verified;
-the whole pipeline is `/srv/m-sdd/glm53-reshard.sh`):
+**4. Reshard across the drives** (bandwidth-proportional, byte-verified;
+the whole pipeline is `/srv/m-sdd/glm53-reshard.sh`). **Weights are the
+MEASURED MB/s — measure first** (`dd iflag=direct bs=8M` per drive, solo).
+This deployment's scar, preserved so it is not re-earned: an equal-weight
+first attempt assumed "four SSDs" and benched **slower than one drive**
+(0.058 vs 0.105 tok/s O_DIRECT B=1) — because `sdc` is not an SSD, it is a
+Hitachi 5400 rpm laptop HDD reading 77–87 MB/s, and an equal split gates
+*every* token on it. Same lesson deployment-glm52.md records ("a stripe
+including the HDD would run the whole array at HDD speed").
 
 ```sh
 target/release/peregrine-reshard --model /srv/m-sdd/GLM-5.3-Flash-peregrine \
-    --out /srv/m-sdb/glm53-reshard --groups sda:530,sdb:514,sdc:530,sdd:547 --verify
+    --out /srv/m-sdb/glm53-reshard --groups sda:470,sdb:540,sdc:85,sdd:570 --verify
 # per-drive placement: experts-l*-<g>.safetensors → /srv/m-<g>/glm53-experts/
 # (trunk-sda-* rides sda, the first group), then a model dir holding only the
 # sidecars + model_paths.json:
 #   {"paths": ["/srv/m-sda/glm53-experts", ..., "/srv/m-sdd/glm53-experts"]}
 ```
 
-The dry-run plan lands 37–47 GB per drive at 24.3–25.7% expected per-token
-routed share each.
+With measured weights the plan lands 28.1/32.3/5.2/34.4% per-token routed
+share (the HDD carries 7.9 GB), balancing every device at ~2.6 s of reads
+per token — a ~0.39 tok/s B=1 ceiling before caching and batching. GLM-5.2's
+five-way split also uses `/srv/model600p` (nvme, 669 MB/s); it sits at 21 GB
+free, so GLM-5.3 skips it — a capacity-capped ~`nv1:130` group there is a
+possible +4% if that drive is ever cleared.
 
 **5. Serve** with the machinery GLM-5.2 earned: `COLI_IO_DEVICE_SCHED` (on
 by default), `COLI_SSD_AWARE_SCHED=1`, the warm cache, `COLI_ENTROPY_ADAPT`,
