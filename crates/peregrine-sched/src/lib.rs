@@ -360,7 +360,7 @@ mod tests {
         let g: Vec<f32> = (0..inter * hidden).map(|_| r.f()).collect();
         let u: Vec<f32> = (0..inter * hidden).map(|_| r.f()).collect();
         let d: Vec<f32> = (0..hidden * inter).map(|_| r.f()).collect();
-        Mlp { gate: qi4(&g, inter, hidden), up: qi4(&u, inter, hidden), down: qi4(&d, hidden, inter) }
+        Mlp { gate: qi4(&g, inter, hidden), up: qi4(&u, inter, hidden), down: qi4(&d, hidden, inter), limit: 0.0 }
     }
 
     /// Append one QtWeight's weight + scale regions to `f`, returning its DiskQt

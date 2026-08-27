@@ -1513,10 +1513,37 @@ fn run_bench(batch_args: &[String]) -> Result<(), Error> {
     if let Some(l) = model.byte_ledger() {
         print!("{}", l.report(model.rows_forwarded()));
     }
+    // Where the time actually went, per lane — the serve engine has printed
+    // this at shutdown since the counters landed, but `bench` (the tool whose
+    // whole job is attributing a tok/s figure) never did, so "was that run
+    // I/O-bound?" was unanswerable from a bench log. Sums are across lanes
+    // that run concurrently, so `sum / wall` is the overlap achieved.
+    {
+        let (t, forwards) = model.lane_totals();
+        if forwards > 0 {
+            let s = |us: u64| us as f64 / 1e6;
+            let (io, cpu, gpu, red) = (s(t.io_us), s(t.cpu_us), s(t.gpu_us), s(t.reduce_us));
+            let sum = (io + cpu + gpu + red).max(1e-9);
+            let pct = |v: f64| 100.0 * v / sum;
+            println!(
+                "[lane] {forwards} forwards: io {io:.1}s ({:.0}%) cpu {cpu:.1}s ({:.0}%) \
+                 gpu {gpu:.1}s ({:.0}%) reduce {red:.1}s ({:.0}%)",
+                pct(io),
+                pct(cpu),
+                pct(gpu),
+                pct(red)
+            );
+        }
+    }
     // Per-read latency distribution (COLI_IO_LATENCY=1). Printed here because a
     // histogram collected and never surfaced is an inert knob — the exact
     // failure this repo keeps catching in its own instrumentation.
     if let Some(l) = model.io_latency_report() {
+        print!("{l}");
+    }
+    // Learned per-device bandwidth (COLI_SSD_AWARE_SCHED=1). Same rule: the
+    // scheduler consuming the model is not evidence of it; the numbers are.
+    if let Some(l) = model.ssd_clock_report() {
         print!("{l}");
     }
     Ok(())

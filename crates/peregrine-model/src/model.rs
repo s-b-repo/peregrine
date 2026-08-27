@@ -41,6 +41,13 @@ struct LayerW {
     /// DSA lightning-indexer weights, when the checkpoint carries them. Weights
     /// only — the key cache is per-sequence and lives in `LayerKv`.
     indexer: Option<IndexerWeights>,
+    /// Glm5Next mHC hyper-connections, one per sublayer site. `Some` on the
+    /// main-stack layers of an hc checkpoint; `None` everywhere else (every
+    /// other architecture, and the MTP head layer, which the checkpoint ships
+    /// with a conventional residual). Presence switches `forward_layer` between
+    /// the single-residual and the stream-form hidden state.
+    hc_attn: Option<crate::hyper::HyperConn>,
+    hc_ffn: Option<crate::hyper::HyperConn>,
 }
 
 /// Per-layer attention weights, one variant per architecture family. GLM's
@@ -76,6 +83,25 @@ enum LayerAttn {
         norm: Vec<f32>,
         out: QtWeight,
     },
+    /// Glm5Next KDA linear attention (Kimi Delta Attention): separate q/k/v
+    /// projections convolved together, a per-channel low-rank forget gate, and
+    /// a sigmoid-gated output norm. Shares [`GdnState`] with `Gdn` — the
+    /// Glm5Next config lays its `lin_*` geometry out so the state shapes match.
+    Kda {
+        q: QtWeight,
+        k: QtWeight,
+        v: QtWeight,
+        conv: Vec<f32>,
+        f_a: QtWeight,
+        f_b: QtWeight,
+        dt_bias: Vec<f32>,
+        a_log: Vec<f32>,
+        b: QtWeight,
+        g_a: QtWeight,
+        g_b: QtWeight,
+        o_norm: Vec<f32>,
+        o: QtWeight,
+    },
 }
 
 impl LayerW {
@@ -96,6 +122,17 @@ impl LayerW {
             LayerAttn::Gdn { in_qkv, in_z, in_a, in_b, out, .. } => {
                 vec![("in_qkv", in_qkv), ("in_z", in_z), ("in_a", in_a), ("in_b", in_b), ("out", out)]
             }
+            LayerAttn::Kda { q, k, v, f_a, f_b, b, g_a, g_b, o, .. } => vec![
+                ("q", q),
+                ("k", k),
+                ("v", v),
+                ("f_a", f_a),
+                ("f_b", f_b),
+                ("b", b),
+                ("g_a", g_a),
+                ("g_b", g_b),
+                ("o", o),
+            ],
         }
     }
 
@@ -148,6 +185,29 @@ impl LayerW {
                 })
             }
             _ => Err(Error::Format("GDN attention path reached on a non-GDN layer".into())),
+        }
+    }
+
+    fn kda(&self) -> Result<crate::gdn::KdaWeights<'_>, Error> {
+        match &self.attn {
+            LayerAttn::Kda { q, k, v, conv, f_a, f_b, dt_bias, a_log, b, g_a, g_b, o_norm, o } => {
+                Ok(crate::gdn::KdaWeights {
+                    q,
+                    k,
+                    v,
+                    conv,
+                    f_a,
+                    f_b,
+                    dt_bias,
+                    a_log,
+                    b,
+                    g_a,
+                    g_b,
+                    o_norm,
+                    o,
+                })
+            }
+            _ => Err(Error::Format("KDA attention path reached on a non-KDA layer".into())),
         }
     }
 }
@@ -542,7 +602,7 @@ impl SeqKv {
             layers: (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, dt)).collect(),
             gdn: (0..cfg.n_layers as usize)
                 .map(|i| {
-                    (cfg.arch == peregrine_core::Arch::HybridGdn
+                    (matches!(cfg.arch, peregrine_core::Arch::HybridGdn | peregrine_core::Arch::Glm5Next)
                         && !cfg.full_attn.get(i).copied().unwrap_or(true))
                     .then(|| GdnState::new(cfg))
                 })
@@ -557,14 +617,18 @@ impl SeqKv {
         self.gdn.iter().any(Option::is_some)
     }
 
-    /// Positions cached so far (the sequence length); all layers share it.
+    /// Positions cached so far (the sequence length). Every *KV-carrying*
+    /// layer shares it; a recurrent (GDN/KDA) layer holds a point state whose
+    /// `LayerKv` stays empty, so this reads the maximum across layers rather
+    /// than layer 0 — on a hybrid whose first layer is linear, layer 0 would
+    /// report 0 forever.
     pub fn len(&self) -> usize {
-        self.layers.first().map_or(0, |k| k.len())
+        self.layers.iter().map(|k| k.len()).max().unwrap_or(0)
     }
 
     /// Whether no positions are cached yet.
     pub fn is_empty(&self) -> bool {
-        self.layers.first().is_none_or(|k| k.is_empty())
+        self.len() == 0
     }
 
     /// Rewind every KV layer to `new_len` (speculative-decode reject cleanup).
@@ -1674,6 +1738,55 @@ fn router_lookahead_batch() -> bool {
     *ON.get_or_init(|| !matches!(std::env::var("COLI_ROUTER_LOOKAHEAD_BATCH").as_deref(), Ok("0") | Ok("false")))
 }
 
+/// How many layers ahead the router look-ahead reaches (`COLI_ROUTER_LOOKAHEAD_K`,
+/// default `1` — exactly the historical Δ=1 behaviour).
+///
+/// This is the multi-layer extension the upstream research issue asks for: at the
+/// end of layer `L`, layers `L+1 … L+k`' routers are all applied to layer `L`'s
+/// output and each ranking warms its own layer's window. The mechanism is already
+/// trusted one step out — the Δ=1 look-ahead beats every history statistic ~2× on
+/// recall (`router_lookahead`) — so the question is purely how recall *decays*
+/// with lead time, and the repo's own scoreboard arm prices that: `router-lookahead-2`
+/// exists because "at 93% io duty a Δ=1 warm often cannot finish before its layer
+/// executes … what Δ=2 buys is lead time". Deeper horizons trade residual-stream
+/// drift (the missing attention deltas accumulate) for schedule lead.
+///
+/// The budget does not multiply by `k`. Each further horizon halves the window —
+/// see [`lookahead_horizon_widths`] — because a wider deep guess displaces reads
+/// the engine actually needs, the exact failure `router_lookahead_width` documents
+/// at width 10. Waste is bounded twice over: by the decay itself and by the
+/// stale-drop gate aging speculative warms past their layer window.
+///
+/// Read per forward rather than `OnceLock`-latched, deliberately: the latch on the
+/// neighbouring knobs is about not flipping mid-process, and this knob wants an
+/// in-process A/B (`COLI_PREDICT_EVAL` arms run in one process too) more than it
+/// wants to save one env lookup per decode step.
+fn router_lookahead_k() -> usize {
+    std::env::var("COLI_ROUTER_LOOKAHEAD_K")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+/// Per-horizon window sizes for a look-ahead reaching `k` layers out with `width`
+/// slots at Δ=1: geometric halving, integer, no floor. `width / 2^(h-1)`, so the
+/// sequence hits zero on its own — a sticky minimum would let a large `k` keep
+/// issuing one-slot guesses forever, which is precisely the widening failure the
+/// budget exists to prevent. Horizon 1 always receives the full `width`, so `k == 1`
+/// reproduces today's behaviour slot-for-slot.
+///
+/// Pure so the decay policy is unit-testable without a model, and deterministic
+/// so two processes agree on what "horizon 3" means mid-run.
+fn lookahead_horizon_widths(width: usize, k: usize) -> Vec<usize> {
+    (0..k)
+        .scan(width, |w, _| {
+            let cur = *w;
+            *w /= 2;
+            Some(cur)
+        })
+        .collect()
+}
+
 /// The arms the predictor scoreboard compares, in the order the forward loop stashes
 /// them. See [`predict_eval_init`].
 const PREDICT_EVAL_ARMS: [&str; 5] = [
@@ -2604,6 +2717,13 @@ impl Model {
         Some(s)
     }
 
+    /// What the SSD clock has learned this process (`COLI_SSD_AWARE_SCHED=1`),
+    /// or `None` before any claim window has been observed — a table with no
+    /// evidence behind it must not print like a measurement.
+    pub fn ssd_clock_report(&self) -> Option<String> {
+        crate::ssdclock::snapshot_report()
+    }
+
     /// Rows this model has forwarded — the byte ledger's per-token denominator.
     pub fn rows_forwarded(&self) -> u64 {
         self.rows_forwarded.load(std::sync::atomic::Ordering::Relaxed)
@@ -2624,12 +2744,12 @@ impl Model {
         let uniform = self
             .expert_bytes_on_disk(first_sparse, 1)
             .is_none_or(|b| b == bytes_per_expert);
-        let (hits, misses, wasted) = match self.ecache.as_ref() {
+        let (hits, misses, wasted, rereads) = match self.ecache.as_ref() {
             Some(c) => {
                 let c = c.lock();
-                (c.hits, c.total_misses(), c.prefetch_wasted)
+                (c.hits, c.total_misses(), c.prefetch_wasted, c.rereads_after_eviction)
             }
-            None => (0, 0, 0),
+            None => (0, 0, 0, 0),
         };
         Some(
             crate::ledger::LedgerInput {
@@ -2638,6 +2758,7 @@ impl Model {
                 cache_hits: hits,
                 cache_misses: misses,
                 prefetch_wasted: wasted,
+                rereads,
                 bytes_per_expert,
                 uniform_expert_size: uniform,
             }
@@ -2785,7 +2906,11 @@ fn load_f32(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
 /// naming, kept verbatim per the Track C contract).
 fn layer_prefix(cfg: &Cfg, i: usize) -> String {
     match cfg.arch {
-        Arch::GlmMla | Arch::DenseGqa => format!("model.layers.{i}."),
+        // Glm5Next uses the GLM stem: `peregrine-import-hf` renames the HF
+        // checkpoint's `model.language_model.` stem to `model.` at import so
+        // the expert-streaming lane, reshard and layout tools — all written
+        // against `model.layers.{l}.mlp.experts.{e}.` — work unchanged.
+        Arch::GlmMla | Arch::DenseGqa | Arch::Glm5Next => format!("model.layers.{i}."),
         Arch::HybridGdn => format!("model.language_model.layers.{i}."),
     }
 }
@@ -2834,8 +2959,10 @@ fn load_layer_at(
         .full_attn
         .unwrap_or(cfg.arch == Arch::DenseGqa || cfg.full_attn.get(i).copied().unwrap_or(false));
 
-    let attn = match cfg.arch {
-        Arch::GlmMla => LayerAttn::Mla {
+    // The MLA loader, shared by GLM-5.2 (every layer) and Glm5Next (its DSA
+    // layers and the MTP head layer — NoPE there, so `qkr` is simply 0).
+    let load_mla = |st: &SafeTensors| -> Result<LayerAttn, Error> {
+        Ok(LayerAttn::Mla {
             q_a: QtWeight::load(st, &p("self_attn.q_a_proj.weight"), ql, d)?,
             q_a_ln: load_f32(st, &p("self_attn.q_a_layernorm.weight"), ql)?,
             q_b: QtWeight::load(st, &p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
@@ -2843,7 +2970,37 @@ fn load_layer_at(
             kv_a_ln: load_f32(st, &p("self_attn.kv_a_layernorm.weight"), kvl)?,
             kv_b: QtWeight::load(st, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
             o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, h * vh)?,
-        },
+        })
+    };
+    let attn = match cfg.arch {
+        Arch::GlmMla => load_mla(st)?,
+        Arch::Glm5Next if is_full_attn => load_mla(st)?,
+        Arch::Glm5Next => {
+            // KDA: the checkpoint ships three per-projection depthwise convs;
+            // concatenate them in q‖k‖v order — exactly the order `kda_forward`
+            // builds its conv input in.
+            let (lh, ld) = (cfg.lin_k_heads as usize, cfg.lin_k_dim as usize);
+            let (qkv, taps) = (lh * ld, cfg.lin_conv_k as usize);
+            let mut conv = Vec::with_capacity(3 * qkv * taps);
+            for t in ["q_conv1d", "k_conv1d", "v_conv1d"] {
+                conv.extend(load_f32(st, &p(&format!("self_attn.{t}.weight")), qkv * taps)?);
+            }
+            LayerAttn::Kda {
+                q: QtWeight::load(st, &p("self_attn.q_proj.weight"), qkv, d)?,
+                k: QtWeight::load(st, &p("self_attn.k_proj.weight"), qkv, d)?,
+                v: QtWeight::load(st, &p("self_attn.v_proj.weight"), qkv, d)?,
+                conv,
+                f_a: QtWeight::load(st, &p("self_attn.f_a_proj.weight"), ld, d)?,
+                f_b: QtWeight::load(st, &p("self_attn.f_b_proj.weight"), qkv, ld)?,
+                dt_bias: load_f32(st, &p("self_attn.dt_bias"), qkv)?,
+                a_log: load_f32(st, &p("self_attn.A_log"), lh)?,
+                b: QtWeight::load(st, &p("self_attn.b_proj.weight"), lh, d)?,
+                g_a: QtWeight::load(st, &p("self_attn.g_a_proj.weight"), ld, d)?,
+                g_b: QtWeight::load(st, &p("self_attn.g_b_proj.weight"), qkv, ld)?,
+                o_norm: load_f32(st, &p("self_attn.o_norm.weight"), ld)?,
+                o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, qkv)?,
+            }
+        }
         Arch::DenseGqa | Arch::HybridGdn if is_full_attn => {
             let (nh, nkv, hd) = (cfg.n_heads as usize, cfg.n_kv_heads as usize, cfg.head_dim as usize);
             // attn_output_gate widens q_proj to [2*nh*hd, d]: query rows then
@@ -2896,6 +3053,7 @@ fn load_layer_at(
             gate: QtWeight::load(st, &p("mlp.gate_proj.weight"), di, d)?,
             up: QtWeight::load(st, &p("mlp.up_proj.weight"), di, d)?,
             down: QtWeight::load(st, &p("mlp.down_proj.weight"), d, di)?,
+            limit: cfg.swiglu_limit,
         });
     } else {
         let (e_n, mi, si) = (cfg.n_experts as usize, cfg.moe_inter as usize, (cfg.moe_inter * cfg.n_shared) as usize);
@@ -2905,6 +3063,7 @@ fn load_layer_at(
             gate: QtWeight::load(st, &p("mlp.shared_experts.gate_proj.weight"), si, d)?,
             up: QtWeight::load(st, &p("mlp.shared_experts.up_proj.weight"), si, d)?,
             down: QtWeight::load(st, &p("mlp.shared_experts.down_proj.weight"), d, si)?,
+            limit: cfg.swiglu_limit,
         });
         for e in 0..e_n {
             let pe = |s: &str| format!("{pre}mlp.experts.{e}.{s}");
@@ -2922,9 +3081,28 @@ fn load_layer_at(
                     gate: QtWeight::load(st, &pe("gate_proj.weight"), mi, d)?,
                     up: QtWeight::load(st, &pe("up_proj.weight"), mi, d)?,
                     down: QtWeight::load(st, &pe("down_proj.weight"), d, mi)?,
+                    limit: cfg.swiglu_limit,
                 });
             }
         }
+    }
+
+    // mHC hyper-connections: required on Glm5Next main-stack layers (a stream
+    // caller and a single-residual layer disagreeing about the hidden width
+    // would corrupt silently), tensor-presence-optional off the stack (the MTP
+    // head layer legitimately has none).
+    let hc_attn = crate::hyper::HyperConn::load(st, &pre, "attn", cfg)?;
+    let hc_ffn = crate::hyper::HyperConn::load(st, &pre, "ffn", cfg)?;
+    if cfg.arch == Arch::Glm5Next
+        && cfg.hc_mult > 1
+        && site.prefix.is_none()
+        && i < cfg.n_layers as usize
+        && (hc_attn.is_none() || hc_ffn.is_none())
+    {
+        return Err(Error::Format(format!(
+            "layer {i}: glm5_next declares hc_mult={} but the hyper-connection tensors ({pre}hc_attn_fn / {pre}hc_ffn_fn) are missing",
+            cfg.hc_mult
+        )));
     }
 
     Ok(LayerW {
@@ -2946,7 +3124,43 @@ fn load_layer_at(
         shared,
         experts,
         indexer: IndexerWeights::load(st, i, cfg)?,
+        hc_attn,
+        hc_ffn,
     })
+}
+
+/// Replicate `x[s_n, d]` into the mHC stream form `[s_n, hc*d]` (every stream
+/// starts as a copy of the embedding — the HF reference's `expand`).
+fn expand_hc_streams(x: &[f32], s_n: usize, d: usize, hc: usize) -> Vec<f32> {
+    let mut out = vec![0f32; s_n * hc * d];
+    for s in 0..s_n {
+        let row = &x[s * d..(s + 1) * d];
+        for h in 0..hc {
+            out[s * hc * d + h * d..s * hc * d + (h + 1) * d].copy_from_slice(row);
+        }
+    }
+    out
+}
+
+/// Collapse the mHC stream form `[s_n, hc*d]` back to `[s_n, d]` by the
+/// unweighted stream mean — GLM-5.3-Flash's `HyperHead` (DeepSeek-V4 uses a
+/// weighted collapse; this model's is a plain mean).
+fn collapse_hc_streams(x: &[f32], s_n: usize, d: usize, hc: usize) -> Vec<f32> {
+    let mut out = vec![0f32; s_n * d];
+    let inv = 1.0 / hc as f32;
+    for s in 0..s_n {
+        for h in 0..hc {
+            let src = &x[s * hc * d + h * d..s * hc * d + (h + 1) * d];
+            let dst = &mut out[s * d..(s + 1) * d];
+            for (o, &v) in dst.iter_mut().zip(src) {
+                *o += v;
+            }
+        }
+        for o in &mut out[s * d..(s + 1) * d] {
+            *o *= inv;
+        }
+    }
+    out
 }
 
 /// Row-wise RMSNorm of `x[s_n, d]` with weight `w`, into a fresh buffer. Rows are
@@ -3052,20 +3266,19 @@ impl CalibAccum {
     }
 }
 
-fn forward_layer(
+/// The single-sequence attention dispatch shared by [`forward_layer`]'s plain
+/// and hc-stream forms. `nrm` is the input-layernormed sublayer input.
+fn attn_dispatch(
     l: &LayerW,
     li: usize,
-    state: LayerState<'_>,
+    kv: &mut LayerKv,
+    gdn: Option<&mut GdnState>,
     ctx: &ForwardCtx,
-    x: &mut [f32],
+    nrm: &[f32],
     s_n: usize,
     pos_base: usize,
-) -> Result<(), Error> {
-    let LayerState { kv, gdn } = state;
+) -> Result<Vec<f32>, Error> {
     let cfg = ctx.cfg;
-    let d = cfg.hidden as usize;
-    let eps = cfg.eps;
-    let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
     // Weight absorption is the decode-shaped form of the same algebra: it works
     // in the 512-wide latent space instead of reconstructing `[k_nope|v]` for
     // every cached position on every step, which is what makes the dense path
@@ -3079,8 +3292,8 @@ fn forward_layer(
     // with an indexer and `COLI_DSA=1` takes the dense-sparse path even when
     // `COLI_MLA_ABSORB` is also set — stated here rather than left to
     // whichever branch happened to come first.
-    let attn = match &l.attn {
-        LayerAttn::Gqa { .. } => crate::attention::gqa_attention(&l.gqa(cfg.attn_gate)?, &nrm, s_n, pos_base, kv, cfg)?,
+    Ok(match &l.attn {
+        LayerAttn::Gqa { .. } => crate::attention::gqa_attention(&l.gqa(cfg.attn_gate)?, nrm, s_n, pos_base, kv, cfg)?,
         LayerAttn::Gdn { .. } => {
             // A GDN layer's context lives in a recurrent state, not the KV
             // cache. Paths that cannot supply one (external-KV serving, RLM
@@ -3089,28 +3302,38 @@ fn forward_layer(
             let st_g = gdn.ok_or_else(|| {
                 Error::Format(format!("layer {li}: gated-DeltaNet needs a recurrent state on this path (hybrid serving is Track C phase 2)"))
             })?;
-            crate::gdn::gdn_forward(&l.gdn()?, &nrm, s_n, st_g, cfg)?
+            crate::gdn::gdn_forward(&l.gdn()?, nrm, s_n, st_g, cfg)?
+        }
+        LayerAttn::Kda { .. } => {
+            let st_g = gdn.ok_or_else(|| {
+                Error::Format(format!("layer {li}: KDA needs a recurrent state on this path"))
+            })?;
+            crate::gdn::kda_forward(&l.kda()?, nrm, s_n, st_g, cfg)?
         }
         LayerAttn::Mla { .. } => match (ctx.dsa.then_some(()).and(l.indexer.as_ref()), ctx.absorb) {
-            (Some(ix), _) => mla_attention_dsa_indexed(&l.attn()?, ix, &nrm, s_n, pos_base, kv, cfg)?,
-            (None, true) => mla_attention_absorb(&l.attn()?, &nrm, s_n, pos_base, kv, cfg)?,
-            (None, false) => mla_attention(&l.attn()?, &nrm, s_n, pos_base, kv, cfg)?,
+            (Some(ix), _) => mla_attention_dsa_indexed(&l.attn()?, ix, nrm, s_n, pos_base, kv, cfg)?,
+            (None, true) => mla_attention_absorb(&l.attn()?, nrm, s_n, pos_base, kv, cfg)?,
+            (None, false) => mla_attention(&l.attn()?, nrm, s_n, pos_base, kv, cfg)?,
         },
-    };
-    for z in 0..s_n * d {
-        x[z] += attn[z];
-    }
-    let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
-    let ffn: Vec<f32> = if l.sparse {
+    })
+}
+
+/// The FFN dispatch shared by [`forward_layer`]'s plain and hc-stream forms
+/// (and mirrored, not shared, by the batched path — its dense branch differs).
+/// `nrm2` is the post-attention-layernormed sublayer input.
+fn ffn_dispatch(l: &LayerW, li: usize, ctx: &ForwardCtx, nrm2: &[f32], s_n: usize) -> Result<Vec<f32>, Error> {
+    let cfg = ctx.cfg;
+    let d = cfg.hidden as usize;
+    Ok(if l.sparse {
         // Calibration capture sees exactly what the router is about to see —
         // the one place "the MoE input's channel magnitudes" is unambiguous.
         if let Some(cal) = ctx.calib {
-            cal.lock().accumulate(li, &nrm2, s_n);
+            cal.lock().accumulate(li, nrm2, s_n);
         }
         if ctx.stream_experts {
-            moe_forward_dispatch(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
+            moe_forward_dispatch(ctx, li, nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
         } else {
-            moe_forward(&nrm2, &l.router, &l.router_bias, &l.experts, l.shared.as_ref(), MoeCfg { s_n, hidden: d, k: cfg.topk as usize, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale })
+            moe_forward(nrm2, &l.router, &l.router_bias, &l.experts, l.shared.as_ref(), MoeCfg { s_n, hidden: d, k: cfg.topk as usize, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale })
         }
     } else {
         let dense = l
@@ -3131,17 +3354,114 @@ fn forward_layer(
         // floats each way at Qwen's shape). Generalizing here would cost more
         // than it generalized. The rule is: fused where a fused kernel exists,
         // per-weight everywhere else.
-        match ctx.gpu_dense.and_then(|t| t.mlp(li, &nrm2, s_n, d)) {
+        match ctx.gpu_dense.and_then(|t| t.mlp(li, nrm2, s_n, d)) {
             Some(Ok(y)) => y,
             Some(Err(e)) => {
                 peregrine_io::note_advisory_err("gpu dense MLP (CPU fallback)", &e);
-                dense.swiglu(&nrm2, s_n)
+                dense.swiglu(nrm2, s_n)
             }
-            None => dense.swiglu(&nrm2, s_n),
+            None => dense.swiglu(nrm2, s_n),
         }
-    };
+    })
+}
+
+fn forward_layer(
+    l: &LayerW,
+    li: usize,
+    state: LayerState<'_>,
+    ctx: &ForwardCtx,
+    x: &mut [f32],
+    s_n: usize,
+    pos_base: usize,
+) -> Result<(), Error> {
+    let LayerState { kv, gdn } = state;
+    // A layer carrying hyper-connections operates on the mHC stream form
+    // (`x` is `[s_n, hc_mult*hidden]`); everything else is the historical
+    // single-residual form, bit for bit.
+    if l.hc_attn.is_some() {
+        return forward_layer_hc(l, li, kv, gdn, ctx, x, s_n, pos_base);
+    }
+    let cfg = ctx.cfg;
+    let d = cfg.hidden as usize;
+    let eps = cfg.eps;
+    let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
+    let attn = attn_dispatch(l, li, kv, gdn, ctx, &nrm, s_n, pos_base)?;
+    for z in 0..s_n * d {
+        x[z] += attn[z];
+    }
+    let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
+    let ffn = ffn_dispatch(l, li, ctx, &nrm2, s_n)?;
     for z in 0..s_n * d {
         x[z] += ffn[z];
+    }
+    Ok(())
+}
+
+/// [`forward_layer`] in the mHC stream form: `x` is `[s_n, hc_mult*hidden]`
+/// (`hc_mult` parallel residual streams per position). Each sublayer site
+/// computes its mixing weights from the streams, collapses them into the
+/// single sublayer input, runs the ordinary sublayer (the same dispatches the
+/// plain form uses), and places the output back while Sinkhorn-mixing the
+/// streams — the residual add is *replaced* by that placement, not augmented.
+fn forward_layer_hc(
+    l: &LayerW,
+    li: usize,
+    kv: &mut LayerKv,
+    gdn: Option<&mut GdnState>,
+    ctx: &ForwardCtx,
+    x: &mut [f32],
+    s_n: usize,
+    pos_base: usize,
+) -> Result<(), Error> {
+    let cfg = ctx.cfg;
+    let d = cfg.hidden as usize;
+    let hc = cfg.hc_mult.max(1) as usize;
+    let eps = cfg.eps;
+    let (hca, hcf) = match (&l.hc_attn, &l.hc_ffn) {
+        (Some(a), Some(f)) => (a, f),
+        _ => {
+            return Err(Error::Format(format!(
+                "layer {li}: hyper-connection sites are incomplete (attn {}, ffn {})",
+                l.hc_attn.is_some(),
+                l.hc_ffn.is_some()
+            )))
+        }
+    };
+    if x.len() < s_n * hc * d {
+        return Err(Error::Format(format!(
+            "layer {li}: hc stream buffer holds {} floats, expected {} ({} rows x {} streams x {})",
+            x.len(),
+            s_n * hc * d,
+            s_n,
+            hc,
+            d
+        )));
+    }
+    let mut collapsed = vec![0f32; s_n * d];
+    let mut scratch: Vec<f32> = Vec::new();
+
+    // Attention site.
+    let mixes: Vec<crate::hyper::HcMix> =
+        (0..s_n).map(|s| hca.mix(&x[s * hc * d..(s + 1) * hc * d], cfg)).collect();
+    for (s, m) in mixes.iter().enumerate() {
+        m.collapse(&x[s * hc * d..(s + 1) * hc * d], d, &mut collapsed[s * d..(s + 1) * d]);
+    }
+    let nrm = rmsnorm_rows(&collapsed, &l.in_ln, s_n, d, eps);
+    let attn = attn_dispatch(l, li, kv, gdn, ctx, &nrm, s_n, pos_base)?;
+    for (s, m) in mixes.iter().enumerate() {
+        m.place(&mut x[s * hc * d..(s + 1) * hc * d], &attn[s * d..(s + 1) * d], d, &mut scratch);
+    }
+
+    // FFN site.
+    let mixes: Vec<crate::hyper::HcMix> =
+        (0..s_n).map(|s| hcf.mix(&x[s * hc * d..(s + 1) * hc * d], cfg)).collect();
+    for (s, m) in mixes.iter().enumerate() {
+        m.collapse(&x[s * hc * d..(s + 1) * hc * d], d, &mut collapsed[s * d..(s + 1) * d]);
+    }
+    let nrm2 = rmsnorm_rows(&collapsed, &l.post_ln, s_n, d, eps);
+    let ffn = ffn_dispatch(l, li, ctx, &nrm2, s_n)?;
+    for (s, m) in mixes.iter().enumerate() {
+        m.place(&mut x[s * hc * d..(s + 1) * hc * d], &ffn[s * d..(s + 1) * d], d, &mut scratch);
     }
     Ok(())
 }
@@ -3165,15 +3485,46 @@ fn forward_layer_batched(
     let d = cfg.hidden as usize;
     let eps = cfg.eps;
     let s_n = rows_at.len();
+    if l.hc_attn.is_some() {
+        return forward_layer_batched_hc(l, li, caches, gstates, rows_at, ctx, x);
+    }
     let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
-    let attn = match &l.attn {
+    let attn = attn_dispatch_batched(l, li, caches, gstates, rows_at, ctx, &nrm)?;
+    for z in 0..s_n * d {
+        x[z] += attn[z];
+    }
+    let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
+    // Same capture point as `forward_layer` — the batched rows are main
+    // stream too (draft rows never reach here with `calib` set).
+    let ffn = ffn_dispatch(l, li, ctx, &nrm2, s_n)?;
+    for z in 0..s_n * d {
+        x[z] += ffn[z];
+    }
+    Ok(())
+}
+
+/// The batched attention dispatch shared by [`forward_layer_batched`]'s plain
+/// and hc-stream forms.
+fn attn_dispatch_batched(
+    l: &LayerW,
+    li: usize,
+    caches: &mut [&mut LayerKv],
+    gstates: &mut [Option<&mut GdnState>],
+    rows_at: RowLayout<'_>,
+    ctx: &ForwardCtx,
+    nrm: &[f32],
+) -> Result<Vec<f32>, Error> {
+    let cfg = ctx.cfg;
+    let d = cfg.hidden as usize;
+    let s_n = rows_at.len();
+    Ok(match &l.attn {
         // Same selector as the single-sequence path above: DSA runs only when
         // `COLI_DSA` is on *and* this layer carries indexer weights. Passing it
         // here is what extends sparse selection to the batched server; `None`
         // keeps the historical dense/absorb behaviour bit for bit.
         LayerAttn::Mla { .. } => mla_attention_rows(
             &l.attn()?,
-            &nrm,
+            nrm,
             rows_at,
             caches,
             cfg,
@@ -3199,13 +3550,13 @@ fn forward_layer_batched(
             }
             out
         }
-        LayerAttn::Gdn { .. } => {
+        LayerAttn::Gdn { .. } | LayerAttn::Kda { .. } => {
             // Row s advances its owner's recurrent state by one token. Rows of
             // one owner arrive in ascending position order (decode is one row
             // per sequence; a fused prefill chunk is consecutive positions of
             // one sequence), and this loop runs them in row order — the same
             // sequential contract `gdn_one_call_matches_stepwise` pins.
-            let w = l.gdn()?;
+            let is_kda = matches!(&l.attn, LayerAttn::Kda { .. });
             let mut out = vec![0.0f32; s_n * d];
             for s in 0..s_n {
                 let owner = rows_at.owner[s];
@@ -3217,57 +3568,74 @@ fn forward_layer_batched(
                             "layer {li}: row {s}'s sequence {owner} has no recurrent state (cache built for another architecture?)"
                         ))
                     })?;
-                let row = crate::gdn::gdn_forward(&w, &nrm[s * d..(s + 1) * d], 1, st, cfg)?;
+                let row = if is_kda {
+                    crate::gdn::kda_forward(&l.kda()?, &nrm[s * d..(s + 1) * d], 1, st, cfg)?
+                } else {
+                    crate::gdn::gdn_forward(&l.gdn()?, &nrm[s * d..(s + 1) * d], 1, st, cfg)?
+                };
                 out[s * d..(s + 1) * d].copy_from_slice(&row);
             }
             out
         }
+    })
+}
+
+/// [`forward_layer_batched`] in the mHC stream form — the batched twin of
+/// [`forward_layer_hc`], with `x` as `[s_n, hc_mult*hidden]` rows.
+fn forward_layer_batched_hc(
+    l: &LayerW,
+    li: usize,
+    caches: &mut [&mut LayerKv],
+    gstates: &mut [Option<&mut GdnState>],
+    rows_at: RowLayout<'_>,
+    ctx: &ForwardCtx,
+    x: &mut [f32],
+) -> Result<(), Error> {
+    let cfg = ctx.cfg;
+    let d = cfg.hidden as usize;
+    let hc = cfg.hc_mult.max(1) as usize;
+    let eps = cfg.eps;
+    let s_n = rows_at.len();
+    let (hca, hcf) = match (&l.hc_attn, &l.hc_ffn) {
+        (Some(a), Some(f)) => (a, f),
+        _ => {
+            return Err(Error::Format(format!(
+                "layer {li}: hyper-connection sites are incomplete (attn {}, ffn {})",
+                l.hc_attn.is_some(),
+                l.hc_ffn.is_some()
+            )))
+        }
     };
-    for z in 0..s_n * d {
-        x[z] += attn[z];
+    if x.len() < s_n * hc * d {
+        return Err(Error::Format(format!(
+            "layer {li}: hc stream buffer holds {} floats, expected {}",
+            x.len(),
+            s_n * hc * d
+        )));
     }
-    let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
-    let ffn: Vec<f32> = if l.sparse {
-        // Same capture point as `forward_layer` — the batched rows are main
-        // stream too (draft rows never reach here with `calib` set).
-        if let Some(cal) = ctx.calib {
-            cal.lock().accumulate(li, &nrm2, s_n);
-        }
-        if ctx.stream_experts {
-            moe_forward_dispatch(ctx, li, &nrm2, &l.router, &l.router_bias, l.shared.as_ref(), s_n)?
-        } else {
-            moe_forward(&nrm2, &l.router, &l.router_bias, &l.experts, l.shared.as_ref(), MoeCfg { s_n, hidden: d, k: cfg.topk as usize, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale })
-        }
-    } else {
-        let dense = l
-            .dense
-            .as_ref()
-            .ok_or_else(|| Error::Format(format!("layer {li}: dense MLP weights missing")))?;
-        // VRAM-resident layers compute their SwiGLU on the device; the rest take
-        // the CPU path. Which one a layer takes is fixed for the whole run (see
-        // `GpuDenseTier`), so this is a placement decision, not a race. A device
-        // failure mid-run is an advisory and a fallback, never a lost request.
-        //
-        // **Why the MLP keeps a fused tier while every other weight goes through
-        // `QtWeight`'s own device handle.** That asymmetry is deliberate and
-        // reads as an inconsistency without the reason. The fused kernel does
-        // gate, up and down in one call with the intermediates held in VRAM;
-        // three per-weight matvecs would download a `moe_inter`-wide
-        // intermediate and upload it again, twice per layer per token (17408
-        // floats each way at Qwen's shape). Generalizing here would cost more
-        // than it generalized. The rule is: fused where a fused kernel exists,
-        // per-weight everywhere else.
-        match ctx.gpu_dense.and_then(|t| t.mlp(li, &nrm2, s_n, d)) {
-            Some(Ok(y)) => y,
-            Some(Err(e)) => {
-                peregrine_io::note_advisory_err("gpu dense MLP (CPU fallback)", &e);
-                dense.swiglu(&nrm2, s_n)
-            }
-            None => dense.swiglu(&nrm2, s_n),
-        }
-    };
-    for z in 0..s_n * d {
-        x[z] += ffn[z];
+    let mut collapsed = vec![0f32; s_n * d];
+    let mut scratch: Vec<f32> = Vec::new();
+
+    let mixes: Vec<crate::hyper::HcMix> =
+        (0..s_n).map(|s| hca.mix(&x[s * hc * d..(s + 1) * hc * d], cfg)).collect();
+    for (s, m) in mixes.iter().enumerate() {
+        m.collapse(&x[s * hc * d..(s + 1) * hc * d], d, &mut collapsed[s * d..(s + 1) * d]);
+    }
+    let nrm = rmsnorm_rows(&collapsed, &l.in_ln, s_n, d, eps);
+    let attn = attn_dispatch_batched(l, li, caches, gstates, rows_at, ctx, &nrm)?;
+    for (s, m) in mixes.iter().enumerate() {
+        m.place(&mut x[s * hc * d..(s + 1) * hc * d], &attn[s * d..(s + 1) * d], d, &mut scratch);
+    }
+
+    let mixes: Vec<crate::hyper::HcMix> =
+        (0..s_n).map(|s| hcf.mix(&x[s * hc * d..(s + 1) * hc * d], cfg)).collect();
+    for (s, m) in mixes.iter().enumerate() {
+        m.collapse(&x[s * hc * d..(s + 1) * hc * d], d, &mut collapsed[s * d..(s + 1) * d]);
+    }
+    let nrm2 = rmsnorm_rows(&collapsed, &l.post_ln, s_n, d, eps);
+    let ffn = ffn_dispatch(l, li, ctx, &nrm2, s_n)?;
+    for (s, m) in mixes.iter().enumerate() {
+        m.place(&mut x[s * hc * d..(s + 1) * hc * d], &ffn[s * d..(s + 1) * d], d, &mut scratch);
     }
     Ok(())
 }
@@ -3456,7 +3824,7 @@ impl Model {
         let vocab = cfg.vocab as usize;
 
         let (embed_name, norm_name) = match cfg.arch {
-            Arch::GlmMla | Arch::DenseGqa => ("model.embed_tokens.weight", "model.norm.weight"),
+            Arch::GlmMla | Arch::DenseGqa | Arch::Glm5Next => ("model.embed_tokens.weight", "model.norm.weight"),
             Arch::HybridGdn => ("model.language_model.embed_tokens.weight", "model.language_model.norm.weight"),
         };
         let embed = QtWeight::load(&st, embed_name, vocab, d)?;
@@ -3475,8 +3843,9 @@ impl Model {
         let kv = (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, kv_dtype())).collect();
         let gdn: Vec<Option<GdnState>> = (0..cfg.n_layers as usize)
             .map(|i| {
-                (cfg.arch == Arch::HybridGdn && !cfg.full_attn.get(i).copied().unwrap_or(true))
-                    .then(|| GdnState::new(&cfg))
+                (matches!(cfg.arch, Arch::HybridGdn | Arch::Glm5Next)
+                    && !cfg.full_attn.get(i).copied().unwrap_or(true))
+                .then(|| GdnState::new(&cfg))
             })
             .collect();
         // The concurrent MoE lane needs its own ring, set up once, so a layer's
@@ -3613,7 +3982,20 @@ impl Model {
         };
         // Optional GPU VRAM tier (opt-in via COLI_GPU): dequantize as many experts
         // as fit to f32 and upload. Reserve 2 GB headroom for activations/context.
-        let gpu = if std::env::var("COLI_GPU").is_ok() {
+        //
+        // Refused (loudly) on a clamped-SwiGLU architecture: the CUDA expert
+        // kernels compute `silu(gate)*up` with no clamp, so a VRAM-resident
+        // Glm5Next expert would silently produce different activations than the
+        // CPU/streamed ones. Lifted when the kernels grow the clamp.
+        let gpu_allowed = cfg.swiglu_limit == 0.0;
+        if !gpu_allowed && std::env::var("COLI_GPU").is_ok() {
+            eprintln!(
+                "peregrine: COLI_GPU ignored — swiglu_limit={} needs the clamp in the CUDA expert \
+                 kernels (not implemented); experts stay on the CPU lane",
+                cfg.swiglu_limit
+            );
+        }
+        let gpu = if gpu_allowed && std::env::var("COLI_GPU").is_ok() {
             // Open the disk→GPU lane before anything allocates an aligned
             // buffer. `cudaHostRegister` pins pages in place, so it can only
             // catch allocations made after the hook is installed — installing
@@ -3810,8 +4192,18 @@ impl Model {
         let n = cfg.n_layers as usize;
         let mtp = if st.has(&format!("model.layers.{n}.eh_proj.weight")) {
             // GLM: the MTP layer is the (n_layers)-th layer of the main stack.
+            // `full_attn: Some(true)` is what makes the layer load as MLA on
+            // Glm5Next (its per-layer schedule ends at n_layers-1, and the
+            // default there would be KDA — the checkpoint's MTP layer is DSA);
+            // on GLM-5.2 the override is a no-op (every layer is MLA).
             Some(MtpHead {
-                layer: load_layer(&st, n, &cfg, stream_experts)?,
+                layer: load_layer_at(
+                    &st,
+                    n,
+                    &cfg,
+                    stream_experts,
+                    LayerSite { prefix: None, full_attn: Some(true), sparse: None },
+                )?,
                 eh_proj: QtWeight::load(&st, &format!("model.layers.{n}.eh_proj.weight"), d, 2 * d)?,
                 enorm: load_f32(&st, &format!("model.layers.{n}.enorm.weight"), d)?,
                 hnorm: load_f32(&st, &format!("model.layers.{n}.hnorm.weight"), d)?,
@@ -4408,6 +4800,17 @@ impl Model {
         self.mtp.is_some()
     }
 
+    /// How many mHC residual streams the main stack runs on — 1 everywhere
+    /// except Glm5Next, whose forward loops widen the hidden buffer to
+    /// `[s_n, hc*hidden]` between the embedding and the final collapse.
+    fn hc_streams(&self) -> usize {
+        if self.cfg.arch == Arch::Glm5Next {
+            self.cfg.hc_mult.max(1) as usize
+        } else {
+            1
+        }
+    }
+
     /// Whether rejecting a draft is a pure KV rewind. `SeqKv::truncate` rewinds
     /// the KV layers exactly, so on a KV-only arch a rejected speculative tail
     /// leaves no trace. A recurrent arch does not have that property: the verify
@@ -4434,7 +4837,7 @@ impl Model {
     }
 
     pub fn spec_reject_is_kv_only(&self) -> bool {
-        self.cfg.arch != Arch::HybridGdn
+        !matches!(self.cfg.arch, Arch::HybridGdn | Arch::Glm5Next)
     }
 
     /// Which chat-prompt markup this checkpoint expects. GLM ships no chat
@@ -4443,7 +4846,7 @@ impl Model {
     /// serving layer selects its prompt builder from this so a Qwen model is not
     /// fed GLM control tokens (which tokenize to garbage and degenerate output).
     pub fn uses_chatml_prompt(&self) -> bool {
-        !matches!(self.cfg.arch, Arch::GlmMla)
+        !matches!(self.cfg.arch, Arch::GlmMla | Arch::Glm5Next)
     }
 
     /// `(hits, misses, disk_reads)` from the warm tier, or `None` when not
@@ -5231,6 +5634,16 @@ impl Model {
         let co = self.coactivation.lock();
         let pairs = co.fused_pairs(threshold);
         let loose = co.fused_pairs(threshold * 0.5);
+        // Joint eviction (`COLI_JOINT_EVICTION`): publish the full pair table
+        // into the warm cache so its victim score can spare a coupled half.
+        // The cache applies it only when the knob is on; the publish rides a
+        // lock hold this rebuild already pays, every 64 forwards.
+            let joint_pairs: std::collections::HashMap<(u32, u32, u32), u32> =
+                if self.ecache.as_ref().is_some_and(|c| c.lock().joint_eviction_enabled()) {
+                    co.pair_table()
+                } else {
+                    std::collections::HashMap::new()
+                };
         drop(co);
         // Union-find per layer over the loose pairs → expert → component id.
         let mut groups: Vec<std::collections::HashMap<u32, u32>> = Vec::with_capacity(loose.len());
@@ -5266,6 +5679,9 @@ impl Model {
             groups.push(map);
         }
         *self.affinity.lock() = Arc::new(crate::concurrent::AffinityHints { pairs, groups });
+        if let Some(cache) = &self.ecache {
+            cache.lock().set_joint_pairs(joint_pairs);
+        }
     }
 
     /// The current affinity snapshot (cheap Arc clone).
@@ -5429,7 +5845,7 @@ impl Model {
     /// at the boundary (~151 MB per entry at 27B dims) — a trade to measure,
     /// not assume (Track C phase 2a).
     pub fn prefix_cachable(&self) -> bool {
-        self.cfg.arch != Arch::HybridGdn
+        !matches!(self.cfg.arch, Arch::HybridGdn | Arch::Glm5Next)
     }
 
     pub fn save_topic_profiles_here(&self) -> Result<(), Error> {
@@ -5770,6 +6186,14 @@ impl Model {
             let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
             self.embed.dequant_row_into(tid, &mut x[s * d..s * d + d]);
         }
+        // Glm5Next runs the stack on `hc_mult` mHC residual streams: replicate
+        // the embedding into the stream form here, collapse (unweighted mean)
+        // after the last layer — so every consumer of this function's return
+        // value keeps seeing the ordinary `[s_n, hidden]` shape.
+        let hc = self.hc_streams();
+        if hc > 1 {
+            x = expand_hc_streams(&x, s_n, d, hc);
+        }
 
         // This forward logs into `route_hist` (see the `route_log` field below),
         // so the co-activation fold in `publish_lane_timings` has a fresh frame.
@@ -5859,7 +6283,11 @@ impl Model {
             // and that is the one the new multi-row look-ahead lives in. Keep this gate
             // the historical shape (single-row decode-only) so chunk-prefill stays
             // measured-neutral.
-            let la_width = if router_lookahead() && s_n == 1 { router_lookahead_width() } else { 0 };
+            // `hc == 1` guard: the look-ahead ranks the next layer's router
+            // over `x`, and in stream form `x` rows are `[hc*d]` — the router
+            // wants the collapsed `[d]` view, which does not exist mid-stack.
+            // Wiring a per-layer collapse for prediction is future work.
+            let la_width = if router_lookahead() && s_n == 1 && hc == 1 { router_lookahead_width() } else { 0 };
             // Built independently of `pfc`, not from it: the two are separate
             // features with separate knobs, and one asks the routing history while
             // the other asks the next layer's router. Deriving this from `pfc` would
@@ -5883,7 +6311,11 @@ impl Model {
             // reasoning: a prefill chunk's "actual set" is a union over positions, so
             // recall against it would not be the number any of these predictors is
             // trying to hit.
-            let eval = (s_n == 1).then_some(predict_eval.as_ref()).flatten();
+            let eval = (s_n == 1 && hc == 1).then_some(predict_eval.as_ref()).flatten();
+            // Multi-layer look-ahead: horizon widths decay geometrically from the
+            // full window, so horizon 1 is today's behaviour and each deeper layer
+            // spends half the slots. Zeros end the loop — the sequence halts itself.
+            let la_widths = lookahead_horizon_widths(la_width, router_lookahead_k());
             // Per-step carry for the Δ=2 eval arm: `deep[t]` is layer `t`'s
             // predicted set ranked two layers early. Fresh each forward step.
             let mut deep: Vec<Vec<i32>> =
@@ -5898,9 +6330,16 @@ impl Model {
                 // Emitted here, after this layer's own reads have been consumed and
                 // before the next layer's attention, because that gap is the whole
                 // resource being spent. `x` is this layer's output, which is the next
-                // layer's input.
+                // layer's input. Deeper horizons rank layers L+2… from the same
+                // state — advisory guesses whose recall decays with distance, spent
+                // out of a shrinking window.
                 if let Some(la) = &la {
-                    la.emit(layers, li + 1, &x, la_width);
+                    for (h, &w) in la_widths.iter().enumerate() {
+                        if w == 0 {
+                            break;
+                        }
+                        la.emit(layers, li + 1 + h, &x, w);
+                    }
                 }
                 if let (Some(eval), Some(rh)) = (eval, route_hist.as_ref()) {
                     // Score first, then predict. `forward_layer` has just pushed this
@@ -5912,6 +6351,9 @@ impl Model {
                     score_and_stash(&sc, li, &x, &mut deep);
                 }
             }
+        }
+        if hc > 1 {
+            x = collapse_hc_streams(&x, s_n, d, hc);
         }
         // When look-ahead is off, fall back to one bulk next-token enqueue after the
         // forward (main forward only).
@@ -6070,6 +6512,14 @@ impl Model {
         pos_base: usize,
         kv_at: &dyn Fn(usize) -> LayerKv,
     ) -> Result<Vec<f32>, Error> {
+        // The replay re-runs main-stack layers on a `[d]`-wide hidden; a
+        // Glm5Next layer operates on the `[hc*d]` stream form, which does not
+        // exist post-collapse. Refuse rather than index garbage.
+        if self.hc_streams() > 1 {
+            return Err(Error::Format(
+                "RLM recursive replay is not supported on an mHC-stream architecture (glm5_next)".into(),
+            ));
+        }
         let n_layers = self.cfg.n_layers as usize;
         let k = crate::rlm::rlm_layers().min(n_layers);
         let start = n_layers - k;
@@ -6199,6 +6649,12 @@ impl Model {
             let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
             self.embed.dequant_row_into(tid, &mut x[s * d..s * d + d]);
         }
+        // mHC stream form between embedding and final collapse — same shape
+        // discipline as `forward_hidden`.
+        let hc = self.hc_streams();
+        if hc > 1 {
+            x = expand_hc_streams(&x, s_n, d, hc);
+        }
         let ctx = self.forward_ctx();
         for (li, l) in self.layers.iter().enumerate() {
             // Advancing the sweep clock here matters even though this path emits no
@@ -6207,6 +6663,9 @@ impl Model {
             // stale by the end of it — and should read as such.
             self.sweep.tick();
             forward_layer(l, li, LayerState { kv: &mut seq.layers[li], gdn: seq.gdn[li].as_mut() }, &ctx, &mut x, s_n, pos_base)?;
+        }
+        if hc > 1 {
+            x = collapse_hc_streams(&x, s_n, d, hc);
         }
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
         Ok(self.lm_head.apply_vec(&xf, s_n))
@@ -6498,6 +6957,12 @@ impl Model {
             let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
             self.embed.dequant_row_into(tid, &mut x[s * d..s * d + d]);
         }
+        // mHC stream form between embedding and final collapse — same shape
+        // discipline as `forward_hidden`.
+        let hc = self.hc_streams();
+        if hc > 1 {
+            x = expand_hc_streams(&x, s_n, d, hc);
+        }
         // Built inline (not via `forward_ctx`) so the per-sequence history borrow and
         // the model borrows share one inferred lifetime.
         let balancer = self.build_balancer();
@@ -6545,12 +7010,13 @@ impl Model {
             let mut seen = std::collections::HashSet::with_capacity(seqs.len());
             owner.iter().all(|&o| seen.insert(o)) && seen.len() == s_n
         };
-        let la_width = if router_lookahead() && (s_n == 1 || (batched_decode && router_lookahead_batch())) {
+        let la_width = if router_lookahead() && hc == 1 && (s_n == 1 || (batched_decode && router_lookahead_batch())) {
             router_lookahead_width()
         } else {
             0
         };
         let la = (la_width > 0).then(|| self.lookahead_ctx()).flatten();
+        let la_widths = lookahead_horizon_widths(la_width, router_lookahead_k());
         let layers: &[LayerW] = &self.layers;
         for (li, l) in layers.iter().enumerate() {
             self.sweep.tick();
@@ -6571,10 +7037,18 @@ impl Model {
             };
             forward_layer_batched(l, li, &mut caches, &mut gstates, rows_at, &ctx, &mut x)?;
             if let Some(la) = &la {
-                la.emit(layers, li + 1, &x, la_width);
+                for (h, &w) in la_widths.iter().enumerate() {
+                    if w == 0 {
+                        break;
+                    }
+                    la.emit(layers, li + 1 + h, &x, w);
+                }
             }
         }
         self.publish_lane_timings();
+        if hc > 1 {
+            x = collapse_hc_streams(&x, s_n, d, hc);
+        }
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
         Ok((self.lm_head.apply_vec(&xf, s_n), x))
     }
@@ -7107,6 +7581,17 @@ impl Model {
             return Ok(Vec::new());
         }
         if self.mtp.is_none() || g_draft == 0 {
+            let mut greedy = Sampler::new(0.0, 0.9, 1);
+            return self.generate(prompt, n_new, &mut greedy);
+        }
+        // A recurrent arch (HybridGdn / Glm5Next) cannot rewind a rejected
+        // draft out of the model-resident states: `truncate_kv` reaches only
+        // the KV rows, and the verify forward has already folded the rejected
+        // positions into every GDN/KDA delta-rule memory. The serve engine
+        // speculates on these arches with the documented SeqKv
+        // snapshot/restore rollback; this model-resident convenience path
+        // falls back to plain greedy instead of silently corrupting state.
+        if !self.spec_reject_is_kv_only() {
             let mut greedy = Sampler::new(0.0, 0.9, 1);
             return self.generate(prompt, n_new, &mut greedy);
         }
@@ -7759,6 +8244,172 @@ mod tests {
         prefill_step_identity_and_generate(&d)?;
         std::fs::remove_dir_all(&d)?;
         Ok(())
+    }
+
+    fn tmp_glm53_model_dir(tag: &str) -> Result<PathBuf, peregrine_core::Error> {
+        let d = std::env::temp_dir().join(format!("peregrine_glm53_{}_{}", std::process::id(), tag));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_glm53_model(&d, 0x53F1A5)?;
+        Ok(d)
+    }
+
+    #[test]
+    fn glm5next_model_loads_decodes_and_is_step_consistent() -> Result<(), peregrine_core::Error> {
+        // Exercises every Glm5Next mechanism through the full stack: three KDA
+        // layers (per-channel forget gates, conv rings), one NoPE MLA layer,
+        // mHC streams at every site, the clamped SwiGLU, the sigmoid router,
+        // and the mean stream collapse — prefill vs stepwise bit-identity is
+        // the strongest single check that the stream state carries correctly.
+        let d = tmp_glm53_model_dir("stack")?;
+        prefill_step_identity_and_generate(&d)?;
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn glm5next_streamed_experts_match_resident() -> Result<(), peregrine_core::Error> {
+        // The streamed path clamps its SwiGLU exactly like the resident one
+        // (`Mlp::limit` travels through `moe_forward_concurrent`'s rebuild), so
+        // the two must stay bit-identical on a clamped-SwiGLU architecture too.
+        let d = tmp_glm53_model_dir("stream")?;
+        let mut resident = Model::load_streaming(&d, false)?;
+        let mut streamed = Model::load_streaming(&d, true)?;
+        assert!(streamed.stream_experts && !resident.stream_experts);
+        let toks = [1, 5, 9, 2, 7];
+        let lr = resident.forward_step(&toks, 0)?;
+        let ls = streamed.forward_step(&toks, 0)?;
+        assert_eq!(lr, ls, "streamed logits must equal resident logits");
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn glm5next_checkpoint_with_an_mtp_head_loads_and_drafts() -> Result<(), peregrine_core::Error> {
+        // The MTP layer is GLM-dialect (model.layers.{n}.eh_proj), loads as a
+        // *DSA* layer despite sitting past the KDA/DSA schedule, and runs a
+        // conventional residual (no hc tensors). The draft head must produce
+        // in-vocab tokens from a collapsed hidden, and the model-resident
+        // speculative entry must stay output-identical to greedy (on this
+        // recurrent arch it does so by falling back — the serve engine owns
+        // the SeqKv snapshot/rollback speculation).
+        let d = tmp_glm53_model_dir("mtp")?;
+        let mut m = Model::load(&d)?;
+        assert!(m.has_mtp(), "the fixture carries a GLM-dialect MTP head");
+        assert!(!m.spec_reject_is_kv_only(), "KDA states need snapshot/restore on reject");
+        let toks = [1i32, 5, 9];
+        let vocab = m.cfg.vocab;
+        // The draft head itself: hidden from a prefill, then a 2-deep draft.
+        let x = m.forward_hidden(&toks, 0)?;
+        let dh = m.cfg.hidden as usize;
+        let hlast = x[(toks.len() - 1) * dh..toks.len() * dh].to_vec();
+        let draft = m.mtp_draft(3, 2, &hlast, 0.0)?;
+        assert_eq!(draft.len(), 2, "the MTP head drafts through its DSA layer");
+        assert!(draft.iter().all(|&t| t >= 0 && (t as i64) < vocab), "drafts in vocab: {draft:?}");
+        m.reset();
+        let mut greedy_s = Sampler::new(0.0, 0.95, 1);
+        let greedy = m.generate(&toks, 5, &mut greedy_s)?;
+        m.reset();
+        let spec = m.generate_speculative(&toks, 5, 2)?;
+        assert_eq!(greedy, spec, "speculation must be output-invisible");
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn glm5next_batched_decode_matches_per_sequence() -> Result<(), peregrine_core::Error> {
+        // Three sequences, one batched decode step — row s must match decoding
+        // sequence s alone. Exercises the batched hc-stream form and the
+        // per-owner KDA state routing.
+        let d = tmp_glm53_model_dir("batched")?;
+        let m = Model::load(&d)?;
+        let vocab = m.cfg.vocab as usize;
+        let prompts: [&[i32]; 3] = [&[1, 5, 9], &[2, 7], &[3, 8, 4, 6]];
+        let newtok = [4i32, 6, 2];
+        let mut ref_logits = vec![0f32; 3 * vocab];
+        for (s, p) in prompts.iter().enumerate() {
+            let mut sk = SeqKv::new(&m.cfg);
+            m.forward_prefill_seq(p, &mut sk, 0)?;
+            let mut one: [&mut SeqKv; 1] = [&mut sk];
+            let pos = [p.len()];
+            let lg = m.forward_step_batched(&[newtok[s]], &mut one, &pos, None)?;
+            ref_logits[s * vocab..s * vocab + vocab].copy_from_slice(&lg);
+        }
+        let mut seqs: Vec<SeqKv> = Vec::new();
+        for p in prompts.iter() {
+            let mut sk = SeqKv::new(&m.cfg);
+            m.forward_prefill_seq(p, &mut sk, 0)?;
+            seqs.push(sk);
+        }
+        let mut refs: Vec<&mut SeqKv> = seqs.iter_mut().collect();
+        let pos_of: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+        let bat = m.forward_step_batched(&newtok, &mut refs, &pos_of, None)?;
+        for z in 0..3 * vocab {
+            assert!((ref_logits[z] - bat[z]).abs() < 1e-4, "z={z} ref={} bat={}", ref_logits[z], bat[z]);
+        }
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn glm5next_kpool_dsa_selects_a_subset_once_context_exceeds_index_topk() -> Result<(), peregrine_core::Error> {
+        // With index_topk 4 (a one-pool budget) over 13 positions the indexer
+        // has 3 complete pools to choose 1 from, plus the always-selected
+        // 1-token tail — a strict subset, so the sparse output must differ
+        // from dense while staying finite. (At 7 positions this is exactly
+        // dense: the single complete pool plus the 3-token tail covers every
+        // key, which is the k-pool analogue of the below-topk shortcut.)
+        let d = std::env::temp_dir().join(format!("peregrine_glm53_kpool_{}", std::process::id()));
+        if d.exists() {
+            std::fs::remove_dir_all(&d)?;
+        }
+        crate::testkit::build_tiny_glm53_model_cfg(&d, 0x53F1A5, crate::testkit::tiny_glm53_indexer_cfg_json(4))?;
+        let mut m = Model::load(&d)?;
+        let toks = [1i32, 5, 9, 2, 6, 3, 8, 4, 7, 11, 13, 2, 9];
+        let mut off = SeqKv::new(&m.cfg);
+        let dense = m.forward_prefill_seq(&toks, &mut off, 0)?;
+        m.dsa = true;
+        let mut on = SeqKv::new(&m.cfg);
+        let sparse = m.forward_prefill_seq(&toks, &mut on, 0)?;
+        assert_eq!(dense.len(), sparse.len());
+        assert!(sparse.iter().all(|v| v.is_finite()), "sparse attention must not produce NaN");
+        assert!(
+            dense.iter().zip(&sparse).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "index_topk=4 over 13 positions must attend a strict subset"
+        );
+        // Decode continues on the sparse cache. `SeqKv::len` reads layer 0,
+        // which is a KDA layer holding a point state instead of KV rows — the
+        // position count lives on the DSA layer's cache.
+        let mut one: [&mut SeqKv; 1] = [&mut on];
+        m.forward_step_batched(&[7], &mut one, &[toks.len()], None)?;
+        assert_eq!(on.layers[2].len(), toks.len() + 1, "the DSA layer's cache advanced");
+        std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn glm5next_swiglu_clamp_actually_clamps() {
+        // A pre-activation far past the limit must saturate: build one Mlp with
+        // and one without the clamp from identical weights and drive them with
+        // a large input — outputs must differ, and the clamped intermediate is
+        // bounded by construction.
+        use crate::weight::test_support::quant_i8;
+        let (o, i) = (4usize, 4usize);
+        let w: Vec<f32> = (0..o * i).map(|z| 8.0 + z as f32).collect();
+        let mk = |limit: f32| Mlp {
+            gate: quant_i8(&w, o, i),
+            up: quant_i8(&w, o, i),
+            down: quant_i8(&w, o, i),
+            limit,
+        };
+        let x = vec![4.0f32; i];
+        let plain = mk(0.0).swiglu(&x, 1);
+        let clamped = mk(10.0).swiglu(&x, 1);
+        assert!(
+            plain.iter().zip(&clamped).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a 100+-magnitude pre-activation must be visibly clamped at 10"
+        );
     }
 
     /// `accept_run_sampled` must emit the request's own distribution.
@@ -8710,7 +9361,6 @@ mod tests {
         assert_eq!(cap_ecache_budget(4 << 30, 2 << 30, 2 << 30, 1 << 30), 0);
     }
 
-    #[test]
     /// One ring per device is the whole point of the device-aware sizing: with
     /// fewer rings than device groups, `ring_homes` leaves at least one group
     /// with no home ring, reachable only by a ring that has run dry.
@@ -10231,6 +10881,55 @@ mod tests {
         // A short hidden state is refused rather than read out of bounds — the
         // look-ahead is advisory and must degrade, never panic.
         assert!(router_ranks_for(&m.layers[next], &m.cfg, &x[..2], 4).is_empty());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn lookahead_horizon_widths_decay_halve_and_terminate() {
+        // Horizon 1 is today's behaviour, slot-for-slot: any drift here would
+        // silently retune every existing deployment that relies on it.
+        assert_eq!(lookahead_horizon_widths(6, 1), vec![6]);
+        // Geometric halving, integer, no floor: 6 -> 3 -> 1 -> 0. The zero is
+        // the point — the sequence terminates on its own instead of sticking
+        // at one-slot guesses forever, which would let a large k keep paying
+        // reads after the recall is gone.
+        assert_eq!(lookahead_horizon_widths(6, 4), vec![6, 3, 1, 0]);
+        assert_eq!(lookahead_horizon_widths(8, 3), vec![8, 4, 2]);
+        // Monotone non-increasing: a deeper horizon never outranks a nearer
+        // one for slots, because near guesses have strictly better recall.
+        let w = lookahead_horizon_widths(7, 6);
+        for pair in w.windows(2) {
+            assert!(pair[0] >= pair[1], "widths must not grow with distance: {w:?}");
+        }
+        // A zero window stays zero however far it reaches.
+        assert_eq!(lookahead_horizon_widths(0, 4), vec![0, 0, 0, 0]);
+        // k == 0 reaches nowhere.
+        assert!(lookahead_horizon_widths(6, 0).is_empty());
+    }
+
+    #[test]
+    fn multi_layer_lookahead_is_bit_identical_to_the_single_layer_horizon() -> Result<(), Error> {
+        // The whole safety argument for the look-ahead, restated for the
+        // horizon: warms are advisory — the authoritative router still decides
+        // at each layer — so reaching two layers further may only change which
+        // speculative reads are issued, never a token. Both arms in ONE test:
+        // `COLI_ROUTER_LOOKAHEAD_K` is read per forward precisely so this A/B
+        // can flip it in-process without racing a latch.
+        let dir = tmp_model_dir("lookahead_horizon_bits")?;
+        let prompt = [3i32, 7, 1, 4];
+        std::env::set_var("COLI_ROUTER_LOOKAHEAD_K", "1");
+        let want = {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            m.generate(&prompt, 6, &mut Sampler::new(0.0, 0.9, 1))?
+        };
+        std::env::set_var("COLI_ROUTER_LOOKAHEAD_K", "3");
+        let got = {
+            let mut m = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+            m.generate(&prompt, 6, &mut Sampler::new(0.0, 0.9, 1))?
+        };
+        std::env::remove_var("COLI_ROUTER_LOOKAHEAD_K");
+        assert_eq!(got, want, "a deeper advisory horizon must not change tokens");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

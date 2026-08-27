@@ -1,7 +1,31 @@
 #include "backend_cuda.h"
 
 #include <cuda_runtime.h>
+
+/* ---- vendor portability -------------------------------------------------
+ * This file also compiles for AMD via `hipify-perl` + `hipcc`
+ * (`PEREGRINE_GPU_BACKEND=hip`; see docs/gpu-vendors.md). Two constructs have
+ * no HIP form and are bracketed here:
+ *
+ * - NVIDIA's WMMA (tensor-core) intrinsics. `<mma.h>` does not exist under
+ *   ROCm, and every `wmma::` kernel below already preprocesses to an EMPTY
+ *   body via its `__CUDA_ARCH__` guard (undefined on AMD). COLI_HAS_WMMA is
+ *   the HOST-side mirror of that fact: every launch gate consults it, so an
+ *   AMD build routes to the portable kernels instead of launching a no-op
+ *   and reading back zeros. (The AMD device gate cannot be `compute_major`,
+ *   which reports gfx generation — 11 on RDNA3 — and would pass a `>= 7`.)
+ * - Masked warp shuffles. AMD wavefronts execute in lockstep and HIP ships
+ *   only the unmasked form; on NVIDIA the macro expands to the historical
+ *   `__shfl_down_sync`, so that instruction stream is unchanged.
+ */
+#if defined(__HIP_PLATFORM_AMD__)
+#define COLI_HAS_WMMA 0
+#define COLI_SHFL_DOWN(v, off) __shfl_down((v), (off))
+#else
+#define COLI_HAS_WMMA 1
+#define COLI_SHFL_DOWN(v, off) __shfl_down_sync(0xffffffffu, (v), (off))
 #include <mma.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -1005,7 +1029,8 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
     if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=2||up->fmt!=2||down->fmt!=2||
        gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
        gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
-    DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    DeviceContext *ctx=find_ctx(gate->device);
+    if(!select_ctx(ctx)||!COLI_HAS_WMMA||ctx->compute_major<7)return 0;
     int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
     if(!reserve(ctx, &ctx->x,&ctx->x_cap,xb)||!reserve(ctx, &ctx->gate,&ctx->gate_cap,ib)||
        !reserve(ctx, &ctx->up,&ctx->up_cap,ib)||!reserve(ctx, &ctx->y,&ctx->y_cap,xb)||
@@ -1066,7 +1091,7 @@ __global__ void w4_gemv_rows(float *__restrict__ y, const float *__restrict__ x,
         acc += (float)hi * x[2 * b + 1];
     }
     /* Warp reduction, then one partial per warp through shared memory. */
-    for (int off = warpSize / 2; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    for (int off = warpSize / 2; off > 0; off >>= 1) acc += COLI_SHFL_DOWN(acc, off);
     __shared__ float warp_sums[32];
     const int lane = threadIdx.x & (warpSize - 1);
     const int warp = threadIdx.x / warpSize;
@@ -1075,7 +1100,7 @@ __global__ void w4_gemv_rows(float *__restrict__ y, const float *__restrict__ x,
     if (warp == 0) {
         const int nwarps = (int)blockDim.x / warpSize;
         float v = (lane < nwarps) ? warp_sums[lane] : 0.f;
-        for (int off = warpSize / 2; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+        for (int off = warpSize / 2; off > 0; off >>= 1) v += COLI_SHFL_DOWN(v, off);
         if (lane == 0) y[o] = v * s[o];
     }
 }
@@ -1148,12 +1173,12 @@ extern "C" int coli_cuda_w4_matvec(ColiCudaTensor *w, float *y, const float *x) 
 enum { ARM_TC_INT4 = 0, ARM_W4A16 = 1, ARM_W4_PACKED = 2, ARM_GENERIC = 3 };
 
 static int select_arm(DeviceContext *ctx, int all_s4, int D, int I, const int *rows, int count) {
-    int tc = getenv("COLI_CUDA_TC_INT4") && atoi(getenv("COLI_CUDA_TC_INT4"));
+    int tc = COLI_HAS_WMMA && getenv("COLI_CUDA_TC_INT4") && atoi(getenv("COLI_CUDA_TC_INT4"));
     tc = tc && all_s4 && D % 32 == 0 && I % 32 == 0 && D % 8 == 0 && I % 8 == 0;
     int tc_min = getenv("COLI_CUDA_TC_MIN_ROWS") ? atoi(getenv("COLI_CUDA_TC_MIN_ROWS")) : 8;
     for (int c = 0; c < count && tc; c++) tc = rows[c] >= tc_min;
     if (tc) return ARM_TC_INT4;
-    if (all_s4 && ctx->compute_major >= 7 && getenv("COLI_CUDA_TC_W4A16") && atoi(getenv("COLI_CUDA_TC_W4A16")))
+    if (COLI_HAS_WMMA && all_s4 && ctx->compute_major >= 7 && getenv("COLI_CUDA_TC_W4A16") && atoi(getenv("COLI_CUDA_TC_W4A16")))
         return ARM_W4A16;
     if (all_s4 && (!getenv("COLI_CUDA_W4_PACKED") || atoi(getenv("COLI_CUDA_W4_PACKED")))) return ARM_W4_PACKED;
     return ARM_GENERIC;

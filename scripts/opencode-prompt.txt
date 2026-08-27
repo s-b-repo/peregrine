@@ -1,0 +1,18 @@
+Optimize peregrine-serve (/home/cortix/peregrine) for maximum token generation speed with Qwen3.8-27B on RTX 3060.
+
+CRITICAL constraints (violating these will cause the quality gate to FAIL and block your commit):
+- Do NOT modify scripts/audit-bad-patterns.sh (quality gate)
+- Do NOT modify scripts/auto-improve-loop.sh (loop orchestrator)
+- Do NOT modify scripts/opencode-prompt.txt (this file)
+- Do NOT modify .config/peregrine/serve-qwen.sh's COLI_GPU=1, COLI_GPU_DENSE=1, max-tokens 32768, max-batch 32 settings
+- Do NOT remove any existing functionality
+
+Focus areas:
+1. CUDA kernel dispatch — ensure gpu.calls > 0 (currently weights on GPU but compute on CPU)
+2. PCIe transfer reduction — minimize host-device copies per token
+3. Weight placement tuning in crates/peregrine-model/
+4. Batch processing in crates/peregrine-sched/ and crates/peregrine-engine/
+
+Verify with: cargo build --release --features cuda (CUDA_HOME=/opt/cuda)
+Quality gate: bash scripts/audit-bad-patterns.sh must pass after changes.
+Target: >= 0.6 tok/s token generation speed.

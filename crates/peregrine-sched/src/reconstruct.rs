@@ -46,5 +46,8 @@ pub fn mlp_from_segments(metas: &[QtMeta; 3], bufs: &[(Vec<u8>, Vec<u8>); 3]) ->
         gate: qt_from_raw(metas[0], &bufs[0].0, &bufs[0].1)?,
         up: qt_from_raw(metas[1], &bufs[1].0, &bufs[1].1)?,
         down: qt_from_raw(metas[2], &bufs[2].0, &bufs[2].1)?,
+        // This crate is the M4 GLM-5.2 scheduler; no clamped-SwiGLU model
+        // routes through it (Glm5Next streams via `concurrent.rs`).
+        limit: 0.0,
     })
 }

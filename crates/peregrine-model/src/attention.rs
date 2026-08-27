@@ -1362,8 +1362,8 @@ pub fn mla_attention_dsa_indexed(
         // query in this step — `score_keys` is pinned to a flat `&[f32]` by its
         // own arithmetic test, and re-gathering per row would cost `s_n` times
         // as much for the same bytes.
-        let mut keys: Vec<f32> = Vec::with_capacity(tk * ix.hd());
-        cache.ix_span(tk).extend_f32(tk, ix.hd(), &mut keys);
+        let mut keys: Vec<f32> = Vec::with_capacity(tk * ix.row_width());
+        cache.ix_span(tk).extend_f32(tk, ix.row_width(), &mut keys);
         let sel: Vec<Option<Vec<usize>>> = (0..s_n)
             .map(|s| {
                 let pos = pos_base + s;
@@ -1585,8 +1585,8 @@ pub fn mla_attention_rows(
                 }
                 let keys = key_mats[o].get_or_insert_with(|| {
                     let n = views[o].len();
-                    let mut k = Vec::with_capacity(n * ix.hd());
-                    views[o].ix_span(n).extend_f32(n, ix.hd(), &mut k);
+                    let mut k = Vec::with_capacity(n * ix.row_width());
+                    views[o].ix_span(n).extend_f32(n, ix.row_width(), &mut k);
                     k
                 });
                 Some(ix.select(&qr[s * ql..s * ql + ql], &x[s * hidden..s * hidden + hidden], rope_of[s], c, keys))

@@ -158,6 +158,196 @@ pub fn build_tiny_model(dir: &Path) -> Result<(), Error> {
     build_tiny_model_seeded(dir, 0xC0FFEE)
 }
 
+/// The tiny GLM-5.3-Flash-shaped config: the multimodal wrapper nesting, a
+/// KDA/DSA hybrid schedule (3 KDA + 1 DSA over 4 layers, like the real 3:1),
+/// one dense-prefix layer, the k-pool indexer, mHC hyper-connections and the
+/// SwiGLU clamp — every Glm5Next mechanism at toy dims.
+pub fn tiny_glm53_cfg_json() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "glm5_next",
+        "text_config": {
+            "model_type": "glm5_next_text",
+            "vocab_size": 32, "hidden_size": 16,
+            "num_hidden_layers": 4, "num_attention_heads": 2,
+            "n_routed_experts": 4, "num_experts_per_tok": 2,
+            "moe_intermediate_size": 8, "intermediate_size": 8,
+            "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+            "layer_types": ["linear_attention", "linear_attention",
+                            "deepseek_sparse_attention", "linear_attention"],
+            "indexer_types": ["full", "full", "full", "full"],
+            "q_lora_rank": 12, "kv_lora_rank": 8,
+            "qk_nope_head_dim": 4, "qk_rope_head_dim": 0, "v_head_dim": 4,
+            "n_shared_experts": 1, "n_group": 1, "topk_group": 1,
+            "norm_topk_prob": true, "routed_scaling_factor": 2.5,
+            "rms_norm_eps": 1e-5, "swiglu_limit": 10.0,
+            "linear_attn_config": {"num_heads": 2, "head_dim": 4,
+                                   "short_conv_kernel_size": 4, "gate_lower_bound": -5.0},
+            "index_topk": 8, "index_n_heads": 2, "index_head_dim": 4,
+            "index_kpool": 4, "index_kpool_always_select_tail": true,
+            "hc_mult": 4, "hc_eps": 1e-6, "hc_sinkhorn_iters": 20, "mhc": true,
+            "eos_token_id": 0
+        }
+    })
+}
+
+/// [`tiny_glm53_cfg_json`] with the indexer's keep budget overridden — small
+/// enough that a handful of prompt tokens crosses it and the k-pool sparse
+/// path actually engages (`topk` must stay a multiple of `index_kpool` 4).
+#[cfg(test)]
+pub(crate) fn tiny_glm53_indexer_cfg_json(topk: i64) -> serde_json::Value {
+    let mut v = tiny_glm53_cfg_json();
+    v["text_config"]["index_topk"] = serde_json::json!(topk);
+    v
+}
+
+/// Write a tiny random GLM-5.3-Flash-shaped model into `dir`, emitting exactly
+/// the container contract `peregrine-import-hf` produces for `glm5_next`: the
+/// GLM `model.` stem (the importer renames `model.language_model.`), int4 +
+/// `.qs` big projections, **int8** + `.qs` gate-critical matrices (hc `fn`,
+/// KDA `f_*`/`g_*`/`b`, the k-pool compress gate), F32 norms/vectors, and the
+/// GLM-dialect MTP head layer at index `n_layers` (DSA + sparse, no hc).
+pub fn build_tiny_glm53_model(dir: &Path, seed: u64) -> Result<(), Error> {
+    build_tiny_glm53_model_cfg(dir, seed, tiny_glm53_cfg_json())
+}
+
+/// [`build_tiny_glm53_model`] for an arbitrary tiny Glm5Next config.
+pub(crate) fn build_tiny_glm53_model_cfg(dir: &Path, seed: u64, cfg_json: serde_json::Value) -> Result<(), Error> {
+    let cfg: Cfg = Cfg::from_json(&cfg_json)?;
+    let mut r = Lcg(seed);
+    let rnd = |n: usize, r: &mut Lcg| (0..n).map(|_| r.f()).collect::<Vec<f32>>();
+    let (d, h) = (cfg.hidden as usize, cfg.n_heads as usize);
+    let (qkh, vh) = (cfg.qk_head as usize, cfg.v_head as usize);
+    let (ql, kvl, qkr, qkn) = (cfg.q_lora as usize, cfg.kv_lora as usize, cfg.qk_rope as usize, cfg.qk_nope as usize);
+    let (lh, ld, taps) = (cfg.lin_k_heads as usize, cfg.lin_k_dim as usize, cfg.lin_conv_k as usize);
+    let lqkv = lh * ld;
+    let hc = cfg.hc_mult.max(1) as usize;
+    let vocab = cfg.vocab as usize;
+
+    let mut blobs = Vec::new();
+    let w4 = |blobs: &mut Vec<Blob>, name: &str, o: usize, i: usize, r: &mut Lcg| {
+        let w = rnd(o * i, r);
+        let (q, s) = quant_i4(&w, o, i);
+        blobs.push(Blob::new(name.to_string(), "U8", vec![o as i64, (i.div_ceil(2)) as i64], q));
+        blobs.push(Blob::new(format!("{name}.qs"), "F32", vec![o as i64], f32_bytes(&s)));
+    };
+    let w8 = |blobs: &mut Vec<Blob>, name: &str, o: usize, i: usize, r: &mut Lcg| {
+        let w = rnd(o * i, r);
+        let (q, s) = quant_i8(&w, o, i);
+        blobs.push(Blob::new(name.to_string(), "U8", vec![o as i64, i as i64], q));
+        blobs.push(Blob::new(format!("{name}.qs"), "F32", vec![o as i64], f32_bytes(&s)));
+    };
+    let wf = |blobs: &mut Vec<Blob>, name: &str, n: usize, r: &mut Lcg| {
+        let v: Vec<f32> = (0..n).map(|_| 1.0 + r.f() * 0.1).collect();
+        blobs.push(Blob::new(name.to_string(), "F32", vec![n as i64], f32_bytes(&v)));
+    };
+    let wraw = |blobs: &mut Vec<Blob>, name: &str, v: &[f32], shape: Vec<i64>| {
+        blobs.push(Blob::new(name.to_string(), "F32", shape, f32_bytes(v)));
+    };
+
+    let w = rnd(vocab * d, &mut r);
+    let (q, s) = quant_i8(&w, vocab, d);
+    blobs.push(Blob::new("model.embed_tokens.weight", "U8", vec![vocab as i64, d as i64], q));
+    blobs.push(Blob::new("model.embed_tokens.weight.qs", "F32", vec![vocab as i64], f32_bytes(&s)));
+    let w = rnd(vocab * d, &mut r);
+    let (q, s) = quant_i8(&w, vocab, d);
+    blobs.push(Blob::new("lm_head.weight", "U8", vec![vocab as i64, d as i64], q));
+    blobs.push(Blob::new("lm_head.weight.qs", "F32", vec![vocab as i64], f32_bytes(&s)));
+    wf(&mut blobs, "model.norm.weight", d, &mut r);
+
+    // layers 0..n_layers are the main stack; layer n_layers is the MTP head
+    // layer — DSA whatever the schedule would say, sparse, and hc-free.
+    for i in 0..=cfg.n_layers as usize {
+        let p = |s: &str| format!("model.layers.{i}.{s}");
+        let is_mtp = i == cfg.n_layers as usize;
+        let full = is_mtp || cfg.full_attn.get(i).copied().unwrap_or(false);
+        wf(&mut blobs, &p("input_layernorm.weight"), d, &mut r);
+        wf(&mut blobs, &p("post_attention_layernorm.weight"), d, &mut r);
+        if full {
+            w4(&mut blobs, &p("self_attn.q_a_proj.weight"), ql, d, &mut r);
+            wf(&mut blobs, &p("self_attn.q_a_layernorm.weight"), ql, &mut r);
+            w4(&mut blobs, &p("self_attn.q_b_proj.weight"), h * qkh, ql, &mut r);
+            w4(&mut blobs, &p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d, &mut r);
+            wf(&mut blobs, &p("self_attn.kv_a_layernorm.weight"), kvl, &mut r);
+            w4(&mut blobs, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl, &mut r);
+            w4(&mut blobs, &p("self_attn.o_proj.weight"), d, h * vh, &mut r);
+            // DSA indexer with the k-pool compressor.
+            let (inh, ihd) = (cfg.index_nh as usize, cfg.index_hd as usize);
+            w4(&mut blobs, &p("self_attn.indexer_projections.wq_b"), inh * ihd, ql, &mut r);
+            w4(&mut blobs, &p("self_attn.indexer_projections.wk"), ihd, d, &mut r);
+            w4(&mut blobs, &p("self_attn.indexer_projections.weights_proj"), inh, d, &mut r);
+            wf(&mut blobs, &p("self_attn.indexer.k_norm.weight"), ihd, &mut r);
+            let kb: Vec<f32> = (0..ihd).map(|_| r.f() * 0.1).collect();
+            wraw(&mut blobs, &p("self_attn.indexer.k_norm.bias"), &kb, vec![ihd as i64]);
+            let kp = cfg.index_kpool as usize;
+            w8(&mut blobs, &p("self_attn.indexer.index_kpool_compress_gate"), ihd, d, &mut r);
+            let ape: Vec<f32> = (0..kp * ihd).map(|_| r.f() * 0.1).collect();
+            wraw(&mut blobs, &p("self_attn.indexer.index_kpool_compress_ape"), &ape, vec![kp as i64, ihd as i64]);
+        } else {
+            w4(&mut blobs, &p("self_attn.q_proj.weight"), lqkv, d, &mut r);
+            w4(&mut blobs, &p("self_attn.k_proj.weight"), lqkv, d, &mut r);
+            w4(&mut blobs, &p("self_attn.v_proj.weight"), lqkv, d, &mut r);
+            for t in ["q_conv1d", "k_conv1d", "v_conv1d"] {
+                let conv = rnd(lqkv * taps, &mut r);
+                wraw(&mut blobs, &p(&format!("self_attn.{t}.weight")), &conv, vec![lqkv as i64, 1, taps as i64]);
+            }
+            w8(&mut blobs, &p("self_attn.f_a_proj.weight"), ld, d, &mut r);
+            w8(&mut blobs, &p("self_attn.f_b_proj.weight"), lqkv, ld, &mut r);
+            let dtb: Vec<f32> = (0..lqkv).map(|_| r.f() * 0.5).collect();
+            wraw(&mut blobs, &p("self_attn.dt_bias"), &dtb, vec![lqkv as i64]);
+            let a_log: Vec<f32> = (0..lh).map(|_| r.f() * 0.5).collect();
+            wraw(&mut blobs, &p("self_attn.A_log"), &a_log, vec![lh as i64]);
+            w8(&mut blobs, &p("self_attn.b_proj.weight"), lh, d, &mut r);
+            w8(&mut blobs, &p("self_attn.g_a_proj.weight"), ld, d, &mut r);
+            w8(&mut blobs, &p("self_attn.g_b_proj.weight"), lqkv, ld, &mut r);
+            wf(&mut blobs, &p("self_attn.o_norm.weight"), ld, &mut r);
+            w4(&mut blobs, &p("self_attn.o_proj.weight"), d, lqkv, &mut r);
+        }
+        // mHC hyper-connections on main-stack layers only.
+        if !is_mtp {
+            let mix = (2 + hc) * hc;
+            for site in ["attn", "ffn"] {
+                w8(&mut blobs, &p(&format!("hc_{site}_fn")), mix, hc * d, &mut r);
+                let base: Vec<f32> = (0..mix).map(|_| r.f() * 0.5).collect();
+                wraw(&mut blobs, &p(&format!("hc_{site}_base")), &base, vec![mix as i64]);
+                let scale: Vec<f32> = (0..3).map(|_| 1.0 + r.f() * 0.1).collect();
+                wraw(&mut blobs, &p(&format!("hc_{site}_scale")), &scale, vec![3]);
+            }
+        }
+        if i < cfg.first_dense as usize {
+            let di = cfg.dense_inter as usize;
+            w4(&mut blobs, &p("mlp.gate_proj.weight"), di, d, &mut r);
+            w4(&mut blobs, &p("mlp.up_proj.weight"), di, d, &mut r);
+            w4(&mut blobs, &p("mlp.down_proj.weight"), d, di, &mut r);
+        } else {
+            let (e_n, mi, si) = (cfg.n_experts as usize, cfg.moe_inter as usize, (cfg.moe_inter * cfg.n_shared) as usize);
+            let rw = rnd(e_n * d, &mut r);
+            blobs.push(Blob::new(p("mlp.gate.weight"), "F32", vec![e_n as i64, d as i64], f32_bytes(&rw)));
+            let rb: Vec<f32> = (0..e_n).map(|_| r.f() * 0.1).collect();
+            blobs.push(Blob::new(p("mlp.gate.e_score_correction_bias"), "F32", vec![e_n as i64], f32_bytes(&rb)));
+            w4(&mut blobs, &p("mlp.shared_experts.gate_proj.weight"), si, d, &mut r);
+            w4(&mut blobs, &p("mlp.shared_experts.up_proj.weight"), si, d, &mut r);
+            w4(&mut blobs, &p("mlp.shared_experts.down_proj.weight"), d, si, &mut r);
+            for e in 0..e_n {
+                let pe = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
+                w4(&mut blobs, &pe("gate_proj.weight"), mi, d, &mut r);
+                w4(&mut blobs, &pe("up_proj.weight"), mi, d, &mut r);
+                w4(&mut blobs, &pe("down_proj.weight"), d, mi, &mut r);
+            }
+        }
+        if is_mtp {
+            w4(&mut blobs, &p("eh_proj.weight"), d, 2 * d, &mut r);
+            wf(&mut blobs, &p("enorm.weight"), d, &mut r);
+            wf(&mut blobs, &p("hnorm.weight"), d, &mut r);
+            wf(&mut blobs, &p("shared_head.norm.weight"), d, &mut r);
+        }
+    }
+
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&cfg_json)?)?;
+    write_safetensors(dir, &blobs)?;
+    Ok(())
+}
+
 /// The tiny classic-Qwen3 (dense GQA) config — Track C's GQA core fixture.
 /// Dims mirror `peregrine_core::config`'s tests and C2's importer fixture.
 pub fn tiny_qwen_cfg_json() -> serde_json::Value {

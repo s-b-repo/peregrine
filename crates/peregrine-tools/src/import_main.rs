@@ -53,7 +53,10 @@ fn main() -> std::process::ExitCode {
         [a, b] => (Path::new(*a), Path::new(*b)),
         _ => return std::process::ExitCode::from(usage() as u8),
     };
-    eprintln!("peregrine-import-hf: {} -> {} (track-c-rev2 contract)", indir.display(), outdir.display());
+    // The contract (track-c-rev2 vs glm5-next) is resolved inside `import_hf`
+    // from the checkpoint's own model_type; naming one here would lie for the
+    // other family, so the banner names neither.
+    eprintln!("peregrine-import-hf: {} -> {}", indir.display(), outdir.display());
     match import_hf(indir, outdir, shard_bytes) {
         Ok(rep) => {
             eprintln!(

@@ -74,6 +74,22 @@ pub struct IndexerWeights {
     nh: usize,
     hd: usize,
     topk: usize,
+    /// Glm5Next k-pool compression: `Some` scores pools of `kpool` consecutive
+    /// tokens (learned per-channel within-pool weighting) instead of tokens.
+    kpool: Option<KpoolWeights>,
+}
+
+/// The k-pool half of a Glm5Next indexer: pool size, the learned gate that
+/// produces per-token pooling logits, and the pool-slot embedding.
+struct KpoolWeights {
+    /// Pool width in tokens (`index_kpool`).
+    k: usize,
+    /// Whether the incomplete tail pool's tokens are always selected.
+    tail: bool,
+    /// `index_kpool_compress_gate`: `[hd, hidden]` — per-token pooling logits.
+    gate: QtWeight,
+    /// `index_kpool_compress_ape`: `[k, hd]` — additive per-slot embedding.
+    ape: Vec<f32>,
 }
 
 impl IndexerWeights {
@@ -90,6 +106,29 @@ impl IndexerWeights {
         let mut k_norm_b = vec![0f32; hd];
         st.read_f32(&format!("{base}.indexer.k_norm.weight"), &mut k_norm_w)?;
         st.read_f32(&format!("{base}.indexer.k_norm.bias"), &mut k_norm_b)?;
+        // k-pool compression: required when the config declares it — an indexer
+        // silently falling back to per-token scoring would select different
+        // keys than the checkpoint was trained to.
+        let kpool = if cfg.index_kpool > 0 && cfg.arch == peregrine_core::Arch::Glm5Next {
+            let gate_name = format!("{base}.indexer.index_kpool_compress_gate");
+            if !st.has(&gate_name) {
+                return Err(Error::Format(format!(
+                    "config declares index_kpool={} but {gate_name} is missing",
+                    cfg.index_kpool
+                )));
+            }
+            let k = cfg.index_kpool as usize;
+            let mut ape = vec![0f32; k * hd];
+            st.read_f32(&format!("{base}.indexer.index_kpool_compress_ape"), &mut ape)?;
+            Some(KpoolWeights {
+                k,
+                tail: cfg.index_kpool_tail,
+                gate: QtWeight::load(st, &gate_name, hd, hidden)?,
+                ape,
+            })
+        } else {
+            None
+        };
         Ok(Some(IndexerWeights {
             wq: QtWeight::load(st, &wqn, nh * hd, ql)?,
             wk: QtWeight::load(st, &format!("{base}.indexer_projections.wk"), hd, hidden)?,
@@ -99,6 +138,7 @@ impl IndexerWeights {
             nh,
             hd,
             topk: cfg.index_topk.max(0) as usize,
+            kpool,
         }))
     }
 
@@ -107,27 +147,45 @@ impl IndexerWeights {
         self.hd
     }
 
+    /// Width of one cached indexer **row** — `hd` for the per-token indexer,
+    /// `2*hd` for the k-pool form (key ‖ pooling gate logits). This, not
+    /// [`Self::hd`], is what sizes reads of the `LayerKv` index stream.
+    pub fn row_width(&self) -> usize {
+        if self.kpool.is_some() {
+            2 * self.hd
+        } else {
+            self.hd
+        }
+    }
+
     /// How many keys a query keeps. Selection is a no-op at or below this
     /// context length — attention is already dense over that many keys — which
-    /// is the activation rule the C engine uses.
+    /// is the activation rule the C engine uses. (Exact for the k-pool form
+    /// too: at `nt <= topk` every complete pool fits the pool budget and the
+    /// tail is appended, so the selection is all of `0..nt`.)
     pub fn topk(&self) -> usize {
         self.topk
     }
 
     /// Project, LayerNorm (eps 1e-6) and RoPE one position's key. The caller
     /// caches it; this borrows nothing mutable, so a layer's weights stay
-    /// shareable across concurrent sequences.
+    /// shareable across concurrent sequences. In k-pool form the row is the
+    /// key with the pooling gate logits appended (`[2*hd]`) — both are
+    /// per-token quantities that later selections need for every past position.
     pub fn key_row(&self, x_row: &[f32], pos: usize, cfg: &Cfg) -> Vec<f32> {
         let mut k = self.wk.apply_vec(x_row, 1); // [hd]
         layernorm_affine(&mut k, &self.k_norm_w, &self.k_norm_b, 1e-6);
-        rope_interleave(&mut k, pos, cfg);
+        rope_interleave(&mut k, pos, cfg); // no-op under NoPE (qk_rope = 0)
+        if let Some(kp) = &self.kpool {
+            k.extend(kp.gate.apply_vec(x_row, 1)); // [hd] gate logits
+        }
         k
     }
 
-    /// Select the top-`index_topk` key indices for a query at `pos`, over the
-    /// caller's cached `keys` (`[nkeys*hd]`, causal order). `qr` is the query's
-    /// **post-`rmsnorm`** q-LoRA row `[q_lora]` — the same tensor `q_b` consumes
-    /// — and `x_row` its hidden `[hidden]`.
+    /// Select the cached key indices a query at `pos` attends, over the
+    /// caller's cached `keys` (`[nkeys*row_width]`, causal order). `qr` is the
+    /// query's **post-`rmsnorm`** q-LoRA row `[q_lora]` — the same tensor `q_b`
+    /// consumes — and `x_row` its hidden `[hidden]`.
     pub fn select(&self, qr: &[f32], x_row: &[f32], pos: usize, cfg: &Cfg, keys: &[f32]) -> Vec<usize> {
         let (nh, hd) = (self.nh, self.hd);
         let mut qi = self.wq.apply_vec(qr, 1); // [nh*hd]
@@ -135,9 +193,61 @@ impl IndexerWeights {
             rope_interleave(&mut qi[h * hd..h * hd + hd], pos, cfg);
         }
         let w = self.wp.apply_vec(x_row, 1); // [nh]
-        let nt = (pos + 1).min(keys.len().checked_div(hd).unwrap_or(0));
-        let scores = score_keys(&qi, &w, &keys[..nt * hd], nh, hd);
-        select_topk(&scores, self.topk)
+        let rw = self.row_width();
+        let nt = (pos + 1).min(keys.len().checked_div(rw).unwrap_or(0));
+        let Some(kp) = &self.kpool else {
+            let scores = score_keys(&qi, &w, &keys[..nt * hd], nh, hd);
+            return select_topk(&scores, self.topk);
+        };
+
+        // --- k-pool form -------------------------------------------------
+        // 1. Compress each complete pool of `k` consecutive tokens into one
+        //    key: per *channel*, softmax over the pool's (gate logit + slot
+        //    embedding), then the weighted sum of the member keys.
+        let k = kp.k;
+        let n_full = nt / k;
+        let mut pool_keys = vec![0f32; n_full * hd];
+        let mut probs = vec![0f32; k];
+        for p in 0..n_full {
+            for c in 0..hd {
+                let mut mx = f32::NEG_INFINITY;
+                for (slot, pr) in probs.iter_mut().enumerate() {
+                    *pr = keys[(p * k + slot) * rw + hd + c] + kp.ape[slot * hd + c];
+                    mx = mx.max(*pr);
+                }
+                let mut sum = 0f32;
+                for pr in probs.iter_mut() {
+                    *pr = (*pr - mx).exp();
+                    sum += *pr;
+                }
+                let inv = 1.0 / sum;
+                let mut acc = 0f32;
+                for (slot, pr) in probs.iter().enumerate() {
+                    acc += (pr * inv) * keys[(p * k + slot) * rw + c];
+                }
+                pool_keys[p * hd + c] = acc;
+            }
+        }
+        // 2. Score pools exactly as the per-token form scores keys, keep the
+        //    top `topk/k` pools, expand each back to its member tokens.
+        let budget = (self.topk / k).max(1);
+        let sel_pools = if n_full > 0 {
+            let scores = score_keys(&qi, &w, &pool_keys, nh, hd);
+            select_topk(&scores, budget)
+        } else {
+            Vec::new()
+        };
+        let mut out = Vec::with_capacity(sel_pools.len() * k + k);
+        for p in sel_pools {
+            out.extend(p * k..(p + 1) * k);
+        }
+        // 3. The incomplete tail pool's tokens ride along (the query's own
+        //    position lives there), so recent context is never invisible.
+        if kp.tail {
+            out.extend(n_full * k..nt);
+        }
+        out.sort_unstable();
+        out
     }
 }
 

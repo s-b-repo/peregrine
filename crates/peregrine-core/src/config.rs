@@ -28,6 +28,16 @@ pub enum Arch {
     /// linear-attention layers carrying a per-stream recurrent state instead
     /// of KV. Dense SwiGLU MLP every layer, like [`Arch::DenseGqa`].
     HybridGdn,
+    /// GLM-5.3-Flash (`model_type: glm5_next[_text]`): a hybrid of KDA
+    /// linear-attention layers (Kimi Delta Attention — per-*channel* forget
+    /// gates, where [`Arch::HybridGdn`]'s GDN decays per head) and NoPE MLA
+    /// layers (`qk_rope_head_dim = 0`) carrying a k-pool-compressed DSA
+    /// indexer. Routed-expert MoE like [`Arch::GlmMla`] (sigmoid router +
+    /// correction bias), but with the SwiGLU pre-activations clamped at
+    /// `swiglu_limit`, and the whole stack running on `hc_mult` mHC
+    /// hyper-connection residual streams (Sinkhorn-normalized mixing at every
+    /// attention/FFN site) instead of a single residual stream.
+    Glm5Next,
 }
 
 /// Parsed `config.json`. Mirrors `Cfg` in `c/glm.c`.
@@ -50,11 +60,17 @@ pub struct Cfg {
     /// o_proj.
     pub attn_gate: bool,
     /// Gated-DeltaNet geometry (`linear_*` in config.json); zero elsewhere.
+    /// Glm5Next reuses these for its KDA layers (`linear_attn_config`), where
+    /// k-heads == v-heads and k-dim == v-dim by construction.
     pub lin_k_heads: i64,
     pub lin_v_heads: i64,
     pub lin_k_dim: i64,
     pub lin_v_dim: i64,
     pub lin_conv_k: i64,
+    /// Glm5Next KDA forget-gate lower bound (`linear_attn_config.gate_lower_bound`).
+    /// `Some(b)`: the log-decay is `b · sigmoid(exp(A_log) · g)` (bounded in
+    /// `(b, 0)`); `None`: the unbounded `-exp(A_log) · softplus(g)` form.
+    pub lin_gate_lb: Option<f32>,
     pub hidden: i64,
     pub n_layers: i64,
     pub n_heads: i64,
@@ -84,6 +100,23 @@ pub struct Cfg {
     pub index_hd: i64,
     /// per-layer indexer type: `true` = full indexer layer, `false` = shared.
     pub idx_type: Vec<bool>,
+    /// Glm5Next: the indexer scores *pools* of this many consecutive tokens
+    /// instead of individual tokens (`index_kpool`); 0 = per-token indexer.
+    pub index_kpool: i64,
+    /// Glm5Next: always append the incomplete tail pool's tokens to the
+    /// selection (`index_kpool_always_select_tail`).
+    pub index_kpool_tail: bool,
+    /// Glm5Next: SwiGLU pre-activation clamp (`swiglu_limit`) — gate clamped to
+    /// `<= limit`, up to `[-limit, limit]`, in every dense/shared/routed MLP.
+    /// 0.0 = no clamp (every other architecture).
+    pub swiglu_limit: f32,
+    /// Glm5Next mHC hyper-connections: number of parallel residual streams
+    /// (`hc_mult`). 0 or 1 = a single conventional residual stream.
+    pub hc_mult: i64,
+    /// mHC Sinkhorn numerical floor (`hc_eps`).
+    pub hc_eps: f32,
+    /// mHC Sinkhorn iteration count (`hc_sinkhorn_iters`).
+    pub hc_sinkhorn: i64,
     // derived
     pub qk_head: i64,
     pub attn_scale: f32,
@@ -167,11 +200,18 @@ impl Cfg {
                 return Cfg::from_json_hybrid(root.get("text_config").unwrap_or(root))
             }
             Some(t) if t.starts_with("qwen3") => return Cfg::from_json_gqa(root),
+            // GLM-5.3-Flash — checked before the "glm" prefix would swallow it
+            // into the MLA-only path. The multimodal checkpoint nests the text
+            // stack under `text_config` (model_type "glm5_next"); a text-only
+            // export is flat (model_type "glm5_next_text").
+            Some(t) if t.starts_with("glm5_next") => {
+                return Cfg::from_json_glm5next(root.get("text_config").unwrap_or(root))
+            }
             Some(t) if t.starts_with("glm") || t.starts_with("deepseek") => {}
             None => {}
             Some(other) => {
                 return Err(Error::Format(format!(
-                    "config: model_type \"{other}\" is not supported (glm/deepseek MLA-MoE, qwen3 dense-GQA, or qwen3_5 hybrid)"
+                    "config: model_type \"{other}\" is not supported (glm/deepseek MLA-MoE, glm5_next KDA+MLA-MoE, qwen3 dense-GQA, or qwen3_5 hybrid)"
                 )))
             }
         }
@@ -258,6 +298,7 @@ impl Cfg {
             lin_k_dim: 0,
             lin_v_dim: 0,
             lin_conv_k: 0,
+            lin_gate_lb: None,
             hidden: gi(root, "hidden_size"),
             n_layers,
             n_heads: gi(root, "num_attention_heads"),
@@ -284,6 +325,12 @@ impl Cfg {
             index_nh: gi(root, "index_n_heads"),
             index_hd: gi(root, "index_head_dim"),
             idx_type,
+            index_kpool: 0,
+            index_kpool_tail: false,
+            swiglu_limit: 0.0,
+            hc_mult: 0,
+            hc_eps: 0.0,
+            hc_sinkhorn: 0,
             qk_head: qk_nope + qk_rope,
             attn_scale: 0.0,
         };
@@ -351,6 +398,7 @@ impl Cfg {
             lin_k_dim: 0,
             lin_v_dim: 0,
             lin_conv_k: 0,
+            lin_gate_lb: None,
             hidden,
             n_layers,
             n_heads,
@@ -382,6 +430,12 @@ impl Cfg {
             index_nh: 0,
             index_hd: 0,
             idx_type: vec![false; n_layers.max(0) as usize],
+            index_kpool: 0,
+            index_kpool_tail: false,
+            swiglu_limit: 0.0,
+            hc_mult: 0,
+            hc_eps: 0.0,
+            hc_sinkhorn: 0,
             qk_head: head_dim,
             attn_scale: 1.0 / (head_dim.max(1) as f32).sqrt(),
         };
@@ -454,6 +508,301 @@ impl Cfg {
         Ok(c)
     }
 
+    /// Parse a GLM-5.3-Flash config (`root` is already the text sub-config when
+    /// the checkpoint is the multimodal wrapper). The MoE half is the GLM-5.2
+    /// shape (sigmoid router, correction bias, shared expert); attention is a
+    /// per-layer schedule of KDA linear attention and NoPE MLA with a
+    /// k-pool-compressed DSA indexer; the residual stream is `hc_mult` mHC
+    /// hyper-connection streams; and every SwiGLU clamps at `swiglu_limit`.
+    fn from_json_glm5next(root: &Value) -> Result<Cfg, Error> {
+        let n_layers = gi(root, "num_hidden_layers");
+        let n = n_layers.max(0) as usize;
+
+        let mut stop_ids = Vec::new();
+        match root.get("eos_token_id") {
+            Some(Value::Number(num)) => match num.as_i64() {
+                Some(id) => stop_ids.push(id as i32),
+                None => return Err(Error::Format(format!("config: eos_token_id={num} is not an integer"))),
+            },
+            Some(Value::Array(a)) => {
+                for v in a.iter() {
+                    match v.as_i64() {
+                        Some(id) => stop_ids.push(id as i32),
+                        None => return Err(Error::Format(format!("config: eos_token_id entry {v} is not an integer"))),
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Per-layer attention schedule. The explicit list wins; the fallback is
+        // the HF class's own default (every 4th layer, 0-indexed 3, 7, 11, … is
+        // the MLA/DSA layer, the rest KDA).
+        let full_attn: Vec<bool> = match root.get("layer_types").and_then(|v| v.as_array()) {
+            Some(types) => {
+                if types.len() != n {
+                    return Err(Error::Format(format!(
+                        "config: layer_types lists {} layers but num_hidden_layers={n}",
+                        types.len()
+                    )));
+                }
+                let mut out = Vec::with_capacity(n);
+                for (i, t) in types.iter().enumerate() {
+                    match t.as_str() {
+                        // "full_attention" is the HF normalization alias for the
+                        // MLA/DSA lane.
+                        Some("deepseek_sparse_attention") | Some("full_attention") => out.push(true),
+                        Some("linear_attention") => out.push(false),
+                        other => {
+                            return Err(Error::Format(format!(
+                                "config: layer_types[{i}] = {other:?} (expected deepseek_sparse_attention | linear_attention)"
+                            )))
+                        }
+                    }
+                }
+                out
+            }
+            None => (0..n).map(|i| i % 4 == 3).collect(),
+        };
+
+        // KDA geometry: the `linear_attn_config` dict, with the flat spellings
+        // and the HF class defaults (64 heads × 128, 4 conv taps) as fallback.
+        let lac = root.get("linear_attn_config");
+        let lac_i = |key: &str, flat: &str, default: i64| -> i64 {
+            match lac.and_then(|d| d.get(key)).and_then(|v| v.as_i64()) {
+                Some(v) => v,
+                None => match gi(root, flat) {
+                    0 => default,
+                    v => v,
+                },
+            }
+        };
+        let lin_heads = lac_i("num_heads", "linear_num_heads", 64);
+        let lin_dim = lac_i("head_dim", "linear_head_dim", 128);
+        let lin_conv_k = lac_i("short_conv_kernel_size", "linear_conv_kernel_dim", 4);
+        // gate_lower_bound: a number bounds the log-decay at that value; absent
+        // (or null) falls back to -5.0 unless `safe_gate: false` opts into the
+        // unbounded softplus form.
+        let lin_gate_lb = match lac.and_then(|d| d.get("gate_lower_bound")).and_then(|v| v.as_f64()) {
+            Some(b) => Some(b as f32),
+            None => {
+                let safe = lac.and_then(|d| d.get("safe_gate")).and_then(|v| v.as_bool()).unwrap_or(true);
+                safe.then_some(-5.0)
+            }
+        };
+
+        // MoE layer schedule: `mlp_layer_types` (dense-prefix + sparse rest) or
+        // `first_k_dense_replace`. A non-prefix dense pattern would need a
+        // per-layer sparse vector this Cfg does not carry — refuse rather than
+        // load a layer with the wrong MLP kind.
+        let first_dense = match root.get("mlp_layer_types").and_then(|v| v.as_array()) {
+            Some(types) => {
+                if types.len() != n {
+                    return Err(Error::Format(format!(
+                        "config: mlp_layer_types lists {} layers but num_hidden_layers={n}",
+                        types.len()
+                    )));
+                }
+                let dense_prefix = types.iter().take_while(|t| t.as_str() == Some("dense")).count();
+                for (i, t) in types.iter().enumerate().skip(dense_prefix) {
+                    match t.as_str() {
+                        Some("sparse") => {}
+                        Some("dense") => {
+                            return Err(Error::Format(format!(
+                                "config: mlp_layer_types has a dense layer at index {i} after sparse layers — only a dense prefix is supported"
+                            )))
+                        }
+                        other => {
+                            return Err(Error::Format(format!(
+                                "config: mlp_layer_types[{i}] = {other:?} (expected dense | sparse)"
+                            )))
+                        }
+                    }
+                }
+                dense_prefix as i64
+            }
+            None => gi(root, "first_k_dense_replace"),
+        };
+
+        // DSA indexer per-layer schedule — same explicit-list-or-formula rule
+        // as the GLM-5.2 parse (GLM-5.3-Flash ships all-"full").
+        let mut idx_type = vec![false; n];
+        {
+            let types = root.get("indexer_types").and_then(|v| v.as_array());
+            let mut freq = gi(root, "index_topk_freq");
+            if freq < 1 {
+                freq = 1;
+            }
+            let off = root.get("index_skip_topk_offset").and_then(|v| v.as_i64()).unwrap_or(2);
+            for (i, slot) in idx_type.iter_mut().enumerate() {
+                *slot = match types.and_then(|t| t.get(i)).and_then(|v| v.as_str()) {
+                    Some(s) => s == "full",
+                    None => {
+                        let v = ((i as i64) - off + 1).max(0);
+                        v % freq == 0
+                    }
+                };
+            }
+        }
+
+        let qk_nope = gi(root, "qk_nope_head_dim");
+        let qk_rope = gi(root, "qk_rope_head_dim");
+        let n_heads = gi(root, "num_attention_heads");
+        let mut c = Cfg {
+            arch: Arch::Glm5Next,
+            n_kv_heads: match gi(root, "num_key_value_heads") {
+                0 => n_heads,
+                v => v,
+            },
+            head_dim: 0,
+            full_attn,
+            attn_gate: false,
+            lin_k_heads: lin_heads,
+            lin_v_heads: lin_heads,
+            lin_k_dim: lin_dim,
+            lin_v_dim: lin_dim,
+            lin_conv_k,
+            lin_gate_lb,
+            hidden: gi(root, "hidden_size"),
+            n_layers,
+            n_heads,
+            n_experts: gi(root, "n_routed_experts"),
+            topk: gi(root, "num_experts_per_tok"),
+            moe_inter: gi(root, "moe_intermediate_size"),
+            dense_inter: gi(root, "intermediate_size"),
+            first_dense,
+            q_lora: gi(root, "q_lora_rank"),
+            kv_lora: gi(root, "kv_lora_rank"),
+            qk_nope,
+            qk_rope,
+            v_head: gi(root, "v_head_dim"),
+            n_shared: gi(root, "n_shared_experts"),
+            vocab: gi(root, "vocab_size"),
+            n_group: match gi(root, "n_group") {
+                0 => 1,
+                v => v,
+            },
+            topk_group: match gi(root, "topk_group") {
+                0 => 1,
+                v => v,
+            },
+            norm_topk: root.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(false),
+            eps: gf(root, "rms_norm_eps", 1e-5),
+            routed_scale: gf(root, "routed_scaling_factor", 1.0),
+            // NoPE: no attention lane is ever rotated (qk_rope = 0 is enforced
+            // below), so theta exists only to satisfy RopeTable's signature.
+            theta: 10000.0,
+            stop_ids,
+            index_topk: gi(root, "index_topk"),
+            index_nh: gi(root, "index_n_heads"),
+            index_hd: gi(root, "index_head_dim"),
+            idx_type,
+            index_kpool: match gi(root, "index_kpool") {
+                0 => 16, // the HF class default when the field is absent
+                v => v,
+            },
+            index_kpool_tail: root
+                .get("index_kpool_always_select_tail")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            swiglu_limit: gf(root, "swiglu_limit", 10.0),
+            hc_mult: match gi(root, "hc_mult") {
+                0 => 4, // the HF class default when the field is absent
+                v => v,
+            },
+            hc_eps: gf(root, "hc_eps", 1e-6),
+            hc_sinkhorn: match gi(root, "hc_sinkhorn_iters") {
+                0 => 20,
+                v => v,
+            },
+            qk_head: qk_nope + qk_rope,
+            attn_scale: 0.0,
+        };
+        c.attn_scale = 1.0 / (c.qk_head.max(1) as f32).sqrt();
+        c.validate_glm5next()?;
+        Ok(c)
+    }
+
+    /// The GLM-5.3-Flash choke point: the GLM-5.2 bounds where the shapes are
+    /// shared, plus the KDA/mHC/k-pool geometry, minus the RoPE checks (the
+    /// architecture is NoPE — `qk_rope_head_dim = 0` is *required*, matching
+    /// the HF implementation's own validation).
+    fn validate_glm5next(&self) -> Result<(), Error> {
+        let ck = |name: &str, v: i64, lo: i64, hi: i64| -> Result<(), Error> {
+            if v < lo || v > hi {
+                Err(Error::Format(format!("config: {name}={v} is outside [{lo},{hi}]")))
+            } else {
+                Ok(())
+            }
+        };
+        ck("hidden_size", self.hidden, 1, 1 << 20)?;
+        ck("num_hidden_layers", self.n_layers, 1, 128)?;
+        ck("num_attention_heads", self.n_heads, 1, 1024)?;
+        ck("n_routed_experts", self.n_experts, 1, 4096)?;
+        ck("num_experts_per_tok", self.topk, 1, 64)?;
+        ck("moe_intermediate_size", self.moe_inter, 1, 1 << 20)?;
+        ck("intermediate_size", self.dense_inter, 1, 1 << 24)?;
+        ck("first_k_dense_replace", self.first_dense, 0, self.n_layers)?;
+        ck("q_lora_rank", self.q_lora, 1, 1 << 20)?;
+        ck("kv_lora_rank", self.kv_lora, 1, 1 << 20)?;
+        ck("qk_nope_head_dim", self.qk_nope, 1, 1 << 16)?;
+        ck("v_head_dim", self.v_head, 1, 1 << 16)?;
+        ck("n_shared_experts", self.n_shared, 0, 64)?;
+        ck("vocab_size", self.vocab, 1, 1 << 24)?;
+        if self.qk_rope != 0 {
+            return Err(Error::Format(format!(
+                "config: qk_rope_head_dim={} — glm5_next attention is NoPE, expected 0",
+                self.qk_rope
+            )));
+        }
+        if self.topk > self.n_experts {
+            return Err(Error::Format(format!(
+                "config: num_experts_per_tok={} exceeds n_routed_experts={}",
+                self.topk, self.n_experts
+            )));
+        }
+        if self.n_group != 1 || self.topk_group != 1 {
+            return Err(Error::Format(format!(
+                "config: n_group={}/topk_group={} — this engine requires ungrouped routing (both 1)",
+                self.n_group, self.topk_group
+            )));
+        }
+        if self.full_attn.len() != self.n_layers.max(0) as usize {
+            return Err(Error::Format("config: layer_types length mismatch".into()));
+        }
+        // KDA geometry, only when a linear layer exists in the schedule.
+        if self.full_attn.iter().any(|f| !f) {
+            ck("linear_attn num_heads", self.lin_k_heads, 1, 1024)?;
+            ck("linear_attn head_dim", self.lin_k_dim, 1, 1 << 16)?;
+            ck("linear_attn short_conv_kernel_size", self.lin_conv_k, 1, 64)?;
+        }
+        // DSA indexer + k-pool geometry, only when configured.
+        if self.index_nh > 0 && self.index_hd > 0 {
+            ck("index_topk", self.index_topk, 1, 1 << 20)?;
+            ck("index_n_heads", self.index_nh, 1, 1024)?;
+            ck("index_head_dim", self.index_hd, 1, 1 << 16)?;
+            ck("index_kpool", self.index_kpool, 1, 1 << 10)?;
+            if self.index_topk % self.index_kpool != 0 {
+                return Err(Error::Format(format!(
+                    "config: index_topk={} is not divisible by index_kpool={}",
+                    self.index_topk, self.index_kpool
+                )));
+            }
+        }
+        ck("hc_mult", self.hc_mult, 1, 16)?;
+        ck("hc_sinkhorn_iters", self.hc_sinkhorn, 1, 256)?;
+        if !(self.swiglu_limit > 0.0 && self.swiglu_limit.is_finite()) {
+            return Err(Error::Format(format!(
+                "config: swiglu_limit={} must be a positive finite clamp",
+                self.swiglu_limit
+            )));
+        }
+        if !(self.hc_eps > 0.0 && self.hc_eps.is_finite()) {
+            return Err(Error::Format(format!("config: hc_eps={} must be a positive finite floor", self.hc_eps)));
+        }
+        Ok(())
+    }
+
     /// The linear-attention geometry checks on top of [`Self::validate_gqa`]
     /// (which already ran inside [`Self::from_json_gqa`]).
     fn validate_hybrid(&self) -> Result<(), Error> {
@@ -522,7 +871,7 @@ impl Cfg {
     /// cache mechanism (prefix cache, disk sessions, truncate/clone) unchanged.
     pub fn kv_row_a(&self) -> i64 {
         match self.arch {
-            Arch::GlmMla => self.kv_lora,
+            Arch::GlmMla | Arch::Glm5Next => self.kv_lora,
             Arch::DenseGqa | Arch::HybridGdn => self.n_kv_heads * self.head_dim,
         }
     }
@@ -531,7 +880,9 @@ impl Cfg {
     /// value heads for one position.
     pub fn kv_row_b(&self) -> i64 {
         match self.arch {
-            Arch::GlmMla => self.qk_rope,
+            // Glm5Next is NoPE (qk_rope = 0): its second slot is legitimately
+            // zero-width — LayerKv is width-parameterized and appends empty rows.
+            Arch::GlmMla | Arch::Glm5Next => self.qk_rope,
             Arch::DenseGqa | Arch::HybridGdn => self.n_kv_heads * self.head_dim,
         }
     }
@@ -906,6 +1257,116 @@ mod tests {
         j["eos_token_id"] = serde_json::json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let c = Cfg::from_json(&j)?;
         assert_eq!(c.stop_ids.len(), 10, "no stop id may be dropped");
+        Ok(())
+    }
+
+    /// A miniature of the real GLM-5.3-Flash config: the multimodal wrapper's
+    /// nesting, the hybrid KDA/DSA schedule, the k-pool indexer, mHC and the
+    /// SwiGLU clamp — every field the Glm5Next parse is responsible for.
+    fn tiny_glm5next_json() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "glm5_next",
+            "text_config": {
+                "model_type": "glm5_next_text",
+                "vocab_size": 32, "hidden_size": 16,
+                "num_hidden_layers": 4, "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "n_routed_experts": 4, "num_experts_per_tok": 2,
+                "moe_intermediate_size": 8, "intermediate_size": 8,
+                "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+                "layer_types": ["linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention"],
+                "indexer_types": ["full", "full", "full", "full"],
+                "q_lora_rank": 12, "kv_lora_rank": 8,
+                "qk_nope_head_dim": 4, "qk_rope_head_dim": 0, "v_head_dim": 4,
+                "n_shared_experts": 1, "n_group": 1, "topk_group": 1,
+                "norm_topk_prob": true, "routed_scaling_factor": 2.5,
+                "rms_norm_eps": 1e-5, "swiglu_limit": 10.0,
+                "linear_attn_config": {
+                    "num_heads": 2, "head_dim": 4,
+                    "short_conv_kernel_size": 3, "gate_lower_bound": -5.0
+                },
+                "index_topk": 8, "index_n_heads": 2, "index_head_dim": 4,
+                "index_kpool": 4, "index_kpool_always_select_tail": true,
+                "hc_mult": 4, "hc_eps": 1e-6, "hc_sinkhorn_iters": 20,
+                "mhc": true,
+                "eos_token_id": [0, 3]
+            }
+        })
+    }
+
+    #[test]
+    fn glm5next_config_parses_the_wrapped_and_flat_spellings() -> Result<(), Error> {
+        let c = Cfg::from_json(&tiny_glm5next_json())?;
+        assert_eq!(c.arch, Arch::Glm5Next);
+        assert_eq!(c.full_attn, vec![false, false, false, true], "3 KDA + 1 DSA");
+        assert_eq!(c.first_dense, 1, "one dense-prefix layer from mlp_layer_types");
+        assert_eq!((c.lin_k_heads, c.lin_k_dim, c.lin_conv_k), (2, 4, 3));
+        assert_eq!(c.lin_gate_lb, Some(-5.0));
+        assert_eq!((c.index_kpool, c.index_kpool_tail), (4, true));
+        assert_eq!((c.hc_mult, c.hc_sinkhorn), (4, 20));
+        assert!((c.swiglu_limit - 10.0).abs() < 1e-9);
+        assert_eq!((c.qk_rope, c.qk_head), (0, 4), "NoPE: qk_head is nope alone");
+        assert_eq!(c.kv_row_b(), 0, "no rope slot in the KV cache");
+        assert_eq!(c.stop_ids, vec![0, 3]);
+        // A flat text-only export parses identically.
+        let flat = tiny_glm5next_json()["text_config"].clone();
+        let cf = Cfg::from_json(&flat)?;
+        assert_eq!(cf.arch, Arch::Glm5Next);
+        assert_eq!(cf.full_attn, c.full_attn);
+        Ok(())
+    }
+
+    #[test]
+    fn glm5next_refuses_rope_lanes_and_interleaved_dense() {
+        // Same shape as the import-contract refusal tests: extract the message
+        // through a match so a wrong acceptance reports *what* was accepted.
+        let refusal = |j: &Value| -> String {
+            match Cfg::from_json(j) {
+                Err(e) => e.to_string(),
+                Ok(c) => format!("wrongly accepted as {:?}", c.arch),
+            }
+        };
+        let mut j = tiny_glm5next_json();
+        j["text_config"]["qk_rope_head_dim"] = serde_json::json!(4);
+        let msg = refusal(&j);
+        assert!(msg.contains("NoPE"), "rope lanes must refuse: {msg}");
+
+        let mut j = tiny_glm5next_json();
+        j["text_config"]["mlp_layer_types"] = serde_json::json!(["dense", "sparse", "dense", "sparse"]);
+        let msg = refusal(&j);
+        assert!(msg.contains("dense prefix"), "interleaved dense must refuse: {msg}");
+
+        let mut j = tiny_glm5next_json();
+        j["text_config"]["index_topk"] = serde_json::json!(6); // not divisible by kpool 4
+        let msg = refusal(&j);
+        assert!(msg.contains("divisible"), "ragged k-pool must refuse: {msg}");
+    }
+
+    #[test]
+    fn glm5next_defaults_match_the_hf_class() -> Result<(), Error> {
+        // Drop every field the HF class defaults, keep only the shapes: the
+        // parse must land on the class defaults, not zeros.
+        let mut j = tiny_glm5next_json()["text_config"].clone();
+        if let Some(o) = j.as_object_mut() {
+            for k in ["linear_attn_config", "index_kpool", "index_kpool_always_select_tail",
+                      "hc_mult", "hc_eps", "hc_sinkhorn_iters", "swiglu_limit", "layer_types"] {
+                o.remove(k);
+            }
+        }
+        // The defaulted kpool is 16, so index_topk must be a multiple of it.
+        j["index_topk"] = serde_json::json!(32);
+        let c = Cfg::from_json(&j)?;
+        assert_eq!((c.lin_k_heads, c.lin_k_dim, c.lin_conv_k), (64, 128, 4));
+        assert_eq!(c.lin_gate_lb, Some(-5.0));
+        assert_eq!(c.index_kpool, 16);
+        assert!(c.index_kpool_tail);
+        assert_eq!((c.hc_mult, c.hc_sinkhorn), (4, 20));
+        assert!((c.swiglu_limit - 10.0).abs() < 1e-9);
+        // layer_types fallback: every 4th layer (0-indexed 3) is the DSA layer.
+        assert_eq!(c.full_attn, vec![false, false, false, true]);
+        // index_topk=8 is not divisible by the defaulted kpool 16 — but the
+        // divisibility gate only applies with an indexer configured, which this
+        // shape still has, so fix topk for the assertion above to have run.
         Ok(())
     }
 }

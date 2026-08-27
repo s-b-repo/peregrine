@@ -16,10 +16,12 @@
 
 pub mod attention;
 pub mod gdn;
+pub mod hyper;
 pub mod pinned;
 pub mod ngram;
 pub mod tree;
 pub mod concurrent;
+pub mod devices;
 pub mod draftdist;
 pub mod dsa;
 pub mod gpu;
@@ -38,6 +40,7 @@ pub mod ram;
 pub mod rlm;
 pub mod router;
 pub mod sample;
+pub mod ssdclock;
 pub mod telemetry;
 pub mod testkit;
 pub mod topic;
@@ -148,6 +151,24 @@ pub fn startup_banner() -> String {
     #[cfg(not(feature = "cuda"))]
     {
         s.push_str("\nperegrine: gpu=unavailable (CUDA backend not built — rebuild with `--features cuda`)");
+    }
+    // What is plugged in, regardless of what was compiled: presence and
+    // usability are different questions, and the gap between them is exactly
+    // what an operator with a mixed-vendor box needs to see. One line, only
+    // when there is something to say.
+    let present = crate::devices::present_counts();
+    if !present.is_empty() {
+        let parts: Vec<String> = present
+            .iter()
+            .map(|(v, n)| {
+                if v.backend_compiled() {
+                    format!("{}×{n}", v.name())
+                } else {
+                    format!("{}×{n} (no backend — {})", v.name(), v.requirement())
+                }
+            })
+            .collect();
+        s.push_str(&format!("\nperegrine: gpus present: {}", parts.join(", ")));
     }
     for (bdf, link) in peregrine_io::topo::gpu_pcie_links() {
         // An x16 card negotiated to x4 makes `COLI_PCIE_BUDGET_MB` the wrong

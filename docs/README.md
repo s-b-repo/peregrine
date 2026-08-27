@@ -17,6 +17,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Tools](tools.md) | `peregrine-gen` (watch and time generation), `peregrine-requantize` (fewer bytes per expert), `peregrine-skipbound`, `peregrine-basisfit` (cross-expert factorization, priced as rate–distortion on activations) |
 | [Configuration](configuration.md) | the complete env-var reference — every tuning knob, none of which can change the token stream |
 | [Performance tuning](performance-tuning.md) | "decode is slow, what do I check" — the levers in **measured** order, including the ones that look like levers and are not |
+| [GLM-5.3-Flash deployment](deployment-glm53-flash.md) | native `glm5_next` support (KDA + NoPE MLA + k-pool DSA + mHC + clamped SwiGLU), the FP8 import pipeline, 4-SSD deployment, and issue #9's bytes/token arithmetic |
 | [Model format & artifacts](model-format.md) | model directory layout, weight naming, QT quant formats, safetensors extensions, every artifact JSON |
 | [Measurement discipline](measurement.md) | how to get a number that means something here: medians over single runs, duty cycles over thread-summed counters, the page-cache trap, **the byte ledger** (11.3 GB/token is not one number) |
 | [Benchmarks](benchmarks.md) | headline numbers + how to reproduce; summary of the full [peregrine-vs-colibri study](peregrine-vs-colibri.md) |
@@ -32,6 +33,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Prefetch & caching](prefetch-and-caching.md) | the prediction spine, two-tier speculation, the warm RAM cache, GPU residency |
 | [I/O & storage](io-and-storage.md) | the io_uring reactor, O_DIRECT lane, slab pool, zstd, hugepages, NUMA, topology probe, perf counters, **per-read latency distribution** and device-geometry alignment |
 | [GPU / CUDA lane](gpu-cuda.md) | building with `cuda`, runtime gates, pinned staging & graphs, autotuning, what still needs hardware |
+| [GPU vendors](gpu-vendors.md) | one kernel source for NVIDIA (production) and AMD/HIP (compiles-by-construction, awaiting hardware): the WMMA/shuffle bracketing, build selection, and the first-run-on-ROCm validation runbook |
 | [Tokenizer](tokenizer.md) | the vendored gigatoken BPE fast path: what's vendored, what's dropped, parity gates |
 
 ## Project
@@ -77,6 +79,9 @@ top level.
 | [`todo.txt`](todo.txt) | the older plain-text predecessor of `todo.md`, kept for its early reasoning |
 | [`ideas-tokens-per-sec-2026-08-15.md`](ideas-tokens-per-sec-2026-08-15.md) | ranked throughput ideas, and the **closed negatives — do NOT re-propose** list |
 | [`ideas-from-colibri.md`](ideas-from-colibri.md) | what was worth taking from the predecessor engine |
+| [`ideas-github-issue-7-2026-08-23.md`](ideas-github-issue-7-2026-08-23.md) | upstream issue #7: the fifteen-technique survey (similarity routing, learned cache replacement, transition-aware placement, …) with its field papers, plus local status annotations |
+| [`ideas-github-issue-8-2026-08-23.md`](ideas-github-issue-8-2026-08-23.md) | upstream issue #8: the ten experiment-shaped streamed-bytes research candidates, byte-ledger instrumentation requirements, and the suggested first experiments |
+| [`ideas-github-issue-9-2026-08-27.md`](ideas-github-issue-9-2026-08-27.md) | upstream issue #9 ("path to 2 tok/s"): every item triaged against the tree after the GLM-5.3-Flash landing — shipped / partial / open / closed, and what to measure first when the checkpoint arrives |
 
 Elsewhere: [`README.md`](../README.md) (project overview) ·
 [`crates/peregrine-token/README.md`](../crates/peregrine-token/README.md)

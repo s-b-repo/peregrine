@@ -19,6 +19,11 @@ pub enum Dtype {
     F32 = 2,
     /// raw bytes — quantized int4/int8/int2 container payloads
     U8 = 3,
+    /// OCP FP8 E4M3 (bias 7, no infinities, S.1111.111 = NaN) — the dtype
+    /// GLM-5.3-Flash ships its block-scaled expert weights in. Read-side only:
+    /// `peregrine-import-hf` widens and dequantizes it; the container never
+    /// stores it.
+    F8E4M3 = 4,
 }
 
 impl Dtype {
@@ -34,6 +39,7 @@ impl Dtype {
             "F16" => Some(Dtype::F16),
             "F32" => Some(Dtype::F32),
             "U8" | "I8" => Some(Dtype::U8),
+            "F8_E4M3" => Some(Dtype::F8E4M3),
             _ => None,
         }
     }
@@ -43,7 +49,7 @@ impl Dtype {
         match self {
             Dtype::F32 => 4,
             Dtype::Bf16 | Dtype::F16 => 2,
-            Dtype::U8 => 1,
+            Dtype::U8 | Dtype::F8E4M3 => 1,
         }
     }
 }
@@ -61,6 +67,35 @@ impl std::str::FromStr for Dtype {
 #[inline]
 pub fn bf16_to_f32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
+}
+
+/// OCP FP8 E4M3 → f32. Exact: every e4m3 value (bias 7, subnormals at
+/// `man/8 · 2⁻⁶`, no infinities, `S.1111.111` = NaN — `S.1111.110` is the
+/// ordinary finite ±448) is representable in f32.
+#[inline]
+pub fn f8e4m3_to_f32(b: u8) -> f32 {
+    let sign = ((b & 0x80) as u32) << 24;
+    let exp = ((b >> 3) & 0xF) as u32;
+    let man = (b & 0x7) as u32;
+    let u = if exp == 0 {
+        if man == 0 {
+            sign
+        } else {
+            // subnormal: renormalize into the f32 exponent range
+            let mut e = 127 - 7 + 1;
+            let mut m = man;
+            while m & 0x8 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | (e << 23) | ((m & 0x7) << 20)
+        }
+    } else if exp == 0xF && man == 0x7 {
+        sign | 0x7FC0_0000 // NaN
+    } else {
+        sign | ((exp + 120) << 23) | (man << 20)
+    };
+    f32::from_bits(u)
 }
 
 /// IEEE float16 → f32. Direct port of `f16_to_f32` in `c/st.h`, including the
@@ -208,8 +243,32 @@ mod tests {
     fn dtype_parse() {
         assert_eq!(Dtype::parse("BF16"), Some(Dtype::Bf16));
         assert_eq!(Dtype::parse("I8"), Some(Dtype::U8));
+        assert_eq!(Dtype::parse("F8_E4M3"), Some(Dtype::F8E4M3));
         assert_eq!(Dtype::parse("F64"), None);
         assert_eq!(Dtype::Bf16 as i32, 0);
         assert_eq!(Dtype::U8 as i32, 3);
+    }
+
+    #[test]
+    fn f8e4m3_decodes_the_reference_values() {
+        // Spot values from the OCP FP8 spec.
+        assert_eq!(f8e4m3_to_f32(0x00), 0.0);
+        assert_eq!(f8e4m3_to_f32(0x80), -0.0);
+        assert_eq!(f8e4m3_to_f32(0x38), 1.0); // exp 7, man 0
+        assert_eq!(f8e4m3_to_f32(0xC0), -2.0);
+        assert_eq!(f8e4m3_to_f32(0x7E), 448.0); // S.1111.110: largest finite
+        assert_eq!(f8e4m3_to_f32(0x01), 2f32.powi(-9)); // smallest subnormal: 1/8 · 2⁻⁶
+        assert_eq!(f8e4m3_to_f32(0x07), 7.0 / 8.0 * 2f32.powi(-6)); // largest subnormal
+        assert_eq!(f8e4m3_to_f32(0x08), 2f32.powi(-6)); // smallest normal
+        assert!(f8e4m3_to_f32(0x7F).is_nan() && f8e4m3_to_f32(0xFF).is_nan());
+        // Every non-NaN encoding is finite (e4m3 has no infinities), and the
+        // decode is monotone over the positive range.
+        let mut prev = -1.0f32;
+        for b in 0u8..0x7F {
+            let v = f8e4m3_to_f32(b);
+            assert!(v.is_finite(), "{b:#04x} decoded to non-finite {v}");
+            assert!(v > prev, "{b:#04x}: {v} not monotone after {prev}");
+            prev = v;
+        }
     }
 }

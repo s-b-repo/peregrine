@@ -174,7 +174,7 @@ print('yes' if float('${current_speed}') >= float('${TARGET_TOK_PER_SEC}') else 
     if ! bash "$AUDIT" "$ROOT"; then
         echo "AUDIT FAILED — requesting OpenCode fix..." | tee -a "$LOG"
         # OpenCode runs via Ollama engine, sandboxed — cannot modify loop scripts
-        opencode run "Fix audit violations in peregrine-serve. Do NOT modify scripts/audit-bad-patterns.sh or serve-qwen.sh max-tokens/COLI_GPU. Reference: https://github.com/s-b-repo/rustsploit/blob/main/scripts/audit-bad-patterns.sh" --no-replay --auto 2>&1 | tee -a "$LOG" || true
+        opencode run "Fix audit violations in peregrine-serve. Do NOT modify scripts/audit-bad-patterns.sh or serve-qwen.sh max-tokens/COLI_GPU. Reference: https://github.com/s-b-repo/rustsploit/blob/main/scripts/audit-bad-patterns.sh" --auto 2>&1 | tee -a "$LOG" || true
         if bash "$AUDIT" "$ROOT"; then
             echo "Audit fixed." | tee -a "$LOG"
         else
@@ -242,20 +242,24 @@ or quality issues before making new changes. The previous iteration may have
 left the code in a broken state — verify it builds and audit passes first."
         OC_PROMPT_FILE="$ROOT/.tmp-opencode-prompt-$iter.txt"
         echo "$OC_PROMPT" > "$OC_PROMPT_FILE"
-    # OpenCode is interactive — use timeout to prevent hanging
+    # OpenCode is interactive — use timeout to prevent hanging.
+    # NOTE: `opencode run -f` only *attaches* a file — it does NOT supply the
+    # message, so OpenCode aborts with "You must provide a message or a
+    # command".  Use run_opencode() instead, which reads the file contents
+    # and passes them as the positional prompt argument.
     GOAL_TIMEOUT="${GOAL_TIMEOUT:-600}"
-    timeout "$GOAL_TIMEOUT" opencode run -f "$OC_PROMPT_FILE" --no-replay --model "ollama/qwen3.8-27b" --auto 2>&1 | tee -a "$LOG" || true
+    run_opencode "$OC_PROMPT_FILE" "${GOAL_TIMEOUT}" || true
         rm -f "$OC_PROMPT_FILE"
     else
-        opencode run -f "$ROOT/scripts/opencode-prompt.txt" --no-replay --model "ollama/qwen3.8-27b" 2>&1 | tee -a "$LOG" || true
+        run_opencode "$ROOT/scripts/opencode-prompt.txt" || true
     fi
 
     echo "[6/6] Verifying + committing AI improvements..." | tee -a "$LOG"
 
     # Force verification: rebuild to confirm code compiles
     cd "$ROOT"
-    echo "[6a/6] Running cargo build --check --features cuda..." | tee -a "$LOG"
-    if cargo build --check --features cuda 2>&1 | tail -5 | tee -a "$LOG"; then
+    echo "[6a/6] Running cargo check --features cuda..." | tee -a "$LOG"
+    if cargo check --features cuda 2>&1 | tail -5 | tee -a "$LOG"; then
         BUILD_OK="yes"
     else
         BUILD_OK="no"
