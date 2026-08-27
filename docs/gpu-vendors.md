@@ -80,6 +80,13 @@ Verified without AMD hardware, and honestly labelled as such:
 
 ## First run on a ROCm host — the validation runbook
 
+The cortix box can be that host: alongside the RTX 3060 it carries a
+**Navi 24 (Radeon RX 6400/6500-class, gfx1034)** — RDNA2, ~4 GB VRAM. ROCm
+does not list gfx1034, but it executes gfx1030 code objects: build with
+`HIPC_ARCH=gfx1030` and run with `HSA_OVERRIDE_GFX_VERSION=10.3.0` (the
+established Navi 24 path). 4 GB is too small for a serious expert tier and
+plenty for the whole kernel test suite.
+
 1. `pacman -S rocm-hip-sdk` (Arch) or the distro equivalent; `hipcc` and
    `hipify-perl` must land under `$ROCM_PATH/bin`.
 2. `PEREGRINE_GPU_BACKEND=hip cargo build --release --features cuda` — the

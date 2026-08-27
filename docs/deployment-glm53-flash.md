@@ -73,27 +73,51 @@ the link is ever needed for something else):
 tail -f /srv/m-sdc/glm53-flash-fp8/download.log
 ```
 
-**2. Import** (FP8 → int4/int8/F32 container, ~170 GB, CPU-bound, hours):
+**2. Import** (FP8 → int4/int8/F32 container). Measured 2026-08-27: 328.33 GB
+→ **161.39 GB** in 1h42m (CPU-bound at ~55 MB/s), 76 108 tensors → 37 524
+int4 + 273 int8 + 626 float, 347 vision skipped — the int4/int8 counts match
+the architecture's expected inventory exactly.
 
 ```sh
 cargo build --release -p peregrine-tools --bin peregrine-import-hf
-target/release/peregrine-import-hf /srv/m-sdc/glm53-flash-fp8 /srv/m-sdc/GLM-5.3-Flash-peregrine
+target/release/peregrine-import-hf /srv/m-sdc/glm53-flash-fp8 /srv/m-sdd/GLM-5.3-Flash-peregrine
 ```
 
-**3. Smoke + parity.** `peregrine /srv/m-sdc/GLM-5.3-Flash-peregrine` for a
-first decode. For the real gate, dump a teacher-forcing reference from
-transformers (needs a version carrying `glm5_next`; the pattern is
+**3. Smoke + ledger.** First real measurement (single drive, cold cache,
+`COLI_UNION_STATS=1 COLI_BENCH_STEPS=2 peregrine bench 1`):
+
+```text
+[workingset] one token routes 4.04 GB of experts against a 2.00 GB cache
+loaded 45 layers, vocab 154880, mtp=yes, in 10.3s  (resident 5.2 GB)
+B=1: 0.119 tok/s   [ledger] from disk 4.239 GB/token, re-read 4.3%
+```
+
+8.4 s/token = 4.24 GB over ~505 MB/s — exactly one SATA drive's ceiling, so
+the decode is purely disk-bound and the reshard multiplies it. (GLM-5.2 on
+the same box: 0.064–0.067 tok/s at 11.3 GB/token.)
+
+For the quality gate, dump a teacher-forcing reference from transformers
+(needs a version carrying `glm5_next`; the pattern is
 `scripts/qwen-parity-reference.py`) and run
 `peregrine flip-rate <container> --reference-json <dump> --text <corpus>`.
+**Not runnable on this box**: teacher-forcing the 330B reference needs the
+bf16/FP8 model resident, far beyond 32 GB RAM — it needs a big-RAM host or a
+layer-at-a-time offline comparer (future work).
 
-**4. Reshard across the four SSDs** (bandwidth-proportional, byte-verbatim):
+**4. Reshard across the four SSDs** (bandwidth-proportional, byte-verified;
+the whole pipeline is `/srv/m-sdd/glm53-reshard.sh`):
 
 ```sh
-target/release/peregrine-reshard /srv/m-sdc/GLM-5.3-Flash-peregrine /srv/m-sdc/glm53-shards \
-    --groups sda=530,sdb=514,sdc=530,sdd=547 --verify
-# move each group's files to its drive, then point the container at them:
-# model_paths.json: {"paths": ["/srv/m-sda/glm53", "/srv/m-sdb/glm53", ...]}
+target/release/peregrine-reshard --model /srv/m-sdd/GLM-5.3-Flash-peregrine \
+    --out /srv/m-sdb/glm53-reshard --groups sda:530,sdb:514,sdc:530,sdd:547 --verify
+# per-drive placement: experts-l*-<g>.safetensors → /srv/m-<g>/glm53-experts/
+# (trunk-sda-* rides sda, the first group), then a model dir holding only the
+# sidecars + model_paths.json:
+#   {"paths": ["/srv/m-sda/glm53-experts", ..., "/srv/m-sdd/glm53-experts"]}
 ```
+
+The dry-run plan lands 37–47 GB per drive at 24.3–25.7% expected per-token
+routed share each.
 
 **5. Serve** with the machinery GLM-5.2 earned: `COLI_IO_DEVICE_SCHED` (on
 by default), `COLI_SSD_AWARE_SCHED=1`, the warm cache, `COLI_ENTROPY_ADAPT`,
