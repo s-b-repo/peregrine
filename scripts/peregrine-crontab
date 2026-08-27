@@ -1,0 +1,7 @@
+# Crontab entry for peregrine watchdog — install with: crontab /home/cortix/peregrine/scripts/peregrine-crontab
+# Run peregrine watchdog every 2 minutes for 1 week
+SHELL=/usr/bin/bash
+PATH=/home/cortix/.local/bin:/home/cortix/.bun/bin:/home/cortix/.cargo/bin:/home/cortix/.opencode/bin:/usr/bin:/usr/local/bin:/bin
+HOME=/home/cortix
+
+*/2 * * * * /home/cortix/peregrine/scripts/loop-watchdog.sh >> /home/cortix/peregrine/auto-improve-loop.log 2>&1
