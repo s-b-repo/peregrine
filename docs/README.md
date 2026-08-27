@@ -33,6 +33,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Prefetch & caching](prefetch-and-caching.md) | the prediction spine, two-tier speculation, the warm RAM cache, GPU residency |
 | [I/O & storage](io-and-storage.md) | the io_uring reactor, O_DIRECT lane, slab pool, zstd, hugepages, NUMA, topology probe, perf counters, **per-read latency distribution** and device-geometry alignment |
 | [GPU / CUDA lane](gpu-cuda.md) | building with `cuda`, runtime gates, pinned staging & graphs, autotuning, what still needs hardware |
+| [GPU vendors](gpu-vendors.md) | one kernel source for NVIDIA (production) and AMD/HIP (compiles-by-construction, awaiting hardware): the WMMA/shuffle bracketing, build selection, and the first-run-on-ROCm validation runbook |
 | [Tokenizer](tokenizer.md) | the vendored gigatoken BPE fast path: what's vendored, what's dropped, parity gates |
 
 ## Project

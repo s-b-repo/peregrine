@@ -238,6 +238,23 @@ mod vendor {
     include!(concat!(env!("OUT_DIR"), "/vendor.rs"));
 }
 
+/// The linked backend's identity string: `"CUDA (NVIDIA)"`, `"HIP (AMD ROCm)"`,
+/// or `""` when the `cuda` feature was on but no toolchain was found at build
+/// time (and when the feature is off). Machine-consumable where [`status`] is
+/// the human line — `devices::Vendor::backend_compiled` matches a *present*
+/// GPU's vendor against this, because "built with the cuda feature" stopped
+/// implying "built for NVIDIA" the day the HIP branch landed.
+pub fn linked_backend() -> &'static str {
+    #[cfg(feature = "cuda")]
+    {
+        vendor::BACKEND
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        ""
+    }
+}
+
 /// Human-readable backend status for startup logging.
 pub fn status() -> &'static str {
     #[cfg(feature = "cuda")]
@@ -2401,6 +2418,18 @@ mod gpu_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `devices::Vendor::backend_compiled` string-matches against this, so the
+    /// set of identities build.rs can write is a contract, not a convention —
+    /// a renamed banner would silently un-drive every GPU.
+    #[test]
+    fn linked_backend_is_one_of_the_three_known_identities() {
+        assert!(
+            matches!(linked_backend(), "" | "CUDA (NVIDIA)" | "HIP (AMD ROCm)"),
+            "unknown backend identity {:?}",
+            linked_backend()
+        );
+    }
 
     #[test]
     fn stub_reports_unavailable_without_feature() {

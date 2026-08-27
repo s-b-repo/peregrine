@@ -190,13 +190,20 @@ fn build_hip(out: &str) -> &'static str {
         Err(e) => panic!("{hipify} exists but could not be executed: {e}"),
     }
 
-    // 2. Compile the translated source for the local or named AMD target.
+    // 2. Compile the translated source for the local or named AMD target(s).
+    //    `HIPC_ARCH` may name several (`gfx1100;gfx90a`). Unset, ask the
+    //    installed ROCm which agents are present (`rocm_agent_enumerator`);
+    //    a host with ROCm but no AMD device — the compile-verification case —
+    //    gets a broad CDNA+RDNA set instead of `native`, which hipcc rejects
+    //    outright when there is no device to inspect.
     let obj = format!("{out}/backend_hip.o");
-    let arch = std::env::var("HIPC_ARCH").unwrap_or_else(|_| "native".to_string());
-    let offload = format!("--offload-arch={arch}");
-    let compiled = Command::new(&hipcc)
-        .args(["-O3", "-std=c++17", "-fPIC", &offload, "-c", &hip_src, "-o", &obj])
-        .status();
+    let arch = std::env::var("HIPC_ARCH").unwrap_or_else(|_| detect_hip_archs(&rocm));
+    let offload: Vec<String> =
+        arch.split(';').filter(|a| !a.is_empty()).map(|a| format!("--offload-arch={a}")).collect();
+    let mut args: Vec<&str> = vec!["-O3", "-std=c++17", "-fPIC"];
+    args.extend(offload.iter().map(String::as_str));
+    args.extend(["-c", hip_src.as_str(), "-o", obj.as_str()]);
+    let compiled = Command::new(&hipcc).args(&args).status();
     match compiled {
         Ok(s) if s.success() => {}
         Ok(s) => panic!("{hipcc} failed to compile {hip_src} ({s}) — ROCm is installed, so treat this as a compile error in the hipified source"),
@@ -212,6 +219,26 @@ fn build_hip(out: &str) -> &'static str {
     println!("cargo:rustc-link-lib=dylib=amdhip64");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     "HIP (AMD ROCm)"
+}
+
+/// The `;`-separated gfx targets to compile for when `HIPC_ARCH` is unset:
+/// what `rocm_agent_enumerator` reports (dropping its gfx000 CPU placeholder),
+/// or — no device / no enumerator — a broad current CDNA + RDNA set, so a
+/// GPU-less ROCm host still compile-verifies every kernel.
+fn detect_hip_archs(rocm: &str) -> String {
+    if let Ok(out) = Command::new(format!("{rocm}/bin/rocm_agent_enumerator")).output() {
+        if out.status.success() {
+            let agents: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .filter(|a| a.starts_with("gfx") && *a != "gfx000")
+                .map(str::to_string)
+                .collect();
+            if !agents.is_empty() {
+                return agents.join(";");
+            }
+        }
+    }
+    "gfx90a;gfx942;gfx1030;gfx1100".to_string()
 }
 
 /// Archive one compiled object into the static lib the Rust FFI links.

@@ -63,13 +63,27 @@ impl Vendor {
     }
 
     /// Whether this binary was built with a backend that can drive the vendor.
-    /// Only NVIDIA ships today; the same kernel source compiles under hipcc for
-    /// AMD (build docs: `docs/gpu-vendors.md`). Intel has no ported kernels yet,
-    /// so its answer is false by construction.
+    ///
+    /// Asked of the *linked* backend, not the cargo feature: `--features cuda`
+    /// selects the GPU lane, and build.rs then links whichever toolchain the
+    /// host had (nvcc → CUDA, hipcc → HIP; `PEREGRINE_GPU_BACKEND` forces one).
+    /// A HIP build drives AMD and cannot drive NVIDIA, and this predicate
+    /// answering from the feature flag alone would have called every AMD card
+    /// unreachable from a HIP build — and, worse, called an NVIDIA card
+    /// reachable from one. Intel has no ported kernels
+    /// (`docs/gpu-vendors.md`), so its answer is false by construction.
     pub fn backend_compiled(self) -> bool {
-        match self {
-            Vendor::Nvidia => cfg!(feature = "cuda"),
-            Vendor::Amd | Vendor::Intel => false,
+        #[cfg(feature = "cuda")]
+        {
+            match self {
+                Vendor::Nvidia => peregrine_cuda::linked_backend().starts_with("CUDA"),
+                Vendor::Amd => peregrine_cuda::linked_backend().starts_with("HIP"),
+                Vendor::Intel => false,
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
         }
     }
 
