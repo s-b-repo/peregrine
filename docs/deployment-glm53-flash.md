@@ -64,11 +64,12 @@ unchanged.
 
 ## Pipeline on this box
 
-**1. Download** (~328 GB at the box's ~1.5 MB/s ceiling ≈ 3–4 days;
-throttled to 1 MB/s by default so the link stays usable):
+**1. Download** (~328 GB; the HF CDN was measured at ~10 MiB/s on this box
+2026-08-27, so budget ~9 hours; unthrottled by default — set `LIMIT=1M` if
+the link is ever needed for something else):
 
 ```sh
-/srv/m-sdc/glm53-flash-fp8/download.sh     # resumable; edit LIMIT= to open the throttle
+/srv/m-sdc/glm53-flash-fp8/download.sh     # resumable (aria2c -c)
 tail -f /srv/m-sdc/glm53-flash-fp8/download.log
 ```
 
