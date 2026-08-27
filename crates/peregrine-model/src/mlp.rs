@@ -13,14 +13,29 @@ pub struct Mlp {
     pub gate: QtWeight,
     pub up: QtWeight,
     pub down: QtWeight,
+    /// Glm5Next SwiGLU clamp (`Cfg::swiglu_limit`): gate pre-activations are
+    /// clamped to `<= limit`, up to `[-limit, limit]`, before the SiLU⊙up.
+    /// `0.0` = no clamp — bit-identical to the historical path on every other
+    /// architecture.
+    pub limit: f32,
 }
 
 impl Mlp {
-    /// SwiGLU: `down( silu(gate·x) ⊙ (up·x) )`. Input `x[s_n, gate.i]`, output
-    /// `[s_n, down.o]`.
+    /// SwiGLU: `down( silu(clamp(gate·x)) ⊙ clamp(up·x) )`. Input
+    /// `x[s_n, gate.i]`, output `[s_n, down.o]`. The clamp is Glm5Next's
+    /// `swiglu_limit` and is skipped entirely at `limit == 0`.
     pub fn swiglu(&self, x: &[f32], s_n: usize) -> Vec<f32> {
         let mut g = self.gate.apply_vec(x, s_n);
-        let u = self.up.apply_vec(x, s_n);
+        let mut u = self.up.apply_vec(x, s_n);
+        if self.limit > 0.0 {
+            let lim = self.limit;
+            for v in g.iter_mut() {
+                *v = v.min(lim); // gate: upper clamp only (HF reference)
+            }
+            for v in u.iter_mut() {
+                *v = v.clamp(-lim, lim);
+            }
+        }
         silu_mul(&mut g, &u);
         self.down.apply_vec(&g, s_n)
     }
@@ -164,6 +179,7 @@ mod tests {
             gate: quant_i4(&gate, inter, hidden),
             up: quant_i4(&up, inter, hidden),
             down: quant_i4(&down, hidden, inter),
+            limit: 0.0,
         }
     }
 

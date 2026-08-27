@@ -25,15 +25,15 @@
 //! quality figure beside it is not a result.** [`Ledger::verdict`] refuses to
 //! present a saving without naming the flip-rate gate that has to qualify it.
 //!
-//! # What it does not have
+//! # The re-read column
 //!
-//! One column is **not** derivable from any counter this engine currently
-//! keeps: bytes re-read because an eviction was wrong. Distinguishing a re-read
-//! from a first read needs per-slab eviction history the warm cache does not
-//! retain. That absence is reported rather than folded silently into
-//! `from_disk`, because a missing column that looks present is worse than one
-//! that is named — see the 0.6 % figure this project has already had to publish
-//! a correction about.
+//! `WarmCache::rereads_after_eviction` has counted re-reads (a disk read of a
+//! slab the cache once held and evicted) since the eviction-history ring
+//! landed, but the ledger printed "NOT MEASURED" long after — the counter and
+//! the report were never wired together (the `[R]` defect class:
+//! written, tested, and unreachable). [`LedgerInput::rereads`] closes that:
+//! the column prints as a measured share of disk traffic, still labelled as
+//! *inside* `from_disk` rather than beside it.
 
 /// One accounting of where a run's expert bytes went.
 ///
@@ -54,6 +54,9 @@ pub struct Ledger {
     pub from_disk: u64,
     /// Speculatively read and never hit before eviction.
     pub prefetch_waste: u64,
+    /// Disk reads of slabs the cache had held and evicted — the eviction
+    /// policy's direct cost, a subset of `from_disk` (not an extra column).
+    pub reread_after_eviction: u64,
     /// Bytes per routed expert, the conversion factor for every column above.
     pub bytes_per_expert: u64,
     /// Whether every routed expert really is that size. `false` on a tiered
@@ -147,10 +150,13 @@ impl Ledger {
             "",
             100.0 * self.waste_share(),
         );
-        s.push_str(
-            "[ledger] re-read after eviction: NOT MEASURED — no counter distinguishes a re-read \n\
-             [ledger]   from a first read. Those bytes are inside `from disk` above, unlabelled.\n",
-        );
+        s.push_str(&format!(
+            "[ledger] {:<18} {:>12.3} GB {:>21}({:.1}% of disk traffic, inside `from disk`)\n",
+            "re-read (evicted)",
+            gb(self.reread_after_eviction),
+            "",
+            if self.from_disk > 0 { 100.0 * self.reread_after_eviction as f64 / self.from_disk as f64 } else { 0.0 },
+        ));
         // The standing rule, enforced here rather than left to the reader.
         s.push_str(
             "[ledger] NOTE: every saving above is a BYTE figure with no quality figure beside it. \n\
@@ -170,6 +176,7 @@ impl Ledger {
         self.unique <= self.requested
             && self.cache_served <= self.unique
             && self.prefetch_waste <= self.from_disk
+            && self.reread_after_eviction <= self.from_disk
     }
 }
 
@@ -188,6 +195,9 @@ pub struct LedgerInput {
     pub cache_misses: u64,
     /// Prefetched slabs evicted before ever being hit.
     pub prefetch_wasted: u64,
+    /// Disk reads of slabs the cache had already held once and evicted
+    /// (`WarmCache::rereads_after_eviction`).
+    pub rereads: u64,
     pub bytes_per_expert: u64,
     pub uniform_expert_size: bool,
 }
@@ -204,6 +214,9 @@ impl LedgerInput {
             cache_served: self.cache_hits.saturating_mul(b),
             from_disk: self.cache_misses.saturating_mul(b),
             prefetch_waste: self.prefetch_wasted.saturating_mul(b),
+            // A subset of `from_disk` by construction; the clamp keeps a
+            // cross-window sample from printing an over-100% share.
+            reread_after_eviction: self.rereads.min(self.cache_misses).saturating_mul(b),
             bytes_per_expert: b,
             uniform_expert_size: self.uniform_expert_size,
         }
@@ -228,6 +241,7 @@ mod tests {
             cache_hits: 50,
             cache_misses: 200,
             prefetch_wasted: 120,
+            rereads: 40,
             bytes_per_expert: 18_900_000,
             uniform_expert_size: true,
         }
@@ -264,12 +278,17 @@ mod tests {
     }
 
     #[test]
-    fn the_column_this_engine_cannot_source_is_named_not_omitted() {
-        // An omitted column reads as an oversight; a fabricated one reads as a
-        // measurement. Neither is true, so it is printed as absent.
-        let r = input().build().report(64);
-        assert!(r.contains("NOT MEASURED"), "{r}");
-        assert!(r.contains("re-read after eviction"), "{r}");
+    fn the_reread_column_is_measured_and_labelled_as_inside_from_disk() {
+        // 40 re-read slabs against 200 misses is a 20% share, printed as a
+        // share of disk traffic and explicitly labelled as inside `from disk`
+        // rather than beside it (the bytes would otherwise double-count).
+        let l = input().build();
+        assert_eq!(l.reread_after_eviction, 40 * 18_900_000);
+        assert!(l.coherent());
+        let r = l.report(64);
+        assert!(r.contains("re-read (evicted)"), "{r}");
+        assert!(r.contains("20.0% of disk traffic"), "{r}");
+        assert!(!r.contains("NOT MEASURED"), "the counter is wired now: {r}");
     }
 
     #[test]

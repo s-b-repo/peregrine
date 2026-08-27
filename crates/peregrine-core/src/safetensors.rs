@@ -777,6 +777,11 @@ fn convert_f32(dtype: Dtype, raw: &[u8], out: &mut [f32]) -> Result<(), Error> {
                 *o = f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
             }
         }
+        Dtype::F8E4M3 => {
+            for (o, &b) in out.iter_mut().zip(raw.iter()) {
+                *o = crate::dtype::f8e4m3_to_f32(b);
+            }
+        }
         // Callers (read_f32/read_slice_f32) reject U8 before converting; keep this
         // total (no `unreachable!`) so a misuse is a surfaced error, not a panic.
         Dtype::U8 => return Err(Error::Format("convert_f32 called on a U8 tensor".into())),

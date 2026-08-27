@@ -1718,6 +1718,9 @@ pub fn moe_forward_concurrent(
     let gplans_ref = &gplans;
     let x_ref = x;
     let completed_ref = &completed;
+    // Glm5Next: streamed experts clamp their SwiGLU pre-activations exactly
+    // like resident ones (`Mlp::limit`); 0.0 on every other architecture.
+    let swiglu_limit = ctx.cfg.swiglu_limit;
     // Per-lane wall-time accumulator (or `None` for the no-tracking path). Copied
     // into each scoped thread so the atomic bumps in the accumulator's four counters
     // are the only synchronization the timing incurs.
@@ -2114,6 +2117,7 @@ pub fn moe_forward_concurrent(
                         gate: rebuild(&plan.entry.plans[0], gw, gs),
                         up: rebuild(&plan.entry.plans[1], uw, us),
                         down: rebuild(&plan.entry.plans[2], dw, ds),
+                        limit: swiglu_limit,
                     };
                     let nr = plan.rows.len();
                     let mut xg = vec![0f32; nr * hidden];

@@ -17,6 +17,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Tools](tools.md) | `peregrine-gen` (watch and time generation), `peregrine-requantize` (fewer bytes per expert), `peregrine-skipbound`, `peregrine-basisfit` (cross-expert factorization, priced as rate–distortion on activations) |
 | [Configuration](configuration.md) | the complete env-var reference — every tuning knob, none of which can change the token stream |
 | [Performance tuning](performance-tuning.md) | "decode is slow, what do I check" — the levers in **measured** order, including the ones that look like levers and are not |
+| [GLM-5.3-Flash deployment](deployment-glm53-flash.md) | native `glm5_next` support (KDA + NoPE MLA + k-pool DSA + mHC + clamped SwiGLU), the FP8 import pipeline, 4-SSD deployment, and issue #9's bytes/token arithmetic |
 | [Model format & artifacts](model-format.md) | model directory layout, weight naming, QT quant formats, safetensors extensions, every artifact JSON |
 | [Measurement discipline](measurement.md) | how to get a number that means something here: medians over single runs, duty cycles over thread-summed counters, the page-cache trap, **the byte ledger** (11.3 GB/token is not one number) |
 | [Benchmarks](benchmarks.md) | headline numbers + how to reproduce; summary of the full [peregrine-vs-colibri study](peregrine-vs-colibri.md) |
