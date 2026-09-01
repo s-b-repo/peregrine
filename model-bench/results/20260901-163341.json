@@ -1,0 +1,60 @@
+{
+  "run_id": "20260901-163341",
+  "timestamp": "2026-09-01T16:33:41.044895",
+  "servers": {
+    "peregrine_serve_8132": {
+      "results": [
+        {
+          "text": "",
+          "latency_ms": 0,
+          "error": "<urlopen error [Errno 111] Connection refused>",
+          "test_name": "arithmetic",
+          "prompt": "What is 2+2?"
+        },
+        {
+          "text": "",
+          "latency_ms": 0,
+          "error": "<urlopen error [Errno 111] Connection refused>",
+          "test_name": "poetry",
+          "prompt": "Write a 3-line poem about code"
+        },
+        {
+          "text": "",
+          "latency_ms": 0,
+          "error": "<urlopen error [Errno 111] Connection refused>",
+          "test_name": "reasoning",
+          "prompt": "If x=5, y=3, what is x+y?"
+        }
+      ],
+      "metrics_before": {},
+      "metrics_after": {}
+    },
+    "llama_server_8080": {
+      "results": [
+        {
+          "text": "",
+          "latency_ms": 0,
+          "error": "<urlopen error [Errno 111] Connection refused>",
+          "test_name": "arithmetic",
+          "prompt": "What is 2+2?"
+        },
+        {
+          "text": "",
+          "latency_ms": 0,
+          "error": "<urlopen error [Errno 111] Connection refused>",
+          "test_name": "poetry",
+          "prompt": "Write a 3-line poem about code"
+        },
+        {
+          "text": "",
+          "latency_ms": 0,
+          "error": "<urlopen error [Errno 111] Connection refused>",
+          "test_name": "reasoning",
+          "prompt": "If x=5, y=3, what is x+y?"
+        }
+      ],
+      "metrics_before": {},
+      "metrics_after": {}
+    }
+  }
+}
