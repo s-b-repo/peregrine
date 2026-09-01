@@ -204,6 +204,40 @@ impl OutputFilter {
         std::mem::take(&mut self.calls)
     }
 
+    /// The name of the call currently open, before any argument parsing —
+    /// the cheap probe (one `find` over the buffered body) that lets a
+    /// speculator skip non-hosted tools without ever building a snapshot.
+    /// `None` when no `<tool_call>` is open or the body does not yet carry a
+    /// name.
+    pub fn open_call_name(&self) -> Option<&str> {
+        if !self.in_call {
+            return None;
+        }
+        let cut = self.call_buf.find("<arg_key>").unwrap_or(self.call_buf.len());
+        let name = self.call_buf[..cut].lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        if name.is_empty() || name.contains('<') {
+            return None;
+        }
+        Some(name)
+    }
+
+    /// The call the still-open `<tool_call>` determines so far — the
+    /// speculative view sPTC executes against while the model is still
+    /// writing (see [`crate::sptc`]).
+    ///
+    /// Read-only over the accumulating buffer: what reaches the client is
+    /// decided by the closing parse alone, so a snapshot can never change
+    /// the stream. Costs one full re-parse of the buffered body per call, so
+    /// callers gate it on [`Self::open_call_name`] naming a hosted tool —
+    /// the body itself is bounded by the server's argument cap in the
+    /// speculation path.
+    pub fn speculation(&self) -> Option<SpecSnapshot> {
+        if !self.in_call {
+            return None;
+        }
+        parse_call_prefix(&self.call_buf, Some(&self.schemas)).map(|c| SpecSnapshot { name: c.name, arguments: c.arguments })
+    }
+
     fn drain(&mut self, eof: bool) -> String {
         let mut out = String::new();
         loop {
@@ -317,6 +351,20 @@ fn tail_prefix_len(s: &str, marker: &str) -> usize {
     0
 }
 
+/// A call as far as the still-open `<tool_call>` markup determines it: the
+/// name and every *terminated* argument pair, typed exactly as the closing
+/// parse will type them. Produced only by [`OutputFilter::speculation`] and
+/// consumed only by the sPTC layer (see [`crate::sptc`]) — it never touches
+/// the wire.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpecSnapshot {
+    pub name: String,
+    /// Only complete `<arg_key>/<arg_value>` pairs; an argument the model is
+    /// still writing is excluded, which makes these arguments a *prefix* of
+    /// the final ones.
+    pub arguments: Value,
+}
+
 /// Parse one `<tool_call>` body (the text between the tags) into a call.
 ///
 /// Shape: a name, then `<arg_key>`/`<arg_value>` pairs. The name is whatever
@@ -356,6 +404,48 @@ fn parse_call(body: &str, schemas: Option<&SchemaMap>) -> Option<ParsedCall> {
             break;
         }
         cur = next;
+    }
+    Some(ParsedCall { name: name.to_string(), arguments: Value::Object(args) })
+}
+
+/// The speculative twin of [`parse_call`]: parse a *still-open* call body
+/// (no `</tool_call>` yet) into the call its markup determines so far —
+/// the name, plus every **terminated** `<arg_key>/<arg_value>` pair, typed
+/// by the same [`coerce`] rules the closing parse will apply.
+///
+/// The one behavioural difference from [`parse_call`] is the point: an
+/// unterminated trailing `<arg_value>` is *excluded* here rather than taken,
+/// because a value the model is still writing is not a value yet — running a
+/// tool against it would be running it against text that is about to change.
+/// Excluding it makes the snapshot's arguments a **prefix** of the final
+/// arguments (every terminated pair survives to the close unchanged), which
+/// is what lets a speculated result be verified by exact-argument match
+/// instead of trusted: the sPTC layer compares the close-time key against
+/// the speculated one, and a mismatch is a discard, never a wrong answer.
+fn parse_call_prefix(body: &str, schemas: Option<&SchemaMap>) -> Option<ParsedCall> {
+    let cut = body.find("<arg_key>").unwrap_or(body.len());
+    let name = body[..cut].lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if name.is_empty() || name.contains('<') {
+        return None;
+    }
+    let props = schemas.and_then(|m| m.get(name));
+    let mut args = Map::new();
+    let mut cur = &body[cut..];
+    while let Some(ks) = cur.find("<arg_key>") {
+        let after_k = &cur[ks + "<arg_key>".len()..];
+        let Some(ke) = after_k.find("</arg_key>") else { break };
+        let key = after_k[..ke].trim().to_string();
+        let after_key_close = &after_k[ke + "</arg_key>".len()..];
+        let Some(vs) = after_key_close.find("<arg_value>") else { break };
+        let after_v = &after_key_close[vs + "<arg_value>".len()..];
+        // The difference from `parse_call`: an unclosed value stops the scan.
+        // The model has not finished saying it.
+        let Some(ve) = after_v.find("</arg_value>") else { break };
+        if !key.is_empty() {
+            let declared = props.and_then(|p| p.get(&key)).map(String::as_str);
+            args.insert(key, coerce(after_v[..ve].trim(), declared));
+        }
+        cur = &after_v[ve + "</arg_value>".len()..];
     }
     Some(ParsedCall { name: name.to_string(), arguments: Value::Object(args) })
 }
@@ -645,5 +735,92 @@ mod tests {
         out.push_str(&f.finish());
         assert_eq!(out, "héllo →");
         assert_eq!(f.take_calls().len(), 1);
+    }
+
+    #[test]
+    fn a_still_open_call_speculates_from_its_complete_pairs_only() -> Result<(), String> {
+        // The sPTC view: the call is open, one pair is fully written, the
+        // second is mid-value. The snapshot must carry the first pair and
+        // nothing of the second — a value the model is still writing is not
+        // a value yet.
+        let mut f = OutputFilter::with_tools(&[]);
+        assert_eq!(f.push("<tool_call>"), "", "the marker itself never shows");
+        assert!(f.open_call_name().is_none(), "the open body has no name yet");
+
+        f.push("write\n<arg_key>filePath</arg_key>\n<arg_value>/tmp/a</arg_value>\n");
+        assert_eq!(f.open_call_name(), Some("write"), "the cheap name probe");
+        let snap = f.speculation().ok_or_else(|| "open call must yield a snapshot".to_string())?;
+        assert_eq!(snap.name, "write");
+        assert_eq!(snap.arguments["filePath"], json!("/tmp/a"));
+
+        f.push("<arg_key>content</arg_key>\n<arg_value>half a thought");
+        let snap2 = f.speculation().ok_or_else(|| "still open".to_string())?;
+        assert!(
+            snap2.arguments.get("content").is_none(),
+            "an unterminated value is excluded from speculation: {}",
+            snap2.arguments
+        );
+        assert_eq!(snap2.arguments["filePath"], json!("/tmp/a"), "complete pairs survive");
+
+        // The close-time parse is unchanged by any of this: the final call
+        // carries both pairs, typed as ever.
+        f.push(" done</arg_value>\n</tool_call>");
+        assert_eq!(f.push(""), "");
+        let calls = f.take_calls();
+        let c = calls.first().ok_or_else(|| "the close must parse one call".to_string())?;
+        assert_eq!(c.arguments["content"], json!("half a thought done"));
+        assert!(f.speculation().is_none(), "no open call, no snapshot");
+        Ok(())
+    }
+
+    #[test]
+    fn the_speculated_prefix_key_equals_the_finished_call_key() -> Result<(), String> {
+        // THE property sPTC verification rests on: parse the same call
+        // partially and fully, and the canonical serializations agree —
+        // otherwise every speculation would miss and the layer would be
+        // pure overhead.
+        let tools = vec![ToolDef {
+            function: FunctionDef {
+                name: "bash".into(),
+                description: None,
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}
+                })),
+            },
+        }];
+        let full = "<tool_call>bash\n<arg_key>command</arg_key>\n<arg_value>1.10</arg_value>\n\
+                    <arg_key>timeout</arg_key>\n<arg_value>30</arg_value>\n</tool_call>";
+        let mut f = OutputFilter::with_tools(&tools);
+        // Feed everything except the close tag: prefix state.
+        let body = &full[..full.len() - "</tool_call>".len()];
+        f.push(body);
+        let snap = f
+            .speculation()
+            .ok_or_else(|| "open call must yield a snapshot".to_string())?;
+        f.push("</tool_call>");
+        let calls = f.take_calls();
+        let c = calls.first().ok_or_else(|| "the close must parse one call".to_string())?;
+        assert_eq!(snap.name, c.name);
+        assert_eq!(
+            snap.arguments.to_string(),
+            c.arguments.to_string(),
+            "canonical keys must agree, or speculation never verifies"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_name_probe_costs_no_argument_parse_and_lies_about_nothing() -> Result<(), String> {
+        // A call whose name is known but whose first key has not arrived:
+        // open_call_name answers, speculation answers with empty args.
+        let mut f = OutputFilter::with_tools(&[]);
+        f.push("<tool_call>read\n");
+        assert_eq!(f.open_call_name(), Some("read"));
+        let snap = f.speculation().ok_or_else(|| "open call must yield a snapshot".to_string())?;
+        assert_eq!(snap.name, "read");
+        let empty = snap.arguments.as_object().ok_or_else(|| "arguments are an object".to_string())?;
+        assert!(empty.is_empty(), "no complete pairs yet: {snap:?}");
+        Ok(())
     }
 }

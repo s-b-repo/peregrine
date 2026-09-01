@@ -171,7 +171,10 @@ impl AlignCost {
         // it beats what the padding costs, and on large regions it usually
         // will not — which is the answer, not a failed measurement.
         let (saved, cost) = (self.units_saved(), self.disk_cost());
-        let mean_region = if self.regions > 0 { self.data_bytes / self.regions } else { 0 };
+        // For unsigned ints `checked_div` is `None` exactly when the divisor is
+        // zero, so the zero-region case keeps its explicit 0 mean — same
+        // arithmetic as a hand-written guard, without restating the check.
+        let mean_region = self.data_bytes.checked_div(self.regions).unwrap_or(0);
         // Two different situations both produce "no units saved", and the
         // explanation is opposite in each. Regions much LARGER than the unit
         // barely straddle; regions much SMALLER than it already fit inside one

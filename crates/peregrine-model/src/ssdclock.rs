@@ -205,7 +205,10 @@ mod tests {
         assert_eq!(bw(D), before);
         observe(D, 4096, std::time::Duration::ZERO); // clamped to 1us span
         let after = bw(D);
-        assert!(after >= MIN_BPS && after <= MAX_BPS, "out-of-bounds: {after}");
+        assert!(
+            (MIN_BPS..=MAX_BPS).contains(&after),
+            "out-of-bounds: {after}"
+        );
     }
 
     #[test]

@@ -98,6 +98,29 @@ charge; and a test asserting 3 MB regions make alignment pointless that simply
 byte ledger and miacollective's tolerance-in-the-key digest, the latter blocked
 on Q4 not existing yet.*
 
+*2026-09-02 wave (+0 shipped, +0 checkboxes, one external corroboration and
+one watch updated — from the [Tencent AngelSpec](https://github.com/Tencent/AngelSpec)
+cross-read, [arXiv:2607.25852](https://arxiv.org/abs/2607.25852)): a unified
+PyTorch training workbench putting six drafter architectures (DFly, DFlash,
+DFlare, EAGLE 3, DSpark, MTP) behind one config flag. Nothing here is portable
+code and no line-item opens — it is a *training* workbench, and the checkpoint
+is the artifact this workspace cannot make — but three of its reported results
+bear on standing entries. **D-cut** (batch-level dynamic verification
+budgeting, +15.7 % live-serving throughput) is outside evidence for the
+cost-side gate this repo built the instrument for and deliberately left
+untuned: `COLI_SPEC_UNION_MAX`'s owed `decode.tokens_emitted`/`ecache`
+measurement now has independent evidence the union term is real on live
+serving loads (§3b's decode-economics entry, `configuration.md`). **DFly** —
+DFlash's shared projection + DFlare's per-layer target fusion + an
+autoregressive correction head, 4.79 average accepted length on Hunyuan 3,
+1.98×–2.40× end-to-end — independently reports the per-workload framing the
+speculation pages score by. And the **74:1 attention gap** between standalone
+drafter checkpoints and the training toolkit reinforces the
+checkpoint-scarcity thesis `dflash.md` closes on. Full notes in
+[dflash.md §AngelSpec](dflash.md#the-angelspec-cross-read-2026-09-02). The
+dashboard counts are unchanged: the roadmap was ~94 % done against a scope
+this cross-read widens by zero items.*
+
 ## 📌 What is actually left (2026-08-08; defrag + min-share closed 2026-08-13)
 
 **2026-08-21 — portability across Linux machines.** The engine no longer

@@ -18,6 +18,7 @@
 mod batch;
 mod kvstore;
 mod memo;
+mod sptc;
 mod tok;
 mod tools;
 
@@ -71,6 +72,12 @@ struct Args {
     /// `<model>/tokenizer.json`; no model weights are loaded.
     #[arg(long, value_name = "TEXT_FILE")]
     bench_tokenizer: Option<std::path::PathBuf>,
+    /// Server-hosted tools (`--host-tool tokenize`, repeatable): tools the
+    /// server executes itself when the model calls them, with sPTC running
+    /// pure ones speculatively while the call is still streaming (see
+    /// [`sptc`]). An unknown name is a boot error.
+    #[arg(long, value_name = "NAME")]
+    host_tool: Vec<String>,
 }
 
 /// Shared, cloneable server state.
@@ -91,6 +98,10 @@ struct Inner {
     /// for GLM's `[gMASK]<sop>` markup. Captured at load from the model's arch
     /// before it moves into the engine thread; selects `build_prompt`'s dialect.
     chatml_prompt: bool,
+    /// The sPTC shadow executor when tools are hosted, `None` — with zero
+    /// footprint — otherwise. Hosted tools execute when the model's call
+    /// closes; pure ones have already run speculatively while it streamed.
+    sptc: Option<Arc<sptc::ShadowRepl>>,
 }
 
 // ---- OpenAI request/response shapes ----
@@ -653,6 +664,26 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
                 t.ngram_accepted as f64 / t.ngram_proposed as f64
             } else { 0.0 },
         },
+        // sPTC (null when no tools are hosted): speculation's hit rate is the
+        // number to read. `speculated` counts enqueued guesses, `verified_hits`
+        // the ones the model's actual close confirmed — hits close to
+        // speculations with `sync_runs` low means the shadow is saving a
+        // client-visible wait per hosted call; the reverse says the pool is
+        // only burning CPU on guesses that never verify.
+        "sptc": state.inner.sptc.as_ref().map(|s| {
+            let st = s.stats();
+            serde_json::json!({
+                "tools": st.tools,
+                "speculation_enabled": st.speculation_enabled,
+                "speculated": st.speculated,
+                "verified_hits": st.verified_hits,
+                "sync_runs": st.sync_runs,
+                "hosted_calls": st.hosted_calls,
+                "rejected_input": st.rejected_input,
+                "rejected_busy": st.rejected_busy,
+                "table": { "entries": st.table_entries, "bytes": st.table_bytes, "evictions": st.table_evictions },
+            })
+        }),
         // RLM recursive refinement (COLI_RLM): passes emitted and tokens that
         // triggered at least one.
         "rlm": { "passes": t.rlm.0, "tokens_recursed": t.rlm.1 },
@@ -730,6 +761,7 @@ async fn chat_completions(
             let stream = req.stream;
             let tool_defs = active_tools(&req).to_vec();
             let replay_tok = tokenizer.clone();
+            let replay_sptc = state.inner.sptc.clone();
             let frame = ReplayFrame {
                 completion_id: completion_id.clone(),
                 model_id: model_id.clone(),
@@ -737,7 +769,7 @@ async fn chat_completions(
                 prompt_tokens,
             };
             return tokio::task::spawn_blocking(move || {
-                memo_response(stream, &tool_defs, &replay_tok, &out_ids, &frame)
+                memo_response(stream, &tool_defs, &replay_tok, replay_sptc, &out_ids, &frame)
             })
             .await
             .map_err(|e| ApiError::internal(format!("memo replay task: {e}")))?;
@@ -756,6 +788,7 @@ async fn chat_completions(
         // The schemas outlive the request body here: the filter types arguments
         // from them, and the spawned task owns everything it touches.
         let stream_tools: Vec<tools::ToolDef> = active_tools(&req).to_vec();
+        let sptc = state.inner.sptc.clone();
         tokio::spawn(async move {
             // Token payloads split multi-byte characters, so deltas come from an
             // incremental decoder that holds an unfinished character until the
@@ -770,6 +803,11 @@ async fn chat_completions(
             // through the filter before any of it becomes a delta: a client must
             // never see half a `<tool_call>`.
             let mut filter = tools::OutputFilter::with_tools(&stream_tools);
+            // sPTC: while a hosted tool's call is still streaming, its complete
+            // argument pairs are speculated in the background. `None` (no tools
+            // hosted) makes both call sites no-ops on a code path that is
+            // otherwise untouched.
+            let mut spec = sptc::Speculator::new();
             let mut emitted_calls = 0usize;
             // OpenAI clients expect the role in the first chunk.
             if sse_tx.send(Ok(chunk_event(&cid, &mid, created, None, Some("assistant"), None))).await.is_err() {
@@ -784,8 +822,16 @@ async fn chat_completions(
                             continue; // token only extended an unfinished character
                         }
                         let delta = filter.push(&decoded);
+                        if let Some(shadow) = &sptc {
+                            spec.observe(shadow, &filter);
+                        }
                         for c in filter.take_calls() {
                             let call = c.to_openai(emitted_calls, &call_id(&cid, emitted_calls));
+                            let call = if let Some(shadow) = &sptc {
+                                shadow.attach_result(call, &c)
+                            } else {
+                                call
+                            };
                             emitted_calls += 1;
                             if sse_tx.send(Ok(tool_call_chunk_event(&cid, &mid, created, call))).await.is_err() {
                                 return; // client disconnected
@@ -834,6 +880,7 @@ async fn chat_completions(
             // A call closed only by end-of-generation still reaches the client.
             for c in filter.take_calls() {
                 let call = c.to_openai(emitted_calls, &call_id(&cid, emitted_calls));
+                let call = if let Some(shadow) = &sptc { shadow.attach_result(call, &c) } else { call };
                 emitted_calls += 1;
                 hung_up = hung_up || sse_tx.send(Ok(tool_call_chunk_event(&cid, &mid, created, call))).await.is_err();
             }
@@ -872,6 +919,7 @@ async fn chat_completions(
         Ok(Json(json_completion(
             &text,
             &calls,
+            state.inner.sptc.as_deref(),
             &completion_id,
             &model_id,
             created,
@@ -923,10 +971,13 @@ async fn debug_tokenize(
 }
 
 /// The OpenAI `chat.completion` body. Shared by the generated and memoized paths so
-/// a replayed response cannot drift in shape from a fresh one.
+/// a replayed response cannot drift in shape from a fresh one. `sptc` resolves
+/// hosted tools' results into the calls (identically on both paths — a pure
+/// tool answers the same from a speculation, a synchronous run, or a replay).
 fn json_completion(
     text: &str,
     calls: &[tools::ParsedCall],
+    sptc: Option<&sptc::ShadowRepl>,
     completion_id: &str,
     model_id: &str,
     created: u64,
@@ -942,8 +993,17 @@ fn json_completion(
         if text.is_empty() && !calls.is_empty() { serde_json::Value::Null } else { serde_json::json!(text) },
     );
     if !calls.is_empty() {
-        let arr: Vec<serde_json::Value> =
-            calls.iter().enumerate().map(|(i, c)| c.to_openai(i, &call_id(completion_id, i))).collect();
+        let arr: Vec<serde_json::Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let openai = c.to_openai(i, &call_id(completion_id, i));
+                match sptc {
+                    Some(shadow) => shadow.attach_result(openai, c),
+                    None => openai,
+                }
+            })
+            .collect();
         message.insert("tool_calls".into(), serde_json::Value::Array(arr));
     }
     // A turn with calls finishes as `tool_calls`; agent clients branch on this
@@ -991,6 +1051,7 @@ fn memo_response(
     stream: bool,
     tool_defs: &[tools::ToolDef],
     tokenizer: &TokenBackend,
+    sptc: Option<Arc<sptc::ShadowRepl>>,
     out_ids: &[u32],
     frame: &ReplayFrame,
 ) -> Result<Response, ApiError> {
@@ -1001,6 +1062,7 @@ fn memo_response(
         return Ok(Json(json_completion(
             &text,
             &calls,
+            sptc.as_deref(),
             completion_id,
             model_id,
             created,
@@ -1316,6 +1378,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("peregrine-serve: prefetch predictor = {name} (COLI_PREDICT_SOURCE)");
     }
     let tokenizer = TokenBackend::load(&dir).map_err(|e| format!("tokenizer: {e}"))?;
+    // sPTC: hosted tools + the shadow executor. Inert (None) unless
+    // --host-tool names at least one tool; speculation is the COLI_SPTC kill
+    // switch's to veto. Built after the tokenizer because the hosted set is
+    // the tokenizer-query family.
+    let tokenizer = Arc::new(tokenizer);
+    let sptc = sptc::ShadowRepl::from_args(&args.host_tool, &tokenizer, sptc::speculation_enabled())?;
+    if let Some(shadow) = &sptc {
+        let st = shadow.stats();
+        eprintln!(
+            "[sptc] hosting tools: {}; speculation {}",
+            st.tools.join(", "),
+            if st.speculation_enabled { "on (COLI_SPTC)" } else { "off (COLI_SPTC=0)" }
+        );
+    }
     // Capture the prompt dialect before the model moves into the engine thread.
     let chatml_prompt = model.uses_chatml_prompt();
 
@@ -1326,10 +1402,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         inner: Arc::new(Inner {
             engine,
-            tokenizer: Arc::new(tokenizer),
+            tokenizer,
             args,
             memo: parking_lot::Mutex::new(memo::ResponseMemo::from_env()),
             chatml_prompt,
+            sptc,
         }),
     };
 
@@ -1600,14 +1677,18 @@ mod tests {
     #[test]
     fn a_calls_only_turn_nulls_content_and_finishes_as_tool_calls() {
         let calls = vec![tools::ParsedCall { name: "read".into(), arguments: json!({"p": 1}) }];
-        let v = json_completion("", &calls, "chatcmpl-abc", "m", 0, 1, 1);
+        let v = json_completion("", &calls, None, "chatcmpl-abc", "m", 0, 1, 1);
         let choice = &v["choices"][0];
         assert_eq!(choice["message"]["content"], serde_json::Value::Null, "null, not \"\"");
         assert_eq!(choice["finish_reason"], json!("tool_calls"));
         assert_eq!(choice["message"]["tool_calls"][0]["id"], json!("call_abc_0"));
+        assert!(
+            choice["message"]["tool_calls"][0].get("peregrine_result").is_none(),
+            "no hosted tools configured → no result field, wire shape untouched"
+        );
 
         // Opposite outcome over the same function: no calls → text and "stop".
-        let plain = json_completion("hello", &[], "chatcmpl-abc", "m", 0, 1, 1);
+        let plain = json_completion("hello", &[], None, "chatcmpl-abc", "m", 0, 1, 1);
         let choice = &plain["choices"][0];
         assert_eq!(choice["message"]["content"], json!("hello"));
         assert_eq!(choice["finish_reason"], json!("stop"));

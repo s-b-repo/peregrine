@@ -2963,6 +2963,19 @@ mod tests {
         eprintln!("skipping {what}: io_uring unavailable: {e}");
     }
 
+    /// Best-effort removal of a test's temp file on a skip/error path. A
+    /// missing file is the expected outcome (another cleanup already removed
+    /// it, or it was never created), so `NotFound` stays silent; any other
+    /// failure is a real cleanup error and is surfaced as an advisory note
+    /// rather than discarded.
+    fn remove_temp_or_note(op: &str, p: &std::path::Path) {
+        match std::fs::remove_file(p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => crate::note_advisory_err(op, &e),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn uring_write_many_matches_pwrite() -> std::io::Result<()> {
@@ -2986,8 +2999,8 @@ mod tests {
             Ok(r) => r,
             Err(e) => {
                 skip_or_fail("uring_write_many_matches_pwrite", &e);
-                let _ = std::fs::remove_file(&p_ring);
-                let _ = std::fs::remove_file(&p_pw);
+                remove_temp_or_note("ring temp file cleanup", &p_ring);
+                remove_temp_or_note("pwrite temp file cleanup", &p_pw);
                 return Ok(());
             }
         };

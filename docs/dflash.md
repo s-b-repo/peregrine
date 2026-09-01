@@ -7,7 +7,10 @@ draft model for speculative decoding. Its draft is not autoregressive: it takes
 the whole verify block as mask tokens, cross-attends to hidden states pulled
 from several layers of the target, and emits every position of the block in
 **one** forward. DFlash 2 adds a low-rank candidate selector to put back the
-sequential dependency that parallel drafting throws away.
+sequential dependency that parallel drafting throws away. The 2026-09-02
+cross-read of Tencent's [AngelSpec](#the-angelspec-cross-read-2026-09-02) —
+which trains DFlash alongside five other drafter architectures behind one
+config flag — is recorded [at the end of this page](#the-angelspec-cross-read-2026-09-02).
 
 This page records what was taken, what was measured, and — at least as
 importantly — what could not be taken and why, in the style of
@@ -259,6 +262,76 @@ verify row against a 2.63× union growth factor, and a weight-free substitute fo
 the codebooks would be a new heuristic with no measurement behind it. It is here
 so that if a tree builder is ever wanted, this shape is the one to reach for
 first.
+
+## The AngelSpec cross-read (2026-09-02)
+
+While DFlash 2 was drawing its audience (132 000 downloads, 99 Hacker News
+points), Tencent quietly open-sourced
+[**AngelSpec**](https://github.com/Tencent/AngelSpec)
+([arXiv:2607.25852](https://arxiv.org/abs/2607.25852), Apache-2.0): a unified
+PyTorch training workbench that puts **six** speculative-drafting
+architectures — **DFly, DFlash, DFlare, EAGLE 3, DSpark and MTP** — behind a
+single config flag. Its own thesis is that no single drafter architecture wins
+across real-world workloads, and that what governs autoregressive decoding is
+memory bandwidth — which is this repo's byte-ledger thesis arriving from the
+training side. It is a *training* workbench, not an engine, so nothing in it
+is portable code; what it moves is the supply side of the question this page
+kept hitting: where trained drafters come from.
+
+What the cross-read reports, and what each point does to the claims above:
+
+- **DFly**, the flagship, is a *composition*, not a new mechanism: DFlash's
+  shared projection + DFlare's per-layer target fusion + an autoregressive
+  correction head. Reported at **4.79 average accepted length** on Hunyuan 3
+  (Hy3-A21B) — ~30 % over DFlash — with a **1.98×–2.40×** end-to-end
+  throughput speedup. Two readings worth keeping. First, the hybrid confirms
+  the direction the [candidate-selector note](#the-candidate-selector-shape-recorded)
+  ends on: the interesting object is a drafter assembled from mechanisms, not
+  a mechanism. Second, it independently reports the framing this repo scores
+  by — the six architectures trade off per workload, which is exactly why
+  [the alternatives page](speculative-decoding-alternatives.md) scores them
+  per *track* (disk-bound vs resident) rather than arguing about the
+  literature's one number.
+- **D-cut** — batch-level dynamic verification budgeting, reported at
+  **+15.7 %** live-serving throughput — is the cost-side gate this repo
+  already built the instrument for and deliberately left untuned:
+  `COLI_SPEC_UNION_MAX` prices a tick's projected routed-expert union, and
+  the number that should set it is owed to `decode.tokens_emitted` against
+  `ecache` on the real container
+  ([configuration.md](configuration.md#coli_spec_union_max)). D-cut is
+  independent evidence, from a serving regime where verify rows are *cheap*,
+  that the denominator of `speedup = (1 + accepted) / union_growth` is worth
+  gating in production — which lowers the odds the owed measurement comes
+  back "the gate is never the limiting term".
+- **The 74:1 attention gap** between the standalone drafter checkpoints and
+  the core training toolkit. Whatever its exact accounting, the asymmetry it
+  names is the one this page hit from the other side: the architectures are
+  published, the *artifact* is scarce — and a standalone drafter checkpoint
+  is measurably not the object the training toolkit's own config produces.
+  Anyone consuming a published drafter checkpoint (as peregrine would on the
+  resident track) is consuming the checkpoint, not the paper, and a loader
+  has to be written against what ships.
+- **Three GitHub issues open within nine seconds** of release — the serving
+  and benchmarking surface is where users actually land, consistent with this
+  repo's own experience that engines outlast papers. **Apache-2.0**
+  throughout, so nothing borrowed from it later is license-encumbered.
+
+Sources: [AngelSpec paper](https://arxiv.org/abs/2607.25852) ·
+[Tencent/AngelSpec](https://github.com/Tencent/AngelSpec) ·
+[DFlash research page](https://z-lab.ai/projects/dflash) ·
+[DFlash paper](https://arxiv.org/abs/2602.06036) ·
+[DFlash 2 announcement](https://inco.ai/blog/dflash2) ·
+[DSpark (PKU & DeepSeek)](https://arxiv.org/abs/2607.05147) ·
+[EAGLE-3](https://arxiv.org/abs/2503.01840).
+
+**What it changes here: nothing shipped, one standing watch updated.** The
+"DFlash has no GLM-5.2 draft" gap [above](#what-could-not-be-taken-and-why)
+is now one instance of a general condition: draft checkpoints trail
+architectures, and AngelSpec is the first toolkit that puts all six one
+config away for whoever trains the target. If a GLM-5.2 or Qwen3.5 drafter
+ever ships out of AngelSpec, the resident-track build sized
+[above](#what-could-not-be-taken-and-why) is the plan that wakes up. Until
+then this stays a recorded observation, not a work item.
 
 ## Also read
 

@@ -486,6 +486,7 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_DRAFT_SAMPLED` | off | extend speculation to temperature > 0 — [note](#coli_draft_sampled) |
 | `COLI_SPEC_GDN` | off | allow speculation on a **recurrent** (Qwen3.5-hybrid) arch — [note](#coli_spec_gdn) |
 | `COLI_SPEC_GDN_MAX_B` | 0 | batch width above which `COLI_SPEC_GDN` stops drafting; `0` = uncapped |
+| `COLI_SPEC_CONF` | 0 | confidence floor for MTP drafting: stop a draft early when the head's top-token probability drops under it — [note](#coli_spec_conf) |
 | `COLI_DRAFT_NGRAM` | 0 | prompt-lookup drafting: match suffixes up to this length — [note](#coli_draft_ngram) |
 | `COLI_SPEC_UNION_MAX` | 0 | ceiling on a tick's projected routed-expert union, in expert-read requests — [note](#coli_spec_union_max) |
 | `COLI_DRAFT_TREE` | off | verify both draft sources as a token tree instead of choosing one — [note](#coli_draft_tree) |
@@ -731,6 +732,30 @@ unaffected — `accept_run` still decides by argmax identity, asserted by
 checkpoint, `prompt_lookup_speculates_without_an_mtp_head`.
 
 
+### `COLI_SPEC_CONF`
+
+The **acceptance-side** gate on MTP drafting. Default **off** (`0`).
+
+A draft that will be rejected still costs its verify row's expert reads, so
+the cheapest draft is the one the head itself does not believe in. This knob
+stops an MTP draft early when the head's top-token probability drops under
+the floor. Depth-only: `accept_run` is untouched, so greedy output is
+bit-identical by construction (`the_confidence_floor_never_changes_a_greedy_stream`) —
+it prunes *rows*, never changes a token.
+
+**CONFIRMED, REPEATS=3 (2026-08-16):** `COLI_DRAFT=5` + floor **0.65** measured
+**0.060 → 0.082 median tok/s (+37 %) with −22 % disk reads** at B=16 on the
+streaming GLM container — the `COLI_DRAFT=4` regression inverts once
+low-confidence drafts stop paying for verify rows, and the win is
+bytes-shaped, not cache-shaped. Defaults stay off on purpose: both confirmed
+arms drafted at depth 5, so the measurement licenses "if you speculate, floor
+it", not "speculate by default" — the controlled draft0-vs-floored sweep
+decides that (`performance-tuning.md`).
+
+`/metrics` reports `spec.conf_stops` beside `spec.union_stops` (its
+[cost-side twin](#coli_spec_union_max)): together they say which term of
+`speedup = (1 + accepted) / union_growth` is actually limiting a run.
+
 ### `COLI_SPEC_UNION_MAX`
 
 The **cost-side** twin of [`COLI_SPEC_CONF`](#coli_spec_conf). Default **off**.
@@ -772,7 +797,11 @@ together they say which term of the fraction is actually limiting a run.
 `decode.tokens_emitted` against `ecache`, measured on the real container.
 Picking a ceiling before that measurement exists would be tuning against a
 quantity nobody has measured, which is the failure
-[`measurement.md`](measurement.md) opens with.
+[`measurement.md`](measurement.md) opens with. Outside corroboration that the
+term is real on live serving loads: Tencent AngelSpec's **D-cut**
+(batch-level dynamic verification budgeting, reported +15.7 % live-serving
+throughput; [arXiv:2607.25852](https://arxiv.org/abs/2607.25852)) — see
+[the AngelSpec cross-read](dflash.md#the-angelspec-cross-read-2026-09-02).
 
 
 ### `COLI_DRAFT_TREE`

@@ -127,6 +127,40 @@ usual "no checkpoint" closure below does *not* settle it is that DFlash publishe
 one for Qwen3.5-27B. Full accounting, with the numbers and the two rejected
 designs, in [`dflash.md`](dflash.md).
 
+### AngelSpec: six drafter architectures behind one config flag (2026-09-02)
+
+Tencent's [AngelSpec](https://github.com/Tencent/AngelSpec)
+([arXiv:2607.25852](https://arxiv.org/abs/2607.25852), Apache-2.0) is a unified
+PyTorch training workbench covering six of the rows above at once — **DFly,
+DFlash, DFlare, EAGLE 3, DSpark, MTP** — behind a single config flag, with the
+reported headline that the *composition* (DFly = DFlash's shared projection +
+DFlare's per-layer target fusion + an autoregressive correction head) beats
+each part alone: **4.79** average accepted length on Hunyuan 3 (Hy3-A21B),
+~30 % over DFlash, **1.98×–2.40×** end-to-end. Three points land on this page:
+
+1. **D-cut corroborates the cost-side gate.** Batch-level dynamic verification
+   budgeting, reported at **+15.7 %** live-serving throughput, is the same
+   trade `COLI_SPEC_CONF` (acceptance side) and `COLI_SPEC_UNION_MAX`
+   (union-cost side) sit on either side of. The cost-side knob here ships
+   deliberately untuned — the number that sets it is the owed
+   `decode.tokens_emitted`/`ecache` measurement — and D-cut is outside
+   evidence the term is real on live serving loads, not only on this repo's
+   streaming container.
+2. **"No single drafter architecture wins across workloads"** is this page's
+   founding move (score per track, not per literature), now reported
+   independently by a workbench built to switch between six.
+3. The **74:1 attention gap** between the standalone drafter checkpoints and
+   the core training toolkit reinforces what the closures below rest on:
+   architectures are cheap to describe; the trained checkpoint is the scarce
+   artifact. A published drafter checkpoint is not the object the training
+   config describes — audit what ships, not what the paper says ships.
+
+Full notes and sources hang off
+[`dflash.md`](dflash.md#the-angelspec-cross-read-2026-09-02). Nothing is
+shipped and no row of the table moves: AngelSpec is a training workbench, and
+its relevance here is that it lowers the cost of the artifact every
+"not buildable" row above is actually blocked on.
+
 ### Closed here, and why
 
 Recorded in the style of `ideas-tokens-per-sec-2026-08-15.md`'s closed

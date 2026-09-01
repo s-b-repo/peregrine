@@ -120,7 +120,10 @@ mod tests {
         assert_eq!(std::fs::read(&p)?, b"{\"v\":2,\"more\":true}");
         // ...and never leaves the temp file behind for the next reader to find.
         assert!(!temp_sibling(&p)?.exists(), "temp file must be renamed away");
-        let entries: Vec<_> = std::fs::read_dir(&d)?.filter_map(|e| e.ok()).collect();
+        // Collect fallibly: a directory entry that fails to stat is an error
+        // worth surfacing, not an entry to silently skip (which could make the
+        // count assertion below pass or fail for the wrong reason).
+        let entries: Vec<_> = std::fs::read_dir(&d)?.collect::<Result<Vec<_>, std::io::Error>>()?;
         assert_eq!(entries.len(), 1, "only the target file remains");
         std::fs::remove_dir_all(&d)?;
         Ok(())

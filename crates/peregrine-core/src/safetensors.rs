@@ -762,19 +762,24 @@ fn convert_f32(dtype: Dtype, raw: &[u8], out: &mut [f32]) -> Result<(), Error> {
         )));
     }
     match dtype {
+        // `as_chunks::<N>().0` is the array-typed view of `chunks_exact(N)`: it
+        // yields the same floor(len/N) chunks in the same order and drops the
+        // same trailing bytes, so the produced f32s are bit-identical. The
+        // dropped tail is unreachable anyway — the length check above already
+        // rejected any `raw` shorter than `out.len() * elem_size`.
         Dtype::F32 => {
-            for (o, c) in out.iter_mut().zip(raw.chunks_exact(4)) {
-                *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            for (o, c) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
+                *o = f32::from_le_bytes(*c);
             }
         }
         Dtype::Bf16 => {
-            for (o, c) in out.iter_mut().zip(raw.chunks_exact(2)) {
-                *o = bf16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            for (o, c) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
+                *o = bf16_to_f32(u16::from_le_bytes(*c));
             }
         }
         Dtype::F16 => {
-            for (o, c) in out.iter_mut().zip(raw.chunks_exact(2)) {
-                *o = f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            for (o, c) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
+                *o = f16_to_f32(u16::from_le_bytes(*c));
             }
         }
         Dtype::F8E4M3 => {

@@ -71,6 +71,14 @@ impl TokenBackend {
     pub fn name(&self) -> &'static str {
         "gigatoken"
     }
+
+    /// Test-only constructor from an already-built tokenizer — the parity
+    /// fixture path, so sptc tests exercise the real tokenizer without a
+    /// model directory on disk.
+    #[cfg(test)]
+    pub(crate) fn from_giga_for_test(t: GigaTokenizer) -> TokenBackend {
+        TokenBackend { giga: Box::new(parking_lot::Mutex::new(t)) }
+    }
 }
 
 /// Turns a token-id stream into text deltas, one token at a time.

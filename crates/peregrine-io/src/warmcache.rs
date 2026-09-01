@@ -945,8 +945,11 @@ impl WarmCache {
         let PreparedInsert { data: slot_data, incoming, raw_bytes } = prepared;
         self.uncompressed_bytes_seen = self.uncompressed_bytes_seen.saturating_add(raw_bytes as u64);
         self.compressed_bytes_seen = self.compressed_bytes_seen.saturating_add(incoming as u64);
-        let was_new;
-        match self.map.get_mut(&key) {
+        // The match arms both yield the newness flag, so the binding is
+        // initialized at declaration rather than declared empty and assigned in
+        // each arm — the control flow (which arm runs, what it mutates) is
+        // unchanged.
+        let was_new = match self.map.get_mut(&key) {
             Some(slot) => {
                 self.used = self.used - slot.bytes + incoming;
                 slot.bytes = incoming;
@@ -957,15 +960,15 @@ impl WarmCache {
                 slot.from_prefetch = from_prefetch;
                 slot.ever_hit = false;
                 slot.heat = 0;
-                was_new = false;
+                false
             }
             None => {
                 self.used += incoming;
                 self.map
                     .insert(key, Slot { used: now, bytes: incoming, data: slot_data, from_prefetch, ever_hit: false, prio: 0, heat: 0 });
-                was_new = true;
+                true
             }
-        }
+        };
         if was_new {
             self.hint.add(key);
         }

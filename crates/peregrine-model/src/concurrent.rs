@@ -1342,7 +1342,7 @@ fn rebuild(t: &TPlan, wb: Bytes, sb: Bytes) -> QtWeight {
     // scale bytes → f32 (a copy inherent to the reinterpret; scales are tiny). The
     // weight bytes `wb` move into the QtWeight with no copy — zero-copy end to end
     // when `wb` is an O_DIRECT aligned region.
-    let scale: Vec<f32> = sb.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let scale: Vec<f32> = sb.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect();
     match t.fmt {
         QuantFmt::Int4Grouped => QtWeight::new_grouped(t.o, t.i, wb, scale, t.gs),
         f => QtWeight::new(f, t.o, t.i, wb, scale),
