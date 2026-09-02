@@ -87,3 +87,4 @@ bench-data/**/kvstore/
 /.watchdog-start.time
 /auto-improve-loop.pid
 /scripts/loop-watchdog.sh
+qwen-cache/
