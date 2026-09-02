@@ -56,7 +56,11 @@ pub mod topic;
 /// outright) once a second module grew tests of its own. The lock lives at crate
 /// level so `gpu.rs` and `model.rs` share ONE, rather than each serializing only
 /// against itself.
-#[cfg(test)]
+///
+/// Gated on the `cuda` feature, not merely `test`, because every caller is a
+/// `#[cfg(feature = "cuda")]` test: under a plain `cfg(test)` the lock has zero
+/// reachable callers in a default (no-CUDA) build and compiles as dead code.
+#[cfg(all(test, feature = "cuda"))]
 pub(crate) mod gpu_test_lock {
     static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// `unwrap_or_else` recovers a poisoned lock (a panicked test) without

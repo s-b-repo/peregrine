@@ -1211,7 +1211,15 @@ mod shape_dispatch {
         if !enabled() || s_n == 0 {
             return None;
         }
-        let Ok(mut t) = table().lock() else { return None };
+        // Poisoned-lock recovery, not a swallowed error: poisoning requires a
+        // panic while the table was held, i.e. mid probe-update. The table
+        // holds only plain per-shape dispatch counters — no cross-entry
+        // invariants — so the worst a panic can leave is a half-counted probe
+        // for one shape. The data is still trusted, and recovering the guard
+        // keeps every other shape's memoized decision alive instead of
+        // silently disabling the whole specialization on one transient panic
+        // elsewhere in the process.
+        let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
         let stat = t.entry((fmt, o, i)).or_default();
         if stat.serial_n >= PROBES && stat.par_n >= PROBES {
             // locked in: pick the faster measured mean (per call)
@@ -1228,7 +1236,10 @@ mod shape_dispatch {
 
     /// Post-dispatch: record the probe timing.
     pub fn post(fmt: u8, o: usize, i: usize, used_par: bool, ns: u64) {
-        let Ok(mut t) = table().lock() else { return };
+        // Same poisoned-lock recovery as `pre` (see there): plain counters, no
+        // invariants to protect, so the guard is recovered rather than the
+        // timing discarded.
+        let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
         let stat = t.entry((fmt, o, i)).or_default();
         if used_par {
             stat.par_ns = stat.par_ns.saturating_add(ns);

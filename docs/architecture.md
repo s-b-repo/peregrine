@@ -70,8 +70,10 @@ RAM       ──  warm expert cache (priority-weighted LRU + Bloom filter, optio
 SSD       ──  everything else, streamed per token over io_uring
 ```
 
-Residency is decided by a greedy heat/bytes knapsack (`gpu.rs::solve_residency_greedy`),
-falling back to round-robin on a cold heat table. The
+Residency is decided by a size-aware greedy heat/bytes knapsack
+(`gpu.rs::solve_residency_sized`; an earlier revision of this page named
+`solve_residency_greedy`, which predates the sizing fix and has no production
+caller), falling back to round-robin on a cold heat table. The
 [`LaneBalancer`](adaptive-runtime.md) can override static residency at dispatch
 time when telemetry shows one lane is the bottleneck.
 

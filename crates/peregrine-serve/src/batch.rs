@@ -2927,12 +2927,10 @@ mod tests {
         let last = (prompt.len() - 1) * vocab;
         let mut tok = argmax(&logits[last..last + vocab]) as i32;
         let mut toks = prompt.clone();
-        let mut pos = prompt.len();
-        for _ in 0..4 {
+        for pos in prompt.len()..prompt.len() + 4 {
             let mut one: [&mut SeqKv; 1] = [&mut seq];
             let lg = model.forward_step_batched(&[tok], &mut one, &[pos], None)?;
             toks.push(tok);
-            pos += 1;
             tok = argmax(&lg[..vocab]) as i32;
         }
         assert_eq!(toks.len(), seq.len(), "fed-token log stays row-aligned");

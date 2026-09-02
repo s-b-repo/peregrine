@@ -60,7 +60,14 @@ fn install_moe_engine() {
             eprintln!("peregrine: COLI_MOE_ENGINE={other} is not a known engine (concurrent|sched); using concurrent");
             return;
         }
-        _ => return,
+        // Not present is the expected absence. A non-unicode value is an
+        // operator error: they asked for an engine by name and the wildcard
+        // this replaced silently served the default instead of saying so.
+        Err(std::env::VarError::NotPresent) => return,
+        Err(e) => {
+            eprintln!("peregrine: COLI_MOE_ENGINE unreadable ({e}); using concurrent");
+            return;
+        }
     }
     let depth: u32 = std::env::var("COLI_IO_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     match peregrine_sched::SchedEngine::new(depth) {

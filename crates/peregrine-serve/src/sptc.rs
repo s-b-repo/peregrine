@@ -60,7 +60,8 @@ use std::sync::Arc;
 /// or final. A call body is model output, so it is untrusted input to the
 /// tool — the cap bounds both the speculation's re-parse cost (one full scan
 /// per new argument pair) and what a hosted tool may be handed.
-const MAX_ARG_BYTES: usize = 64 * 1024;/// Output ceiling per run. A hosted tool's result rides inside a
+const MAX_ARG_BYTES: usize = 64 * 1024;
+/// Output ceiling per run. A hosted tool's result rides inside a
 /// `tool_calls` chunk, so a runaway result would be a wire-shape hazard
 /// before it is a memory one.
 const MAX_OUT_BYTES: usize = 1024 * 1024;
@@ -506,8 +507,10 @@ fn worker_loop(rx: Arc<Mutex<Receiver<Job>>>, core: Arc<ShadowCore>) {
     loop {
         // The lock spans the `recv`: an empty queue parks this worker holding
         // it, which is what routes the next arriving job to exactly one
-        // worker. Lock hold time is one job's execution; jobs are bounded
-        // in-process pure calls.
+        // worker. The guard is a temporary of this `let` statement, so it
+        // drops at the semicolon — before the job below runs — and the two
+        // workers can execute distinct jobs concurrently; jobs are bounded
+        // in-process pure calls, so that overlap costs nothing.
         let job = match rx.lock().recv() {
             Ok(job) => job,
             Err(std::sync::mpsc::RecvError) => return,

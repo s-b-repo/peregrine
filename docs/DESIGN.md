@@ -236,7 +236,7 @@ staged learned/entropy prefetch-distance nudges. Feedback loop closed. All new s
 **The completion sweep** (same day) finished every non-hardware roadmap item on top of this loop:
 NUMA-bound landing buffers (`bind_local_if_enabled`, first-touch-correct `mbind`), hierarchical
 two-level pool dispatch (`plan_assignments` over a worker→node map), per-expert adaptive mixed
-precision (`plan_precision`, applied in the cuda tier's `reheat`), SQ-full-delta-driven io-wq
+precision (`plan_precision_fitted`, applied in the cuda tier's `reheat`), SQ-full-delta-driven io-wq
 tuning, macro-state routing compression (`MacroTable` + `PredictSource::WithMacro`), the
 `galactic` one-shot preprocessing pass (all artifacts from one corpus run), Hilbert / spectral /
 2-opt layout methods + hypergraph tier placement (`tiers.json`, RAM tier prefetch-warmed at load),

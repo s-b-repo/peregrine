@@ -8,7 +8,7 @@
 //! the mode must refuse the argument combinations that would silently measure
 //! the wrong thing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bin() -> Command {
@@ -26,7 +26,7 @@ fn tiny_hybrid(tag: &str) -> Result<PathBuf, peregrine_core::Error> {
 
 /// The container's own teacher-forced argmax, dumped the way the HF runner
 /// dumps its reference — the fixture for a self-agreement gate.
-fn self_dump(dir: &PathBuf, tokens: &[i32]) -> Result<Vec<i32>, peregrine_core::Error> {
+fn self_dump(dir: &Path, tokens: &[i32]) -> Result<Vec<i32>, peregrine_core::Error> {
     let mut m = peregrine_model::Model::load(dir)?;
     m.teacher_forcing(tokens)
 }

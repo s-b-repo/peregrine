@@ -49,7 +49,13 @@ pub const fn align_up_usize(x: usize, a: usize) -> usize {
 /// throttling: `cudaHostRegister` walks and pins page tables and is far too
 /// expensive to run per read. Returning `false` declines a buffer, and a
 /// declined buffer is never passed to `unpin`.
-type PinHook = (fn(*mut u8, usize) -> bool, fn(*mut u8, usize));
+///
+/// The pointers are `unsafe fn`: a pin hook dereferences the raw allocation
+/// pointer by contract (`cudaHostRegister` needs the live range), so the
+/// safety obligation belongs on the type — a backend that cannot honor it
+/// cannot be installed — and the two invocation sites below carry the
+/// `# SAFETY` arguments for why *their* calls uphold it.
+type PinHook = (unsafe fn(*mut u8, usize) -> bool, unsafe fn(*mut u8, usize));
 static PIN_HOOK: std::sync::OnceLock<PinHook> = std::sync::OnceLock::new();
 
 /// Install the [`PIN_HOOK`]. Returns `false` if one was already installed (the
@@ -57,7 +63,11 @@ static PIN_HOOK: std::sync::OnceLock<PinHook> = std::sync::OnceLock::new();
 /// second caller is a bug rather than a race.
 /// `unpin` receives the same length `pin` was given, so a backend can keep
 /// live-pinned-bytes accounting without a side table keyed by address.
-pub fn set_pin_hook(pin: fn(*mut u8, usize) -> bool, unpin: fn(*mut u8, usize)) -> bool {
+///
+/// Storing the pointers is safe; the `unsafe` lives in the hook *type* and is
+/// discharged at the invocation sites, where the live-allocation argument can
+/// actually be made.
+pub fn set_pin_hook(pin: unsafe fn(*mut u8, usize) -> bool, unpin: unsafe fn(*mut u8, usize)) -> bool {
     PIN_HOOK.set((pin, unpin)).is_ok()
 }
 
@@ -125,7 +135,12 @@ impl AlignedBuf {
         // Pin last: after the hugepage and NUMA advice, so the hook registers the
         // pages the kernel is actually going to back this range with.
         let pinned = match PIN_HOOK.get() {
-            Some((pin, _)) => pin(ptr.as_ptr(), len),
+            // SAFETY: `ptr` is a live allocation of exactly `len` bytes (created
+            // above, not yet returned or freed), the exact precondition the pin
+            // hook's contract states. On acceptance the buffer records `pinned`,
+            // which is what routes the matching unpin through `Drop` below
+            // before the range is ever deallocated.
+            Some((pin, _)) => unsafe { pin(ptr.as_ptr(), len) },
             None => false,
         };
         Some(AlignedBuf { ptr, len, layout, pinned })
@@ -163,7 +178,10 @@ impl Drop for AlignedBuf {
         // mapped, and a `cudaHostUnregister` of a freed pointer is undefined.
         if self.pinned {
             if let Some((_, unpin)) = PIN_HOOK.get() {
-                unpin(self.ptr.as_ptr(), self.len);
+                // SAFETY: `self.pinned` means this exact (ptr, len) pair was
+                // accepted by the pin hook, and `dealloc` below has not run —
+                // the range is still mapped, which is the unpin contract.
+                unsafe { unpin(self.ptr.as_ptr(), self.len) };
             }
         }
         // SAFETY: `ptr` came from `alloc_zeroed` with exactly `self.layout` and is

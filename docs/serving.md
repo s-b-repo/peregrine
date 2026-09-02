@@ -28,6 +28,7 @@ graceful on Ctrl-C / SIGINT (in-flight connections drain; no SIGTERM handler).
 | `--model-id <id>` | `glm-5.2` | id reported by `/v1/models` and echoed in responses |
 | `--max-batch <n>` | `32` | continuous-batching width ceiling |
 | `--bench-tokenizer <file>` | unset | tokenizer throughput bench, then exit (no weights loaded) |
+| `--host-tool <name>` | none (repeatable) | server-hosted tools (`tokenize`, `detokenize`, `count_tokens`) executed when the model calls them, speculated while the call streams — [sPTC](sptc.md); unknown name = boot error |
 
 ## Endpoints
 

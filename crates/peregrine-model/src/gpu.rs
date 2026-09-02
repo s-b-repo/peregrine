@@ -69,6 +69,10 @@ pub fn plan_residency(
 }
 
 use std::cmp::Reverse;
+// Both maps are used only by `owner_summary`, which exists solely in the
+// `cuda` build (`mod real` imports its own). Ungated, the import is an
+// unused-import warning on every non-CUDA build — which is the default.
+#[cfg(feature = "cuda")]
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1313,7 +1317,22 @@ mod gpu_residency_tests {
         build_tiny_model(&dir)?;
         let st = SafeTensors::open(&dir)?;
         let cfg = Cfg::load(&dir)?;
-        let prev = std::env::var("COLI_GPU_DEVICES").ok();
+        // Both variants named rather than `.ok()`: unset is the ordinary absent
+        // case (restored below by removing the variable), while a non-UTF-8
+        // value is a real misconfiguration — reported, then treated as absent,
+        // because `set_var` cannot spell such a value back anyway, so removal
+        // is the only faithful restore available.
+        let prev = match std::env::var("COLI_GPU_DEVICES") {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(e @ std::env::VarError::NotUnicode(_)) => {
+                peregrine_io::note_advisory_err(
+                    "COLI_GPU_DEVICES is not valid Unicode; this test will restore it as unset",
+                    &e,
+                );
+                None
+            }
+        };
         std::env::set_var("COLI_GPU_DEVICES", "cuda:0,cuda:1");
         let built = GpuTier::build(&st, &cfg, 0, &[]);
         match prev {
@@ -3128,14 +3147,28 @@ mod real {
             let groups = self.group_by_owner(layer, jobs);
             let mut parts: Vec<Result<Vec<f32>, Error>> = Vec::with_capacity(groups.len());
             if groups.len() == 1 {
-                parts.push(self.reduce_group(layer, jobs, &groups[0].1, hidden, dst, weights, &job_at, s_n));
+                parts.push(self.reduce_group(
+                    layer,
+                    jobs,
+                    &groups[0].1,
+                    hidden,
+                    &ReduceArgs { dst, weights, job_at: &job_at, s_n },
+                ));
             } else {
                 std::thread::scope(|s| {
                     let handles: Vec<_> = groups
                         .iter()
                         .map(|(_, idxs)| {
                             let job_at = job_at.clone();
-                            s.spawn(move || self.reduce_group(layer, jobs, idxs, hidden, dst, weights, &job_at, s_n))
+                            s.spawn(move || {
+                                self.reduce_group(
+                                    layer,
+                                    jobs,
+                                    idxs,
+                                    hidden,
+                                    &ReduceArgs { dst, weights, job_at: &job_at, s_n },
+                                )
+                            })
                         })
                         .collect();
                     for h in handles {
@@ -3162,19 +3195,15 @@ mod real {
 
         /// One device's slice of [`Self::compute_reduced`]: format-class partials
         /// summed within the group, returning that group's `[s_n, hidden]` share.
-        #[allow(clippy::too_many_arguments)]
         fn reduce_group(
             &self,
             layer: usize,
             jobs: &[(usize, Vec<f32>)],
             idxs: &[usize],
             hidden: usize,
-            dst: &[usize],
-            weights: &[f32],
-            job_at: &[usize],
-            s_n: usize,
+            args: &ReduceArgs<'_>,
         ) -> Result<Vec<f32>, Error> {
-            let mut acc = vec![0f32; s_n * hidden];
+            let mut acc = vec![0f32; args.s_n * hidden];
             let fmt: Vec<bool> =
                 idxs.iter().map(|&i| self.precision.get(&(layer, jobs[i].0)).copied().unwrap_or(self.int4)).collect();
             for cls in &super::partition_by_format(&fmt) {
@@ -3193,12 +3222,12 @@ mod real {
                     refs.push(ge);
                     rows.push((xg.len() / hidden) as i32);
                     x.extend_from_slice(xg);
-                    cdst.extend_from_slice(&dst[job_at[job_i]..job_at[job_i + 1]]);
-                    crw.extend_from_slice(&weights[job_at[job_i]..job_at[job_i + 1]]);
+                    cdst.extend_from_slice(&args.dst[args.job_at[job_i]..args.job_at[job_i + 1]]);
+                    crw.extend_from_slice(&args.weights[args.job_at[job_i]..args.job_at[job_i + 1]]);
                 }
-                let layout = peregrine_cuda::ReduceLayout::build(&cdst, s_n)
+                let layout = peregrine_cuda::ReduceLayout::build(&cdst, args.s_n)
                     .ok_or_else(|| Error::Format("gpu compute_reduced: row destination out of range".into()))?;
-                let part = peregrine_cuda::expert_group_reduce(&refs, &rows, &x, hidden, &layout, &crw, s_n)?;
+                let part = peregrine_cuda::expert_group_reduce(&refs, &rows, &x, hidden, &layout, &crw, args.s_n)?;
                 if part.len() != acc.len() {
                     return Err(Error::Format("gpu compute_reduced: short partial".into()));
                 }
@@ -3214,6 +3243,23 @@ mod real {
     /// (`true` = int4). Produced together because the format decides the byte
     /// cost, which decides how many fit.
     type ResidencyGeneration = (Vec<(usize, usize)>, HashMap<(usize, usize), bool>);
+
+    /// The fused-reduce inputs one device group consumes, bundled so
+    /// [`GpuTier::reduce_group`] stays readable instead of carrying eight loose
+    /// parameters behind a lint suppression.
+    ///
+    /// `dst` and `weights` are the per-row destination rows and gate weights in
+    /// the flattened job order `compute_reduced` builds; `job_at` maps each job
+    /// index to that job's start inside the flat arrays (one past the last at
+    /// index `jobs.len()`); `s_n` is the partial's row count. Shared read-only
+    /// across the per-device worker threads, which is why it borrows rather
+    /// than owns.
+    struct ReduceArgs<'a> {
+        dst: &'a [usize],
+        weights: &'a [f32],
+        job_at: &'a [usize],
+        s_n: usize,
+    }
 
     /// Live `GpuTier`s in this process. `peregrine_cuda::shutdown()` is global —
     /// it loops every device context — so a tier that called it from its own

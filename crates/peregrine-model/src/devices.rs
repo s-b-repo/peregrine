@@ -189,7 +189,7 @@ pub fn parse_device_list(spec: &str) -> Result<Vec<DeviceRequest>, String> {
     }
     fn ordinal(text: &str, tok: &str) -> Result<i32, String> {
         text.parse::<i32>()
-            .map_err(|_| format!("COLI_GPU_DEVICES: bad ordinal in {tok:?} (expected a non-negative integer)"))
+            .map_err(|e| format!("COLI_GPU_DEVICES: bad ordinal in {tok:?} (expected a non-negative integer): {e}"))
             .and_then(|i| {
                 if i < 0 {
                     Err(format!("COLI_GPU_DEVICES: negative ordinal in {tok:?}"))
@@ -237,7 +237,15 @@ pub fn parse_device_list(spec: &str) -> Result<Vec<DeviceRequest>, String> {
 /// running on a device the operator did not ask for is worse than running on none.
 pub fn selected_devices() -> Vec<i32> {
     let requests = match std::env::var("COLI_GPU_DEVICES") {
-        Err(_) => return vec![0],
+        // Both variants named rather than `Err(_)`: unset is the ordinary
+        // default-device case, while a non-UTF-8 value is a real
+        // misconfiguration — reported, then handled the same way, since a
+        // value Rust cannot spell is no more parseable than an absent one.
+        Err(std::env::VarError::NotPresent) => return vec![0],
+        Err(e @ std::env::VarError::NotUnicode(_)) => {
+            peregrine_io::note_advisory_err("COLI_GPU_DEVICES is not valid Unicode; using the default device", &e);
+            return vec![0];
+        }
         Ok(spec) => match parse_device_list(&spec) {
             Ok(r) => r,
             Err(msg) => {

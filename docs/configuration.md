@@ -476,6 +476,7 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_ADAPTIVE_WINDOW` | 1 | run prefill every Nth engine tick (decode-heavy window) |
 | `COLI_FUSE_PREFILL` | **on** (2026-08-13) | prefill chunk rides the decode batch's forward; `=0` restores two forwards — [note](#coli_fuse_prefill) |
 | `COLI_MEMO_ENTRIES` / `COLI_MEMO_MB` | 32 / 64 | exact response memo — [note](#coli_memo_entries--coli_memo_mb) |
+| `COLI_SPTC` | **on** (when `--host-tool` is used) | sPTC tool speculation — `0`/`false`/`off` stops guessing while keeping hosted execution at close; see [sptc.md](sptc.md). Read once at boot |
 | `COLI_KV_BUDGET_MB` | 0 | resident-KV byte ceiling for admission — [note](#coli_kv_budget_mb) |
 | `COLI_KV_POOL_MB` | 0 | recycle a retired sequence's KV allocations — [note](#coli_kv_pool_mb) |
 | `COLI_PREFIX_CACHE_MB` | **2048** (2026-08-13) | cross-request KV prefix cache (`0` disables); caches prompts *and* generated tokens, matched by comparing tokens, not hashing |

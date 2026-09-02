@@ -21,7 +21,10 @@ pub struct QtMeta {
 
 /// Decode f32 scales from their little-endian byte region.
 fn scales_from_bytes(s: &[u8]) -> Vec<f32> {
-    s.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    // `as_chunks` (not `chunks_exact`) so each group is a real `[u8; 4]` the
+    // compiler can hand to `from_le_bytes` directly; the trailing partial group
+    // (`.1`) is discarded, matching `chunks_exact`'s behavior exactly.
+    s.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// Rebuild one quantized weight from its streamed weight-bytes + scale-bytes.

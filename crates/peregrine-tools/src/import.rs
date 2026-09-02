@@ -583,7 +583,7 @@ mod tests {
         let mut greedy = peregrine_model::Sampler::new(0.0, 0.9, 1);
         let toks = m.generate(&[1, 5, 9], 4, &mut greedy)?;
         assert!(!toks.is_empty(), "the imported container must decode");
-        assert!(toks.iter().all(|&t| t >= 0 && t < 32), "tokens in vocab: {toks:?}");
+        assert!(toks.iter().all(|&t| (0..32).contains(&t)), "tokens in vocab: {toks:?}");
         std::fs::remove_dir_all(&dir)?;
         std::fs::remove_dir_all(&out)?;
         Ok(())
@@ -825,7 +825,7 @@ mod tests {
         let mut greedy = peregrine_model::Sampler::new(0.0, 0.9, 1);
         let toks = m.generate(&[1, 5, 9], 4, &mut greedy)?;
         assert_eq!(toks.len(), 4, "the imported container must decode");
-        assert!(toks.iter().all(|&t| t >= 0 && t < 32), "tokens in vocab: {toks:?}");
+        assert!(toks.iter().all(|&t| (0..32).contains(&t)), "tokens in vocab: {toks:?}");
         std::fs::remove_dir_all(&dir)?;
         std::fs::remove_dir_all(&out)?;
         Ok(())

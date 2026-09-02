@@ -120,6 +120,14 @@ impl Ledger {
     /// this engine cannot source is printed as absent rather than omitted: an
     /// omitted column reads as an oversight and a fabricated one reads as a
     /// measurement, and neither is true.
+    ///
+    /// A ledger that fails [`Self::coherent`] is printed with a WARNING rather
+    /// than rendered anyway: the one thing worse than no decomposition is a
+    /// decomposition that looks exact while its columns were sampled from
+    /// different windows. [`Self::coherent`] was written as the invariant check
+    /// for exactly this and lived reachable only from tests; the report is the
+    /// one place a reader trusts the numbers, so it is the place the check
+    /// speaks.
     pub fn report(&self, tokens: u64) -> String {
         let gb = |b: u64| b as f64 / 1e9;
         let mut s = format!(
@@ -157,6 +165,18 @@ impl Ledger {
             "",
             if self.from_disk > 0 { 100.0 * self.reread_after_eviction as f64 / self.from_disk as f64 } else { 0.0 },
         ));
+        // The coherence invariant, surfaced where the numbers are consumed. The
+        // builders clamp what they can (`distinct_guard`, the re-read clamp), so
+        // a violation here means the raw counters themselves crossed windows —
+        // the state the module doc calls "looks precise and is not".
+        if !self.coherent() {
+            s.push_str(
+                "[ledger] WARNING: columns are mutually inconsistent — at least one\n\
+                 [ledger]   subset exceeds its superset, which means neighbouring\n\
+                 [ledger]   counters were sampled from different windows. Treat every\n\
+                 [ledger]   figure above as unreliable until the run is re-measured.\n",
+            );
+        }
         // The standing rule, enforced here rather than left to the reader.
         s.push_str(
             "[ledger] NOTE: every saving above is a BYTE figure with no quality figure beside it. \n\
@@ -171,7 +191,9 @@ impl Ledger {
     /// `unique` cannot exceed `requested` and `cache_served + from_disk` should
     /// account for `unique`. A violation means a counter was read from a
     /// different window than its neighbours — which produces a ledger that
-    /// looks precise and is not.
+    /// looks precise and is not. [`Ledger::report`] prints a WARNING when this
+    /// returns `false`, so the violation reaches the reader instead of only the
+    /// tests.
     pub fn coherent(&self) -> bool {
         self.unique <= self.requested
             && self.cache_served <= self.unique
@@ -334,5 +356,28 @@ mod tests {
         let (arith, real) = (l.requested_per_token(10), l.disk_per_token(10));
         assert!(real < arith, "disk traffic must be below the arithmetic figure");
         assert!((arith / real - 5.0).abs() < 1e-9, "1000 selections vs 200 disk reads");
+    }
+
+    #[test]
+    fn an_incoherent_ledger_warns_in_its_own_report() {
+        // The coherence check must reach the reader of the report, not only the
+        // tests: the fields are public, so a hand-assembled ledger (or a future
+        // builder that forgets a clamp) can violate the invariant, and the
+        // printed figures would otherwise look exact while describing
+        // different windows. `LedgerInput::build` clamps what it can, so the
+        // violation has to be constructed directly.
+        let mut l = input().build();
+        assert!(!l.report(64).contains("WARNING"), "a coherent ledger must not warn");
+        l.cache_served = l.unique + 1; // cache hit bytes beyond the unique set
+        assert!(!l.coherent(), "the fixture must actually violate the invariant");
+        let r = l.report(64);
+        assert!(r.contains("WARNING"), "{r}");
+        assert!(r.contains("different windows"), "{r}");
+        // The warning precedes the gate NOTE, so an operator reads
+        // "do not trust these" before the advice that presumes they are.
+        let warn = r.find("WARNING");
+        let note = r.find("flip-rate");
+        assert!(warn.is_some() && note.is_some(), "both lines must be present: {r}");
+        assert!(warn < note, "the warning must precede the gate NOTE: {r}");
     }
 }

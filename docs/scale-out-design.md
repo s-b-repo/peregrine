@@ -126,7 +126,7 @@ token does not wait on a cross-device fetch.
 (`COLI_REPLICATE_K`, which warms hot GPU residents into the CPU warm cache).
 The VRAM side needs a second device to mean anything.
 
-**Where it hooks in.** `plan_residency`/`plan_precision` in `gpu.rs` already rank
+**Where it hooks in.** `plan_residency`/`plan_precision_fitted` in `gpu.rs` already rank
 residents by heat from the persisted `HeatTable`; replication is a third knob
 (`COLI_VRAM_REPLICATE_K`) applied before item 1's partition.
 

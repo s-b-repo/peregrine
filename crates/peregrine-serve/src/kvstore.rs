@@ -412,7 +412,7 @@ impl KvSessionStore {
         if tok_bytes.len() < want {
             return Err(Error::Format(format!("{}: truncated token list", path.display())));
         }
-        let tokens = tok_bytes.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let tokens = tok_bytes.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect();
         Ok(Some((tokens, bytes)))
     }
 
@@ -760,6 +760,36 @@ fn index_committed(ctx: &WriterCtx, entry: IndexEntry, tokens: &[i32]) {
     }
 }
 
+/// Bounds-checked little-endian reader over a checksummed body.
+struct Reader<'a> {
+    b: &'a [u8],
+    at: usize,
+    path: &'a Path,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        let end = self.at.checked_add(n).filter(|&e| e <= self.b.len()).ok_or_else(|| {
+            Error::Format(format!("{}: truncated at byte {}", self.path.display(), self.at))
+        })?;
+        let s = &self.b[self.at..end];
+        self.at = end;
+        Ok(s)
+    }
+    fn u32(&mut self) -> Result<u32, Error> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn u64(&mut self) -> Result<u64, Error> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+    fn f32s(&mut self, n: usize) -> Result<Vec<f32>, Error> {
+        let b = self.take(n.checked_mul(4).ok_or_else(|| Error::Format("kvstore length overflow".into()))?)?;
+        Ok(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,35 +984,5 @@ mod tests {
         std::fs::remove_dir_all(&mdir)?;
         std::fs::remove_dir_all(&sdir)?;
         Ok(())
-    }
-}
-
-/// Bounds-checked little-endian reader over a checksummed body.
-struct Reader<'a> {
-    b: &'a [u8],
-    at: usize,
-    path: &'a Path,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self.at.checked_add(n).filter(|&e| e <= self.b.len()).ok_or_else(|| {
-            Error::Format(format!("{}: truncated at byte {}", self.path.display(), self.at))
-        })?;
-        let s = &self.b[self.at..end];
-        self.at = end;
-        Ok(s)
-    }
-    fn u32(&mut self) -> Result<u32, Error> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-    fn u64(&mut self) -> Result<u64, Error> {
-        let b = self.take(8)?;
-        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-    }
-    fn f32s(&mut self, n: usize) -> Result<Vec<f32>, Error> {
-        let b = self.take(n.checked_mul(4).ok_or_else(|| Error::Format("kvstore length overflow".into()))?)?;
-        Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
 }

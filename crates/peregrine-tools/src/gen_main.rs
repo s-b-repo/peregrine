@@ -307,11 +307,20 @@ fn main() -> std::process::ExitCode {
     let t0 = Instant::now();
     let mut head = BufReader::new(stream);
 
-    // Status line, then headers.
+    // Status line, then headers. `read_line` is matched, not defaulted: an
+    // I/O error is not the same fact as a clean close, and `unwrap_or(0)` would
+    // have reported "server closed" for a read that actually failed.
     let mut status = String::new();
-    if head.read_line(&mut status).unwrap_or(0) == 0 {
-        eprintln!("peregrine-gen: server closed without a response");
-        return std::process::ExitCode::FAILURE;
+    match head.read_line(&mut status) {
+        Ok(0) => {
+            eprintln!("peregrine-gen: server closed without a response");
+            return std::process::ExitCode::FAILURE;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("peregrine-gen: reading status line: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     }
     let code = status.split_whitespace().nth(1).unwrap_or("").to_string();
     let mut chunked = false;

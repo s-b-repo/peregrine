@@ -13,6 +13,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [Portability](portability.md) | what varies from one Linux box to the next — io_uring, page size, SIMD, O_DIRECT — and which fallbacks are tested |
 | [`peregrine` CLI reference](cli-peregrine.md) | every subcommand (`demo`, `build`, `bench`, `build-automaton`, `dump-routes`, `galactic`, `compile-plan`), the stdio serve protocol |
 | [Serving (`peregrine-serve`)](serving.md) | CLI flags, the OpenAI-compatible HTTP API, SSE streaming, auth, priority header, continuous batching |
+| [sPTC — speculative tool calling](sptc.md) | hosted tools executed while the model is still streaming the call: the pure-by-construction decorator, exact-key verification, the shadow executor, the `peregrine_result` wire extension |
 | [Layout tools](layout-tools.md) | `peregrine-layout-reorg` and `peregrine-prune`: routing traces → disk schedules → physical checkpoint rewrite |
 | [Tools](tools.md) | `peregrine-gen` (watch and time generation), `peregrine-requantize` (fewer bytes per expert), `peregrine-skipbound`, `peregrine-basisfit` (cross-expert factorization, priced as rate–distortion on activations) |
 | [Configuration](configuration.md) | the complete env-var reference — every tuning knob, none of which can change the token stream |

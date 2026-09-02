@@ -612,12 +612,14 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
         // Admission latency: the span between submit and becoming a Prefilling.
         // Every other latency instrument here starts counting once a request is
         // already being served, so queue time was indistinguishable from slow
-        // decode. mean_us = wait_us / admits.
+        // decode. mean_us = wait_us / admits; `checked_div` keeps that quotient
+        // and reads 0 when nothing has been admitted yet — there is no mean
+        // over zero admissions, and 0 is the metric's no-data answer.
         "queue": {
             "wait_us": t.queue_wait_us,
             "admits": t.queue_admits,
             "max_us": t.queue_wait_max_us,
-            "mean_us": if t.queue_admits > 0 { t.queue_wait_us / t.queue_admits } else { 0 },
+            "mean_us": t.queue_wait_us.checked_div(t.queue_admits).unwrap_or(0),
         },
         // CPU-package energy, or null when the host will not give up the RAPL
         // counter (root-only on most current kernels — the PLATYPUS
@@ -916,14 +918,12 @@ async fn chat_completions(
             .await
             .map_err(|e| ApiError::internal(format!("decode task: {e}")))?;
         let (text, calls) = split_output(&tk(decoded)?, active_tools(&req));
+        let frame = ReplayFrame { completion_id, model_id, created, prompt_tokens };
         Ok(Json(json_completion(
             &text,
             &calls,
             state.inner.sptc.as_deref(),
-            &completion_id,
-            &model_id,
-            created,
-            prompt_tokens,
+            &frame,
             n_out,
         ))
         .into_response())
@@ -974,14 +974,13 @@ async fn debug_tokenize(
 /// a replayed response cannot drift in shape from a fresh one. `sptc` resolves
 /// hosted tools' results into the calls (identically on both paths — a pure
 /// tool answers the same from a speculation, a synchronous run, or a replay).
+/// The wire identity rides in one [`ReplayFrame`] rather than as four positional
+/// fields — the same shape a caller silently transposes.
 fn json_completion(
     text: &str,
     calls: &[tools::ParsedCall],
     sptc: Option<&sptc::ShadowRepl>,
-    completion_id: &str,
-    model_id: &str,
-    created: u64,
-    prompt_tokens: usize,
+    frame: &ReplayFrame,
     completion_tokens: usize,
 ) -> serde_json::Value {
     let mut message = serde_json::Map::new();
@@ -997,7 +996,7 @@ fn json_completion(
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let openai = c.to_openai(i, &call_id(completion_id, i));
+                let openai = c.to_openai(i, &call_id(&frame.completion_id, i));
                 match sptc {
                     Some(shadow) => shadow.attach_result(openai, c),
                     None => openai,
@@ -1010,21 +1009,33 @@ fn json_completion(
     // rather than on the presence of the array.
     let finish = if calls.is_empty() { "stop" } else { "tool_calls" };
     serde_json::json!({
-        "id": completion_id,
+        "id": &frame.completion_id,
         "object": "chat.completion",
-        "created": created,
-        "model": model_id,
+        "created": frame.created,
+        "model": &frame.model_id,
         "choices": [{
             "index": 0,
             "message": serde_json::Value::Object(message),
             "finish_reason": finish
         }],
         "usage": {
-            "prompt_tokens": prompt_tokens,
+            "prompt_tokens": frame.prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
+            "total_tokens": frame.prompt_tokens + completion_tokens
         }
     })
+}
+
+/// The wire identity one response is framed with: the completion id, model id,
+/// timestamp, and prompt-token count that go into the OpenAI body and every
+/// tool-call id. Built fresh for a generated response and rebuilt for a memo
+/// replay — always *this* request's identifiers and timestamp, never the
+/// original's (see [`memo_response`]).
+struct ReplayFrame {
+    completion_id: String,
+    model_id: String,
+    created: u64,
+    prompt_tokens: usize,
 }
 
 /// Serve a memoized completion in whichever wire format this request asked for.
@@ -1037,16 +1048,9 @@ fn json_completion(
 ///
 /// The SSE path re-chunks through the same [`tok::IncrementalDecoder`] as a live
 /// stream, so a multi-byte character is split across deltas identically. It is sent
-/// as one ready-made stream with no engine behind it.
-/// The framing a memo replay rebuilds — always *this* request's identifiers and
-/// timestamp, never the original's (see [`memo_response`]).
-struct ReplayFrame {
-    completion_id: String,
-    model_id: String,
-    created: u64,
-    prompt_tokens: usize,
-}
-
+/// as one ready-made stream with no engine behind it. Hosted tools resolve their
+/// results on this path too, exactly as the live streaming task does — a replay
+/// must not drift in shape from a fresh stream.
 fn memo_response(
     stream: bool,
     tool_defs: &[tools::ToolDef],
@@ -1063,10 +1067,7 @@ fn memo_response(
             &text,
             &calls,
             sptc.as_deref(),
-            completion_id,
-            model_id,
-            created,
-            frame.prompt_tokens,
+            frame,
             out_ids.len(),
         ))
         .into_response());
@@ -1087,6 +1088,11 @@ fn memo_response(
         let delta = filter.push(&decoded);
         for c in filter.take_calls() {
             let call = c.to_openai(emitted_calls, &call_id(completion_id, emitted_calls));
+            // Hosted tools resolve here exactly as on the live streaming path:
+            // a replay that dropped `peregrine_result` would serve the same
+            // completion in a different shape depending on whether it was
+            // memoized.
+            let call = if let Some(shadow) = &sptc { shadow.attach_result(call, &c) } else { call };
             emitted_calls += 1;
             events.push(Ok(tool_call_chunk_event(completion_id, model_id, created, call)));
         }
@@ -1105,6 +1111,7 @@ fn memo_response(
     }
     for c in filter.take_calls() {
         let call = c.to_openai(emitted_calls, &call_id(completion_id, emitted_calls));
+        let call = if let Some(shadow) = &sptc { shadow.attach_result(call, &c) } else { call };
         emitted_calls += 1;
         events.push(Ok(tool_call_chunk_event(completion_id, model_id, created, call)));
     }
@@ -1676,8 +1683,14 @@ mod tests {
 
     #[test]
     fn a_calls_only_turn_nulls_content_and_finishes_as_tool_calls() {
+        let frame = ReplayFrame {
+            completion_id: "chatcmpl-abc".into(),
+            model_id: "m".into(),
+            created: 0,
+            prompt_tokens: 1,
+        };
         let calls = vec![tools::ParsedCall { name: "read".into(), arguments: json!({"p": 1}) }];
-        let v = json_completion("", &calls, None, "chatcmpl-abc", "m", 0, 1, 1);
+        let v = json_completion("", &calls, None, &frame, 1);
         let choice = &v["choices"][0];
         assert_eq!(choice["message"]["content"], serde_json::Value::Null, "null, not \"\"");
         assert_eq!(choice["finish_reason"], json!("tool_calls"));
@@ -1688,7 +1701,7 @@ mod tests {
         );
 
         // Opposite outcome over the same function: no calls → text and "stop".
-        let plain = json_completion("hello", &[], None, "chatcmpl-abc", "m", 0, 1, 1);
+        let plain = json_completion("hello", &[], None, &frame, 1);
         let choice = &plain["choices"][0];
         assert_eq!(choice["message"]["content"], json!("hello"));
         assert_eq!(choice["finish_reason"], json!("stop"));
@@ -1712,6 +1725,53 @@ mod tests {
         assert_eq!(text, "here you go", "trimmed, and no markup");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["command"], json!("ls"), "declared string stays a string");
+        Ok(())
+    }
+
+    /// The committed GPT-2 fixture, for tests that need a real tokenizer
+    /// (the same fixture the sptc and parity suites load).
+    fn test_tokenizer() -> Result<Arc<TokenBackend>, Error> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../peregrine-token/tests/fixtures/gpt2_tokenizer.json");
+        let bytes = peregrine_core::Context::ctx(std::fs::read(&path), || {
+            format!("fixture at {}", path.display())
+        })?;
+        let giga = peregrine_token::GigaTokenizer::from_hf_json_bytes(&bytes)
+            .map_err(|e| Error::Format(format!("fixture is BPE: {e}")))?;
+        Ok(Arc::new(TokenBackend::from_giga_for_test(giga)))
+    }
+
+    // `#[tokio::test]` because axum's SSE response spawns its keep-alive task
+    // on `into_response`, which requires a runtime context.
+    #[tokio::test]
+    async fn a_memoized_streaming_replay_attaches_hosted_tool_results_like_a_fresh_stream()
+    -> Result<(), Error> {
+        // The contract under test: a replayed streaming completion must carry
+        // `peregrine_result` for a hosted call exactly as the live stream does
+        // (see `json_completion`'s "identically on both paths"). The shadow's
+        // `hosted_calls` counter is the observable — `attach_result` is the
+        // only thing on the replay path that can increment it, and it is
+        // incremented once per hosted call the replay re-emits.
+        let tok = test_tokenizer()?;
+        let shadow = sptc::ShadowRepl::from_args(&["tokenize".to_string()], &tok, true)?
+            .ok_or_else(|| Error::Format("a requested tool must be hosted".into()))?;
+        assert_eq!(shadow.stats().hosted_calls, 0, "nothing has run yet");
+        let ids = tok
+            .encode("<tool_call>tokenize\n<arg_key>text</arg_key>\n<arg_value>hello world</arg_value>\n</tool_call>")?;
+        let frame = ReplayFrame {
+            completion_id: "chatcmpl-replay".into(),
+            model_id: "glm-5.2".into(),
+            created: 0,
+            prompt_tokens: 1,
+        };
+        let resp = memo_response(true, &[], &tok, Some(Arc::clone(&shadow)), &ids, &frame)
+            .map_err(|e| Error::Format(format!("{}: {}", e.kind, e.message)))?;
+        assert_eq!(resp.status(), StatusCode::OK, "the replay built a response");
+        assert_eq!(
+            shadow.stats().hosted_calls,
+            1,
+            "the replay's hosted call went through attach_result, as a fresh stream's would"
+        );
         Ok(())
     }
 }

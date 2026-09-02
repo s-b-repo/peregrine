@@ -87,21 +87,29 @@ enum LayerAttn {
     /// projections convolved together, a per-channel low-rank forget gate, and
     /// a sigmoid-gated output norm. Shares [`GdnState`] with `Gdn` — the
     /// Glm5Next config lays its `lin_*` geometry out so the state shapes match.
-    Kda {
-        q: QtWeight,
-        k: QtWeight,
-        v: QtWeight,
-        conv: Vec<f32>,
-        f_a: QtWeight,
-        f_b: QtWeight,
-        dt_bias: Vec<f32>,
-        a_log: Vec<f32>,
-        b: QtWeight,
-        g_a: QtWeight,
-        g_b: QtWeight,
-        o_norm: Vec<f32>,
-        o: QtWeight,
-    },
+    /// Boxed: eight `QtWeight`s put this variant at ~1.1 KB against Gqa's 656,
+    /// and every layer of a Kda model carries one — the payload lives behind a
+    /// pointer instead, which costs one deref per field touch against kernels
+    /// that already chase heap-allocated matrices.
+    Kda(Box<KdaW>),
+}
+
+/// The KDA variant's own weight payload, boxed out of [`LayerAttn`] so the
+/// enum's largest variant does not dominate every layer's footprint.
+struct KdaW {
+    q: QtWeight,
+    k: QtWeight,
+    v: QtWeight,
+    conv: Vec<f32>,
+    f_a: QtWeight,
+    f_b: QtWeight,
+    dt_bias: Vec<f32>,
+    a_log: Vec<f32>,
+    b: QtWeight,
+    g_a: QtWeight,
+    g_b: QtWeight,
+    o_norm: Vec<f32>,
+    o: QtWeight,
 }
 
 impl LayerW {
@@ -122,16 +130,16 @@ impl LayerW {
             LayerAttn::Gdn { in_qkv, in_z, in_a, in_b, out, .. } => {
                 vec![("in_qkv", in_qkv), ("in_z", in_z), ("in_a", in_a), ("in_b", in_b), ("out", out)]
             }
-            LayerAttn::Kda { q, k, v, f_a, f_b, b, g_a, g_b, o, .. } => vec![
-                ("q", q),
-                ("k", k),
-                ("v", v),
-                ("f_a", f_a),
-                ("f_b", f_b),
-                ("b", b),
-                ("g_a", g_a),
-                ("g_b", g_b),
-                ("o", o),
+            LayerAttn::Kda(w) => vec![
+                ("q", &mut w.q),
+                ("k", &mut w.k),
+                ("v", &mut w.v),
+                ("f_a", &mut w.f_a),
+                ("f_b", &mut w.f_b),
+                ("b", &mut w.b),
+                ("g_a", &mut w.g_a),
+                ("g_b", &mut w.g_b),
+                ("o", &mut w.o),
             ],
         }
     }
@@ -190,23 +198,21 @@ impl LayerW {
 
     fn kda(&self) -> Result<crate::gdn::KdaWeights<'_>, Error> {
         match &self.attn {
-            LayerAttn::Kda { q, k, v, conv, f_a, f_b, dt_bias, a_log, b, g_a, g_b, o_norm, o } => {
-                Ok(crate::gdn::KdaWeights {
-                    q,
-                    k,
-                    v,
-                    conv,
-                    f_a,
-                    f_b,
-                    dt_bias,
-                    a_log,
-                    b,
-                    g_a,
-                    g_b,
-                    o_norm,
-                    o,
-                })
-            }
+            LayerAttn::Kda(w) => Ok(crate::gdn::KdaWeights {
+                q: &w.q,
+                k: &w.k,
+                v: &w.v,
+                conv: &w.conv,
+                f_a: &w.f_a,
+                f_b: &w.f_b,
+                dt_bias: &w.dt_bias,
+                a_log: &w.a_log,
+                b: &w.b,
+                g_a: &w.g_a,
+                g_b: &w.g_b,
+                o_norm: &w.o_norm,
+                o: &w.o,
+            }),
             _ => Err(Error::Format("KDA attention path reached on a non-KDA layer".into())),
         }
     }
@@ -2985,7 +2991,7 @@ fn load_layer_at(
             for t in ["q_conv1d", "k_conv1d", "v_conv1d"] {
                 conv.extend(load_f32(st, &p(&format!("self_attn.{t}.weight")), qkv * taps)?);
             }
-            LayerAttn::Kda {
+            LayerAttn::Kda(Box::new(KdaW {
                 q: QtWeight::load(st, &p("self_attn.q_proj.weight"), qkv, d)?,
                 k: QtWeight::load(st, &p("self_attn.k_proj.weight"), qkv, d)?,
                 v: QtWeight::load(st, &p("self_attn.v_proj.weight"), qkv, d)?,
@@ -2999,7 +3005,7 @@ fn load_layer_at(
                 g_b: QtWeight::load(st, &p("self_attn.g_b_proj.weight"), qkv, ld)?,
                 o_norm: load_f32(st, &p("self_attn.o_norm.weight"), ld)?,
                 o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, qkv)?,
-            }
+            }))
         }
         Arch::DenseGqa | Arch::HybridGdn if is_full_attn => {
             let (nh, nkv, hd) = (cfg.n_heads as usize, cfg.n_kv_heads as usize, cfg.head_dim as usize);
@@ -3266,6 +3272,19 @@ impl CalibAccum {
     }
 }
 
+/// The sublayer-input view handed to [`attn_dispatch`]: the input-layernormed
+/// activations, how many rows of them are live, and the absolute KV-cache
+/// position of the first row. The three travel together through every hop from
+/// `forward_layer` down to the per-architecture attention kernels, so they
+/// ride as one named bundle — which also keeps the dispatch under clippy's
+/// arity ceiling without threading seven loose arguments through two call
+/// sites.
+struct AttnInput<'a> {
+    nrm: &'a [f32],
+    s_n: usize,
+    pos_base: usize,
+}
+
 /// The single-sequence attention dispatch shared by [`forward_layer`]'s plain
 /// and hc-stream forms. `nrm` is the input-layernormed sublayer input.
 fn attn_dispatch(
@@ -3274,10 +3293,9 @@ fn attn_dispatch(
     kv: &mut LayerKv,
     gdn: Option<&mut GdnState>,
     ctx: &ForwardCtx,
-    nrm: &[f32],
-    s_n: usize,
-    pos_base: usize,
+    inp: AttnInput<'_>,
 ) -> Result<Vec<f32>, Error> {
+    let AttnInput { nrm, s_n, pos_base } = inp;
     let cfg = ctx.cfg;
     // Weight absorption is the decode-shaped form of the same algebra: it works
     // in the 512-wide latent space instead of reconstructing `[k_nope|v]` for
@@ -3304,7 +3322,7 @@ fn attn_dispatch(
             })?;
             crate::gdn::gdn_forward(&l.gdn()?, nrm, s_n, st_g, cfg)?
         }
-        LayerAttn::Kda { .. } => {
+        LayerAttn::Kda(..) => {
             let st_g = gdn.ok_or_else(|| {
                 Error::Format(format!("layer {li}: KDA needs a recurrent state on this path"))
             })?;
@@ -3379,13 +3397,13 @@ fn forward_layer(
     // (`x` is `[s_n, hc_mult*hidden]`); everything else is the historical
     // single-residual form, bit for bit.
     if l.hc_attn.is_some() {
-        return forward_layer_hc(l, li, kv, gdn, ctx, x, s_n, pos_base);
+        return forward_layer_hc(l, li, kv, gdn, ctx, HcStream { x, s_n, pos_base });
     }
     let cfg = ctx.cfg;
     let d = cfg.hidden as usize;
     let eps = cfg.eps;
     let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
-    let attn = attn_dispatch(l, li, kv, gdn, ctx, &nrm, s_n, pos_base)?;
+    let attn = attn_dispatch(l, li, kv, gdn, ctx, AttnInput { nrm: &nrm, s_n, pos_base })?;
     for z in 0..s_n * d {
         x[z] += attn[z];
     }
@@ -3403,16 +3421,26 @@ fn forward_layer(
 /// single sublayer input, runs the ordinary sublayer (the same dispatches the
 /// plain form uses), and places the output back while Sinkhorn-mixing the
 /// streams — the residual add is *replaced* by that placement, not augmented.
+/// The mHC stream view [`forward_layer_hc`] transforms: the `[s_n,
+/// hc_mult*hidden]` parallel-stream activations, the number of live rows, and
+/// the absolute cache position of the first row. One bundle instead of three
+/// loose arguments — the stream buffer, its row count and its position always
+/// describe the same sequence and never travel separately.
+struct HcStream<'a> {
+    x: &'a mut [f32],
+    s_n: usize,
+    pos_base: usize,
+}
+
 fn forward_layer_hc(
     l: &LayerW,
     li: usize,
     kv: &mut LayerKv,
     gdn: Option<&mut GdnState>,
     ctx: &ForwardCtx,
-    x: &mut [f32],
-    s_n: usize,
-    pos_base: usize,
+    hc: HcStream<'_>,
 ) -> Result<(), Error> {
+    let HcStream { x, s_n, pos_base } = hc;
     let cfg = ctx.cfg;
     let d = cfg.hidden as usize;
     let hc = cfg.hc_mult.max(1) as usize;
@@ -3447,7 +3475,7 @@ fn forward_layer_hc(
         m.collapse(&x[s * hc * d..(s + 1) * hc * d], d, &mut collapsed[s * d..(s + 1) * d]);
     }
     let nrm = rmsnorm_rows(&collapsed, &l.in_ln, s_n, d, eps);
-    let attn = attn_dispatch(l, li, kv, gdn, ctx, &nrm, s_n, pos_base)?;
+    let attn = attn_dispatch(l, li, kv, gdn, ctx, AttnInput { nrm: &nrm, s_n, pos_base })?;
     for (s, m) in mixes.iter().enumerate() {
         m.place(&mut x[s * hc * d..(s + 1) * hc * d], &attn[s * d..(s + 1) * d], d, &mut scratch);
     }
@@ -3550,13 +3578,13 @@ fn attn_dispatch_batched(
             }
             out
         }
-        LayerAttn::Gdn { .. } | LayerAttn::Kda { .. } => {
+        LayerAttn::Gdn { .. } | LayerAttn::Kda(..) => {
             // Row s advances its owner's recurrent state by one token. Rows of
             // one owner arrive in ascending position order (decode is one row
             // per sequence; a fused prefill chunk is consecutive positions of
             // one sequence), and this loop runs them in row order — the same
             // sequential contract `gdn_one_call_matches_stepwise` pins.
-            let is_kda = matches!(&l.attn, LayerAttn::Kda { .. });
+            let is_kda = matches!(&l.attn, LayerAttn::Kda(..));
             let mut out = vec![0.0f32; s_n * d];
             for s in 0..s_n {
                 let owner = rows_at.owner[s];
@@ -5854,21 +5882,19 @@ impl Model {
         crate::topic::save_profiles(profiles, &config_tag(&self.cfg), &path)
     }
 
-    /// Serialize the current routing history and heat snapshot to
-    /// `<dir>/route_stats.json`. Overwrites any existing file. Best-effort — a
-    /// missing history or non-writable dir returns `Ok(())` without an error, so
-    /// callers can invoke this from shutdown paths without special-casing.
     /// Restore `<dir>/kernel_tuning.json` into the GPU tier's autotuner.
     ///
-    /// Best-effort and silent on every failure: this file only ever changes
-    /// which of three equally-correct kernel instantiations runs, so a missing,
-    /// truncated or foreign-GPU table costs an exploration round and nothing
-    /// else. Surfacing it as an error would make a performance hint able to fail
-    /// a model load.
+    /// Best-effort: this file only ever changes which of three equally-correct
+    /// kernel instantiations runs, so nothing here can fail a model load. But
+    /// it is not uniformly silent — the distinction [`read_optional_artifact`]
+    /// draws is exactly the operator-relevant one. An absent file is the normal
+    /// first-run case and passes without a word; a present-but-unreadable or
+    /// unparseable table (truncated write, another GPU's timings) is reported
+    /// through `note_advisory_err`, because silently running default kernels
+    /// costs an exploration round nobody can explain after the fact.
     fn try_load_kernel_tuning(&self, dir: &std::path::Path) {
         let Some(gpu) = self.gpu.as_ref() else { return };
-        let Ok(bytes) = peregrine_io::read_file(&dir.join("kernel_tuning.json")) else { return };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
+        let Some(v) = read_optional_artifact(dir, "kernel_tuning.json") else { return };
         gpu.restore_tuning(&v);
     }
 
@@ -7715,7 +7741,7 @@ mod tests {
     use super::*;
     use crate::sample::argmax;
     use crate::testkit::build_tiny_model;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn merge_spills_bumps_by_multiplicity_and_ignores_out_of_range() {
@@ -7782,7 +7808,7 @@ mod tests {
     /// bit-identical last-position logits (through reset), and run a short
     /// greedy generate. The strongest whole-stack self-consistency available
     /// before the real-container parity gate.
-    fn prefill_step_identity_and_generate(dir: &PathBuf) -> Result<(), peregrine_core::Error> {
+    fn prefill_step_identity_and_generate(dir: &Path) -> Result<(), peregrine_core::Error> {
         let mut m = Model::load(dir)?;
         let toks = [1, 5, 9, 2, 7];
         let vocab = m.cfg.vocab as usize;
@@ -8194,16 +8220,15 @@ mod tests {
 
         // (b) batched decode vs solo continuation, both sequences, 3 steps.
         // Solo: continue each sequence with single-token external prefills.
-        let mut solo_logits = vec![Vec::new(), Vec::new()];
+        let mut solo_logits = [Vec::new(), Vec::new()];
         let mut solo_seqs = Vec::new();
         for (i, p) in prompts.iter().enumerate() {
             let mut sk = SeqKv::new(&m.cfg);
             m.forward_prefill_seq(p, &mut sk, 0)?;
-            let mut next = 11i32 + i as i32; // arbitrary in-vocab continuations
-            for step in 0..3 {
+            // Arbitrary in-vocab continuations, three single-token steps each.
+            for (step, next) in (0..3usize).zip(11i32 + i as i32..) {
                 let lg = m.forward_prefill_seq(&[next], &mut sk, p.len() + step)?;
                 solo_logits[i] = lg;
-                next += 1;
             }
             solo_seqs.push(sk);
         }
@@ -9427,11 +9452,6 @@ mod tests {
         let a = stream_transient_reserve(DEFAULT_IO_RINGS, w, 4 * region);
         let b = stream_transient_reserve(DEFAULT_IO_RINGS + 1, w, 4 * region);
         assert!(b > a, "an extra ring must cost extra reserve, else the projection is blind to it");
-    }
-
-    fn stream_transient_reserve_scales_with_lanes() {
-        assert_eq!(stream_transient_reserve(4, 8, 1000), (4 * experts_per_batch() + 8) * 1000);
-        assert_eq!(stream_transient_reserve(0, 0, 1000), 0); // no lanes → no reserve
     }
 
     #[test]
