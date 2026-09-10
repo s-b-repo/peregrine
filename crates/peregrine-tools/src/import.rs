@@ -76,6 +76,13 @@ pub fn classify(name: &str) -> Result<Family, Error> {
         ".mlp.gate_proj.weight",
         ".mlp.up_proj.weight",
         ".mlp.down_proj.weight",
+        // DFlash2 / speculative decoding projection matrices
+        ".hidden_projection.weight",
+        ".output_projection.weight",
+        ".predecessor_codebook",
+        ".successor_codebook",
+        ".attention_conv.kernel_projection.weight",
+        ".mlp_conv.kernel_projection.weight",
     ];
     const FLOAT_SUFFIX: &[&str] = &[
         ".input_layernorm.weight",
@@ -86,6 +93,10 @@ pub fn classify(name: &str) -> Result<Family, Error> {
         ".linear_attn.A_log",
         ".linear_attn.dt_bias",
         ".linear_attn.norm.weight",
+        // DFlash2 norm layers and conv kernels
+        ".hidden_norm.weight",
+        ".attention_conv.base_kernel",
+        ".mlp_conv.base_kernel",
     ];
     if INT4_SUFFIX.iter().any(|s| name.ends_with(s)) {
         return Ok(Family::Int4);
@@ -104,6 +115,12 @@ pub fn classify(name: &str) -> Result<Family, Error> {
         "mtp.norm.weight" | "mtp.pre_fc_norm_embedding.weight" | "mtp.pre_fc_norm_hidden.weight" => {
             Ok(Family::Float)
         }
+        // DFlash2 / speculative decoding tensors (projection matrices → int4)
+        "fc.weight" |
+        "hidden_norm.weight" |
+        "norm.weight" => Ok(Family::Float),
+        // mask token embedding (if present)
+        "mask_token_embed.weight" => Ok(Family::Int8Embed),
         _ => Err(Error::Format(format!(
             "'{name}': not in the Track C REV 2 tensor contract — refusing to guess whether it \
              quantizes, passes through, or is skipped. Extend `classify` in import.rs (and the \
