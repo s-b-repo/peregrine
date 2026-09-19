@@ -121,6 +121,75 @@ checkpoint-scarcity thesis `dflash.md` closes on. Full notes in
 dashboard counts are unchanged: the roadmap was ~94 % done against a scope
 this cross-read widens by zero items.*
 
+## Edge0 / DeepSelect follow-up (2026-09-17)
+
+This separately tracked follow-up does not revise the historical dashboard above.
+Implementation and synthetic parity do not establish recovered model accuracy.
+
+- [x] Opt-in `COLI_IO_ENGINE=mmap`: bounded Linux read-only windows, owned copies,
+  explicit engine reporting, ringless demand streaming, direct-read exclusion,
+  merged/unmerged byte and synthetic prefill/decode logit parity tests.
+  See [configuration](configuration.md#coli_io_enginemmap) for the immutable-file
+  requirement, memory accounting and benchmark commands. This is not zero-copy
+  resident loading and does not eliminate page-cache pressure.
+- [x] Reject nonfinite head inputs and final inference logits with context instead
+  of silently producing token 0. Covers ordinary, external, batched, tree,
+  teacher-forcing, speculative and MTP projections. Finite-input math is unchanged.
+  This is failure detection, not hidden-state repair; reset/discard failed sequence
+  state before reuse. Standalone sampler APIs retain their historical behavior.
+- [x] Exact DSA top-k candidate filtering/compaction replaces the full index sort.
+  Finite selections, low-index ties, signed-zero ties and causal output order match
+  the full-sort oracle. Candidate storage is bounded by min(N, k + max(k, 1024));
+  scores still take O(N). NaNs have a deterministic last-place order.
+- [ ] Restore a complete real checkpoint and reference logits; run the existing
+  `flip-rate --text` gate on identical token IDs plus task-scored quality evaluation.
+  The checked local model locations contain no runnable baseline/candidate pair.
+  Never present synthetic parity or flip rate alone as task accuracy.
+- [ ] Measure real-shard mmap versus pread/uring under cold and warm cache, including
+  RSS, page faults, p50/p99 latency and decode tokens/sec. Small-file benchmark
+  smoke checks validate dispatch/counts only, not a throughput gain.
+- [ ] Benchmark exact DSA top-k across context lengths, k and score distributions;
+  no CUDA port or DeepSelect kernel speedup is claimed for this Rust implementation.
+- [ ] Evaluate quantization recovery using a matched teacher/checkpoint, calibration
+  data and model-specific trained adapters or higher precision. Existing sub-int4
+  RTN and expert-tail pruning measurements remain negative; do not enable either
+  as an accuracy-preserving optimization. Recover-LoRA weights are not portable
+  across unrelated models or base revisions.
+
+Verified upstream lessons:
+
+- [Edge0 #96](https://github.com/Edge0-AI/Edge0/issues/96): the maintainer identifies
+  Qwen3.6-35B-A3B as the base despite the inherited `qwen3_5_moe` architecture tag.
+  Do not infer checkpoint provenance from an architecture class name.
+- [Edge0 #16](https://github.com/Edge0-AI/Edge0/issues/16) and
+  [PR #12](https://github.com/Edge0-AI/Edge0/pull/12): reported FP16 overflow and
+  discarded chat templates caused NaN/token-0 collapse. Their clipping workaround
+  is not copied here; no equivalent overflow source has been reproduced locally.
+- [Edge0 #17](https://github.com/Edge0-AI/Edge0/issues/17): an M1 8-GB user reports
+  much slower decoding than M4 Pro results. Page faults are a proposed explanation,
+  not an established cause; active allocator memory is not total resident memory.
+- [DeepSelect](https://github.com/deepseek-ai/DeepSelect) and its
+  [technical note](https://github.com/deepseek-ai/DeepSelect/blob/main/docs/DeepSelect-deep-dive.md)
+  describe exact threshold/filter/compact selection, not dropping routed experts.
+  Credit also [LiteTopK](https://arxiv.org/abs/2607.11976);
+  [issue #13](https://github.com/deepseek-ai/DeepSelect/issues/13) requests attribution
+  for design overlap and is not evidence of numerical inaccuracy. The local scan
+  is deterministic, not randomized; the note's randomized expected bound is not
+  claimed here. Kernel timing is not end-to-end model throughput.
+
+Truncated V4.1 report/blog/pricing links were not verified and are not evidence for
+new architecture support or performance claims in this pass.
+
+Validation snapshot: 120 I/O tests, 436 model unit tests plus one integration test,
+3 candidate-environment tests, 26 CUDA tests and 16 ARM kernel tests passed.
+The mmap/pread small-file smoke verified 65,855 bytes per pass; it is not an SSD
+benchmark. Workspace and CUDA all-targets type checks passed at that snapshot.
+Final workspace test/lint reruns were blocked by ongoing Qwen4 edits in `model.rs`
+(undefined `kv`, `gdn`, `caches`, `gstates` in the batched path). Earlier workspace
+Clippy also found new importer test unwraps. Formatting check reports broad style
+differences and a tokenizer reference `std::match` parse error; strict audit is not
+clean. These checks must be rerun once the concurrently edited tree is stable.
+
 ## 📌 What is actually left (2026-08-08; defrag + min-share closed 2026-08-13)
 
 **2026-08-21 — portability across Linux machines.** The engine no longer

@@ -24,6 +24,7 @@ pub enum Dtype {
     /// `peregrine-import-hf` widens and dequantizes it; the container never
     /// stores it.
     F8E4M3 = 4,
+    I64 = 5,
 }
 
 impl Dtype {
@@ -38,6 +39,7 @@ impl Dtype {
             "BF16" => Some(Dtype::Bf16),
             "F16" => Some(Dtype::F16),
             "F32" => Some(Dtype::F32),
+            "I64" => Some(Dtype::I64),
             "U8" | "I8" => Some(Dtype::U8),
             "F8_E4M3" => Some(Dtype::F8E4M3),
             _ => None,
@@ -48,6 +50,7 @@ impl Dtype {
     pub fn elem_size(self) -> usize {
         match self {
             Dtype::F32 => 4,
+            Dtype::I64 => 8,
             Dtype::Bf16 | Dtype::F16 => 2,
             Dtype::U8 | Dtype::F8E4M3 => 1,
         }

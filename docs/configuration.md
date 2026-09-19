@@ -104,7 +104,7 @@ Error: ... 6.8 GB short, so the kernel would OOM-kill this run part-way through 
 |---|---|---|
 | `COLI_IO_RINGS` | 4 | io_uring rings, each on its own thread — [note](#coli_io_rings) |
 | `COLI_IO_BATCH` | 16 | **upper bound** on experts claimed per ring — [note](#coli_io_batch) |
-| `COLI_IO_ENGINE` | auto | `uring` \| `pread` \| `regbuf`; unset probes io_uring and falls back to `pread` — [note](#coli_io_engine) |
+| `COLI_IO_ENGINE` | auto | `uring` \| `pread` \| `mmap` \| `regbuf`; unset probes io_uring and falls back to `pread` — [note](#coli_io_engine) |
 | `COLI_IO_COMPLETION` | on | forward each expert as its own reads complete (uring only); `0` restores the blocking whole-wave submit — [note](#coli_io_completion) |
 | `COLI_IO_PROCFS` | ring | whether `/proc` and `/sys` reads go through the ring; `direct` restores a plain `read(2)` — [note](#coli_io_procfs) |
 | `COLI_SQPOLL` | off | kernel submission-polling thread on the streaming rings: no enter syscall per submit — [note](#coli_sqpoll) |
@@ -208,6 +208,33 @@ The often-quoted *"0.84 GB/s against colibrì's 2.02"* was **a two-variable
 comparison** — `pread` implies no O_DIRECT, so it pitted uring-*with* against
 pread-*without*. Working:
 [`M5-io-engine.md`](../bench-data/2026-08-09-prefetch-causes/M5-io-engine.md).
+
+### `COLI_IO_ENGINE=mmap`
+
+Opt-in Linux expert-streaming backend for the concurrent MoE engine. Uses read-only,
+page-aligned mappings of at most 8 MiB each, copies into the existing owned landing
+buffers, and unmaps each window immediately. It is not whole-checkpoint zero-copy
+loading: landing buffers, warm-cache entries and the kernel page cache still consume
+memory. No persistent mapping or raw-fd cache is retained. Other platforms resolve
+the selection to `pread` and report that engine.
+
+No streaming rings or O_DIRECT reads are used. The ring-backed speculative prefetch
+pool is disabled on ringless engines; demand reads and existing fadvise hints remain.
+The default engine is unchanged. Files must stay immutable for the entire read:
+size checks reject already-truncated ranges, but concurrent truncation can still
+cause SIGBUS between the check and mapped access. Never rewrite a loaded checkpoint
+in place. Use `pread` if immutability cannot be guaranteed.
+
+The existing benchmark takes an explicit engine argument, not this environment variable:
+
+```bash
+cargo run --release -p peregrine-io --example iobench -- "$SHARD" 8 4 4 0 mmap 5
+cargo run --release -p peregrine-io --example iobench -- "$SHARD" 8 4 4 0 pread 5
+```
+
+Compare equal workloads and record warm/cold cache, RSS, page faults and latency.
+Synthetic byte/logit parity is tested; real-shard throughput and model quality are
+not established by the small-file benchmark smoke test.
 
 ### `COLI_REGBUF`
 
@@ -966,6 +993,22 @@ guessed.
 Drop trailing routed experts carrying less than this share of a position's gate mass,
 renormalizing the survivors. It removes a real (if small) term from the MoE sum. Size
 it with `COLI_GATE_STATS`. `0` disables it.
+
+### `COLI_ROUTE_TOPP`
+
+Keep each position's leading selections until the kept mass reaches this fraction of
+the position's total (cumulative-mass trim, colibri `TOPP`), renormalizing the
+survivors. Always keeps at least one expert. Composes with `COLI_ROUTE_MIN_SHARE`
+(per-expert floor) and `COLI_EXPERT_BUDGET` (union cap below). `0`/unset disables it.
+
+### `COLI_EXPERT_BUDGET`
+
+Cap the batch union at this many distinct experts per layer, keeping the top experts
+by aggregate gate weight across the batch (colibri `EXPERT_BUDGET`). Per-position
+selections compact to the survivors and renormalize. `0`/unset disables it. This is
+the cross-position lever where `COLI_ROUTE_MIN_SHARE`/`COLI_ROUTE_TOPP` trim within
+one position; all three change token values, so size with `COLI_GATE_STATS` /
+`COLI_UNION_STATS` and gate with `peregrine flip-rate --candidate-env`.
 
 ### `COLI_DSA`
 

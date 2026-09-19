@@ -18,7 +18,10 @@ pub mod reconstruct;
 use std::os::unix::io::RawFd;
 
 use peregrine_core::{Context, Error};
-use peregrine_model::{batch_union, route, Mlp, MoeCfg, Routed, RouterCfg};
+use peregrine_model::{
+    apply_expert_budget, apply_route_topp, batch_union, expert_budget, route, route_topp, Mlp, MoeCfg, Routed,
+    RouterCfg,
+};
 use reconstruct::{mlp_from_segments, QtMeta};
 
 /// Where an expert's weights live.
@@ -182,7 +185,9 @@ pub fn moe_streamed(
 ) -> Result<Vec<f32>, Error> {
     let MoeCfg { s_n, hidden, k: topk, norm_topk, routed_scale } = cfg;
     let e_n = experts.len();
-    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k: topk, norm_topk, routed_scale, min_share: 0.0 });
+    let mut r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k: topk, norm_topk, routed_scale, min_share: 0.0 });
+    apply_route_topp(&mut r, s_n, route_topp(), norm_topk, routed_scale);
+    apply_expert_budget(&mut r, s_n, expert_budget(), norm_topk, routed_scale);
     let uniq = batch_union(&r, s_n);
 
     // partition the batch-union by residency

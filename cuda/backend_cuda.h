@@ -56,6 +56,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device);
 
+/* Glm5Next SwiGLU clamp for every device expert path (`swiglu_limit`, 0 = off):
+ * gate clamps to `<= limit`, up to `[-limit, limit]`, before SiLU multiply.
+ * Process-global, set once before the first dispatch; the reader reports the
+ * live value so a caller can verify the clamp it asked for took effect. */
+COLI_CUDA_DLLEXPORT void coli_cuda_set_swiglu_limit(float limit);
+COLI_CUDA_DLLEXPORT float coli_cuda_swiglu_limit(void);
+
 /* Fused expert pipeline: y = down(silu(gate(x)) * up(x)).  All three tensors
  * must already be resident on one device.  Activations cross PCIe once in
  * each direction instead of once per matrix. */

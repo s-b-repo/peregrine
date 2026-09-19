@@ -733,6 +733,19 @@ impl SafeTensors {
         Ok(())
     }
 
+    pub fn read_i64(&self, name: &str, out: &mut [i64]) -> Result<(), Error> {
+        let t = self.tensor(name)?;
+        if t.dtype != Dtype::I64 || t.layout.is_some() || out.len() as i64 != t.numel {
+            return Err(Error::Format(format!("read_i64 '{name}': requires native I64 and exact output length")));
+        }
+        let mut raw = vec![0; t.uncompressed_nbytes as usize];
+        self.read_raw(name, &mut raw)?;
+        for (value, bytes) in out.iter_mut().zip(raw.as_chunks::<8>().0) {
+            *value = i64::from_le_bytes(*bytes);
+        }
+        Ok(())
+    }
+
     fn tensor(&self, name: &str) -> Result<&TensorInfo, Error> {
         self.find(name).ok_or_else(|| Error::Format(format!("missing tensor: {name}")))
     }
@@ -790,6 +803,7 @@ fn convert_f32(dtype: Dtype, raw: &[u8], out: &mut [f32]) -> Result<(), Error> {
         // Callers (read_f32/read_slice_f32) reject U8 before converting; keep this
         // total (no `unreachable!`) so a misuse is a surfaced error, not a panic.
         Dtype::U8 => return Err(Error::Format("convert_f32 called on a U8 tensor".into())),
+        Dtype::I64 => return Err(Error::Format("I64 requires read_i64; refusing lossy float conversion".into())),
     }
     Ok(())
 }
@@ -877,6 +891,29 @@ mod tests {
             }
         }
         d
+    }
+
+    #[test]
+    fn i64_exact_roundtrip_and_float_refusal() -> Result<(), Error> {
+        let dir = tmpdir("i64");
+        let values = [i64::MIN, i64::MAX, (1i64 << 54) + 3, -1, 0];
+        assert_eq!(Dtype::parse("I64"), Some(Dtype::I64));
+        assert_eq!(Dtype::I64.elem_size(), 8);
+        write_safetensors(&dir, &[
+            Blob { name: "buffer", dtype: "I64", shape: vec![5], bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect() },
+            Blob { name: "float", dtype: "F32", shape: vec![1], bytes: f32_bytes(&[1.0]) },
+        ])?;
+        let st = SafeTensors::open(&dir)?;
+        let mut actual = [0; 5];
+        st.read_i64("buffer", &mut actual)?;
+        assert_eq!(actual, values);
+        assert!(st.read_i64("buffer", &mut [0; 4]).is_err());
+        assert!(st.read_i64("buffer", &mut [0; 6]).is_err());
+        assert!(st.read_i64("float", &mut [0]).is_err());
+        assert!(st.read_f32("buffer", &mut [0.0; 5]).is_err());
+        assert!(st.read_slice_f32("buffer", 0, 1, &mut [0.0]).is_err());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]

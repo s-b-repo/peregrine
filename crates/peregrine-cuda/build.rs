@@ -71,7 +71,10 @@ fn build_cuda(out: &str) -> &'static str {
     // repo layout: rust/crates/peregrine-cuda/build.rs → ../../cuda/backend_cuda.cu
     let src = "../../cuda/backend_cuda.cu";
     println!("cargo:rerun-if-changed={src}");
+    println!("cargo:rerun-if-changed=../../cuda/backend_cuda.h");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=PEREGRINE_GPU_BACKEND");
 
     let obj = format!("{out}/backend_cuda.o");
     let nvcc = format!("{cuda_home}/bin/nvcc");
@@ -154,6 +157,7 @@ const HIPIFY: &str = "hipify-perl";
 fn build_hip(out: &str) -> &'static str {
     let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
     println!("cargo:rerun-if-changed=../../cuda/backend_cuda.cu");
+    println!("cargo:rerun-if-changed=../../cuda/backend_cuda.h");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=PEREGRINE_GPU_BACKEND");
     println!("cargo:rerun-if-env-changed=HIPC_ARCH");

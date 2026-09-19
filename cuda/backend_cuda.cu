@@ -183,11 +183,29 @@ __global__ static void grouped_reduce(float *out,const float *y,const int *row_p
     }
 }
 
-__global__ static void silu_mul(float *gate, const float *up, size_t n) {
+/* Glm5Next SwiGLU clamp (`swiglu_limit`, 0 = off): gate pre-activations clamp
+ * to `<= lim`, up to `[-lim, lim]`, before SiLU multiply — the device form of
+ * `Mlp::swiglu`'s clamp. `lim` rides as a kernel argument set from the host
+ * global `g_swiglu_limit` (`coli_cuda_set_swiglu_limit`, once per process);
+ * 0 keeps the historical computation bit for bit, so unclamped models run
+ * exactly the code they always did. */
+static float g_swiglu_limit = 0.0f;
+extern "C" void coli_cuda_set_swiglu_limit(float limit) {
+    g_swiglu_limit = (limit > 0.0f && limit < 1e30f) ? limit : 0.0f;
+}
+extern "C" float coli_cuda_swiglu_limit(void) {
+    return g_swiglu_limit;
+}
+__global__ static void silu_mul(float *gate, const float *up, size_t n, float lim) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float v = gate[i];
-        gate[i] = (v / (1.0f + expf(-v))) * up[i];
+        float u = up[i];
+        if (lim > 0.0f) {
+            v = fminf(v, lim);
+            u = fminf(fmaxf(u, -lim), lim);
+        }
+        gate[i] = (v / (1.0f + expf(-v))) * u;
     }
 }
 
@@ -1016,7 +1034,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     quant_matmul<<<hidden_grid,256>>>(ctx->up,ctx->x,up->weights,up->scales,
         up->fmt,S,D,I,row_bytes(up->fmt,D));
     size_t n=(size_t)S*I;
-    silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
+    silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n,g_swiglu_limit);
     quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
         down->fmt,S,I,D,row_bytes(down->fmt,I));
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
@@ -1047,7 +1065,7 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
      * to include it rather than inherit it by accident. */
     w4a16_gate_up_t<16,16,16><<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,
         (const uint8_t*)gate->weights,(const uint8_t*)up->weights,gate->scales,up->scales,S,D,I);
-    silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
+    silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I,g_swiglu_limit);
     w4a16_matmul_t<16,16,16><<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D);
     if(!cuda_ok(cudaGetLastError(),"shared w4a16 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
@@ -1129,7 +1147,7 @@ extern "C" int coli_cuda_dense_mlp_gemv(ColiCudaTensor *gate, ColiCudaTensor *up
         (const uint8_t*)gate->weights,gate->scales,D);
     w4_gemv_rows<<<(unsigned)I,256,0,ctx->stream>>>(ctx->up,ctx->x,
         (const uint8_t*)up->weights,up->scales,D);
-    silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I);
+    silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I,g_swiglu_limit);
     w4_gemv_rows<<<(unsigned)D,256,0,ctx->stream>>>(ctx->y,ctx->gate,
         (const uint8_t*)down->weights,down->scales,I);
     if(!cuda_ok(cudaGetLastError(),"dense gemv launch")||
@@ -1216,7 +1234,7 @@ static void dispatch_arm(DeviceContext *ctx, int arm, const GroupDesc *host, Gro
         quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->x,total,D);
         grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->gate,ctx->qx,ctx->qscale,dev,D,I,0);
         grouped_s4_wmma<<<dim3((unsigned)((I+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->up,ctx->qx,ctx->qscale,dev,D,I,1);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I,g_swiglu_limit);
         quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
         grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
     } else if (arm == ARM_W4A16) {
@@ -1243,7 +1261,7 @@ static void dispatch_arm(DeviceContext *ctx, int arm, const GroupDesc *host, Gro
                 dim3 og16((unsigned)((D+tn*4-1)/(tn*4)),(unsigned)((r+tm-1)/tm));
                 w4a16_gate_up_dispatch(hg16,ctx->stream,tm,tn,tk,g16,u16,x16,
                     (const uint8_t*)host[c].g,(const uint8_t*)host[c].u,host[c].gs,host[c].us,r,D,I);
-                silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
+                silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I,g_swiglu_limit);
                 w4a16_matmul_dispatch(og16,ctx->stream,tm,tn,tk,y16,g16,
                     (const uint8_t*)host[c].d,host[c].ds,r,I,D);
             }else{
@@ -1253,7 +1271,7 @@ static void dispatch_arm(DeviceContext *ctx, int arm, const GroupDesc *host, Gro
                     host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D));
                 quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
                     host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D));
-                silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
+                silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I,g_swiglu_limit);
                 quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
                     host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I));
             }
@@ -1267,13 +1285,13 @@ static void dispatch_arm(DeviceContext *ctx, int arm, const GroupDesc *host, Gro
             grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
             grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
         }
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I,g_swiglu_limit);
         grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     } else {
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I,g_swiglu_limit);
         grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }
 }
@@ -1285,7 +1303,9 @@ static int graph_cacheable_arm(int arm) { return arm != ARM_W4A16; }
 
 static int graph_enabled(void) {
     const char *v = getenv("COLI_CUDA_GRAPH");
-    return v && atoi(v);
+    if (v && atoi(v)) return 1;
+    const char *w = getenv("COLI_CUDA_GRAPHS");
+    return w && atoi(w);
 }
 
 /* Launch a cached graph and wait for it, so the pinned output buffer is settled
@@ -1786,7 +1806,7 @@ extern "C" int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *u
                                        size_t n){
     DeviceContext *ctx=find_ctx(device); if(!n||!select_ctx(ctx)) return 0;
     // on ctx->stream so it composes into an overlapped / graph-captured chain
-    silu_mul<<<(unsigned)((n+255)/256),256,0,ctx->stream>>>(gate_dev,up_dev,n);
+    silu_mul<<<(unsigned)((n+255)/256),256,0,ctx->stream>>>(gate_dev,up_dev,n,g_swiglu_limit);
     return cuda_ok(cudaGetLastError(),"pipe silu mul");
 }
 extern "C" int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n){

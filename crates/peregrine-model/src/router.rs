@@ -226,6 +226,201 @@ pub fn route_min_share() -> f32 {
     })
 }
 
+/// Cumulative-mass per-position trim (`COLI_ROUTE_TOPP`). `0`/unset disables
+/// (the historical behaviour). When set in `(0, 1]`, each position keeps the
+/// leading selections until the kept mass reaches `topp` of the position's
+/// total, always keeping at least one. This is colibri's `TOPP`: cumulative
+/// where `min_share` is per-expert, and it composes with `EXPERT_BUDGET`
+/// (trim positions first, then cap the union).
+///
+/// Off by default because it changes token values: gate it with
+/// `peregrine flip-rate --candidate-env COLI_ROUTE_TOPP=p`.
+pub fn route_topp() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_ROUTE_TOPP")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|f| f.is_finite() && *f > 0.0 && *f <= 1.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// Trim each position's selection to the cumulative-mass prefix. Returns the
+/// total slots dropped. Pure — unit-testable without a model.
+pub fn apply_route_topp(
+    r: &mut Routed,
+    s_n: usize,
+    topp: f32,
+    norm_topk: bool,
+    routed_scale: f32,
+) -> usize {
+    if !(topp > 0.0 && topp <= 1.0) {
+        return 0;
+    }
+    let k = r.k;
+    if k == 0 || s_n == 0 {
+        return 0;
+    }
+    let mut dropped = 0usize;
+    for s in 0..s_n {
+        let kept = r.keff.get(s).copied().unwrap_or(0).max(0) as usize;
+        let kept = kept.min(k);
+        if kept <= 1 {
+            continue;
+        }
+        let base = s * k;
+        let total: f32 = r.w.get(base..base + kept.min(r.w.len().saturating_sub(base))).map(|w| w.iter().sum()).unwrap_or(0.0);
+        if !total.is_finite() || total <= 0.0 {
+            continue;
+        }
+        let target = topp * total;
+        let mut cum = 0f32;
+        let mut keep_n = 0usize;
+        for kk in 0..kept {
+            cum += r.w.get(base + kk).copied().unwrap_or(0.0).abs();
+            keep_n += 1;
+            if cum >= target {
+                break;
+            }
+        }
+        keep_n = keep_n.max(1).min(kept);
+        if keep_n >= kept {
+            continue;
+        }
+        dropped += kept - keep_n;
+        for slot in keep_n..k.min(r.idx.len().saturating_sub(base)) {
+            r.idx[base + slot] = 0;
+            r.w[base + slot] = 0.0;
+        }
+        if let Some(ke) = r.keff.get_mut(s) {
+            *ke = keep_n as i32;
+        }
+        if norm_topk {
+            let wlen = r.w.len();
+            let end = base + keep_n.min(wlen.saturating_sub(base));
+            let sum: f32 = r.w[base..end].iter().sum();
+            if sum.is_finite() && sum > 0.0 && routed_scale.is_finite() {
+                let gain = routed_scale / sum;
+                for w in r.w[base..end].iter_mut() {
+                    *w *= gain;
+                }
+            }
+        }
+    }
+    dropped
+}
+
+/// Per-layer distinct-expert ceiling for the batch union (`COLI_EXPERT_BUDGET`).
+/// `0`/unset disables the cap (the historical behaviour). When set, the union
+/// is trimmed to the top-`budget` experts by aggregate gate weight across the
+/// batch, per-position selections are compacted to the survivors, and positions
+/// renormalize when `norm_topk` is on — the same scale-preserving rule `route`
+/// applies to the negligible tail. This is the colibri `EXPERT_BUDGET` lever:
+/// it trims the *cross-position* union where `min_share` trims within one
+/// position, and the two compose.
+///
+/// Off by default because it changes token values like `min_share` does: size
+/// it with `COLI_GATE_STATS`/`COLI_UNION_STATS` and gate it with
+/// `peregrine flip-rate --candidate-env COLI_EXPERT_BUDGET=N`.
+pub fn expert_budget() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("COLI_EXPERT_BUDGET")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Trim a routed batch to at most `budget` distinct experts. Returns the number
+/// of distinct experts dropped (`0` when the feature is off or the union
+/// already fits). Pure — unit-testable without a model.
+pub fn apply_expert_budget(
+    r: &mut Routed,
+    s_n: usize,
+    budget: usize,
+    norm_topk: bool,
+    routed_scale: f32,
+) -> usize {
+    if budget == 0 {
+        return 0;
+    }
+    let k = r.k;
+    if k == 0 || s_n == 0 {
+        return 0;
+    }
+    let mut mass: std::collections::HashMap<i32, f32> = std::collections::HashMap::new();
+    for s in 0..s_n {
+        let kept = r.keff.get(s).copied().unwrap_or(0).max(0) as usize;
+        for kk in 0..kept.min(k) {
+            let (Some(&e), Some(&w)) = (r.idx.get(s * k + kk), r.w.get(s * k + kk)) else { continue };
+            if w.is_finite() {
+                *mass.entry(e).or_insert(0.0) += w.abs();
+            }
+        }
+    }
+    if mass.len() <= budget {
+        return 0;
+    }
+    let mut ranked: Vec<(i32, f32)> = mass.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(budget);
+    let keep: std::collections::HashSet<i32> = ranked.into_iter().map(|(e, _)| e).collect();
+    let before = batch_union_size(r, s_n);
+    for s in 0..s_n {
+        let kept = r.keff.get(s).copied().unwrap_or(0).max(0) as usize;
+        let base = s * k;
+        let mut dst = 0usize;
+        for kk in 0..kept.min(k) {
+            let (Some(&e), Some(&w)) =
+                (r.idx.get(base + kk), r.w.get(base + kk))
+            else {
+                continue;
+            };
+            if keep.contains(&e) {
+                if dst != kk {
+                    r.idx[base + dst] = e;
+                    r.w[base + dst] = w;
+                }
+                dst += 1;
+            }
+        }
+        for slot in dst..k.min(r.idx.len().saturating_sub(base)) {
+            r.idx[base + slot] = 0;
+            r.w[base + slot] = 0.0;
+        }
+        if let Some(ke) = r.keff.get_mut(s) {
+            *ke = dst as i32;
+        }
+        if norm_topk && dst > 0 {
+            let wlen = r.w.len();
+            let end = base + dst.min(wlen.saturating_sub(base));
+            let sum: f32 = r.w[base..end].iter().sum();
+            if sum.is_finite() && sum > 0.0 && routed_scale.is_finite() {
+                let gain = routed_scale / sum;
+                for w in r.w[base..end].iter_mut() {
+                    *w *= gain;
+                }
+            }
+        }
+    }
+    before.saturating_sub(budget)
+}
+
+fn batch_union_size(r: &Routed, s_n: usize) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for s in 0..s_n {
+        let kept = r.keff.get(s).copied().unwrap_or(0).max(0) as usize;
+        for kk in 0..kept.min(r.k) {
+            if let Some(&e) = r.idx.get(s * r.k + kk) {
+                seen.insert(e);
+            }
+        }
+    }
+    seen.len()
+}
+
 /// Gate-share thresholds the accumulator reports on.
 pub const GATE_THRESHOLDS: [f32; 4] = [0.005, 0.01, 0.02, 0.05];
 
@@ -897,5 +1092,54 @@ mod tests {
         let bias = [0.0f32, 0.0, 0.0];
         let r = route(&x, &router_w, &bias, RouterCfg { s_n: 1, d_n: 1, e_n: 3, k: 2, norm_topk: false, routed_scale: 1.0, min_share: 0.0 });
         assert_eq!(&r.idx[..], &[0, 1]);
+    }
+
+    #[test]
+    fn expert_budget_zero_is_a_noop() {
+        let mut r = Routed { idx: vec![0, 1, 2, 3], w: vec![0.4, 0.3, 0.2, 0.1], keff: vec![2, 2], k: 2 };
+        assert_eq!(super::apply_expert_budget(&mut r, 2, 0, true, 1.0), 0);
+        assert_eq!((r.idx, r.w, r.keff), (vec![0, 1, 2, 3], vec![0.4, 0.3, 0.2, 0.1], vec![2, 2]));
+    }
+
+    #[test]
+    fn expert_budget_keeps_top_mass_and_renormalizes() {
+        // Mass {0:0.4, 1:0.1, 2:0.2, 3:0.1}; budget 2 keeps {0,2} by mass.
+        let mut r = Routed { idx: vec![0, 1, 2, 3], w: vec![0.4, 0.1, 0.2, 0.1], keff: vec![2, 2], k: 2 };
+        let dropped = super::apply_expert_budget(&mut r, 2, 2, true, 1.0);
+        assert_eq!(dropped, 2);
+        assert_eq!(r.keff, vec![1, 1]);
+        assert_eq!(&r.idx[..], &[0, 0, 2, 0]);
+        let s0: f32 = r.w[..1].iter().sum();
+        let s1: f32 = r.w[2..3].iter().sum();
+        assert!((s0 - 1.0).abs() < 1e-6, "survivors renormalize to routed_scale, got {s0}");
+        assert!((s1 - 1.0).abs() < 1e-6, "survivors renormalize to routed_scale, got {s1}");
+    }
+
+    #[test]
+    fn expert_budget_fitting_union_is_a_noop() {
+        let mut r = Routed { idx: vec![0, 2, 2, 3], w: vec![1.0; 4], keff: vec![2, 2], k: 2 };
+        assert_eq!(super::apply_expert_budget(&mut r, 2, 8, false, 1.0), 0);
+        assert_eq!(super::batch_union(&r, 2), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn route_topp_off_is_a_noop() {
+        let mut r = Routed { idx: vec![0, 1], w: vec![0.9, 0.1], keff: vec![2], k: 2 };
+        assert_eq!(super::apply_route_topp(&mut r, 1, 0.0, true, 1.0), 0);
+        assert_eq!((r.idx, r.w, r.keff), (vec![0, 1], vec![0.9, 0.1], vec![2]));
+    }
+
+    #[test]
+    fn route_topp_keeps_cumulative_prefix_and_renormalizes() {
+        // Weights [0.7, 0.2, 0.1], topp 0.8 → keep [0.7, 0.2] (cum 0.9 ≥ 0.8).
+        let mut r = Routed { idx: vec![0, 1, 2], w: vec![0.7, 0.2, 0.1], keff: vec![3], k: 3 };
+        assert_eq!(super::apply_route_topp(&mut r, 1, 0.8, true, 1.0), 1);
+        assert_eq!(r.keff, vec![2]);
+        assert_eq!(&r.idx[..], &[0, 1, 0]);
+        let sum: f32 = r.w[..2].iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "survivors renormalize, got {sum}");
+        // Full mass keeps everything.
+        let mut full = Routed { idx: vec![0, 1, 2], w: vec![0.7, 0.2, 0.1], keff: vec![3], k: 3 };
+        assert_eq!(super::apply_route_topp(&mut full, 1, 1.0, false, 1.0), 0);
     }
 }

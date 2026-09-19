@@ -48,6 +48,7 @@ struct LayerW {
     /// the single-residual and the stream-form hidden state.
     hc_attn: Option<crate::hyper::HyperConn>,
     hc_ffn: Option<crate::hyper::HyperConn>,
+    qwen4: Option<crate::qwen4::Layer>,
 }
 
 /// Per-layer attention weights, one variant per architecture family. GLM's
@@ -299,6 +300,7 @@ pub struct Model {
     rss_limit_bytes: u64,
     layers: Vec<LayerW>,
     final_norm: Vec<f32>,
+    qwen4_mixer: Option<crate::qwen4::GatedResidual>,
     lm_head: QtWeight,
     kv: Vec<LayerKv>,
     /// Per-layer gated-DeltaNet recurrent state for the engine's own sequence
@@ -608,8 +610,12 @@ impl SeqKv {
             layers: (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, dt)).collect(),
             gdn: (0..cfg.n_layers as usize)
                 .map(|i| {
-                    (matches!(cfg.arch, peregrine_core::Arch::HybridGdn | peregrine_core::Arch::Glm5Next)
-                        && !cfg.full_attn.get(i).copied().unwrap_or(true))
+                    (matches!(
+                        cfg.arch,
+                        peregrine_core::Arch::HybridGdn
+                            | peregrine_core::Arch::Glm5Next
+                            | peregrine_core::Arch::Qwen4Exp
+                    ) && !cfg.full_attn.get(i).copied().unwrap_or(true))
                     .then(|| GdnState::new(cfg))
                 })
                 .collect(),
@@ -2126,9 +2132,17 @@ fn peek_persisted_heat(dir: &std::path::Path, cfg: &Cfg) -> Vec<u32> {
         return Vec::new();
     };
     let snap: Vec<u32> = arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
-    // A short/long array would silently misalign layers; take it only at the
-    // exact expected shape.
-    if snap.len() != (cfg.n_layers as usize) * (cfg.n_experts as usize) {
+    // A short/long array would silently misalign layers; take it only at an
+    // exact known shape. The heat table carries `n_layers + 1` rows since
+    // 2026-08-09 (the extra row is the MTP head at index `n_layers`, which
+    // nothing but drafting executes) while older files have `n_layers` rows;
+    // the residency knapsack below only ranks rows under `n_layers`, so the
+    // trailing MTP row rides along unread rather than shifting anyone.
+    let rows = snap.len() / (cfg.n_experts as usize).max(1);
+    if cfg.n_experts == 0
+        || snap.len() % (cfg.n_experts as usize) != 0
+        || (rows != cfg.n_layers as usize && rows != cfg.n_layers as usize + 1)
+    {
         return Vec::new();
     }
     snap
@@ -2916,7 +2930,7 @@ fn layer_prefix(cfg: &Cfg, i: usize) -> String {
         // checkpoint's `model.language_model.` stem to `model.` at import so
         // the expert-streaming lane, reshard and layout tools — all written
         // against `model.layers.{l}.mlp.experts.{e}.` — work unchanged.
-        Arch::GlmMla | Arch::DenseGqa | Arch::Glm5Next => format!("model.layers.{i}."),
+        Arch::GlmMla | Arch::DenseGqa | Arch::Glm5Next | Arch::Qwen4Exp => format!("model.layers.{i}."),
         Arch::HybridGdn => format!("model.language_model.layers.{i}."),
     }
 }
@@ -3007,7 +3021,7 @@ fn load_layer_at(
                 o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, qkv)?,
             }))
         }
-        Arch::DenseGqa | Arch::HybridGdn if is_full_attn => {
+        Arch::DenseGqa | Arch::HybridGdn | Arch::Qwen4Exp if is_full_attn => {
             let (nh, nkv, hd) = (cfg.n_heads as usize, cfg.n_kv_heads as usize, cfg.head_dim as usize);
             // attn_output_gate widens q_proj to [2*nh*hd, d]: query rows then
             // gate rows, the flat-chunk layout (Track C contract, gate-pinned).
@@ -3029,7 +3043,7 @@ fn load_layer_at(
                 },
             }
         }
-        Arch::DenseGqa | Arch::HybridGdn => {
+        Arch::DenseGqa | Arch::HybridGdn | Arch::Qwen4Exp => {
             let (kh, vh_l, kd, vd) = (
                 cfg.lin_k_heads as usize,
                 cfg.lin_v_heads as usize,
@@ -3037,11 +3051,29 @@ fn load_layer_at(
                 cfg.lin_v_dim as usize,
             );
             let conv_dim = 2 * kh * kd + vh_l * vd;
+            // Qwen4Exp keeps its z/a/b projections as full-precision
+            // `Matrix` weights (`qwen4::Layer::gdn_abz`, F32 in production) —
+            // `QtWeight` cannot load an F32 tensor, so these slots hold an
+            // unread dummy here. The Qwen4 forward never touches them: it
+            // projects via `gdn_abz` and runs `gdn_forward_projected`, which
+            // only reads `conv`/`a_log`/`dt_bias`/`norm`/`out` from this view.
+            let dummy_qt = || {
+                crate::weight::QtWeight::new(crate::weight::QuantFmt::Int8, 1, 1, vec![0u8], vec![1.0])
+            };
+            let (in_z, in_a, in_b) = if cfg.arch == Arch::Qwen4Exp {
+                (dummy_qt(), dummy_qt(), dummy_qt())
+            } else {
+                (
+                    QtWeight::load(st, &p("linear_attn.in_proj_z.weight"), vh_l * vd, d)?,
+                    QtWeight::load(st, &p("linear_attn.in_proj_a.weight"), vh_l, d)?,
+                    QtWeight::load(st, &p("linear_attn.in_proj_b.weight"), vh_l, d)?,
+                )
+            };
             LayerAttn::Gdn {
                 in_qkv: QtWeight::load(st, &p("linear_attn.in_proj_qkv.weight"), conv_dim, d)?,
-                in_z: QtWeight::load(st, &p("linear_attn.in_proj_z.weight"), vh_l * vd, d)?,
-                in_a: QtWeight::load(st, &p("linear_attn.in_proj_a.weight"), vh_l, d)?,
-                in_b: QtWeight::load(st, &p("linear_attn.in_proj_b.weight"), vh_l, d)?,
+                in_z,
+                in_a,
+                in_b,
                 conv: load_f32(st, &p("linear_attn.conv1d.weight"), conv_dim * cfg.lin_conv_k as usize)?,
                 a_log: load_f32(st, &p("linear_attn.A_log"), vh_l)?,
                 dt_bias: load_f32(st, &p("linear_attn.dt_bias"), vh_l)?,
@@ -3062,9 +3094,27 @@ fn load_layer_at(
             limit: cfg.swiglu_limit,
         });
     } else {
-        let (e_n, mi, si) = (cfg.n_experts as usize, cfg.moe_inter as usize, (cfg.moe_inter * cfg.n_shared) as usize);
+        // Qwen4Exp sizes its shared expert by `shared_expert_intermediate_size`
+        // (`dense_inter`), not `moe_inter*n_shared` — the importer contract and
+        // HF shapes agree on `[dense_inter, hidden]`.
+        let (e_n, mi, si) = (
+            cfg.n_experts as usize,
+            cfg.moe_inter as usize,
+            if cfg.arch == Arch::Qwen4Exp {
+                cfg.dense_inter as usize
+            } else {
+                (cfg.moe_inter * cfg.n_shared) as usize
+            },
+        );
         router = load_f32(st, &p("mlp.gate.weight"), e_n * d)?;
-        router_bias = load_f32(st, &p("mlp.gate.e_score_correction_bias"), e_n)?;
+        // Qwen4Exp routes by plain softmax (`qwen4::route`) — the checkpoint
+        // carries no `e_score_correction_bias`. Requiring it here would refuse
+        // every Qwen4 model at load for a tensor its forward never reads.
+        router_bias = if cfg.arch == Arch::Qwen4Exp {
+            Vec::new()
+        } else {
+            load_f32(st, &p("mlp.gate.e_score_correction_bias"), e_n)?
+        };
         shared = Some(Mlp {
             gate: QtWeight::load(st, &p("mlp.shared_experts.gate_proj.weight"), si, d)?,
             up: QtWeight::load(st, &p("mlp.shared_experts.up_proj.weight"), si, d)?,
@@ -3112,12 +3162,20 @@ fn load_layer_at(
     }
 
     Ok(LayerW {
-        in_ln: if cfg.arch == Arch::HybridGdn {
+        // Qwen4Exp carries no per-layer input/post norms — its residual sites
+        // are `GatedResidual` mixers (`qwen4::Layer`), loaded below. Dummy
+        // identity weights keep the struct total while the Qwen4 forward path
+        // never reads these fields.
+        in_ln: if cfg.arch == Arch::Qwen4Exp {
+            vec![1.0; d]
+        } else if cfg.arch == Arch::HybridGdn {
             load_norm_zero_centered(st, &p("input_layernorm.weight"), d)?
         } else {
             load_f32(st, &p("input_layernorm.weight"), d)?
         },
-        post_ln: if cfg.arch == Arch::HybridGdn {
+        post_ln: if cfg.arch == Arch::Qwen4Exp {
+            vec![1.0; d]
+        } else if cfg.arch == Arch::HybridGdn {
             load_norm_zero_centered(st, &p("post_attention_layernorm.weight"), d)?
         } else {
             load_f32(st, &p("post_attention_layernorm.weight"), d)?
@@ -3132,6 +3190,7 @@ fn load_layer_at(
         indexer: IndexerWeights::load(st, i, cfg)?,
         hc_attn,
         hc_ffn,
+        qwen4: (cfg.arch == Arch::Qwen4Exp).then(|| crate::qwen4::Layer::load(st, i, cfg)).transpose()?,
     })
 }
 
@@ -3139,12 +3198,19 @@ fn load_layer_at(
 /// starts as a copy of the embedding — the HF reference's `expand`).
 fn expand_hc_streams(x: &[f32], s_n: usize, d: usize, hc: usize) -> Vec<f32> {
     let mut out = vec![0f32; s_n * hc * d];
-    for s in 0..s_n {
-        let row = &x[s * d..(s + 1) * d];
-        for h in 0..hc {
-            out[s * hc * d + h * d..s * hc * d + (h + 1) * d].copy_from_slice(row);
+    // One row's fan-out never touches another's: split over `s`, keeping the
+    // in-row copy order serial. Narrow shapes stay serial under the same
+    // 256-wide rule as `rmsnorm_rows`.
+    let gate = if hc * d >= 256 { peregrine_par::PAR_ROWS_MIN } else { usize::MAX };
+    peregrine_par::par_chunks_mut(&mut out, hc * d, s_n, gate, |start, end, chunk| {
+        for s in start..end {
+            let row = &x[s * d..(s + 1) * d];
+            let dst = &mut chunk[(s - start) * hc * d..(s - start + 1) * hc * d];
+            for h in 0..hc {
+                dst[h * d..(h + 1) * d].copy_from_slice(row);
+            }
         }
-    }
+    });
     out
 }
 
@@ -3154,19 +3220,31 @@ fn expand_hc_streams(x: &[f32], s_n: usize, d: usize, hc: usize) -> Vec<f32> {
 fn collapse_hc_streams(x: &[f32], s_n: usize, d: usize, hc: usize) -> Vec<f32> {
     let mut out = vec![0f32; s_n * d];
     let inv = 1.0 / hc as f32;
-    for s in 0..s_n {
-        for h in 0..hc {
-            let src = &x[s * hc * d + h * d..s * hc * d + (h + 1) * d];
-            let dst = &mut out[s * d..(s + 1) * d];
-            for (o, &v) in dst.iter_mut().zip(src) {
-                *o += v;
+    // Rows accumulate disjointly (each `s` owns its output row, and the stream
+    // sum plus scale stay in serial order within it): split over `s`.
+    let gate = if d >= 256 { peregrine_par::PAR_ROWS_MIN } else { usize::MAX };
+    peregrine_par::par_chunks_mut(&mut out, d, s_n, gate, |start, end, chunk| {
+        for s in start..end {
+            let dst = &mut chunk[(s - start) * d..(s - start + 1) * d];
+            for h in 0..hc {
+                let src = &x[s * hc * d + h * d..s * hc * d + (h + 1) * d];
+                for (o, &v) in dst.iter_mut().zip(src) {
+                    *o += v;
+                }
+            }
+            for o in dst.iter_mut() {
+                *o *= inv;
             }
         }
-        for o in &mut out[s * d..(s + 1) * d] {
-            *o *= inv;
-        }
-    }
+    });
     out
+}
+
+fn project_logits(head: &QtWeight, x: &[f32], rows: usize, context: &str) -> Result<Vec<f32>, Error> {
+    crate::sample::ensure_finite_rows(x, head.i, "lm_head input").ctx(|| context.to_string())?;
+    let logits = head.apply_vec(x, rows);
+    crate::sample::ensure_finite_rows(&logits, head.o, "final inference logits").ctx(|| context.to_string())?;
+    Ok(logits)
 }
 
 /// Row-wise RMSNorm of `x[s_n, d]` with weight `w`, into a fresh buffer. Rows are
@@ -3334,6 +3412,183 @@ fn attn_dispatch(
             (None, false) => mla_attention(&l.attn()?, nrm, s_n, pos_base, kv, cfg)?,
         },
     })
+}
+
+/// Qwen4Exp sparse full-attention layer: GQA projections over `mixed`
+/// (`[s_n, hidden]`, already mixer-normalized) with per-head q/k norms and
+/// RoPE, K/V appended to `kv`, QSA indexer keys appended to `kv`'s index
+/// stream, and each query attending only its [`crate::qwen4::Qsa`] selection.
+///
+/// Sequential over `s_n` (append-then-attend per row, in order), so chunked
+/// prefill and stepwise decode are bit-identical like the dense GQA path.
+fn qwen4_gqa_forward(
+    l: &LayerW,
+    ql: &crate::qwen4::Layer,
+    kv: &mut LayerKv,
+    mixed: &[f32],
+    s_n: usize,
+    pos_base: usize,
+    cfg: &Cfg,
+) -> Result<Vec<f32>, Error> {
+    let d = cfg.hidden as usize;
+    let nh = cfg.n_heads as usize;
+    let nkv = (cfg.n_kv_heads as usize).max(1);
+    let hd = cfg.head_dim as usize;
+    if s_n == 0 || mixed.len() != s_n * d || !nh.is_multiple_of(nkv.max(1)) {
+        return Err(Error::Format("qwen4_exp: invalid QSA batch geometry".into()));
+    }
+    let group = nh / nkv;
+    let kdim = nkv * hd;
+    let (index_mat, qsa) = ql.index.as_ref().ok_or_else(|| {
+        Error::Format("qwen4_exp: full-attention layer missing QSA indexer".into())
+    })?;
+    let qsa_cfg = cfg
+        .qwen4
+        .as_ref()
+        .and_then(|q| q.qsa.as_ref())
+        .ok_or_else(|| Error::Format("qwen4_exp: missing validated QSA config".into()))?;
+    let (ix_heads, ix_hd) = (qsa_cfg.n_heads as usize, qsa_cfg.head_dim as usize);
+    let idx_width = (ix_heads + 1) * ix_hd;
+    let w = l.gqa(cfg.attn_gate)?;
+    let table = crate::math::RopeTable::from_cfg(cfg);
+
+    // Batched projections; per-row norm/RoPE/cache/select below.
+    let qg_all = w.wq.apply_vec(mixed, s_n);
+    let (mut q_all, gate_all): (Vec<f32>, Option<Vec<f32>>) = if w.gated {
+        if qg_all.len() != s_n * 2 * nh * hd {
+            return Err(Error::Format("qwen4_exp: gated q_proj width mismatch".into()));
+        }
+        let mut q = vec![0.0f32; s_n * nh * hd];
+        let mut g = vec![0.0f32; s_n * nh * hd];
+        for s in 0..s_n {
+            for h in 0..nh {
+                let blk = &qg_all[s * 2 * nh * hd + h * 2 * hd..s * 2 * nh * hd + (h + 1) * 2 * hd];
+                q[s * nh * hd + h * hd..s * nh * hd + (h + 1) * hd].copy_from_slice(&blk[..hd]);
+                g[s * nh * hd + h * hd..s * nh * hd + (h + 1) * hd].copy_from_slice(&blk[hd..]);
+            }
+        }
+        (q, Some(g))
+    } else {
+        (qg_all, None)
+    };
+    let mut k_all = w.wk.apply_vec(mixed, s_n);
+    let v_all = w.wv.apply_vec(mixed, s_n);
+    if q_all.len() != s_n * nh * hd || k_all.len() != s_n * kdim || v_all.len() != s_n * kdim {
+        return Err(Error::Format("qwen4_exp: QSA projection width mismatch".into()));
+    }
+    let idx_all = index_mat.apply(mixed).map_err(|e| {
+        Error::Format(format!("qwen4_exp: indexer projection failed: {e}"))
+    })?;
+    if idx_all.len() != s_n * idx_width {
+        return Err(Error::Format("qwen4_exp: indexer projection width mismatch".into()));
+    }
+
+    let mut ctx_out = vec![0.0f32; s_n * nh * hd];
+    let mut kbuf: Vec<f32> = Vec::new();
+    let mut vbuf: Vec<f32> = Vec::new();
+    let mut ixbuf: Vec<f32> = Vec::new();
+    let mut kmat_buf: Vec<f32> = Vec::new();
+    let mut vmat_buf: Vec<f32> = Vec::new();
+    let mut scores: Vec<f32> = Vec::new();
+    for s in 0..s_n {
+        let pos = pos_base + s;
+        // Norm + RoPE the query and key rows in place.
+        {
+            let q_row = &mut q_all[s * nh * hd..(s + 1) * nh * hd];
+            for h in 0..nh {
+                let qh = &mut q_row[h * hd..(h + 1) * hd];
+                crate::math::rmsnorm_inplace(qh, w.q_norm, cfg.eps);
+                crate::math::rope_neox_with(qh, pos, &table);
+            }
+        }
+        {
+            let k_row = &mut k_all[s * kdim..(s + 1) * kdim];
+            for h in 0..nkv {
+                let kh = &mut k_row[h * hd..(h + 1) * hd];
+                crate::math::rmsnorm_inplace(kh, w.k_norm, cfg.eps);
+                crate::math::rope_neox_with(kh, pos, &table);
+            }
+        }
+        kv.append(pos, &k_all[s * kdim..(s + 1) * kdim], &v_all[s * kdim..(s + 1) * kdim])?;
+        // Cache the raw indexer key (pre-norm — `Qsa::select` normalizes itself).
+        let idx_row = &idx_all[s * idx_width..(s + 1) * idx_width];
+        let (idx_q, idx_k) = idx_row.split_at(ix_heads * ix_hd);
+        kv.append_index_key(idx_k);
+
+        let len = kv.len();
+        // Materialize the cached K, V and indexer keys for this prefix.
+        let ks = kv.lc_span(len);
+        let k_mat: &[f32] = match ks.as_contiguous_f32(len, kdim) {
+            Some(m) => m,
+            None => {
+                kbuf.clear();
+                ks.extend_f32(len, kdim, &mut kbuf);
+                kmat_buf.clear();
+                kmat_buf.extend_from_slice(&kbuf);
+                &kmat_buf
+            }
+        };
+        // Copy out before the next span borrow (lc/rc spans borrow `kv`).
+        let k_mat = k_mat.to_vec();
+        let vs = kv.rc_span(len);
+        let v_mat: &[f32] = match vs.as_contiguous_f32(len, kdim) {
+            Some(m) => m,
+            None => {
+                vbuf.clear();
+                vs.extend_f32(len, kdim, &mut vbuf);
+                vmat_buf.clear();
+                vmat_buf.extend_from_slice(&vbuf);
+                &vmat_buf
+            }
+        };
+        let v_mat = v_mat.to_vec();
+        let ixs = kv.ix_span(len);
+        let ix_mat: &[f32] = match ixs.as_contiguous_f32(len, ix_hd) {
+            Some(m) => m,
+            None => {
+                ixbuf.clear();
+                ixs.extend_f32(len, ix_hd, &mut ixbuf);
+                // `ixbuf` is reused across rows; copy out via a scratch that
+                // lives past the span borrow like K/V above.
+                kbuf.clear();
+                kbuf.extend_from_slice(&ixbuf);
+                &kbuf
+            }
+        };
+        let ix_mat = ix_mat.to_vec();
+        let positions: Vec<usize> = (0..len).collect();
+        let visible: Vec<usize> = (0..len).collect();
+        let selected = qsa
+            .select(idx_q, &ix_mat, &positions, pos, &visible)
+            .map_err(|e| Error::Format(format!("qwen4_exp: QSA select failed: {e}")))?;
+
+        let q_row = &q_all[s * nh * hd..(s + 1) * nh * hd];
+        for h in 0..nh {
+            let qh = &q_row[h * hd..(h + 1) * hd];
+            let kv_off = (h / group) * hd;
+            scores.clear();
+            scores.extend(selected.iter().map(|&t| {
+                let kt = &k_mat[t * kdim + kv_off..t * kdim + kv_off + hd];
+                qh.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * cfg.attn_scale
+            }));
+            crate::math::softmax(&mut scores);
+            let out = &mut ctx_out[s * nh * hd + h * hd..s * nh * hd + (h + 1) * hd];
+            for (t, &a) in selected.iter().zip(scores.iter()) {
+                let vt = &v_mat[t * kdim + kv_off..t * kdim + kv_off + hd];
+                for (o, &vv) in out.iter_mut().zip(vt) {
+                    *o += a * vv;
+                }
+            }
+        }
+        if let Some(gate_all) = &gate_all {
+            let gate = &gate_all[s * nh * hd..(s + 1) * nh * hd];
+            let out = &mut ctx_out[s * nh * hd..(s + 1) * nh * hd];
+            for (o, &g) in out.iter_mut().zip(gate) {
+                *o *= crate::math::sigmoidf(g);
+            }
+        }
+    }
+    Ok(w.o.apply_vec(&ctx_out, s_n))
 }
 
 /// The FFN dispatch shared by [`forward_layer`]'s plain and hc-stream forms
@@ -3710,6 +3965,7 @@ impl Model {
         // NUMA-pinning worker hook (no-op unless COLI_NUMA_PIN=1).
         install_numa_pin_hook();
         let cfg = Cfg::load(dir)?;
+        crate::qwen4::require_runtime(&cfg)?;
         let st = SafeTensors::open(dir)?;
 
         // Decide whether routed experts must be streamed from disk: sum their
@@ -3853,14 +4109,27 @@ impl Model {
 
         let (embed_name, norm_name) = match cfg.arch {
             Arch::GlmMla | Arch::DenseGqa | Arch::Glm5Next => ("model.embed_tokens.weight", "model.norm.weight"),
+            Arch::Qwen4Exp => ("model.embed_tokens.weight", "model.hyper_connection_mixer.hc_norm.weight"),
             Arch::HybridGdn => ("model.language_model.embed_tokens.weight", "model.language_model.norm.weight"),
         };
         let embed = QtWeight::load(&st, embed_name, vocab, d)?;
         let lm_head = QtWeight::load(&st, "lm_head.weight", vocab, d)?;
-        let final_norm = if cfg.arch == Arch::HybridGdn {
+        // Qwen4Exp has no trunk final norm — the checkpoint's
+        // `hyper_connection_mixer.hc_norm` is `[hidden*hc]` (the global mixer's
+        // own norm, loaded as `qwen4_mixer` below) and cannot serve as the
+        // `[hidden]` final norm the generic path expects. The Qwen4 forward
+        // collapses streams through that global mixer and projects directly,
+        // so this field is an unused identity placeholder there.
+        let final_norm = if cfg.arch == Arch::Qwen4Exp {
+            vec![1.0; d]
+        } else if cfg.arch == Arch::HybridGdn {
             load_norm_zero_centered(&st, norm_name, d)?
         } else {
             load_f32(&st, norm_name, d)?
+        };
+        let qwen4_mixer = match cfg.arch {
+            Arch::Qwen4Exp => Some(crate::qwen4::GatedResidual::load(&st, "model.hyper_connection_mixer", &cfg, false)?),
+            _ => None,
         };
 
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
@@ -3871,7 +4140,7 @@ impl Model {
         let kv = (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, kv_dtype())).collect();
         let gdn: Vec<Option<GdnState>> = (0..cfg.n_layers as usize)
             .map(|i| {
-                (matches!(cfg.arch, Arch::HybridGdn | Arch::Glm5Next)
+                (matches!(cfg.arch, Arch::HybridGdn | Arch::Glm5Next | Arch::Qwen4Exp)
                     && !cfg.full_attn.get(i).copied().unwrap_or(true))
                 .then(|| GdnState::new(&cfg))
             })
@@ -3922,7 +4191,11 @@ impl Model {
         // never left guessing which one it got — a silent degrade that halves
         // throughput is worse than a loud one.
         if stream_experts && io_reactors.is_empty() {
-            eprintln!("peregrine: [io] rings=0 engine=pread (no io_uring) threads={}", default_workers());
+            eprintln!(
+                "peregrine: [io] rings=0 engine={} (no io_uring) threads={}",
+                crate::concurrent::engine_name(),
+                default_workers(),
+            );
         }
         let workers = default_workers();
         // O_DIRECT streaming (opt-in via `COLI_DIRECT`): bypass the page cache for
@@ -3940,7 +4213,7 @@ impl Model {
             let why = if direct {
                 "enabled"
             } else if !crate::concurrent::engine_supports_direct() {
-                "off — the pread engine has no aligned buffers; buffered fallback"
+                "off — the selected engine does not support direct reads; buffered fallback"
             } else {
                 "requested but unavailable — buffered fallback"
             };
@@ -3997,12 +4270,17 @@ impl Model {
                 // not spawn costs throughput, never correctness — and making it
                 // fatal is what stopped this engine loading at all on a host
                 // with no io_uring, since each lane wants its own ring.
-                let pool = match spawn_prefetch_pool(cache, &st, direct, prefetch_lanes(), &sweep) {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        peregrine_io::note_advisory_err("spawn prefetch pool (running without prefetch)", &e);
-                        None
+                let pool = if crate::concurrent::engine_needs_rings() {
+                    match spawn_prefetch_pool(cache, &st, direct, prefetch_lanes(), &sweep) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            peregrine_io::note_advisory_err("spawn prefetch pool (running without prefetch)", &e);
+                            None
+                        }
                     }
+                } else {
+                    eprintln!("peregrine: [io] ring-backed prefetch disabled for {}", crate::concurrent::engine_name());
+                    None
                 };
                 (Some(Mutex::new(RouteHistory::new(cfg.n_layers as usize, route_hist_depth()))), pool)
             }
@@ -4011,15 +4289,22 @@ impl Model {
         // Optional GPU VRAM tier (opt-in via COLI_GPU): dequantize as many experts
         // as fit to f32 and upload. Reserve 2 GB headroom for activations/context.
         //
-        // Refused (loudly) on a clamped-SwiGLU architecture: the CUDA expert
-        // kernels compute `silu(gate)*up` with no clamp, so a VRAM-resident
-        // Glm5Next expert would silently produce different activations than the
-        // CPU/streamed ones. Lifted when the kernels grow the clamp.
+        // The device SwiGLU clamp (`coli_cuda_set_swiglu_limit`) is what lets a
+        // clamped architecture (Glm5Next `swiglu_limit=10`) share the GPU tier:
+        // without it a VRAM-resident expert would silently produce different
+        // activations than the CPU/streamed ones. Allowed exactly when the set
+        // took effect — a linked backend always takes it (0 included), an
+        // unlinked one never does, so the refusal below stays reachable on
+        // CPU-only builds rather than becoming a dead branch.
+        #[cfg(feature = "cuda")]
+        let gpu_allowed = peregrine_cuda::set_swiglu_limit(cfg.swiglu_limit);
+        #[cfg(not(feature = "cuda"))]
         let gpu_allowed = cfg.swiglu_limit == 0.0;
         if !gpu_allowed && std::env::var("COLI_GPU").is_ok() {
             eprintln!(
-                "peregrine: COLI_GPU ignored — swiglu_limit={} needs the clamp in the CUDA expert \
-                 kernels (not implemented); experts stay on the CPU lane",
+                "peregrine: COLI_GPU ignored — swiglu_limit={} but no GPU backend is linked in \
+                 this binary (rebuild with `--features cuda` on a host with nvcc/hipcc); experts \
+                 stay on the CPU lane",
                 cfg.swiglu_limit
             );
         }
@@ -4383,7 +4668,7 @@ impl Model {
             rss_limit_bytes,
             layers,
             final_norm,
-            lm_head,
+            qwen4_mixer,            lm_head,
             kv,
             stream_experts,
             direct,
@@ -4865,7 +5150,7 @@ impl Model {
     }
 
     pub fn spec_reject_is_kv_only(&self) -> bool {
-        !matches!(self.cfg.arch, Arch::HybridGdn | Arch::Glm5Next)
+        !matches!(self.cfg.arch, Arch::HybridGdn | Arch::Glm5Next | Arch::Qwen4Exp)
     }
 
     /// Which chat-prompt markup this checkpoint expects. GLM ships no chat
@@ -6197,10 +6482,148 @@ impl Model {
         self.ecache.as_ref().map(|c| c.lock().priority((layer as u32, expert as u32)))
     }
 
+    /// Qwen4Exp single-stream forward: `[s_n, hidden]` embed → replicate to
+    /// `[s_n, hidden*hc]` streams → per-layer PLE / gated-residual attention /
+    /// gated-residual softmax-MoE → global mixer collapse → `[s_n, hidden]`.
+    ///
+    /// Sequential by construction (PLE hash history, GDN recurrence, KV and
+    /// indexer-key appends all advance in token order), so one call over `s_n`
+    /// rows and `s_n` single-row calls are bit-identical — the property
+    /// `generate` (prefill-then-decode) depends on.
+    fn forward_hidden_qwen4(&mut self, tokens: &[i32], pos_base: usize) -> Result<Vec<f32>, Error> {
+        let s_n = tokens.len();
+        let d = self.cfg.hidden as usize;
+        if s_n == 0 {
+            return Ok(Vec::new());
+        }
+        let hc = self
+            .cfg
+            .qwen4
+            .as_ref()
+            .ok_or_else(|| Error::Format("qwen4_exp: missing validated Qwen4Cfg".into()))?
+            .hc_count as usize;
+        if hc < 2 {
+            return Err(Error::Format("qwen4_exp: hc_count must be >= 2".into()));
+        }
+        if self.stream_experts {
+            return Err(crate::qwen4::unsupported(
+                "expert streaming (the shared-gate MoE only has a resident implementation)",
+            ));
+        }
+        let width = d * hc;
+        let vocab = self.cfg.vocab as usize;
+        let mut embed = vec![0f32; s_n * d];
+        for (s, &t) in tokens.iter().enumerate() {
+            let tid = (t.max(0) as usize).min(vocab.saturating_sub(1));
+            self.embed.dequant_row_into(tid, &mut embed[s * d..s * d + d]);
+        }
+        // Replicate the embedding into every stream (the HF reference's
+        // `expand`); the per-site mixers then collapse and re-inject.
+        let mut streams = vec![0f32; s_n * width];
+        for s in 0..s_n {
+            for h in 0..hc {
+                streams[s * width + h * d..s * width + (h + 1) * d]
+                    .copy_from_slice(&embed[s * d..(s + 1) * d]);
+            }
+        }
+        // Split disjoint fields so layers (imm) + kv/gdn (mut) borrow together.
+        let Model { cfg, layers, kv, gdn, st, qwen4_mixer, .. } = self;
+        let mixer = qwen4_mixer.as_ref().ok_or_else(|| {
+            Error::Format("qwen4_exp: missing global hyper-connection mixer".into())
+        })?;
+        for (li, l) in layers.iter().enumerate() {
+            let ql = l.qwen4.as_ref().ok_or_else(|| {
+                Error::Format(format!("qwen4_exp: layer {li} missing gated-residual weights"))
+            })?;
+            // PLE enriches the streams before the attention mixer. One token at
+            // a time, in order — the ngram hash and conv history are sequential
+            // state, so a chunked prefill and stepwise decode coincide.
+            if let Some(ple) = ql.ple.as_ref() {
+                let g = gdn[li].as_mut().ok_or_else(|| {
+                    Error::Format(format!("qwen4_exp: layer {li} PLE needs a recurrent state"))
+                })?;
+                for s in 0..s_n {
+                    let row = &mut streams[s * width..(s + 1) * width];
+                    ple.inject(st, tokens[s], row, &mut g.ple)?;
+                }
+            }
+            // Attention site.
+            let mixed_in = ql.attn.mix(&streams).map_err(|e| {
+                Error::Format(format!("qwen4_exp: layer {li} attn mix failed: {e}"))
+            })?;
+            let injection_a = mixed_in.injection.ok_or_else(|| {
+                Error::Format(format!("qwen4_exp: layer {li} attn mixer missing injection"))
+            })?;
+            let attn_out = if cfg.full_attn.get(li).copied().unwrap_or(false) {
+                qwen4_gqa_forward(l, ql, &mut kv[li], &mixed_in.mixed, s_n, pos_base, cfg)
+                    .map_err(|e| Error::Format(format!("qwen4_exp: layer {li} QSA forward failed: {e}")))?
+            } else {
+                let g = gdn[li].as_mut().ok_or_else(|| {
+                    Error::Format(format!("qwen4_exp: layer {li} GDN needs a recurrent state"))
+                })?;
+                // Qwen4 z/a/b live as full-precision `Matrix` weights
+                // (`gdn_abz`); the generic `QtWeight` slots are dummies (see
+                // the loader). Project here, then run the shared projected
+                // core — the only part that reads `conv`/`norm`/`out`.
+                let gw = l.gdn()?;
+                let (mat_a, mat_b, mat_z) = ql.gdn_abz.as_ref().ok_or_else(|| {
+                    Error::Format(format!("qwen4_exp: layer {li} missing GDN a/b/z projections"))
+                })?;
+                let qkv_pre = gw.in_qkv.apply_vec(&mixed_in.mixed, s_n);
+                let z_all = mat_z.apply(&mixed_in.mixed).map_err(|e| {
+                    Error::Format(format!("qwen4_exp: layer {li} GDN z-proj failed: {e}"))
+                })?;
+                let a_all = mat_a.apply(&mixed_in.mixed).map_err(|e| {
+                    Error::Format(format!("qwen4_exp: layer {li} GDN a-proj failed: {e}"))
+                })?;
+                let b_all = mat_b.apply(&mixed_in.mixed).map_err(|e| {
+                    Error::Format(format!("qwen4_exp: layer {li} GDN b-proj failed: {e}"))
+                })?;
+                crate::gdn::gdn_forward_projected(&gw, &qkv_pre, &z_all, &a_all, &b_all, g, cfg).map_err(|e| {
+                    Error::Format(format!("qwen4_exp: layer {li} GDN forward failed: {e}"))
+                })?
+            };
+            streams = ql.attn.combine(&streams, &attn_out, &injection_a).map_err(|e| {
+                Error::Format(format!("qwen4_exp: layer {li} attn combine failed: {e}"))
+            })?;
+            // MLP site (softmax MoE + gated shared expert).
+            let mixed_mlp = ql.mlp.mix(&streams).map_err(|e| {
+                Error::Format(format!("qwen4_exp: layer {li} mlp mix failed: {e}"))
+            })?;
+            let injection_m = mixed_mlp.injection.ok_or_else(|| {
+                Error::Format(format!("qwen4_exp: layer {li} mlp mixer missing injection"))
+            })?;
+            let mlp_out = crate::qwen4::moe_forward_qwen4(
+                &mixed_mlp.mixed,
+                &l.router,
+                &ql.shared_gate,
+                &l.experts,
+                l.shared.as_ref(),
+                cfg,
+                s_n,
+            )
+            .map_err(|e| Error::Format(format!("qwen4_exp: layer {li} MoE failed: {e}")))?;
+            streams = ql.mlp.combine(&streams, &mlp_out, &injection_m).map_err(|e| {
+                Error::Format(format!("qwen4_exp: layer {li} mlp combine failed: {e}"))
+            })?;
+        }
+        let final_mix = mixer.mix(&streams).map_err(|e| {
+            Error::Format(format!("qwen4_exp: global mixer failed: {e}"))
+        })?;
+        Ok(final_mix.mixed)
+    }
+
     /// Run `tokens` (new positions from `pos_base`) through all layers, appending
     /// to the KV cache, and return the **pre-final-norm** hidden state `[S,
     /// hidden]`. The MTP head reuses the last position's hidden as its draft seed.
     pub fn forward_hidden(&mut self, tokens: &[i32], pos_base: usize) -> Result<Vec<f32>, Error> {
+        // Qwen4Exp runs its own stream-form stack (gated residuals, PLE, QSA);
+        // the generic single-residual path below cannot execute it.
+        if self.cfg.arch == Arch::Qwen4Exp {
+            let out = self.forward_hidden_qwen4(tokens, pos_base)?;
+            self.publish_lane_timings();
+            return Ok(out);
+        }
         let s_n = tokens.len();
         let d = self.cfg.hidden as usize;
 
@@ -6476,7 +6899,7 @@ impl Model {
         let eps = self.cfg.eps;
         let x = self.forward_hidden(tokens, pos_base)?;
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
-        Ok(self.lm_head.apply_vec(&xf, s_n))
+        project_logits(&self.lm_head, &xf, s_n, "forward_step")
     }
 
     /// **RLM recursive pass** — re-runs the last `K = COLI_RLM_LAYERS` transformer
@@ -6546,6 +6969,11 @@ impl Model {
                 "RLM recursive replay is not supported on an mHC-stream architecture (glm5_next)".into(),
             ));
         }
+        if self.cfg.arch == Arch::Qwen4Exp {
+            return Err(crate::qwen4::unsupported(
+                "RLM recursive replay (replays a [hidden]-wide hidden the stream-form layers cannot consume)",
+            ));
+        }
         let n_layers = self.cfg.n_layers as usize;
         let k = crate::rlm::rlm_layers().min(n_layers);
         let start = n_layers - k;
@@ -6575,7 +7003,7 @@ impl Model {
             // Drop `kv_local` here is unnecessary — it owns no shared `&self`
             // borrow; the constraint is just `ctx` going out of scope.
             let xf = rmsnorm_rows(h, &self.final_norm, s_n, d, eps);
-            self.lm_head.apply_vec(&xf, s_n)
+            project_logits(&self.lm_head, &xf, s_n, "forward_hidden_recursive")?
         };
         Ok(lg)
     }
@@ -6694,7 +7122,7 @@ impl Model {
             x = collapse_hc_streams(&x, s_n, d, hc);
         }
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
-        Ok(self.lm_head.apply_vec(&xf, s_n))
+        project_logits(&self.lm_head, &xf, s_n, "forward_prefill_seq")
     }
 
     /// Batched decode step over B **independent sequences** (one new token each):
@@ -6956,6 +7384,15 @@ impl Model {
         tree: Option<crate::tree::TreeRows<'_>>,
         histories: Option<&[&Mutex<RouteHistory>]>,
     ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        // Qwen4Exp serves single-stream only for now: its per-sequence GDN/PLE
+        // recurrence and stream-form residuals have no batched counterpart yet.
+        // Refuse loudly rather than run the generic batched stack (which would
+        // skip mixers/PLE/QSA and return plausible-looking wrong logits).
+        if self.cfg.arch == Arch::Qwen4Exp {
+            return Err(crate::qwen4::unsupported(
+                "batched / concurrent serving (per-sequence GDN/PLE recurrence has no multi-sequence counterpart yet)",
+            ));
+        }
         let s_n = tokens.len();
         if owner.len() != s_n || pos_of.len() != s_n {
             return Err(Error::Format(format!(
@@ -7076,7 +7513,8 @@ impl Model {
             x = collapse_hc_streams(&x, s_n, d, hc);
         }
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
-        Ok((self.lm_head.apply_vec(&xf, s_n), x))
+        let logits = project_logits(&self.lm_head, &xf, s_n, "forward_rows_tree_inner")?;
+        Ok((logits, x))
     }
 
     /// Re-select the GPU tier's resident experts as the current hottest set (by
@@ -7149,7 +7587,7 @@ impl Model {
         // unchanged — same algebra, bit-identical.
         let mut x_all = self.forward_hidden(prompt, 0)?;
         let xf = rmsnorm_rows(&x_all, &self.final_norm, prompt.len(), d, eps);
-        let logits = self.lm_head.apply_vec(&xf, prompt.len());
+        let logits = project_logits(&self.lm_head, &xf, prompt.len(), "generate prefill")?;
         let mut h_last = x_all[(prompt.len() - 1) * d..prompt.len() * d].to_vec();
         let mut lg = logits[(prompt.len() - 1) * vocab..prompt.len() * vocab].to_vec();
         // RLM refinement loop: each pass refines `h_last` and recomputes the head.
@@ -7158,7 +7596,7 @@ impl Model {
         while self.rlm.should_recurse(&lg, sampler.temp) {
             self.forward_hidden_recursive(&mut h_last, 1, prompt.len() - 1)?;
             let xf2 = rmsnorm_rows(&h_last, &self.final_norm, 1, d, eps);
-            lg = self.lm_head.apply_vec(&xf2, 1);
+            lg = project_logits(&self.lm_head, &xf2, 1, "generate recursive")?;
         }
         let mut next = sampler.pick(&lg, -1) as i32;
         let mut out = vec![next];
@@ -7177,13 +7615,13 @@ impl Model {
             x_all = self.forward_hidden(&[next], pos)?;
             h_last = x_all[..d].to_vec();
             let xf = rmsnorm_rows(&x_all, &self.final_norm, 1, d, eps);
-            lg = self.lm_head.apply_vec(&xf, 1);
+            lg = project_logits(&self.lm_head, &xf, 1, "generate decode")?;
             // RLM recursion: refine `h_last` and recompute logits while the
             // controller says to. No-op (structurally — see `rlm.rs:114`) when off.
             while self.rlm.should_recurse(&lg, sampler.temp) {
                 self.forward_hidden_recursive(&mut h_last, 1, pos)?;
                 let xf2 = rmsnorm_rows(&h_last, &self.final_norm, 1, d, eps);
-                lg = self.lm_head.apply_vec(&xf2, 1);
+                lg = project_logits(&self.lm_head, &xf2, 1, "generate recursive")?;
             }
             next = sampler.pick(&lg, -1) as i32;
             out.push(next);
@@ -7305,6 +7743,12 @@ impl Model {
         conf_floor: f32,
         mut pick: impl FnMut(&[f32]) -> i32,
     ) -> Result<Vec<i32>, Error> {
+        // No Qwen4 checkpoint carries an MTP head; name the architecture
+        // rather than reporting a missing head the checkpoint was never
+        // supposed to have.
+        if self.cfg.arch == Arch::Qwen4Exp {
+            return Err(crate::qwen4::mtp_unsupported());
+        }
         let d = self.cfg.hidden as usize;
         let eps = self.cfg.eps;
         let vocab = self.cfg.vocab as usize;
@@ -7390,7 +7834,7 @@ impl Model {
             // one MTP transformer layer at relative position g (fresh local KV)
             forward_layer(&mtp.layer, n_layers, LayerState { kv: &mut kv, gdn: None }, &ctx, &mut hx, 1, g)?;
             let row = rmsnorm_rows(&hx, &mtp.mtp_norm, 1, d, eps);
-            let logit = lm_head.apply_vec(&row, 1);
+            let logit = project_logits(lm_head, &row, 1, "mtp_draft")?;
             // The confidence gate (ds4's DSpark idea): a step whose top token
             // holds less than `conf_floor` of the distribution ends the draft
             // *before* `pick` — the low-confidence token itself is excluded,
@@ -7569,7 +8013,7 @@ impl Model {
                 )?;
             }
             let rows = rmsnorm_rows(&hx, &mtp.mtp_norm, n_act, d, eps);
-            let logits = lm_head.apply_vec(&rows, n_act);
+            let logits = project_logits(lm_head, &rows, n_act, "mtp_draft_batched")?;
             let mut still: Vec<usize> = Vec::with_capacity(n_act);
             for (r, &i) in active.iter().enumerate() {
                 let Some(lg) = logits.get(r * vocab..(r + 1) * vocab) else { continue };
@@ -7632,7 +8076,7 @@ impl Model {
         let mut hlast = x[(plen - 1) * d..plen * d].to_vec();
         let logits = {
             let xf = rmsnorm_rows(&x, &self.final_norm, plen, d, eps);
-            self.lm_head.apply_vec(&xf, plen)
+            project_logits(&self.lm_head, &xf, plen, "generate_speculative prefill")?
         };
         let mut next = crate::sample::argmax(&logits[(plen - 1) * vocab..plen * vocab]) as i32;
 
@@ -7656,7 +8100,7 @@ impl Model {
             let xb = self.forward_hidden(&batch, pos)?;
             let logits_b = {
                 let xbf = rmsnorm_rows(&xb, &self.final_norm, s, d, eps);
-                self.lm_head.apply_vec(&xbf, s)
+                project_logits(&self.lm_head, &xbf, s, "generate_speculative verify")?
             };
 
             // `next` is confirmed (it was the model's argmax); emit it
@@ -7704,7 +8148,7 @@ impl Model {
             while self.rlm.should_recurse(&lb_k, 0.0) {
                 self.forward_hidden_recursive(&mut hlast, 1, pos + k)?;
                 let xf2 = rmsnorm_rows(&hlast, &self.final_norm, 1, d, eps);
-                let lg2 = self.lm_head.apply_vec(&xf2, 1);
+                let lg2 = project_logits(&self.lm_head, &xf2, 1, "generate_speculative recursive")?;
                 lb_k = lg2[..vocab].to_vec();
             }
             next = crate::sample::argmax(&lb_k) as i32;
@@ -7868,7 +8312,7 @@ mod tests {
         let uf: Vec<f32> = (0..inter * hidden).map(|_| rnd() * 0.1).collect();
         let df: Vec<f32> = (0..hidden * inter).map(|_| rnd() * 0.1).collect();
         let x: Vec<f32> = (0..s_n * hidden).map(|_| rnd()).collect();
-        let mlp = Mlp { gate: qi4(&gf, inter, hidden), up: qi4(&uf, inter, hidden), down: qi4(&df, hidden, inter) };
+        let mlp = Mlp { gate: qi4(&gf, inter, hidden), up: qi4(&uf, inter, hidden), down: qi4(&df, hidden, inter), limit: 0.0 };
 
         // Ground truth: the weights the container actually holds (dequantized
         // exactly), with activations left in f32 — no activation quantization
@@ -8705,6 +9149,116 @@ mod tests {
         Ok(())
     }
 
+    fn mmap_child(test: &str, merge: &str) -> Result<(), peregrine_core::Error> {
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("COLI_") {
+                cmd.env_remove(key);
+            }
+        }
+        let out = cmd
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env("PEREGRINE_MMAP_CHILD", "1")
+            .env("COLI_IO_ENGINE", "mmap")
+            .env("COLI_DIRECT", "1")
+            .env("COLI_IO_COMPLETION", "1")
+            .env("COLI_IO_RECOVERY", "0")
+            .env("COLI_REGBUF", "1")
+            .env("COLI_EXPERT_MERGE", merge)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "merge={merge}: child failed.\n{stdout}\n{stderr}");
+        let engine = if cfg!(target_os = "linux") { "mmap" } else { "pread" };
+        assert!(stderr.contains(&format!("rings=0 engine={engine} (no io_uring)")), "{stderr}");
+        assert!(stderr.contains("selected engine does not support direct reads"), "{stderr}");
+        assert!(!stderr.contains("sqpoll="), "{stderr}");
+        Ok(())
+    }
+
+    #[test]
+    fn mmap_streaming_runs_with_zero_rings() -> Result<(), peregrine_core::Error> {
+        if std::env::var("PEREGRINE_MMAP_CHILD").is_err() {
+            for merge in ["0", "1"] {
+                mmap_child("model::tests::mmap_streaming_runs_with_zero_rings", merge)?;
+            }
+            return Ok(());
+        }
+        let dir = tmp_model_dir("mmap_zeroring")?;
+        let shard = dir.join("model.safetensors");
+        let bytes = std::fs::read(&shard)?;
+        let invalid = || Error::Format("invalid mmap test fixture".into());
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().map_err(|_| invalid())?) as usize;
+        let mut header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len])?;
+        let entries = header.as_object_mut().ok_or_else(invalid)?;
+        let mut names: Vec<String> = entries.keys().cloned().collect();
+        names.sort_by_key(|name| (name.ends_with(".qs"), name.clone()));
+        let mut data = Vec::new();
+        for name in names {
+            let entry = entries.get_mut(&name).ok_or_else(invalid)?;
+            let offsets = &entry["data_offsets"];
+            let start = offsets[0].as_u64().ok_or_else(invalid)? as usize;
+            let end = offsets[1].as_u64().ok_or_else(invalid)? as usize;
+            let new_start = data.len();
+            data.extend_from_slice(&bytes[8 + header_len + start..8 + header_len + end]);
+            entry["data_offsets"] = serde_json::json!([new_start, data.len()]);
+        }
+        let header = serde_json::to_vec(&header)?;
+        let mut packed = (header.len() as u64).to_le_bytes().to_vec();
+        packed.extend_from_slice(&header);
+        packed.extend_from_slice(&data);
+        std::fs::write(&shard, packed)?;
+        let mut resident = Model::load_streaming_ecache(&dir, false, 0)?;
+        let mut streamed = Model::load_streaming_ecache(&dir, true, 0)?;
+        assert!(!crate::concurrent::engine_needs_rings());
+        assert!(!crate::concurrent::engine_supports_direct());
+        assert_eq!(crate::concurrent::engine_name(), if cfg!(target_os = "linux") { "mmap" } else { "pread" });
+        assert!(streamed.io_reactors.is_empty());
+        assert!(!streamed.direct);
+        assert!(streamed.ecache.is_none());
+        assert!(streamed.expert_index.as_ref().is_some_and(|ix| ix.mergeable() > 0));
+        let toks: Vec<i32> = (0..40).map(|k| (k * 5 + 2) % 32).collect();
+        let want = resident.forward_step(&toks, 0)?;
+        let got = streamed.forward_step(&toks, 0)?;
+        assert_eq!(want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), got.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        for (i, tok) in [3, 7, 1, 4].into_iter().enumerate() {
+            let want = resident.forward_step(&[tok], toks.len() + i)?;
+            let got = streamed.forward_step(&[tok], toks.len() + i)?;
+            assert_eq!(want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "decode {i}");
+        }
+        assert!(streamed.io_reactors.is_empty());
+        let mut cached = Model::load_streaming_ecache(&dir, true, 8 << 20)?;
+        assert!(cached.io_reactors.is_empty());
+        assert!(cached.prefetch.is_none());
+        assert!(!cached.direct);
+        resident.reset();
+        assert_eq!(resident.forward_step(&toks, 0)?, cached.forward_step(&toks, 0)?);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mmap_streaming_rejects_truncated_region() -> Result<(), peregrine_core::Error> {
+        if std::env::var("PEREGRINE_MMAP_CHILD").is_err() {
+            return mmap_child("model::tests::mmap_streaming_rejects_truncated_region", "1");
+        }
+        let dir = tmp_model_dir("mmap_truncated")?;
+        let mut streamed = Model::load_streaming_ecache(&dir, true, 0)?;
+        assert!(streamed.io_reactors.is_empty());
+        assert!(!crate::concurrent::engine_supports_direct());
+        std::fs::OpenOptions::new().write(true).open(dir.join("model.safetensors"))?.set_len(0)?;
+        let err = streamed.forward_step(&[3, 7, 1, 4], 0).err()
+            .ok_or_else(|| Error::Format("truncated mmap region unexpectedly succeeded".into()))?;
+        assert!(!err.to_string().contains("without io_uring"), "{err}");
+        if cfg!(target_os = "linux") {
+            assert!(err.to_string().contains("Invalid argument"), "{err}");
+        } else {
+            assert!(err.to_string().contains("EOF"), "{err}");
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
     #[test]
     fn tiled_rows_streamed_matches_resident() -> Result<(), peregrine_core::Error> {
         // Cooperative tiled dispatch: a forward whose row count crosses the
@@ -9305,6 +9859,149 @@ mod tests {
     }
 
     #[test]
+    fn nonfinite_head_scale_fails_forward() -> Result<(), Error> {
+        let dir = tmp_model_dir("nonfinite_head")?;
+        let mut m = Model::load(&dir)?;
+        let (vocab, d) = (m.cfg.vocab as usize, m.cfg.hidden as usize);
+        let mut scales = vec![1.0; vocab];
+        scales[7] = f32::NAN;
+        m.lm_head = QtWeight::new(crate::weight::QuantFmt::Int8, vocab, d, vec![1u8; vocab * d], scales);
+        let result = m.forward_step(&[3, 7], 0);
+        std::fs::remove_dir_all(&dir)?;
+        let error = result.err().ok_or_else(|| Error::Format("corrupt head returned logits".into()))?.to_string();
+        assert!(error.contains("forward_step"), "{error}");
+        assert!(error.contains("nonfinite final inference logits at row 0, column 7"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn nonfinite_final_norm_input_fails_forward() -> Result<(), Error> {
+        let dir = tmp_model_dir("nonfinite_norm")?;
+        let mut m = Model::load(&dir)?;
+        m.final_norm[7] = f32::NAN;
+        let result = m.forward_step(&[3, 7], 0);
+        std::fs::remove_dir_all(&dir)?;
+        let error = result.err().ok_or_else(|| Error::Format("NaN head input returned logits".into()))?.to_string();
+        assert!(error.contains("forward_step"), "{error}");
+        assert!(error.contains("nonfinite lm_head input at row 0, column 7"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn nonfinite_projection_is_rejected_on_every_output_path() -> Result<(), Error> {
+        let dir = tmp_model_dir("nonfinite_paths")?;
+        let mut m = Model::load(&dir)?;
+        let (vocab, d) = (m.cfg.vocab as usize, m.cfg.hidden as usize);
+        let hidden = m.forward_hidden(&[3], 0)?;
+        for corrupt_input in [false, true] {
+            m.final_norm.fill(if corrupt_input { f32::NAN } else { 1.0 });
+            if let Some(mtp) = m.mtp.as_mut() {
+                mtp.mtp_norm.fill(if corrupt_input { f32::NAN } else { 1.0 });
+            }
+            m.lm_head = QtWeight::new(
+                crate::weight::QuantFmt::Int8, vocab, d, vec![1u8; vocab * d],
+                vec![if corrupt_input { 1.0 } else { f32::NAN }; vocab],
+            );
+            let mut seq = SeqKv::new(&m.cfg);
+            let prefill = m.forward_prefill_seq(&[3, 7], &mut seq, 0);
+            let mut a = SeqKv::new(&m.cfg);
+            let mut b = SeqKv::new(&m.cfg);
+            let batched = m.forward_step_batched(&[3, 7], &mut [&mut a, &mut b], &[0, 0], None);
+            let mut seq = SeqKv::new(&m.cfg);
+            let rows = m.forward_rows_batched_hidden(&[3, 7], &[0, 0], &mut [&mut seq], &[0, 1], None);
+            let mut seq = SeqKv::new(&m.cfg);
+            let tree = m.forward_tree_rows(
+                &[3, 7], &[0, 0], &mut [&mut seq], &[0, 1],
+                crate::tree::TreeRows { rope_pos: &[0, 1], sel: &[Some(vec![0]), Some(vec![0, 1])] },
+            );
+            let mut seq = SeqKv::new(&m.cfg);
+            let verify = m.verify_drafts_batched(&[3], &[vec![7]], &mut [&mut seq], &[0]);
+            let recursive = m.forward_hidden_recursive(&mut hidden.clone(), 1, 0);
+            let seq = SeqKv::new(&m.cfg);
+            let recursive_seq = m.forward_hidden_recursive_seq(&seq, &mut hidden.clone(), 1, 0);
+            let draft = m.mtp_draft(3, 1, &hidden, 0.9);
+            let draft_sampled = m.mtp_draft_sampled(3, 1, &hidden, 0.9, &mut Sampler::new(0.8, 0.9, 42));
+            let draft_batch = m.mtp_draft_batched(&[3, 7], &[&hidden, &hidden], &[1, 1], 0.9);
+            let teacher = m.teacher_forcing(&[3, 7]);
+            let greedy = m.generate(&[3, 7], 2, &mut Sampler::new(0.0, 0.9, 42));
+            let sampled = m.generate(&[3, 7], 2, &mut Sampler::new(0.8, 0.9, 42));
+            let speculative = m.generate_speculative(&[3, 7], 2, 1);
+            for (context, result) in [
+                ("forward_prefill_seq", prefill.map(|_| ())),
+                ("forward_rows_tree_inner", batched.map(|_| ())),
+                ("forward_rows_tree_inner", rows.map(|_| ())),
+                ("forward_rows_tree_inner", tree.map(|_| ())),
+                ("forward_rows_tree_inner", verify.map(|_| ())),
+                ("forward_hidden_recursive", recursive.map(|_| ())),
+                ("forward_hidden_recursive", recursive_seq.map(|_| ())),
+                ("mtp_draft", draft.map(|_| ())),
+                ("mtp_draft", draft_sampled.map(|_| ())),
+                ("mtp_draft_batched", draft_batch.map(|_| ())),
+                ("forward_step", teacher.map(|_| ())),
+                ("generate prefill", greedy.map(|_| ())),
+                ("generate prefill", sampled.map(|_| ())),
+                ("generate_speculative prefill", speculative.map(|_| ())),
+            ] {
+                let error = result.err().ok_or_else(|| Error::Format(format!("{context} accepted nonfinite values")))?.to_string();
+                assert!(error.contains(context), "{error}");
+                let stage = if corrupt_input { "lm_head input" } else { "final inference logits" };
+                assert!(error.contains(&format!("nonfinite {stage} at row 0, column 0")), "{error}");
+            }
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn projection_rejects_nonfinite_values_in_later_rows() -> Result<(), Error> {
+        let head = QtWeight::new(crate::weight::QuantFmt::Int8, 2, 16, vec![1u8; 32], vec![1.0; 2]);
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut x = vec![1.0; 32];
+            x[23] = value;
+            let error = project_logits(&head, &x, 2, "later row")
+                .err().ok_or_else(|| Error::Format("accepted nonfinite input".into()))?.to_string();
+            assert!(error.contains("nonfinite lm_head input at row 1, column 7"), "{error}");
+        }
+        for scale in [f32::MAX, -f32::MAX, f32::INFINITY, f32::NEG_INFINITY] {
+            let head = QtWeight::new(crate::weight::QuantFmt::Int8, 2, 16, vec![1u8; 32], vec![1.0, scale]);
+            let error = project_logits(&head, &[1.0; 32], 2, "overflow")
+                .err().ok_or_else(|| Error::Format("accepted nonfinite output".into()))?.to_string();
+            assert!(error.contains("nonfinite final inference logits at row 0, column 1"), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checked_projection_preserves_finite_forward_bits() -> Result<(), Error> {
+        let dir = tmp_model_dir("finite_projection")?;
+        let mut m = Model::load(&dir)?;
+        let tokens = [3, 7, 1];
+        let (vocab, d) = (m.cfg.vocab as usize, m.cfg.hidden as usize);
+        let hidden = m.forward_hidden(&tokens, 0)?;
+        let xf = rmsnorm_rows(&hidden, &m.final_norm, tokens.len(), d, m.cfg.eps);
+        let expected = m.lm_head.apply_vec(&xf, tokens.len());
+        let bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
+        m.reset();
+        let ordinary = m.forward_step(&tokens, 0)?;
+        let mut seq = SeqKv::new(&m.cfg);
+        let external = m.forward_prefill_seq(&tokens, &mut seq, 0)?;
+        let mut seq = SeqKv::new(&m.cfg);
+        let batched = m.forward_rows_batched(&tokens, &[0, 0, 0], &mut [&mut seq], &[0, 1, 2], None)?;
+        for logits in [ordinary, external, batched] {
+            assert_eq!(logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
+        }
+        let predictions: Vec<i32> = expected.chunks_exact(vocab).map(|row| argmax(row) as i32).collect();
+        assert_eq!(m.teacher_forcing(&tokens)?, predictions);
+        for temp in [0.0, 0.8] {
+            let mut reference = Sampler::new(temp, 0.9, 42);
+            let want = reference.pick(&expected[2 * vocab..], -1) as i32;
+            assert_eq!(m.generate(&tokens, 1, &mut Sampler::new(temp, 0.9, 42))?, vec![want]);
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn generate_is_deterministic_greedy() -> Result<(), peregrine_core::Error> {
         let dir = tmp_model_dir("gen")?;
         let mut m = Model::load(&dir)?;
@@ -9524,6 +10221,52 @@ mod tests {
         assert!(
             par.iter().zip(&serial).all(|(a, b)| a.to_bits() == b.to_bits()),
             "rmsnorm_rows must be bit-identical parallel vs serial"
+        );
+    }
+
+    #[test]
+    fn hc_stream_expand_collapse_match_serial() {
+        // hc=4, d=512: both pool paths engage. The oracles are independent
+        // hand-written serial loops; the arbiter is exact bits plus the shared
+        // hash (one u64 for logs/anchors).
+        let (s_n, d, hc) = (17usize, 512usize, 4usize);
+        let x: Vec<f32> = (0..s_n * d).map(|k| ((k * 7 + 3) as f32 * 0.01).sin()).collect();
+        let par_e = expand_hc_streams(&x, s_n, d, hc);
+        let mut serial_e = vec![0f32; s_n * hc * d];
+        for s in 0..s_n {
+            for h in 0..hc {
+                serial_e[s * hc * d + h * d..s * hc * d + (h + 1) * d]
+                    .copy_from_slice(&x[s * d..(s + 1) * d]);
+            }
+        }
+        assert!(
+            par_e.iter().zip(&serial_e).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "expand_hc_streams must be bit-identical parallel vs serial"
+        );
+        let par_c = collapse_hc_streams(&par_e, s_n, d, hc);
+        let inv = 1.0 / hc as f32;
+        let mut serial_c = vec![0f32; s_n * d];
+        for s in 0..s_n {
+            for h in 0..hc {
+                for (o, &v) in serial_c[s * d..(s + 1) * d]
+                    .iter_mut()
+                    .zip(&serial_e[s * hc * d + h * d..s * hc * d + (h + 1) * d])
+                {
+                    *o += v;
+                }
+            }
+            for o in &mut serial_c[s * d..(s + 1) * d] {
+                *o *= inv;
+            }
+        }
+        assert!(
+            par_c.iter().zip(&serial_c).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "collapse_hc_streams must be bit-identical parallel vs serial"
+        );
+        assert_eq!(
+            crate::testkit::hash_f32_bits(&par_c),
+            crate::testkit::hash_f32_bits(&serial_c),
+            "shared hash must agree on identical tensors"
         );
     }
 

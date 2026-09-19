@@ -460,13 +460,13 @@ async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>
         return Err(ApiError::bad_request("messages must not be empty"));
     }
     let prompt = build_prompt(&req.messages, active_tools(req), state.inner.chatml_prompt);
-    // Encode is CPU-bound and serialized behind the process-wide encode mutex
-    // (`tok.rs`: `encode` is `&mut`, so every request takes the same lock). Run it
-    // on the blocking pool: a burst of B arrivals then parks blocking-pool threads
-    // waiting on that mutex, not the runtime workers the SSE pump tasks and every
-    // other endpoint are scheduled on. parking_lot does not yield to tokio, so
-    // before this change B-1 of a burst's handlers each pinned a worker thread
-    // doing nothing.
+    // Encode is CPU-bound, so it runs on the blocking pool rather than the
+    // runtime workers the SSE pump tasks and every other endpoint are
+    // scheduled on (parking_lot does not yield to tokio). Within the pool,
+    // encodes spread across the backend's fork shards (`tok.rs`: one mutex
+    // per fork, round-robin) instead of serializing on a single process-wide
+    // lock — a burst of B arrivals computes in parallel up to the shard
+    // count, parking only on shard collisions past it.
     let tokenizer = state.inner.tokenizer.clone();
     let ids = tk(tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
         .await
@@ -911,8 +911,9 @@ async fn chat_completions(
         if let Some(key) = memo_key {
             state.inner.memo.lock().insert(key, out_ids.clone());
         }
-        // Decode goes through the same global tokenizer mutex as encode, so it
-        // belongs on the blocking pool for the same reason (see `resolve_params`).
+        // Decode is CPU-bound like encode (and takes a shard lock like it),
+        // so it belongs on the blocking pool for the same reason
+        // (see `resolve_params`).
         let n_out = out_ids.len();
         let decoded = tokio::task::spawn_blocking(move || tokenizer.decode(&out_ids))
             .await

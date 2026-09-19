@@ -2078,6 +2078,133 @@ impl Reactor {
     pub fn queue_dontneed(&mut self, _regions: &[(RawFd, u64, usize)]) {}
 }
 
+#[cfg(any(target_os = "linux", test))]
+const MMAP_WINDOW: usize = 8 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+mod mmap_read {
+    use super::{ReadReq, MMAP_WINDOW};
+    use std::os::unix::io::RawFd;
+
+    struct Window {
+        addr: *mut libc::c_void,
+        map_len: usize,
+    }
+
+    impl Window {
+        fn map(fd: RawFd, a_off: u64, map_len: usize) -> std::io::Result<Window> {
+            let offset = libc::off_t::try_from(a_off)
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    map_len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    fd,
+                    offset,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Window { addr: p, map_len })
+        }
+
+        fn copy_out(&self, dst: &mut [u8], head: usize) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (self.addr as *const u8).add(head),
+                    dst.as_mut_ptr(),
+                    dst.len(),
+                );
+            }
+        }
+    }
+
+    impl Drop for Window {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::munmap(self.addr, self.map_len) };
+        }
+    }
+
+    fn regular_len(fd: RawFd) -> Result<u64, std::io::Error> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        u64::try_from(st.st_size).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    pub(super) fn page_size() -> std::io::Result<usize> {
+        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if p <= 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        usize::try_from(p).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+    }
+
+    fn cached_page_size() -> std::io::Result<usize> {
+        static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        if let Some(&ps) = CACHED.get() {
+            return Ok(ps);
+        }
+        let ps = page_size()?;
+        let _ = CACHED.set(ps);
+        Ok(CACHED.get().copied().unwrap_or(ps))
+    }
+
+    pub(super) fn read_one(r: &mut ReadReq) -> std::io::Result<i64> {
+        let invalid = || std::io::Error::from_raw_os_error(libc::EINVAL);
+        let fsize = regular_len(r.fd)?;
+        let want = u64::try_from(r.buf.len()).map_err(|_| invalid())?;
+        let end = r.offset.checked_add(want).ok_or_else(invalid)?;
+        if end > fsize {
+            return Err(invalid());
+        }
+        let count = i64::try_from(want).map_err(|_| invalid())?;
+        if want == 0 {
+            return Ok(0);
+        }
+        let ps = cached_page_size()?;
+        if ps > MMAP_WINDOW {
+            return Err(invalid());
+        }
+        let capacity = MMAP_WINDOW / ps * ps;
+        let mut offset = r.offset;
+        let mut remaining = &mut r.buf[..];
+        while !remaining.is_empty() {
+            let head = (offset % ps as u64) as usize;
+            let a_off = offset - head as u64;
+            let need = remaining.len().min(capacity - head);
+            let (dst, rest) = remaining.split_at_mut(need);
+            let w = Window::map(r.fd, a_off, head + need)?;
+            w.copy_out(dst, head);
+            drop(w);
+            offset += need as u64;
+            remaining = rest;
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn mmap_many(reqs: &mut [ReadReq]) -> Vec<i64> {
+    reqs.iter_mut()
+        .map(|r| match mmap_read::read_one(r) {
+            Ok(n) => n,
+            Err(e) => -(e.raw_os_error().unwrap_or(5) as i64),
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn mmap_many(reqs: &mut [ReadReq]) -> Vec<i64> {
+    pread_many(reqs)
+}
 /// Read a whole file through io_uring (open → size → one ring-backed exact read).
 /// For the small metadata files (`config.json`) and any full-file load; bulk
 /// tensor reads use a persistent [`Reactor`] instead of a per-call ring.
@@ -2204,13 +2331,15 @@ mod tests {
         pattern: &[u8],
         n: usize,
     ) -> std::io::Result<(std::fs::File, std::path::PathBuf, Vec<u8>)> {
-        let path = std::env::temp_dir().join(format!("peregrine_io_{}_{}", std::process::id(), n));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("peregrine_io_{}_{}_{}", std::process::id(), n, id));
         let mut data = Vec::new();
         while data.len() < n {
             data.extend_from_slice(pattern);
         }
         data.truncate(n);
-        let mut f = std::fs::File::create(&path)?;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
         f.write_all(&data)?;
         f.sync_all()?;
         let rf = std::fs::File::open(&path)?;
@@ -3136,6 +3265,193 @@ mod tests {
             direct.split_whitespace().count(),
             "COLI_IO_PROCFS lanes disagree: {ringed:?} vs {direct:?}"
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_matches_pread_unaligned_and_eof() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let ps = mmap_read::page_size()?;
+        let n = 3 * ps + 17;
+        let (f, path, data) = temp_file_with(b"mmap-oracle-payload", n)?;
+        let fd = f.as_raw_fd();
+        let cases = [
+            (0, 17), (1, ps - 1), ((ps - 6) as u64, 30),
+            ((2 * ps - 3) as u64, 33), (0, n), ((n - 1) as u64, 1),
+            (0, 0), (1, 0), (n as u64, 0), ((n - 13) as u64, 13),
+        ];
+        let mut want: Vec<Vec<u8>> = cases.iter().map(|&(_, l)| vec![0u8; l]).collect();
+        let mut got: Vec<Vec<u8>> = cases.iter().map(|&(_, l)| vec![0u8; l]).collect();
+        let rw = {
+            let mut reqs: Vec<ReadReq> = cases
+                .iter()
+                .zip(want.iter_mut())
+                .enumerate()
+                .map(|(k, (&(off, _), b))| ReadReq { fd, offset: off, buf: b.as_mut_slice(), tag: k as u64 })
+                .collect();
+            mmap_many(&mut reqs)
+        };
+        let rg = {
+            let mut reqs: Vec<ReadReq> = cases
+                .iter()
+                .zip(got.iter_mut())
+                .enumerate()
+                .map(|(k, (&(off, _), b))| ReadReq { fd, offset: off, buf: b.as_mut_slice(), tag: k as u64 })
+                .collect();
+            pread_many(&mut reqs)
+        };
+        assert_eq!(rw, rg, "mmap and pread must agree on every count");
+        assert_eq!(want, got, "mmap and pread must agree byte for byte");
+        for (k, &(off, len)) in cases.iter().enumerate() {
+            assert_eq!(rw[k], len as i64, "request {k} must read fully");
+            let o = off as usize;
+            assert_eq!(&want[k][..], &data[o..o + len], "request {k} bytes must match the file");
+        }
+        let mut empty: Vec<u8> = Vec::new();
+        let mut empty_reqs = [ReadReq { fd, offset: 0, buf: &mut empty, tag: 0 }];
+        assert_eq!(mmap_many(&mut empty_reqs)[0], 0, "zero-length read returns 0");
+        let mut past_eof = [ReadReq { fd, offset: n as u64, buf: &mut [0u8; 4][..], tag: 0 }];
+        assert_eq!(mmap_many(&mut past_eof), vec![-(libc::EINVAL as i64)]);
+        let mut empty_past_eof = [ReadReq { fd, offset: n as u64 + 1, buf: &mut [], tag: 0 }];
+        assert_eq!(mmap_many(&mut empty_past_eof), vec![-(libc::EINVAL as i64)]);
+        let mut straddle = [ReadReq { fd, offset: (n - 2) as u64, buf: &mut [0u8; 8][..], tag: 0 }];
+        assert_eq!(
+            mmap_many(&mut straddle)[0],
+            -(libc::EINVAL as i64),
+            "range past EOF must be refused, not silently truncated"
+        );
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_invalid_fd_and_nonregular_are_negative_errno() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let (r, w) = std::os::unix::net::UnixStream::pair()?;
+        let fd = r.as_raw_fd();
+        let mut buf = [0u8; 4];
+        let mut reqs = [ReadReq { fd, offset: 0, buf: &mut buf, tag: 0 }];
+        assert_eq!(
+            mmap_many(&mut reqs)[0],
+            -(libc::EINVAL as i64),
+            "mmap of a socket must be refused"
+        );
+        drop(w);
+        let mut bad = [ReadReq { fd: -1, offset: 0, buf: &mut buf, tag: 0 }];
+        assert_eq!(
+            mmap_many(&mut bad)[0],
+            -(libc::EBADF as i64),
+            "invalid fd must surface as -EBADF"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_failure_returns_errno_and_batch_continues() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let (f, path, data) = temp_file_with(b"mmap-failure", 127)?;
+        let write_only = std::fs::OpenOptions::new().write(true).open(&path)?;
+        let mut bad = [0u8; 4];
+        let mut good = [0u8; 4];
+        let mut reqs = [
+            ReadReq { fd: write_only.as_raw_fd(), offset: 0, buf: &mut bad, tag: 0 },
+            ReadReq { fd: f.as_raw_fd(), offset: 1, buf: &mut good, tag: 1 },
+            ReadReq { fd: -1, offset: 0, buf: &mut [], tag: 2 },
+        ];
+        assert_eq!(mmap_many(&mut reqs), vec![-(libc::EACCES as i64), 4, -(libc::EBADF as i64)]);
+        assert_eq!(&good, &data[1..5]);
+        assert_eq!(bad, [0; 4]);
+        assert!(mmap_many(&mut []).is_empty());
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mmap_parity_across_many_files_and_sizes() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let mut files: Vec<(std::fs::File, std::path::PathBuf, usize)> = Vec::new();
+        for n in [4001usize, 8192, 40 * 1024 * 1024] {
+            let (f, path, data) = temp_file_with(b"multi-file-parity-", n)?;
+            let fd = f.as_raw_fd();
+            let mut buf = vec![0u8; 128];
+            let mut reqs = vec![ReadReq { fd, offset: (n / 3) as u64, buf: &mut buf, tag: 0 }];
+            let got = mmap_many(&mut reqs);
+            assert_eq!(got, vec![128], "file sized {n}");
+            assert_eq!(&buf[..], &data[n / 3..n / 3 + 128], "file sized {n}");
+            files.push((f, path, n));
+        }
+        for (f, path, _) in files {
+            drop(f);
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mmap_multiwindow_chunked_request_matches_pread() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let n = (3 * MMAP_WINDOW + 1234567) / 8 * 8;
+        let (f, path, data) = temp_file_with(b"multiwindow-payload-", n)?;
+        let fd = f.as_raw_fd();
+        for (off, len) in [(0, MMAP_WINDOW), (1, MMAP_WINDOW + 1), (123, n - 123)] {
+            let mut got = vec![0u8; len];
+            let mut want = vec![0u8; len];
+            let res = mmap_many(&mut [ReadReq { fd, offset: off as u64, buf: &mut got, tag: 0 }]);
+            let expected = pread_many(&mut [ReadReq { fd, offset: off as u64, buf: &mut want, tag: 0 }]);
+            assert_eq!(res, expected);
+            assert_eq!(res, vec![len as i64]);
+            assert_eq!(got, want);
+            assert_eq!(got, data[off..off + len]);
+        }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mmap_repeated_different_files() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let (a, pa, da) = temp_file_with(b"first-file-", 3000)?;
+        let (b, pb, db) = temp_file_with(b"SECOND-FILE!", 3000)?;
+        for _ in 0..16 {
+            for (f, data) in [(&a, &da), (&b, &db)] {
+                let mut buf = vec![0u8; 100];
+                let mut reqs = [ReadReq { fd: f.as_raw_fd(), offset: 511, buf: &mut buf, tag: 0 }];
+                assert_eq!(mmap_many(&mut reqs), vec![100]);
+                assert_eq!(&buf[..], &data[511..611]);
+            }
+        }
+        drop(a);
+        drop(b);
+        for path in [&pa, &pb, &pa, &pb] {
+            let f = std::fs::File::open(path)?;
+            let data = std::fs::read(path)?;
+            let mut buf = [0u8; 100];
+            let mut reqs = [ReadReq { fd: f.as_raw_fd(), offset: 1, buf: &mut buf, tag: 0 }];
+            assert_eq!(mmap_many(&mut reqs), vec![100]);
+            assert_eq!(&buf[..], &data[1..101]);
+        }
+        std::fs::remove_file(pa)?;
+        std::fs::remove_file(pb)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_oversize_range_overflow_is_einval() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let (f, path, _) = temp_file_with(b"overflow-payload", 64)?;
+        let mut b0 = [0u8; 4];
+        let mut b1 = [0u8; 4];
+        let mut reqs = vec![
+            ReadReq { fd: f.as_raw_fd(), offset: u64::MAX, buf: &mut b0, tag: 0 },
+            ReadReq { fd: f.as_raw_fd(), offset: u64::MAX - 8, buf: &mut b1, tag: 1 },
+        ];
+        let res = mmap_many(&mut reqs);
+        assert_eq!(res, vec![-(libc::EINVAL as i64); 2], "checked range must refuse overflow");
+        std::fs::remove_file(&path)?;
         Ok(())
     }
 }

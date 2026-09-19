@@ -20,3 +20,9 @@ serde_json.workspace = true
 bytemuck = "1"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+
+[dev-dependencies]
+# Async bridge tests only: the model core stays sync by design (async cannot
+# parallelize CPU-bound math), and async callers (peregrine-serve) drive it
+# via spawn_blocking. Same major version as the serve crate's tokio.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

@@ -1062,6 +1062,7 @@ pub fn apply_layout_with(
             peregrine_core::Dtype::F16 => "F16",
             peregrine_core::Dtype::U8 => "U8",
             peregrine_core::Dtype::F8E4M3 => "F8_E4M3",
+            peregrine_core::Dtype::I64 => "I64",
         };
         let mut b = pack::Blob::new(t.name.clone(), dtype_str, t.shape.clone(), raw);
         b.compression = t.compression;

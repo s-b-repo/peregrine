@@ -581,3 +581,167 @@ fn build_tiny_gqa_family_inner(
     write_safetensors(dir, &blobs)?;
     Ok(())
 }
+
+/// The tiny Qwen3.8-Flash-Next (`qwen4_exp`) config: layer 0 GDN, layer 1 QSA
+/// full attention, PLE on layer 0, MoE with a shared expert — every mechanism
+/// at toy dims, one indexed layer exercising the indexer.
+pub(crate) fn tiny_qwen4_cfg_json() -> serde_json::Value {
+    serde_json::json!({
+        "model_type": "qwen4_exp_text", "hidden_size": 8, "vocab_size": 32,
+        "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1,
+        "head_dim": 4, "hc_count": 2, "hc_lowrank": 2,
+        "layer_types": ["linear_attention", "qwen_sparse_attention"],
+        "indexer_n_heads": 1, "indexer_kv_heads": 1, "indexer_head_dim": 4,
+        "indexer_budget": 2, "indexer_compress_ratio": 2,
+        "rope_parameters": {"rope_theta": 10000.0, "partial_rotary_factor": 0.5},
+        "ple_layer_ids": [1], "ple_embed_dim": 4, "ple_conv_kernel_size": 2,
+        "ngram_size": 2, "heads_per_ngram": 2, "ngram_vocab_size_base": 11,
+        "make_ngram_vocab_size_divisible_by": 8, "eos_token_id": 0, "seed": 1234,
+        "num_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 4,
+        "shared_expert_intermediate_size": 4, "norm_topk_prob": true,
+        "linear_num_key_heads": 1, "linear_num_value_heads": 2,
+        "linear_key_head_dim": 2, "linear_value_head_dim": 4,
+        "linear_conv_kernel_dim": 2, "output_gate_type": "sigmoid",
+        "rms_norm_eps": 1e-6
+    })
+}
+
+/// Write a tiny random `qwen4_exp` model into `dir`: the importer's container
+/// contract (trunk `model.`, per-expert expert tensors, one PLE table per PLE
+/// layer at per-head row width) at the tiny config's shapes.
+pub(crate) fn build_tiny_qwen4_model(dir: &Path, seed: u64) -> Result<(), Error> {
+    let cfg_json = tiny_qwen4_cfg_json();
+    let cfg: Cfg = Cfg::from_json(&cfg_json)?;
+    let q = cfg.qwen4.as_ref().ok_or_else(|| Error::Format("fixture: missing qwen4 config".into()))?;
+    let mut r = Lcg(seed);
+    let rnd = |n: usize, r: &mut Lcg| (0..n).map(|_| r.f()).collect::<Vec<f32>>();
+    let d = cfg.hidden as usize;
+    let hc = q.hc_count as usize;
+    let hcv = (d * q.hc_count as usize) as usize;
+    let (nh, nkv, hd) = (cfg.n_heads as usize, cfg.n_kv_heads as usize, cfg.head_dim as usize);
+    let (vhn, vd, kht, kdt) = (cfg.lin_v_heads as usize, cfg.lin_v_dim as usize, cfg.lin_k_heads as usize, cfg.lin_k_dim as usize);
+    let (e_n, mi, si) = (cfg.n_experts as usize, cfg.moe_inter as usize, (cfg.moe_inter * cfg.n_shared) as usize);
+    let vocab = cfg.vocab as usize;
+    let ngram_heads = (q.ple_layer_ids.len() > 0).then(|| ((q.ngram_size - 1) * q.heads_per_ngram) as usize).unwrap_or(0);
+    let ple_w = if ngram_heads > 0 { q.ple_embed_dim as usize / ngram_heads } else { 0 };
+
+    let mut blobs = Vec::new();
+    let w4 = |blobs: &mut Vec<Blob>, name: &str, o: usize, i: usize, r: &mut Lcg| {
+        let w = rnd(o * i, r);
+        let (q, s) = quant_i4(&w, o, i);
+        blobs.push(Blob::new(name.to_string(), "U8", vec![o as i64, (i.div_ceil(2)) as i64], q));
+        blobs.push(Blob::new(format!("{name}.qs"), "F32", vec![o as i64], f32_bytes(&s)));
+    };
+    let wf = |blobs: &mut Vec<Blob>, name: &str, n: usize, r: &mut Lcg| {
+        let v: Vec<f32> = (0..n).map(|_| r.f() * 0.1).collect();
+        blobs.push(Blob::new(name.to_string(), "F32", vec![n as i64], f32_bytes(&v)));
+    };
+    let hc_w = |blobs: &mut Vec<Blob>, name: &str, o: usize, i: usize, r: &mut Lcg| {
+        let w = rnd(o * i, r);
+        let (q, s) = quant_i8(&w, o, i);
+        blobs.push(Blob::new(name.to_string(), "U8", vec![o as i64, i as i64], q));
+        blobs.push(Blob::new(format!("{name}.qs"), "F32", vec![o as i64], f32_bytes(&s)));
+    };
+
+    let w = rnd(vocab * d, &mut r);
+    let (qv, sv) = quant_i8(&w, vocab, d);
+    blobs.push(Blob::new("model.embed_tokens.weight", "U8", vec![vocab as i64, d as i64], qv));
+    blobs.push(Blob::new("model.embed_tokens.weight.qs", "F32", vec![vocab as i64], f32_bytes(&sv)));
+    let w = rnd(vocab * d, &mut r);
+    let (qv, sv) = quant_i8(&w, vocab, d);
+    blobs.push(Blob::new("lm_head.weight", "U8", vec![vocab as i64, d as i64], qv));
+    blobs.push(Blob::new("lm_head.weight.qs", "F32", vec![vocab as i64], f32_bytes(&sv)));
+
+    let hc_mixer = |blobs: &mut Vec<Blob>, prefix: &str, combine: bool, r: &mut Lcg| {
+        wf(blobs, &format!("{prefix}.hc_norm.weight"), hcv, r);
+        hc_w(blobs, &format!("{prefix}.input_mix_weight_down.weight"), q.hc_lowrank as usize, hcv, r);
+        hc_w(blobs, &format!("{prefix}.input_mix_weight_up.weight"), hcv, q.hc_lowrank as usize, r);
+        if combine {
+            hc_w(blobs, &format!("{prefix}.block_inject_weight.weight"), hc, hcv, r);
+        }
+    };
+    hc_mixer(&mut blobs, "model.hyper_connection_mixer", false, &mut r);
+    for i in 0..cfg.n_layers as usize {
+        let p = |s: &str| format!("model.layers.{i}.{s}");
+        hc_mixer(&mut blobs, &p("attn_hyper_connection"), true, &mut r);
+        hc_mixer(&mut blobs, &p("mlp_hyper_connection"), true, &mut r);
+        if cfg.full_attn[i] {
+            w4(&mut blobs, &p("self_attn.q_proj.weight"), 2 * nh * hd, d, &mut r);
+            w4(&mut blobs, &p("self_attn.k_proj.weight"), nkv * hd, d, &mut r);
+            w4(&mut blobs, &p("self_attn.v_proj.weight"), nkv * hd, d, &mut r);
+            w4(&mut blobs, &p("self_attn.o_proj.weight"), d, nh * hd, &mut r);
+            wf(&mut blobs, &p("self_attn.q_norm.weight"), hd, &mut r);
+            wf(&mut blobs, &p("self_attn.k_norm.weight"), hd, &mut r);
+            let ix = q.qsa.as_ref().ok_or_else(|| Error::Format("fixture: missing qsa".into()))?;
+            hc_w(&mut blobs, &p("self_attn.indexer.index_qk_proj.weight"), ((ix.n_heads + 1) * ix.head_dim) as usize, d, &mut r);
+            wf(&mut blobs, &p("self_attn.indexer.q_layernorm.weight"), ix.head_dim as usize, &mut r);
+            wf(&mut blobs, &p("self_attn.indexer.k_layernorm.weight"), ix.head_dim as usize, &mut r);
+        } else {
+            let conv_dim = 2 * kht * kdt + vhn * vd;
+            w4(&mut blobs, &p("linear_attn.in_proj_qkv.weight"), conv_dim, d, &mut r);
+            w4(&mut blobs, &p("linear_attn.out_proj.weight"), d, vhn * vd, &mut r);
+            hc_w(&mut blobs, &p("linear_attn.in_proj_z.weight"), vhn * vd, d, &mut r);
+            hc_w(&mut blobs, &p("linear_attn.in_proj_a.weight"), vhn, d, &mut r);
+            hc_w(&mut blobs, &p("linear_attn.in_proj_b.weight"), vhn, d, &mut r);
+            let conv: Vec<f32> = (0..conv_dim * cfg.lin_conv_k as usize).map(|_| r.f() * 0.1).collect();
+            blobs.push(Blob::new(p("linear_attn.conv1d.weight"), "F32", vec![conv_dim as i64, 1, cfg.lin_conv_k], f32_bytes(&conv)));
+            let a_log: Vec<f32> = (0..vhn).map(|_| r.f() * 0.1 - 0.05).collect();
+            blobs.push(Blob::new(p("linear_attn.A_log"), "F32", vec![vhn as i64], f32_bytes(&a_log)));
+            let dt_bias: Vec<f32> = (0..vhn).map(|_| r.f() * 0.2 - 0.1).collect();
+            blobs.push(Blob::new(p("linear_attn.dt_bias"), "F32", vec![vhn as i64], f32_bytes(&dt_bias)));
+            wf(&mut blobs, &p("linear_attn.norm.weight"), vd, &mut r);
+        }
+        if q.ple_layer_ids.contains(&(i as i64 + 1)) {
+            let pp = |s: &str| format!("model.layers.{i}.ple.{s}");
+            let rows = crate::qwen4::NgramHash::new(&cfg, i as i64 + 1)?.padded_vocab as usize;
+            let w: Vec<f32> = (0..rows * ple_w).map(|_| r.f()).collect();
+            let (qb, sb) = quant_i8(&w, rows, ple_w);
+            let table = format!("model.layers.{i}.ple.ple_embedding.ngram_embedding.weight");
+            blobs.push(Blob::new(&table, "U8", vec![rows as i64, ple_w as i64], qb));
+            blobs.push(Blob::new(format!("{table}.qs"), "F32", vec![rows as i64], f32_bytes(&sb)));
+            hc_w(&mut blobs, &pp("key_proj.weight"), hcv, q.ple_embed_dim as usize, &mut r);
+            hc_w(&mut blobs, &pp("value_proj.weight"), d, q.ple_embed_dim as usize, &mut r);
+            wf(&mut blobs, &pp("norm_key.weight"), hcv, &mut r);
+            wf(&mut blobs, &pp("norm_query.weight"), hcv, &mut r);
+            wf(&mut blobs, &pp("norm_conv.weight"), hcv, &mut r);
+            let cv: Vec<f32> = (0..hcv * q.ple_conv_kernel_size as usize).map(|_| r.f() * 0.1).collect();
+            blobs.push(Blob::new(pp("conv1d.weight"), "F32", vec![hcv as i64, 1, q.ple_conv_kernel_size], f32_bytes(&cv)));
+        }
+        let rw = rnd(e_n * d, &mut r);
+        blobs.push(Blob::new(p("mlp.gate.weight"), "F32", vec![e_n as i64, d as i64], f32_bytes(&rw)));
+        hc_w(&mut blobs, &p("mlp.shared_expert_gate.weight"), 1, d, &mut r);
+        w4(&mut blobs, &p("mlp.shared_experts.gate_proj.weight"), si, d, &mut r);
+        w4(&mut blobs, &p("mlp.shared_experts.up_proj.weight"), si, d, &mut r);
+        w4(&mut blobs, &p("mlp.shared_experts.down_proj.weight"), d, si, &mut r);
+        for e in 0..e_n {
+            let pe = |s: &str| format!("model.layers.{i}.mlp.experts.{e}.{s}");
+            w4(&mut blobs, &pe("gate_proj.weight"), mi, d, &mut r);
+            w4(&mut blobs, &pe("up_proj.weight"), mi, d, &mut r);
+            w4(&mut blobs, &pe("down_proj.weight"), d, mi, &mut r);
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&cfg_json)?)?;
+    write_safetensors(dir, &blobs)?;
+    Ok(())
+}
+
+/// Compact bit-identity hash for parallel-oracle tests (FNV-1a over the
+/// little-endian bits): one `u64` per tensor for logs and cross-run anchors
+/// where a full comparison is verbose. Bit-level, not value-level (`-0.0` and
+/// `0.0` hash differently), deterministic across platforms for the same
+/// values. A hash-only check could in principle collide (2⁻⁶⁴); oracle tests
+/// pair it with an exact `to_bits` comparison, which remains the arbiter.
+///
+/// Shared here — rather than one copy per architecture family — so every
+/// family's parallel-oracle tests hash the same way.
+pub fn hash_f32_bits(values: &[f32]) -> u64 {
+    let mut h = 14695981039346656037u64;
+    for v in values {
+        for b in v.to_bits().to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+    }
+    h
+}

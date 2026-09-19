@@ -423,6 +423,7 @@ fn dtype_str(d: Dtype) -> &'static str {
         Dtype::F16 => "F16",
         Dtype::U8 => "U8",
         Dtype::F8E4M3 => "F8_E4M3",
+        Dtype::I64 => "I64",
     }
 }
 

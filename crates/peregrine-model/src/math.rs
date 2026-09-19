@@ -117,6 +117,22 @@ pub fn silu_mul(g: &mut [f32], u: &[f32]) {
     }
 }
 
+/// Row-batched [`silu_mul`] over `rows` rows of `width`: `g[r, :] =
+/// silu(g[r, :]) * u[r, :]`. Rows are independent (pure elementwise), so the
+/// pool split is bit-identical; only rows wide enough to cover the dispatch
+/// go parallel (same 256-wide rule as `rmsnorm_rows`), narrow shapes stay on
+/// the serial loop above.
+pub fn silu_mul_rows(g: &mut [f32], u: &[f32], rows: usize, width: usize) {
+    let gate = if width >= 256 { peregrine_par::PAR_ROWS_MIN } else { usize::MAX };
+    peregrine_par::par_chunks_mut(g, width, rows, gate, |start, end, g_chunk| {
+        for r in start..end {
+            let gr = &mut g_chunk[(r - start) * width..(r - start + 1) * width];
+            let ur = &u[r * width..(r + 1) * width];
+            silu_mul(gr, ur);
+        }
+    });
+}
+
 /// The inverse frequencies `theta^(-2j/qk)` for one RoPE lane count. They depend
 /// only on the config, so they are computed once and shared by every rotation
 /// instead of being re-derived with `powf` per head, per token, per layer.
@@ -250,6 +266,30 @@ mod tests {
         assert!((all_masked.iter().sum::<f32>() - 1.0).abs() < 1e-6, "uniform fallback sums to 1");
         // Empty rows are a no-op rather than a panic.
         softmax(&mut []);
+    }
+
+    #[test]
+    fn silu_mul_rows_matches_serial() {
+        // width 512 clears the 256-wide gate (pool splits rows); width 16 stays
+        // serial. Both must equal an independent elementwise oracle, exactly.
+        for &(rows, width) in &[(17usize, 512usize), (5usize, 16usize)] {
+            let g0: Vec<f32> =
+                (0..rows * width).map(|k| (((k * 13 + 1) as f32 * 0.05).sin()) * 3.0).collect();
+            let u: Vec<f32> =
+                (0..rows * width).map(|k| (((k * 7 + 5) as f32 * 0.03).cos()) * 3.0).collect();
+            let mut par = g0.clone();
+            silu_mul_rows(&mut par, &u, rows, width);
+            let want: Vec<f32> = g0.iter().zip(&u).map(|(&gi, &ui)| siluf(gi) * ui).collect();
+            assert!(
+                par.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "silu_mul_rows must be bit-identical (rows={rows}, width={width})"
+            );
+            assert_eq!(
+                crate::testkit::hash_f32_bits(&par),
+                crate::testkit::hash_f32_bits(&want),
+                "shared hash must agree on identical tensors"
+            );
+        }
     }
 
     #[test]

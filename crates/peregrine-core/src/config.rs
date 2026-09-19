@@ -38,12 +38,45 @@ pub enum Arch {
     /// hyper-connection residual streams (Sinkhorn-normalized mixing at every
     /// attention/FFN site) instead of a single residual stream.
     Glm5Next,
+    Qwen4Exp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen4OutputGate {
+    Sigmoid,
+    Silu,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4QsaCfg {
+    pub n_heads: i64,
+    pub head_dim: i64,
+    pub budget: i64,
+    pub compress_ratio: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4Cfg {
+    pub hc_count: i64,
+    pub hc_lowrank: i64,
+    pub output_gate: Qwen4OutputGate,
+    pub qsa: Option<Qwen4QsaCfg>,
+    pub ple_layer_ids: Vec<i64>,
+    pub ple_embed_dim: i64,
+    pub ple_conv_kernel_size: i64,
+    pub ngram_size: i64,
+    pub heads_per_ngram: i64,
+    pub ngram_vocab_size_base: i64,
+    pub ngram_vocab_divisor: i64,
+    pub seed: i64,
+    pub split_ngram_parts: i64,
 }
 
 /// Parsed `config.json`. Mirrors `Cfg` in `c/glm.c`.
 #[derive(Clone, Debug)]
 pub struct Cfg {
     pub arch: Arch,
+    pub qwen4: Option<Qwen4Cfg>,
     /// GQA: number of key/value heads (`num_key_value_heads`); equals `n_heads`
     /// under MLA (where every head shares the latent anyway — unused there).
     pub n_kv_heads: i64,
@@ -193,6 +226,9 @@ impl Cfg {
         // containers predate this field being read), but a *declared* type this
         // engine does not implement is a loud error, not a GLM-shaped guess.
         match root.get("model_type").and_then(|v| v.as_str()) {
+            Some("qwen4_exp" | "qwen4_exp_text") => {
+                return Cfg::from_json_qwen4(root.get("text_config").unwrap_or(root));
+            }
             // Hybrid families first: "qwen3_5"/"qwen3_next" (and the VL wrapper,
             // whose text stack lives under `text_config`) — checked before the
             // "qwen3" prefix would swallow them into the pure-dense path.
@@ -288,6 +324,7 @@ impl Cfg {
         };
 
         let mut c = Cfg {
+            qwen4: None,
             arch: Arch::GlmMla,
             n_kv_heads: gi(root, "num_attention_heads"),
             head_dim: 0,
@@ -343,6 +380,172 @@ impl Cfg {
         Ok(c)
     }
 
+    fn from_json_qwen4(root: &Value) -> Result<Cfg, Error> {
+        if !root.is_object() {
+            return Err(Error::Format("config: qwen4_exp text_config must be an object".into()));
+        }
+        let integer = |key: &str, default: i64, lo: i64, hi: i64| -> Result<i64, Error> {
+            let value = match root.get(key) {
+                None => default,
+                Some(v) => v.as_i64().ok_or_else(|| Error::Format(format!("config: {key} must be an integer")))?,
+            };
+            if !(lo..=hi).contains(&value) {
+                return Err(Error::Format(format!("config: {key}={value} is outside [{lo},{hi}]")));
+            }
+            Ok(value)
+        };
+        let boolean = |key: &str, default: bool| -> Result<bool, Error> {
+            match root.get(key) {
+                None => Ok(default),
+                Some(v) => v.as_bool().ok_or_else(|| Error::Format(format!("config: {key} must be boolean"))),
+            }
+        };
+        let hidden = integer("hidden_size", 2048, 1, 1 << 20)?;
+        let n_layers = integer("num_hidden_layers", 40, 1, 128)?;
+        let n_heads = integer("num_attention_heads", 16, 1, 1024)?;
+        let n_kv_heads = integer("num_key_value_heads", 2, 1, n_heads)?;
+        let head_dim = integer("head_dim", 256, 2, 1 << 16)?;
+        let n_experts = integer("num_experts", 512, 1, 4096)?;
+        let topk = integer("num_experts_per_tok", 10, 1, n_experts.min(64))?;
+        let moe_inter = integer("moe_intermediate_size", 512, 1, 1 << 20)?;
+        let shared_inter = integer("shared_expert_intermediate_size", 512, 1, 1 << 20)?;
+        let vocab = integer("vocab_size", 248320, 1, 1 << 24)?;
+        let hc_count = integer("hc_count", 4, 2, 16)?;
+        let hc_lowrank = integer("hc_lowrank", 320, 1, 1 << 20)?;
+        let interval = integer("full_attention_interval", 4, 1, 128)?;
+        let full_attn = match root.get("layer_types") {
+            None | Some(Value::Null) => (0..n_layers).map(|i| (i + 1) % interval == 0).collect(),
+            Some(Value::Array(types)) if types.len() == n_layers as usize => types.iter().enumerate().map(|(i, t)| {
+                match t.as_str() {
+                    Some("linear_attention") => Ok(false),
+                    Some("full_attention" | "qwen_sparse_attention") => Ok(true),
+                    _ => Err(Error::Format(format!("config: unsupported qwen4_exp layer_types[{i}]={t}"))),
+                }
+            }).collect::<Result<Vec<_>, _>>()?,
+            _ => return Err(Error::Format("config: layer_types must match num_hidden_layers".into())),
+        };
+        let hidden_act = root.get("hidden_act").and_then(Value::as_str).unwrap_or("silu");
+        if hidden_act != "silu" || root.get("hidden_act").is_some_and(|v| !v.is_string()) {
+            return Err(Error::Format("config: qwen4_exp requires hidden_act=silu".into()));
+        }
+        let output_gate = match root.get("output_gate_type") {
+            None | Some(Value::Null) => Qwen4OutputGate::Silu,
+            Some(Value::String(s)) if s == "sigmoid" => Qwen4OutputGate::Sigmoid,
+            Some(Value::String(s)) if s == "silu" => Qwen4OutputGate::Silu,
+            _ => return Err(Error::Format("config: output_gate_type must be sigmoid or silu".into())),
+        };
+        if boolean("attention_bias", false)? || boolean("tie_word_embeddings", false)? {
+            return Err(Error::Format("config: qwen4_exp attention bias and tied embeddings are not implemented".into()));
+        }
+        let rp = root.get("rope_parameters");
+        if rp.is_some_and(|v| !v.is_object() && !v.is_null()) {
+            return Err(Error::Format("config: rope_parameters must be an object".into()));
+        }
+        if rp.and_then(|v| v.get("rope_type")).is_some_and(|v| v.as_str() != Some("default")) {
+            return Err(Error::Format("config: qwen4_exp only default text RoPE is implemented".into()));
+        }
+        let positive = |value: Option<&Value>, default: f64, key: &str| -> Result<f32, Error> {
+            let f = match value {
+                None => default,
+                Some(v) => v.as_f64().ok_or_else(|| Error::Format(format!("config: {key} must be numeric")))?,
+            } as f32;
+            if !f.is_finite() || f <= 0.0 {
+                return Err(Error::Format(format!("config: {key} must be positive and finite")));
+            }
+            Ok(f)
+        };
+        let theta = positive(rp.and_then(|v| v.get("rope_theta")).or_else(|| root.get("rope_theta")), 10000.0, "rope_theta")?;
+        let partial = positive(rp.and_then(|v| v.get("partial_rotary_factor")).or_else(|| root.get("partial_rotary_factor")), 1.0, "partial_rotary_factor")?;
+        let rotary_dim = (head_dim as f64 * partial as f64) as i64;
+        if partial > 1.0 || rotary_dim < 2 || rotary_dim % 2 != 0 {
+            return Err(Error::Format("config: qwen4_exp rotary span must be even and in [2,head_dim]".into()));
+        }
+        let qsa_keys = ["indexer_n_heads", "indexer_kv_heads", "indexer_head_dim", "indexer_budget", "indexer_compress_ratio"];
+        let qsa = if qsa_keys.iter().any(|k| root.get(k).is_some_and(|v| !v.is_null())) {
+            if qsa_keys.iter().any(|k| root.get(k).is_none_or(Value::is_null)) {
+                return Err(Error::Format("config: QSA requires all five indexer fields".into()));
+            }
+            let qsa = Qwen4QsaCfg {
+                n_heads: integer("indexer_n_heads", 0, 1, 1024)?,
+                head_dim: integer("indexer_head_dim", 0, 2, 1 << 16)?,
+                budget: integer("indexer_budget", 0, 1, 1 << 20)?,
+                compress_ratio: integer("indexer_compress_ratio", 0, 1, 1024)?,
+            };
+            integer("indexer_kv_heads", 0, 1, 1)?;
+            if qsa.budget % qsa.compress_ratio != 0 || rotary_dim > qsa.head_dim {
+                return Err(Error::Format("config: QSA budget must divide into complete blocks and RoPE must fit its head".into()));
+            }
+            Some(qsa)
+        } else {
+            None
+        };
+        if full_attn.iter().any(|&v| v) && qsa.is_none() {
+            return Err(Error::Format("config: qwen4_exp sparse attention requires QSA indexer fields".into()));
+        }
+        let mut stop_ids = Vec::new();
+        let eos = match root.get("eos_token_id") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(a)) => a.iter().collect(),
+            Some(v) => vec![v],
+        };
+        for v in eos {
+            let id = v.as_i64().filter(|&id| id >= 0 && id < vocab)
+                .ok_or_else(|| Error::Format("config: eos_token_id must be an integer in the vocabulary".into()))?;
+            stop_ids.push(id as i32);
+        }
+        let mut ple_layer_ids = match root.get("ple_layer_ids") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(a)) => a.iter().map(|v| v.as_i64().filter(|&id| id >= 1 && id <= n_layers)
+                .ok_or_else(|| Error::Format("config: ple_layer_ids must contain one-indexed decoder layer ids".into())))
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err(Error::Format("config: ple_layer_ids must be an array".into())),
+        };
+        ple_layer_ids.sort_unstable();
+        ple_layer_ids.dedup();
+        let ple_embed_dim = if root.get("ple_embed_dim").is_some_and(Value::is_null) { hidden } else { integer("ple_embed_dim", hidden, 1, 1 << 20)? };
+        let ngram_size = integer("ngram_size", 3, 2, 32)?;
+        let heads_per_ngram = integer("heads_per_ngram", 8, 1, 256)?;
+        if !ple_layer_ids.is_empty() && (stop_ids.is_empty()
+            || ple_embed_dim % ((ngram_size - 1) * heads_per_ngram) != 0
+            || ple_layer_ids.iter().any(|&id| full_attn[(id - 1) as usize])) {
+            return Err(Error::Format("config: PLE requires EOS, divisible embedding heads, and linear-only layer ids".into()));
+        }
+        let qwen4 = Qwen4Cfg {
+            hc_count, hc_lowrank, output_gate, qsa, ple_layer_ids, ple_embed_dim,
+            ple_conv_kernel_size: integer("ple_conv_kernel_size", 4, 1, 64)?,
+            ngram_size, heads_per_ngram,
+            ngram_vocab_size_base: integer("ngram_vocab_size_base", 20_000_000, 2, 1 << 31)?,
+            ngram_vocab_divisor: integer("make_ngram_vocab_size_divisible_by", 128, 1, 1 << 20)?,
+            seed: integer("seed", 1234, i64::MIN, i64::MAX)?,
+            split_ngram_parts: integer("split_ngram_parts", 512, 1, 1 << 20)?,
+        };
+        let c = Cfg {
+            arch: Arch::Qwen4Exp,
+            qwen4: Some(qwen4),
+            n_kv_heads, head_dim, full_attn, attn_gate: true,
+            lin_k_heads: integer("linear_num_key_heads", 16, 1, 1024)?,
+            lin_v_heads: integer("linear_num_value_heads", 32, 1, 4096)?,
+            lin_k_dim: integer("linear_key_head_dim", 128, 1, 1 << 16)?,
+            lin_v_dim: integer("linear_value_head_dim", 128, 1, 1 << 16)?,
+            lin_conv_k: integer("linear_conv_kernel_dim", 4, 1, 64)?,
+            lin_gate_lb: None,
+            hidden, n_layers, n_heads, n_experts, topk, moe_inter,
+            dense_inter: shared_inter, first_dense: 0,
+            q_lora: 0, kv_lora: 0, qk_nope: head_dim - rotary_dim, qk_rope: rotary_dim,
+            v_head: head_dim, n_shared: 1, vocab, n_group: 1, topk_group: 1,
+            norm_topk: boolean("norm_topk_prob", true)?,
+            eps: positive(root.get("rms_norm_eps"), 1e-6, "rms_norm_eps")?,
+            routed_scale: 1.0, theta, stop_ids,
+            index_topk: 0, index_nh: 0, index_hd: 0, idx_type: Vec::new(),
+            index_kpool: 0, index_kpool_tail: false, swiglu_limit: 0.0,
+            hc_mult: 0, hc_eps: 0.0, hc_sinkhorn: 0,
+            qk_head: head_dim, attn_scale: 1.0 / (head_dim as f32).sqrt(),
+        };
+        c.validate_gqa()?;
+        c.validate_hybrid()?;
+        Ok(c)
+    }
+
     /// Parse a Qwen3-family dense-GQA config. The MoE/MLA fields are filled
     /// with the degenerate values that keep every existing invariant true —
     /// `first_dense = n_layers` means no layer ever takes the sparse path, so
@@ -388,6 +591,7 @@ impl Cfg {
         };
         let dense_inter = gi(root, "intermediate_size");
         let c = Cfg {
+            qwen4: None,
             arch: Arch::DenseGqa,
             n_kv_heads,
             head_dim,
@@ -649,6 +853,7 @@ impl Cfg {
         let qk_rope = gi(root, "qk_rope_head_dim");
         let n_heads = gi(root, "num_attention_heads");
         let mut c = Cfg {
+            qwen4: None,
             arch: Arch::Glm5Next,
             n_kv_heads: match gi(root, "num_key_value_heads") {
                 0 => n_heads,
@@ -872,7 +1077,7 @@ impl Cfg {
     pub fn kv_row_a(&self) -> i64 {
         match self.arch {
             Arch::GlmMla | Arch::Glm5Next => self.kv_lora,
-            Arch::DenseGqa | Arch::HybridGdn => self.n_kv_heads * self.head_dim,
+            Arch::DenseGqa | Arch::HybridGdn | Arch::Qwen4Exp => self.n_kv_heads * self.head_dim,
         }
     }
 
@@ -883,7 +1088,7 @@ impl Cfg {
             // Glm5Next is NoPE (qk_rope = 0): its second slot is legitimately
             // zero-width — LayerKv is width-parameterized and appends empty rows.
             Arch::GlmMla | Arch::Glm5Next => self.qk_rope,
-            Arch::DenseGqa | Arch::HybridGdn => self.n_kv_heads * self.head_dim,
+            Arch::DenseGqa | Arch::HybridGdn | Arch::Qwen4Exp => self.n_kv_heads * self.head_dim,
         }
     }
 
@@ -982,6 +1187,121 @@ mod tests {
             "rms_norm_eps": 1e-5,
             "eos_token_id": [1, 2, 3]
         })
+    }
+
+    fn qwen4_json() -> Result<Value, Error> {
+        serde_json::from_str(concat!(
+            r#"{"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","#,
+            r#""hidden_size":2560,"vocab_size":248320,"num_hidden_layers":48,"#,
+            r#""num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"#,
+            r#""num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"#,
+            r#""shared_expert_intermediate_size":640,"linear_num_key_heads":16,"#,
+            r#""linear_num_value_heads":48,"linear_key_head_dim":128,"#,
+            r#""linear_value_head_dim":128,"linear_conv_kernel_dim":4,"#,
+            r#""output_gate_type":"sigmoid","hc_count":4,"hc_lowrank":320,"#,
+            r#""ple_layer_ids":[2],"ple_embed_dim":2560,"heads_per_ngram":8,"#,
+            r#""ngram_size":3,"ngram_vocab_size_base":20000000,"#,
+            r#""make_ngram_vocab_size_divisible_by":128,"split_ngram_parts":128,"#,
+            r#""ple_conv_kernel_size":4,"eos_token_id":248044,"indexer_n_heads":4,"#,
+            r#""indexer_kv_heads":1,"indexer_head_dim":128,"indexer_budget":2048,"#,
+            r#""indexer_compress_ratio":4,"#,
+            r#""rope_parameters":{"rope_type":"default","rope_theta":10000000,"#,
+            r#""partial_rotary_factor":0.25,"mrope_interleaved":true,"#,
+            r#""mrope_section":[11,11,10]}}}"#
+        )).map_err(|e| Error::Format(format!("fixture: {e}")))
+    }
+
+    #[test]
+    fn qwen4_official_geometry_is_distinct_and_preserved() -> Result<(), Error> {
+        let c = Cfg::from_json(&qwen4_json()?)?;
+        let q = c.qwen4.as_ref().ok_or_else(|| Error::Format("missing Qwen4 config".into()))?;
+        assert_eq!(c.arch, Arch::Qwen4Exp);
+        assert_eq!((c.hidden, c.n_layers, c.n_heads, c.n_kv_heads, c.head_dim), (2560, 48, 24, 2, 256));
+        assert_eq!((c.n_experts, c.topk, c.moe_inter, c.dense_inter), (512, 10, 640, 640));
+        assert_eq!((c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim), (16, 48, 128, 128));
+        assert_eq!((c.hc_mult, c.index_topk, c.first_dense), (0, 0, 0));
+        assert_eq!((c.qk_rope, c.kv_row_a(), c.kv_row_b()), (64, 512, 512));
+        assert_eq!(c.full_attn, (0..48).map(|i| i % 4 == 3).collect::<Vec<_>>());
+        assert_eq!((q.hc_count, q.hc_lowrank), (4, 320));
+        assert_eq!(q.output_gate, Qwen4OutputGate::Sigmoid);
+        assert_eq!(q.ple_layer_ids, [2]);
+        assert_eq!(q.seed, 1234);
+        assert_eq!(q.split_ngram_parts, 128);
+        assert_eq!(q.qsa, Some(Qwen4QsaCfg { n_heads: 4, head_dim: 128, budget: 2048, compress_ratio: 4 }));
+        assert!(c.attn_gate && c.norm_topk);
+        assert_eq!(c.stop_ids, [248044]);
+        let flat = Cfg::from_json(&qwen4_json()?["text_config"])?;
+        assert_eq!(flat.qwen4, c.qwen4);
+        assert_eq!(flat.arch, c.arch);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen4_alias_schedule_defaults_and_shared_width() -> Result<(), Error> {
+        let mut j = qwen4_json()?["text_config"].clone();
+        j["num_hidden_layers"] = serde_json::json!(4);
+        j["layer_types"] = serde_json::json!(["linear_attention", "linear_attention", "linear_attention", "full_attention"]);
+        j["output_gate_type"] = Value::Null;
+        j["ple_layer_ids"] = serde_json::json!([2, 1, 2]);
+        j["ple_embed_dim"] = Value::Null;
+        j["shared_expert_intermediate_size"] = serde_json::json!(1024);
+        let c = Cfg::from_json(&j)?;
+        let q = c.qwen4.as_ref().ok_or_else(|| Error::Format("missing Qwen4 config".into()))?;
+        assert_eq!(q.output_gate, Qwen4OutputGate::Silu);
+        assert_eq!(q.ple_layer_ids, [1, 2]);
+        assert_eq!(q.ple_embed_dim, c.hidden);
+        assert_eq!((c.moe_inter, c.dense_inter), (640, 1024));
+        j["layer_types"][3] = serde_json::json!("qwen_sparse_attention");
+        assert_eq!(Cfg::from_json(&j)?.full_attn, c.full_attn);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen4_rejects_malformed_or_unsupported_geometry() -> Result<(), Error> {
+        for (key, value) in [
+            ("num_hidden_layers", serde_json::json!(i64::MAX)),
+            ("num_hidden_layers", serde_json::json!(2.5)),
+            ("num_attention_heads", serde_json::json!(0)),
+            ("num_key_value_heads", serde_json::json!(5)),
+            ("num_experts_per_tok", serde_json::json!(513)),
+            ("num_experts", serde_json::json!(0)),
+            ("linear_num_value_heads", serde_json::json!(47)),
+            ("linear_conv_kernel_dim", serde_json::json!(0)),
+            ("hc_count", serde_json::json!(1)),
+            ("hc_lowrank", serde_json::json!(0)),
+            ("indexer_budget", serde_json::json!(7)),
+            ("indexer_kv_heads", serde_json::json!(2)),
+            ("indexer_head_dim", serde_json::json!(32)),
+            ("indexer_n_heads", Value::Null),
+            ("ple_layer_ids", serde_json::json!([0])),
+            ("ple_layer_ids", serde_json::json!([49])),
+            ("ple_layer_ids", serde_json::json!([4])),
+            ("ple_embed_dim", serde_json::json!(15)),
+            ("ngram_size", serde_json::json!(1)),
+            ("eos_token_id", serde_json::json!([])),
+            ("eos_token_id", serde_json::json!(248320)),
+            ("output_gate_type", serde_json::json!("relu")),
+            ("hidden_act", serde_json::json!("gelu")),
+            ("attention_bias", serde_json::json!(true)),
+            ("norm_topk_prob", serde_json::json!(1)),
+            ("tie_word_embeddings", serde_json::json!(true)),
+            ("rms_norm_eps", serde_json::json!(1e100)),
+            ("full_attention_interval", serde_json::json!(0)),
+            ("layer_types", serde_json::json!(["linear_attention"])),
+            ("rope_parameters", serde_json::json!({"rope_type": "yarn"})),
+            ("rope_parameters", serde_json::json!({"partial_rotary_factor": 0.014})),
+            ("rope_parameters", serde_json::json!({"rope_theta": 1e100})),
+        ] {
+            let mut j = qwen4_json()?;
+            j["text_config"][key] = value;
+            assert!(Cfg::from_json(&j).is_err(), "accepted invalid {key}");
+        }
+        let mut j = qwen4_json()?;
+        j["text_config"] = Value::Null;
+        assert!(Cfg::from_json(&j).is_err());
+        j["model_type"] = serde_json::json!("qwen4_exp_unknown");
+        assert!(Cfg::from_json(&j).is_err());
+        Ok(())
     }
 
     #[test]

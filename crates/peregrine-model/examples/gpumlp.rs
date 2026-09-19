@@ -58,7 +58,7 @@ fn main() {
         let gf: Vec<f32> = (0..inter * hidden).map(|_| rnd() * 0.1).collect();
         let uf: Vec<f32> = (0..inter * hidden).map(|_| rnd() * 0.1).collect();
         let df: Vec<f32> = (0..hidden * inter).map(|_| rnd() * 0.1).collect();
-        let mlp = Mlp { gate: w4(&gf, inter, hidden), up: w4(&uf, inter, hidden), down: w4(&df, hidden, inter) };
+        let mlp = Mlp { gate: w4(&gf, inter, hidden), up: w4(&uf, inter, hidden), down: w4(&df, hidden, inter), limit: 0.0 };
         drop((gf, uf, df));
         let x: Vec<f32> = (0..s_n * hidden).map(|_| rnd()).collect();
 

@@ -681,7 +681,7 @@ fn complete_short_read(r: Option<&mut Reactor>, fd: RawFd, off: u64, buf: &mut [
 /// - **pread** — `COLI_IO_ENGINE=pread`: N OS threads of blocking `pread`,
 ///   bypassing io_uring entirely. See [`io_engine`] for why this exists.
 fn read_regions(mut r: Option<&mut Reactor>, regions: &[(RawFd, u64, usize)], direct: bool) -> Result<Vec<Bytes>, Error> {
-    if direct && io_engine() != IoEngine::Pread {
+    if direct && engine_supports_direct() {
         return need_ring(r.as_deref_mut())?
             .read_direct_aligned(regions)
             .ctx(|| "io_uring O_DIRECT zero-copy expert read".to_string());
@@ -723,6 +723,7 @@ fn read_regions(mut r: Option<&mut Reactor>, regions: &[(RawFd, u64, usize)], di
         // positioned read may return short on either path.
         let res = match io_engine() {
             IoEngine::Pread => peregrine_io::pread_many_threaded(&mut reqs, pread_threads()),
+            IoEngine::Mmap => peregrine_io::mmap_many(&mut reqs),
             IoEngine::RegBuf => {
                 // Registered buffers must exist before the first read. Sizing
                 // them needs the largest region in the batch, which is only
@@ -777,6 +778,7 @@ enum IoEngine {
     Uring,
     /// N threads of blocking `pread`.
     Pread,
+    Mmap,
     /// io_uring through pre-registered fixed buffers (`IORING_OP_READ_FIXED`).
     RegBuf,
 }
@@ -853,7 +855,7 @@ fn uring_available() -> bool {
 /// `load_streaming` asks before constructing any, so the `pread` engine costs no
 /// ring — and, more importantly, cannot fail to load on a host that has none.
 pub(crate) fn engine_needs_rings() -> bool {
-    !matches!(io_engine(), IoEngine::Pread)
+    matches!(io_engine(), IoEngine::Uring | IoEngine::RegBuf)
 }
 
 /// Can the resolved engine issue O_DIRECT reads?
@@ -865,13 +867,25 @@ pub(crate) fn engine_needs_rings() -> bool {
 /// its own predicate rather than folded into [`engine_needs_rings`] because the
 /// two happen to agree today for different reasons.
 pub(crate) fn engine_supports_direct() -> bool {
-    !matches!(io_engine(), IoEngine::Pread)
+    matches!(io_engine(), IoEngine::Uring | IoEngine::RegBuf)
+}
+
+pub(crate) fn engine_name() -> &'static str {
+    match io_engine() {
+        IoEngine::Uring => "uring",
+        IoEngine::Pread => "pread",
+        IoEngine::Mmap => "mmap",
+        IoEngine::RegBuf => "regbuf",
+    }
 }
 
 fn io_engine() -> IoEngine {
     static V: std::sync::OnceLock<IoEngine> = std::sync::OnceLock::new();
     *V.get_or_init(|| match std::env::var("COLI_IO_ENGINE").as_deref() {
         Ok("pread") => IoEngine::Pread,
+        Ok("mmap") => {
+            if cfg!(target_os = "linux") { IoEngine::Mmap } else { IoEngine::Pread }
+        }
         Ok("regbuf") => IoEngine::RegBuf,
         // Historical spelling: `COLI_REGBUF=1` was documented and benchmarked
         // for a year while being read by no code at all. Honour it here so the
@@ -1484,7 +1498,15 @@ pub fn moe_forward_concurrent(
     // `moe_inter` is no longer read here: the expert map (or `plans_for`'s
     // fallback) owns the tensor shapes now.
     let (e_n, k) = (cfg.n_experts as usize, cfg.topk as usize);
-    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale, min_share: crate::router::route_min_share() });
+    let mut r = if cfg.arch == peregrine_core::Arch::Qwen4Exp {
+        crate::qwen4::route(x, router_w, cfg)?
+    } else {
+        route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale, min_share: crate::router::route_min_share() })
+    };
+    if cfg.arch != peregrine_core::Arch::Qwen4Exp {
+        crate::router::apply_route_topp(&mut r, s_n, crate::router::route_topp(), cfg.norm_topk, cfg.routed_scale);
+        crate::router::apply_expert_budget(&mut r, s_n, crate::router::expert_budget(), cfg.norm_topk, cfg.routed_scale);
+    }
 
     // Partition the batch-union into GPU-resident (compute on device) and disk
     // (stream + CPU) experts, assigning each a global `pos` in batch-union order

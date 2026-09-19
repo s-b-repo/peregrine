@@ -8,6 +8,17 @@
 
 use crate::draftdist::DraftDist;
 
+pub(crate) fn ensure_finite_rows(values: &[f32], width: usize, context: &str) -> Result<(), peregrine_core::Error> {
+    if let Some((index, value)) = values.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(peregrine_core::Error::Format(format!(
+            "nonfinite {context} at row {}, column {}: {value}",
+            index / width.max(1),
+            index % width.max(1),
+        )));
+    }
+    Ok(())
+}
+
 /// The C engine's default xorshift64 seed. Also the substitute for a caller
 /// seed of 0, which xorshift64 maps to itself forever (a dead RNG stream).
 const DEFAULT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -487,6 +498,39 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_row_validation_rejects_nan_and_both_infinities() -> Result<(), peregrine_core::Error> {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let values = [1.0, 2.0, 3.0, value];
+            let error = ensure_finite_rows(&values, 2, "final inference logits")
+                .err()
+                .ok_or_else(|| peregrine_core::Error::Format("accepted nonfinite row".into()))?;
+            assert!(error.to_string().contains("nonfinite final inference logits at row 1, column 1"));
+            assert_eq!(values[3].to_bits(), value.to_bits());
+        }
+        assert!(ensure_finite_rows(&[f32::NAN; 4], 2, "logits").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn finite_row_validation_preserves_extremes_zeros_and_sampling() -> Result<(), peregrine_core::Error> {
+        let values = [f32::MIN, -0.0, 0.0, f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)];
+        let bits = values.map(f32::to_bits);
+        ensure_finite_rows(&values, 3, "logits")?;
+        ensure_finite_rows(&[], 3, "logits")?;
+        assert_eq!(values.map(f32::to_bits), bits);
+        let logits = [-8.0, 0.0, 2.0, 2.0];
+        for temp in [0.0, 0.8] {
+            let mut checked = Sampler::new(temp, 0.9, 42);
+            let mut unchecked = Sampler::new(temp, 0.9, 42);
+            for _ in 0..32 {
+                ensure_finite_rows(&logits, 4, "logits")?;
+                assert_eq!(checked.pick(&logits, -1), unchecked.pick(&logits, -1));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn argmax_lowest_index_wins_ties() {

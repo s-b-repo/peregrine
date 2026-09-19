@@ -64,6 +64,7 @@ pub struct GdnSnapshot {
     filled: usize,
     s: Vec<f32>,
     len: usize,
+    ple: Option<crate::qwen4::PleState>,
 }
 
 impl GdnSnapshot {
@@ -72,7 +73,7 @@ impl GdnSnapshot {
     /// recurrent speculation pays is this copy against the tokens it buys, and
     /// a cost nobody can see is a cost nobody tunes.
     pub fn bytes(&self) -> usize {
-        (self.ring.len() + self.s.len()) * 4
+        (self.ring.len() + self.s.len()) * 4 + self.ple.as_ref().map_or(0, |p| p.bytes())
     }
 }
 
@@ -90,6 +91,7 @@ pub struct GdnState {
     s: Vec<f32>,
     /// Positions processed — the GDN analogue of `LayerKv::len`.
     pub len: usize,
+    pub(crate) ple: Option<crate::qwen4::PleState>,
 }
 
 impl GdnState {
@@ -101,19 +103,20 @@ impl GdnState {
             filled: 0,
             s: vec![0.0; (c.lin_v_heads * c.lin_k_dim * c.lin_v_dim) as usize],
             len: 0,
+            ple: None,
         }
     }
 
     /// Bytes this state holds — the linear layers' answer to `LayerKv::bytes`.
     pub fn bytes(&self) -> usize {
-        (self.ring.len() + self.s.len()) * 4
+        (self.ring.len() + self.s.len()) * 4 + self.ple.as_ref().map_or(0, |p| p.bytes())
     }
 
     /// A fresh (empty-context) state with `like`'s geometry — the safe
     /// fallback when a caller needs a state slot but cannot legally clone one
     /// mid-sequence (see `SeqKv::clone_prefix`).
     pub fn new_like(like: &GdnState) -> GdnState {
-        GdnState { ring: vec![0.0; like.ring.len()], filled: 0, s: vec![0.0; like.s.len()], len: 0 }
+        GdnState { ring: vec![0.0; like.ring.len()], filled: 0, s: vec![0.0; like.s.len()], len: 0, ple: None }
     }
 
     /// A point-in-time copy of the whole recurrent context. Speculative decode
@@ -126,7 +129,7 @@ impl GdnState {
     /// the accepted rows. ~3.1 MB per layer at 27B dims — one snapshot per
     /// sequence per verify step, never one per draft position.
     pub fn snapshot(&self) -> GdnSnapshot {
-        GdnSnapshot { ring: self.ring.clone(), filled: self.filled, s: self.s.clone(), len: self.len }
+        GdnSnapshot { ring: self.ring.clone(), filled: self.filled, s: self.s.clone(), len: self.len, ple: self.ple.clone() }
     }
 
     /// Restore a snapshot taken from this layer's own stream. Geometry is
@@ -146,6 +149,7 @@ impl GdnState {
         self.filled = snap.filled;
         self.s.copy_from_slice(&snap.s);
         self.len = snap.len;
+        self.ple = snap.ple.clone();
         Ok(())
     }
 
@@ -155,6 +159,7 @@ impl GdnState {
         self.filled = 0;
         self.s.fill(0.0);
         self.len = 0;
+        self.ple = None;
     }
 }
 
@@ -245,7 +250,6 @@ pub fn gdn_forward(
     let vd = c.lin_v_dim as usize;
     let taps = (c.lin_conv_k as usize).max(1);
     let conv_dim = 2 * kh * kd + vh * vd;
-    let group = vh / kh.max(1);
     if w.conv.len() != conv_dim * taps {
         return Err(Error::Format(format!(
             "gdn: conv1d holds {} taps, expected {} ({} channels x {} taps)",
@@ -260,7 +264,27 @@ pub fn gdn_forward(
     let z_all = w.in_z.apply_vec(x, s_n); // [s_n, vh*vd]
     let a_all = w.in_a.apply_vec(x, s_n); // [s_n, vh]
     let b_all = w.in_b.apply_vec(x, s_n); // [s_n, vh]
+    gdn_forward_projected(w, &qkv_pre, &z_all, &a_all, &b_all, state, c)
+}
 
+pub(crate) fn gdn_forward_projected(
+    w: &GdnWeights,
+    qkv_pre: &[f32],
+    z_all: &[f32],
+    a_all: &[f32],
+    b_all: &[f32],
+    state: &mut GdnState,
+    c: &Cfg,
+) -> Result<Vec<f32>, Error> {
+    let (kh, vh, kd, vd) = (c.lin_k_heads as usize, c.lin_v_heads as usize, c.lin_k_dim as usize, c.lin_v_dim as usize);
+    let taps = c.lin_conv_k as usize;
+    let conv_dim = 2 * kh * kd + vh * vd;
+    let group = vh / kh;
+    let s_n = a_all.len() / vh;
+    if qkv_pre.len() != s_n * conv_dim || z_all.len() != s_n * vh * vd || b_all.len() != s_n * vh
+        || w.conv.len() != conv_dim * taps {
+        return Err(Error::Format("gdn: projected input geometry mismatch".into()));
+    }
     let mut y = vec![0.0f32; s_n * (c.hidden as usize)];
     let mut mixed = vec![0.0f32; conv_dim];
     let mut head_out = vec![0.0f32; vd];
@@ -322,7 +346,11 @@ pub fn gdn_forward(
             let inv = 1.0 / (ms + c.eps).sqrt();
             let z = &z_all[t * vh * vd + h * vd..t * vh * vd + (h + 1) * vd];
             for j in 0..vd {
-                gated[h * vd + j] = head_out[j] * inv * w.norm[j] * siluf(z[j]);
+                let gate = match c.qwen4.as_ref().map(|q| q.output_gate) {
+                    Some(peregrine_core::config::Qwen4OutputGate::Sigmoid) => sigmoidf(z[j]),
+                    _ => siluf(z[j]),
+                };
+                gated[h * vd + j] = head_out[j] * inv * w.norm[j] * gate;
             }
         }
         state.len += 1;

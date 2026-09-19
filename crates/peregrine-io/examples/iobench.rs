@@ -45,13 +45,25 @@ fn main() {
     let rings: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(4);
     let direct: bool = a.get(5).map(|s| s != "0").unwrap_or(true);
     let engine: String = a.get(6).cloned().unwrap_or_else(|| "uring".into());
+    if !matches!(engine.as_str(), "uring" | "pread" | "mmap" | "regbuf") {
+        eprintln!("unknown engine {engine:?}; expected uring, pread, mmap, or regbuf");
+        std::process::exit(2);
+    }
+    if blk_mb == 0 || iters == 0 || rings == 0 {
+        eprintln!("block size, iterations, and rings must be positive");
+        std::process::exit(2);
+    }
     // One pass is not a measurement on a contended box. See the header.
     let reps: usize = a
         .get(7)
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(5);
-    let blk = blk_mb * 1024 * 1024;
+    let blk = blk_mb
+        .checked_mul(1024 * 1024)
+        .expect("block size overflow");
+    let read_count = rings.checked_mul(iters).expect("read count overflow");
+    read_count.checked_mul(blk).expect("working set overflow");
 
     // Offsets are `(r * iters + i) * blk % flen`, so a working set larger than the
     // file **wraps**, and the later reads of a pass land on regions that same pass
@@ -63,9 +75,23 @@ fn main() {
     //
     // Warned rather than refused: against tmpfs, or when the re-read *is* the
     // thing being measured, wrapping is legitimate.
-    let flen = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let slots = (flen / blk.max(1) as u64).max(1);
-    let reads = (rings * iters) as u64;
+    let metadata = std::fs::metadata(path).expect("file metadata");
+    let flen = metadata.len();
+    assert!(
+        metadata.is_file() && flen > 0,
+        "expected a nonempty regular file"
+    );
+    let expected_bytes: u64 = (0..read_count)
+        .map(|i| {
+            let off = (i * blk) as u64 % flen;
+            (blk as u64).min(flen - off)
+        })
+        .sum();
+    if flen < blk as u64 {
+        println!("small cache smoke: file is smaller than one block; not an SSD speed measurement");
+    }
+    let slots = (flen / blk as u64).max(1);
+    let reads = read_count as u64;
     if flen > 0 && reads > slots {
         println!(
             "WARNING: {reads} reads of {blk_mb} MB over a {:.1} GB file is only {slots} distinct \
@@ -89,10 +115,21 @@ fn main() {
                 let io_ns = io_ns.clone();
                 let engine = engine.as_str();
                 sc.spawn(move || {
-                let f = std::fs::File::open(path).expect("open");
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(target_os = "linux")]
+                if engine == "uring" && direct {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_DIRECT);
+                }
+                let f = options.open(path).expect("open");
                 let fd = f.as_raw_fd();
-                let mut rx = peregrine_io::ring::Reactor::new(256).expect("ring");
-                let flen = f.metadata().map(|m| m.len()).unwrap_or(0);
+                let mut rx = if matches!(engine, "uring" | "regbuf") {
+                    Some(peregrine_io::ring::Reactor::new(256).expect("ring"))
+                } else {
+                    None
+                };
+                assert_eq!(f.metadata().expect("file metadata").len(), flen, "file size changed");
                 // One buffer per in-flight request: the whole batch is submitted to
                 // the ring in a single call, so queue depth = iters — the way the
                 // streaming lane actually drives it (a depth-1 loop measures latency,
@@ -147,11 +184,14 @@ fn main() {
                 // things, and the engine's own pattern (6 regions per expert, 16
                 // experts per submit) is much closer to this one than to dd's.
                 let t_io = Instant::now();
-                let got: i64 = if engine == "pread" {
+                let counts: Vec<i64> = if engine == "pread" {
                     // Same requests, no ring at all: `iters` blocking preads
                     // spread over `iters` threads, mirroring colibrì's harness.
-                    peregrine_io::pread_many_threaded(&mut reqs, iters).iter().map(|v| (*v).max(0)).sum()
+                    peregrine_io::pread_many_threaded(&mut reqs, iters)
+                } else if engine == "mmap" {
+                    peregrine_io::mmap_many(&mut reqs)
                 } else if engine == "regbuf" {
+                    let rx = rx.as_mut().expect("regbuf ring");
                     // Registered buffers are **pinned** pages, so the pool is
                     // charged against RLIMIT_MEMLOCK (8 MB by default on most
                     // distros). A pool sized for real expert regions blows past
@@ -162,7 +202,7 @@ fn main() {
                     let want = reqs.iter().map(|q| q.buf.len()).max().unwrap_or(0);
                     let slots = reqs.len().max(1);
                     match rx.register_read_buffers(vec![vec![0u8; want]; slots]) {
-                        Ok(()) => rx.read_fixed_many(&mut reqs).expect("fixed read").iter().map(|v| (*v).max(0)).sum(),
+                        Ok(()) => rx.read_fixed_many(&mut reqs).expect("fixed read"),
                         Err(e) => {
                             eprintln!(
                                 "regbuf: cannot register {slots} x {} MB of pinned buffers ({e}). \
@@ -172,19 +212,26 @@ fn main() {
                                     .ok().and_then(|o| String::from_utf8(o.stdout).ok())
                                     .map(|s| s.trim().to_string()).unwrap_or_else(|| "?".into()),
                             );
-                            0
+                            std::process::exit(1);
                         }
                     }
                 } else if direct {
                     let regions: Vec<(std::os::fd::RawFd, u64, usize)> =
                         reqs.iter().map(|r| (r.fd, r.offset, r.buf.len())).collect();
-                    let out = rx.read_direct_aligned(&regions).expect("direct read");
-                    out.iter().map(|b| b.len() as i64).sum()
+                    let out = rx.as_mut().expect("uring ring").read_direct_aligned(&regions).expect("direct read");
+                    out.iter().map(|b| i64::try_from(b.len()).expect("read count overflow")).collect()
                 } else {
-                    rx.read_many(&mut reqs).expect("read").iter().map(|v| (*v).max(0)).sum()
+                    rx.as_mut().expect("uring ring").read_many(&mut reqs).expect("read")
                 };
                 io_ns.fetch_max(t_io.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                total.fetch_add(got as u64, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(reqs.len(), iters, "request count mismatch");
+                assert_eq!(counts.len(), reqs.len(), "completion count mismatch");
+                let got: u64 = counts.iter().zip(&reqs).enumerate().map(|(i, (&n, req))| {
+                    assert!(n >= 0, "{engine} worker {r} read {i} failed with result {n}");
+                    assert_eq!(n as u64, req.buf.len() as u64, "{engine} worker {r} read {i}: byte count mismatch");
+                    n as u64
+                }).sum();
+                total.fetch_add(got, std::sync::atomic::Ordering::Relaxed);
             });
             }
         });
@@ -192,14 +239,18 @@ fn main() {
         // Rings run concurrently, so the slowest ring's I/O window is the one every
         // ring's bytes were moved within.
         let dt = (io_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9).max(1e-9);
-        let bytes = total.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        let bytes = total.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(bytes, expected_bytes, "total byte count mismatch");
         (bytes, dt, wall)
     };
 
     let label = match engine.as_str() {
         "pread" => format!("pread x{iters} threads"),
+        "mmap" if cfg!(target_os = "linux") => "mmap + copy (buffered)".to_string(),
+        "mmap" => "pread fallback (mmap unavailable off Linux)".to_string(),
         "regbuf" => "io_uring READ_FIXED".to_string(),
-        _ => format!("io_uring{}", if direct { " O_DIRECT" } else { " buffered" }),
+        "uring" => format!("io_uring{}", if direct { " O_DIRECT" } else { " buffered" }),
+        _ => unreachable!("engine validated above"),
     };
     // `wall` is printed beside the I/O window on purpose: a large gap between them
     // is setup cost (buffer allocation and zeroing, ring creation), which is what
@@ -212,17 +263,17 @@ fn main() {
         // device converges on measuring the page cache.
         drop_page_cache(path);
         let (bytes, dt, wall) = measure();
-        rates.push(bytes / 1e9 / dt);
+        let bytes_f64 = bytes as f64;
+        rates.push(bytes_f64 / 1e9 / dt);
         println!(
-            "{} x{} rings: {} reads x {}MB = {:.1} GB in {:.2}s io ({:.2}s wall) -> {:.2} GB/s{}",
+            "{} x{} workers: {} reads of up to {}MB = {bytes} bytes (verified) in {:.6}s io ({:.6}s wall) -> {:.2} GB/s{}",
             label,
             rings,
             rings * iters,
             blk_mb,
-            bytes / 1e9,
             dt,
             wall,
-            bytes / 1e9 / dt,
+            bytes_f64 / 1e9 / dt,
             if reps > 1 {
                 format!("  [rep {}/{}]", rep + 1, reps)
             } else {
@@ -275,8 +326,5 @@ fn drop_page_cache(path: &str) {
     let Ok(f) = std::fs::File::open(path) else {
         return;
     };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0) as usize;
-    if let Ok(mut rx) = peregrine_io::ring::Reactor::new(8) {
-        let _ = rx.fadvise_dontneed(f.as_raw_fd(), 0, len);
-    }
+    let _ = peregrine_io::fadvise_many(&[(f.as_raw_fd(), 0, 0)], peregrine_io::FADV_DONTNEED);
 }

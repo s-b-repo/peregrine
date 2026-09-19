@@ -37,20 +37,48 @@ pub fn score_keys(qi: &[f32], w: &[f32], keys: &[f32], nh: usize, hd: usize) -> 
     out
 }
 
+fn cmp_desc(a: f32, ia: usize, b: f32, ib: usize) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal),
+    }
+    .then(ia.cmp(&ib))
+}
+
 /// Indices of the top-`k` scores (highest first, ties broken by lower index),
 /// returned in **ascending** order for causal-order attention. `k >= len` keeps
 /// all indices (the dense case).
 pub fn select_topk(scores: &[f32], k: usize) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..scores.len()).collect();
-    if k >= scores.len() {
-        return idx;
+    let n = scores.len();
+    if k == 0 {
+        return Vec::new();
     }
-    idx.sort_by(|&a, &b| {
-        scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
-    });
-    let mut sel: Vec<usize> = idx.into_iter().take(k).collect();
-    sel.sort_unstable();
-    sel
+    if k >= n {
+        return (0..n).collect();
+    }
+    let block = k.max(1024);
+    let limit = k.saturating_add(block).min(n);
+    let compare = |&a: &usize, &b: &usize| cmp_desc(scores[a], a, scores[b], b);
+    let mut cand = Vec::with_capacity(limit);
+    cand.extend(0..k);
+    let mut threshold = *cand.select_nth_unstable_by(k - 1, compare).1;
+    for i in k..n {
+        if compare(&i, &threshold).is_lt() {
+            cand.push(i);
+            if cand.len() == limit {
+                threshold = *cand.select_nth_unstable_by(k - 1, compare).1;
+                cand.truncate(k);
+            }
+        }
+    }
+    if cand.len() > k {
+        cand.select_nth_unstable_by(k - 1, compare);
+        cand.truncate(k);
+    }
+    cand.sort_unstable();
+    cand
 }
 
 /// Per-layer lightning indexer weights: its own q/k/weight projections and key
@@ -288,5 +316,220 @@ mod tests {
         assert!((s[0] - 2.0 * rs).abs() < 1e-6); // positive dot → weighted
         assert_eq!(s[1], 0.0); // negative dot → ReLU zero
         assert_eq!(s[2], 0.0); // orthogonal → zero
+    }
+
+    fn oracle(scores: &[f32], k: usize) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..scores.len()).collect();
+        idx.sort_by(|&a, &b| {
+            if scores[a].is_nan() && !scores[b].is_nan() {
+                std::cmp::Ordering::Greater
+            } else if scores[b].is_nan() && !scores[a].is_nan() {
+                std::cmp::Ordering::Less
+            } else {
+                scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+            }
+        });
+        idx.truncate(k);
+        idx.sort_unstable();
+        idx
+    }
+
+    fn assert_matches_oracle(scores: &[f32], k: usize) {
+        let selected = select_topk(scores, k);
+        assert_eq!(selected, oracle(scores, k), "n={} k={k}", scores.len());
+        if k == 0 {
+            assert_eq!(selected.capacity(), 0);
+        } else if k < scores.len() {
+            assert!(selected.capacity() <= k.saturating_add(k.max(1024)).min(scores.len()));
+        }
+    }
+
+    fn lcg(state: &mut u64) -> f32 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*state >> 40) as f32 / (1u32 << 24) as f32
+    }
+
+    #[test]
+    fn topk_edge_cases() {
+        assert_eq!(select_topk(&[0.1, 0.9, 0.3, 0.7, 0.2], 2), vec![1, 3]);
+        assert_eq!(select_topk(&[0.1, 0.9, 0.3, 0.7, 0.2], 9), vec![0, 1, 2, 3, 4]);
+        assert_eq!(select_topk(&[0.5, 0.5, 0.1], 1), vec![0]);
+        assert_eq!(select_topk(&[], 0), Vec::<usize>::new());
+        assert_eq!(select_topk(&[], 5), Vec::<usize>::new());
+        assert_eq!(select_topk(&[1.0], 0), Vec::<usize>::new());
+        assert_eq!(select_topk(&[1.0], 1), vec![0]);
+        assert_eq!(select_topk(&[3.0, 1.0, 2.0], 1), vec![0]);
+        let n = 4096usize;
+        let scores: Vec<f32> = (0..n).map(|x| x as f32 / 7.0).collect();
+        assert_matches_oracle(&scores, 0);
+        assert_matches_oracle(&scores, 1);
+        assert_matches_oracle(&scores, n - 1);
+        assert_matches_oracle(&scores, n);
+        assert_matches_oracle(&scores, 17);
+    }
+
+    #[test]
+    fn topk_all_ties() {
+        let n = 513;
+        let scores = vec![0.0f32; n];
+        for k in [0, 1, 2, 100, n - 1, n] {
+            assert_matches_oracle(&scores, k);
+        }
+        let ties = vec![-1.5f32; 200];
+        assert_eq!(select_topk(&ties, 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn topk_sorted_and_reverse() {
+        let asc: Vec<f32> = (0..300).map(|i| i as f32).collect();
+        assert_matches_oracle(&asc, 50);
+        let mut rev = asc.clone();
+        rev.reverse();
+        assert_matches_oracle(&rev, 50);
+    }
+
+    #[test]
+    fn topk_special_floats() {
+        let scores = [f32::INFINITY, f32::NEG_INFINITY, -0.0, 0.0, 1.0, -1.0];
+        assert_matches_oracle(&scores, 3);
+        assert_matches_oracle(&scores, 6);
+        assert_matches_oracle(&scores, 0);
+        let zs = [0.0f32, -0.0];
+        assert_eq!(select_topk(&zs, 1), vec![0]);
+        let zs2 = [-0.0f32, 0.0];
+        assert_eq!(select_topk(&zs2, 1), vec![0]);
+        let nn = [f32::NAN, f32::NAN, 5.0];
+        assert_eq!(select_topk(&nn, 1), vec![2]);
+        assert_eq!(select_topk(&nn, 2), vec![0, 2]);
+        assert_eq!(select_topk(&nn, 3), vec![0, 1, 2]);
+        let all_nan = vec![f32::NAN; 64];
+        assert_matches_oracle(&all_nan, 10);
+        let mixed = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0, f32::NAN];
+        for k in 0..=6 {
+            assert_matches_oracle(&mixed, k);
+        }
+    }
+
+    #[test]
+    fn topk_randomized_matches_full_sort() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        for trial in 0..200 {
+            let n = 1usize + (trial * 37) % 1500;
+            let k = (trial * 13) % (n + 1);
+            let mode = trial % 6;
+            let scores: Vec<f32> = (0..n)
+                .map(|_| match mode {
+                    0 => lcg(&mut state),
+                    1 => {
+                        let v = lcg(&mut state);
+                        if v < 0.2 { f32::NAN } else { v }
+                    }
+                    2 => {
+                        let v = lcg(&mut state) - 0.5;
+                        if v == 0.0 { 0.0 } else { v }
+                    }
+                    3 => match (lcg(&mut state) * 4.0) as u32 {
+                        0 => f32::INFINITY,
+                        1 => f32::NEG_INFINITY,
+                        2 => f32::NAN,
+                        _ => lcg(&mut state),
+                    },
+                    4 => ((trial / 6) % 5) as f32,
+                    _ => {
+                        let r = lcg(&mut state);
+                        if r < 0.5 { 0.0 } else if r < 0.9 { 1.0 } else { r }
+                    }
+                })
+                .collect();
+            for k2 in [k, k.min(3), n.saturating_sub(1)] {
+                assert_matches_oracle(&scores, k2.min(n));
+            }
+        }
+    }
+
+    #[test]
+    fn topk_short_inputs_all_k() {
+        let values = [f32::NAN, f32::NEG_INFINITY, -1.0, -0.0, 0.0, 1.0, f32::INFINITY];
+        for n in 0..=4 {
+            for mut pattern in 0..values.len().pow(n) {
+                let scores: Vec<f32> = (0..n)
+                    .map(|_| {
+                        let value = values[pattern % values.len()];
+                        pattern /= values.len();
+                        value
+                    })
+                    .collect();
+                for k in 0..=scores.len() + 1 {
+                    assert_matches_oracle(&scores, k);
+                }
+                assert_matches_oracle(&scores, usize::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn topk_comparator_total_order() {
+        let scores = [
+            f32::from_bits(0xffc00001),
+            f32::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            f32::INFINITY,
+            f32::from_bits(0x7f800001),
+            f32::from_bits(0x7fc00002),
+        ];
+        let order = [6, 5, 3, 4, 2, 1, 0, 7, 8];
+        for (rank_a, &a) in order.iter().enumerate() {
+            for (rank_b, &b) in order.iter().enumerate() {
+                assert_eq!(cmp_desc(scores[a], a, scores[b], b), rank_a.cmp(&rank_b));
+            }
+        }
+        for k in 0..=scores.len() {
+            let mut expected = order[..k].to_vec();
+            expected.sort_unstable();
+            assert_eq!(select_topk(&scores, k), expected);
+        }
+    }
+
+    #[test]
+    fn topk_large_inputs_and_random_bits() {
+        let mut state = 0x123456789abcdef0u64;
+        let n = 65537;
+        for mode in 0..7 {
+            let scores: Vec<f32> = (0..n)
+                .map(|i| match mode {
+                    0 => i as f32,
+                    1 => (n - i) as f32,
+                    2 => 1.0,
+                    3 => f32::NAN,
+                    4 => if i % 2 == 0 { -0.0 } else { 0.0 },
+                    _ => {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let bits = (state >> 32) as u32;
+                        if mode == 5 {
+                            f32::from_bits(bits)
+                        } else {
+                            f32::from_bits(bits & 0xff7fffff)
+                        }
+                    }
+                })
+                .collect();
+            for k in [0, 1, 2, 63, 1023, 1024, 1025, 4096, n / 2, n - 1, n, usize::MAX] {
+                assert_matches_oracle(&scores, k);
+            }
+        }
+    }
+
+    #[test]
+    fn topk_block_boundary_stability() {
+        for n in [63usize, 64, 65, 1023, 1024, 1025, 1026, 2047, 2048, 2049, 4097] {
+            let scores: Vec<f32> =
+                (0..n).map(|i| ((i as u64 * 2654435761 % 97) as f32) / 97.0).collect();
+            for k in [0, 1, 64, n / 2, n.saturating_sub(1), n] {
+                assert_matches_oracle(&scores, k);
+            }
+        }
     }
 }

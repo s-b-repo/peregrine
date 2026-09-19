@@ -4,7 +4,7 @@
 //! and the MoE compute of `moe()` (Phase A–E), minus the streaming/tiering
 //! (M2), CACHE_ROUTE, and EXPERT_BUDGET opt-ins.
 
-use crate::math::silu_mul;
+use crate::math::silu_mul_rows;
 use crate::router::{batch_union, route, RouterCfg};
 use crate::weight::QtWeight;
 
@@ -25,8 +25,16 @@ impl Mlp {
     /// `x[s_n, gate.i]`, output `[s_n, down.o]`. The clamp is Glm5Next's
     /// `swiglu_limit` and is skipped entirely at `limit == 0`.
     pub fn swiglu(&self, x: &[f32], s_n: usize) -> Vec<f32> {
-        let mut g = self.gate.apply_vec(x, s_n);
-        let mut u = self.up.apply_vec(x, s_n);
+        // Gate and up are independent projections of the same input: run them
+        // concurrently on the pool (index-ordered, each half deterministic, so
+        // the pair is bit-identical to the serial gate-then-up). Decode ran at
+        // ~190% of 1200% CPU with the serial shape; the two halves are the
+        // cheapest available parallelism on that path.
+        let mut parts = peregrine_par::par_map(2, 2, |i| {
+            if i == 0 { self.gate.apply_vec(x, s_n) } else { self.up.apply_vec(x, s_n) }
+        });
+        let mut u = parts.pop().unwrap_or_default();
+        let mut g = parts.pop().unwrap_or_default();
         if self.limit > 0.0 {
             let lim = self.limit;
             for v in g.iter_mut() {
@@ -36,7 +44,8 @@ impl Mlp {
                 *v = v.clamp(-lim, lim);
             }
         }
-        silu_mul(&mut g, &u);
+        let width = self.gate.o;
+        silu_mul_rows(&mut g, &u, s_n, width);
         self.down.apply_vec(&g, s_n)
     }
 }
@@ -68,7 +77,9 @@ pub fn moe_forward(
 ) -> Vec<f32> {
     let MoeCfg { s_n, hidden, k, norm_topk, routed_scale } = cfg;
     let e_n = experts.len();
-    let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk, routed_scale, min_share: crate::router::route_min_share() });
+    let mut r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk, routed_scale, min_share: crate::router::route_min_share() });
+    crate::router::apply_route_topp(&mut r, s_n, crate::router::route_topp(), norm_topk, routed_scale);
+    crate::router::apply_expert_budget(&mut r, s_n, crate::router::expert_budget(), norm_topk, routed_scale);
     let mut out = vec![0f32; s_n * hidden];
 
     // Gather each routed expert's positions (+ gate weights) in batch-union order.

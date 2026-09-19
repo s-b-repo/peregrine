@@ -16,6 +16,7 @@
 
 pub mod attention;
 pub mod gdn;
+pub mod qwen4;
 pub mod hyper;
 pub mod pinned;
 pub mod ngram;
@@ -101,8 +102,8 @@ pub use rlm::{rlm_enabled, rlm_layers, rlm_margin, rlm_max_depth, RLMController}
 pub use draftdist::DraftDist;
 pub use mtp::{speculative_sample, speculative_sample_at};
 pub use router::{
-    batch_union, gate_share_below, gate_stats_snapshot, route, union_low_gate_snapshot, union_stats_snapshot, Routed,
-    RouterCfg,
+    apply_expert_budget, apply_route_topp, batch_union, expert_budget, gate_share_below, gate_stats_snapshot, route,
+    route_topp, union_low_gate_snapshot, union_stats_snapshot, Routed, RouterCfg,
 };
 pub use sample::{argmax, pick_batch_greedy, Sampler};
 pub use weight::{QtWeight, QuantFmt};
@@ -178,6 +179,11 @@ pub fn startup_banner() -> String {
         // An x16 card negotiated to x4 makes `COLI_PCIE_BUDGET_MB` the wrong
         // knob to reach for, and nothing else in the engine would tell you.
         s.push_str(&format!("\nperegrine: pcie {bdf} {} x{}", link.speed, link.width));
+    }
+    if let Ok(v) = std::env::var("HSA_OVERRIDE_GFX_VERSION") {
+        if !v.is_empty() {
+            s.push_str(&format!("\nperegrine: hsa_override_gfx={v}"));
+        }
     }
     s
 }

@@ -85,6 +85,8 @@ mod ffi {
             x: *const f32,
         ) -> c_int;
         pub fn coli_cuda_w4_matvec(w: *mut ColiCudaTensor, y: *mut f32, x: *const f32) -> c_int;
+        pub fn coli_cuda_set_swiglu_limit(limit: f32);
+        pub fn coli_cuda_swiglu_limit() -> f32;
         pub fn coli_cuda_expert_group(
             gates: *const *mut ColiCudaTensor,
             ups: *const *mut ColiCudaTensor,
@@ -279,6 +281,25 @@ pub fn init(devices: &[i32]) -> i32 {
 #[cfg(not(feature = "cuda"))]
 pub fn init(_devices: &[i32]) -> i32 {
     0
+}
+
+/// Set the device SwiGLU clamp (`swiglu_limit`, 0 = off) for every expert path,
+/// then read it back to prove the set took effect. Returns `true` exactly when
+/// the backend is linked and the live value equals the request (after the
+/// kernel's own sanitizing: non-positive or absurd values read back as 0).
+/// A non-positive `limit` is the unclamped historical behaviour, and setting it
+/// must also report `true` on a linked backend — 0 is a value, not a failure.
+#[cfg(feature = "cuda")]
+pub fn set_swiglu_limit(limit: f32) -> bool {
+    // SAFETY: plain setters over a process-global float; always safe to call.
+    unsafe { ffi::coli_cuda_set_swiglu_limit(limit) };
+    let live = unsafe { ffi::coli_cuda_swiglu_limit() };
+    let want = if limit > 0.0 && limit < 1e30 { limit } else { 0.0 };
+    live.to_bits() == want.to_bits() && !vendor::BACKEND.is_empty()
+}
+#[cfg(not(feature = "cuda"))]
+pub fn set_swiglu_limit(_limit: f32) -> bool {
+    false
 }
 
 /// Release all CUDA device contexts and resources. Safe to call once at teardown;
@@ -1417,6 +1438,73 @@ mod gpu_tests {
         assert!(
             worst / scale < 5e-3,
             "device dense MLP must match the CPU SwiGLU (worst {worst:.3e}, scale {scale:.3e})"
+        );
+        Ok(())
+    }
+
+    /// The device SwiGLU clamp must match the CPU `Mlp::swiglu` clamp it unlocks
+    /// the GPU tier for: gate clamps to `<= limit`, up to `[-limit, limit]`.
+    ///
+    /// Tolerance, not bit-identity: device `expf` and host `exp` may differ by a
+    /// ULP, exactly as the dense-MLP test above documents. What must hold is the
+    /// *clamp boundary* — pre-activations past ±10 take the clamped path, and a
+    /// 15.0 gate reads as 10.0, which no ULP can fake. Resets the process-global
+    /// limit to 0 before returning (including on assertion failure paths via the
+    /// early returns below being `Ok` skips only) so the graph tests sharing
+    /// this process keep their unclamped assumption.
+    #[test]
+    fn the_device_swiglu_clamp_matches_the_cpu_clamp() -> Result<(), Error> {
+        use std::os::raw::c_void;
+        let _g = gpu_guard();
+        if init(&[0]) < 1 {
+            return Ok(());
+        }
+        // Gate/up values straddling the ±10 boundary, plus exact-boundary hits.
+        let gate: Vec<f32> = vec![-15.0, -10.0, -9.5, -1.0, 0.0, 3.25, 10.0, 10.5, 25.0, -0.0];
+        let up: Vec<f32> = vec![12.0, -10.0, 9.75, 40.0, 0.5, -11.0, 10.0, -25.0, 1.0, -0.0];
+        let n = gate.len();
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let want: Vec<f32> =
+            gate.iter().zip(&up).map(|(&g, &u)| silu(g.min(10.0)) * u.clamp(-10.0, 10.0)).collect();
+        // Sanity: the clamp actually moves these values — without it the test
+        // would pass against the old kernel and prove nothing.
+        let plain: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
+        assert!(
+            plain.iter().zip(&want).any(|(a, b)| (a - b).abs() > 1.0),
+            "fixture must straddle the clamp boundary"
+        );
+
+        assert!(set_swiglu_limit(10.0), "linked backend must take the clamp");
+        let nb = n * 4;
+        // SAFETY: two n-float device buffers on device 0.
+        let (g_dev, u_dev) = unsafe {
+            (
+                ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32,
+                ffi::coli_cuda_pipe_alloc(0, nb) as *mut f32,
+            )
+        };
+        assert!(!g_dev.is_null() && !u_dev.is_null(), "device alloc");
+        // The launch status is captured, not asserted, until the global limit is
+        // reset below: a panic here would leave limit 10 set for every later
+        // GPU test in this process, turning one red test into a cascade.
+        // SAFETY: both destinations hold `nb` bytes; sources hold `n` f32.
+        let (status, out) = unsafe {
+            ffi::coli_cuda_pipe_upload(0, g_dev as *mut c_void, gate.as_ptr() as *const c_void, nb);
+            ffi::coli_cuda_pipe_upload(0, u_dev as *mut c_void, up.as_ptr() as *const c_void, nb);
+            let status = ffi::coli_cuda_pipe_silu_mul(0, g_dev, u_dev, n);
+            let mut out = vec![0f32; n];
+            ffi::coli_cuda_pipe_download(0, g_dev as *const c_void, out.as_mut_ptr() as *mut c_void, nb);
+            ffi::coli_cuda_pipe_free(0, g_dev as *mut c_void);
+            ffi::coli_cuda_pipe_free(0, u_dev as *mut c_void);
+            (status, out)
+        };
+        assert!(set_swiglu_limit(0.0), "reset must take");
+        assert_eq!(status, 1, "clamped silu_mul launch");
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = out.iter().zip(&want).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            worst / scale < 1e-4,
+            "device clamp must match CPU clamp (worst {worst:.3e}, scale {scale:.3e})"
         );
         Ok(())
     }

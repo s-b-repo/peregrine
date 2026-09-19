@@ -78,9 +78,9 @@ pub use mem::{
 pub use perf::PerfCounter;
 pub use sensors::{energy_uj, max_temp_c, EnergyMeter};
 pub use ring::{
-    fadvise_many, pread_many, pread_many_threaded, probe_direct, pwrite_many, read_file,
-    read_file_seq, read_region, write_file, FADV_DONTNEED, FADV_WILLNEED, OwnedReadReq, Reactor, ReadReq,
-    RegionDone, WriteReq,
+    fadvise_many, mmap_many, pread_many, pread_many_threaded, probe_direct, pwrite_many, read_file,
+    read_file_seq, read_region, write_file, FADV_DONTNEED, FADV_WILLNEED,
+    OwnedReadReq, Reactor, ReadReq, RegionDone, WriteReq,
 };
 pub use slab::{
     align_down, align_up, pin_hook_installed, set_pin_hook, AlignedBuf, Bytes, SlabHandle, SlabPool,
