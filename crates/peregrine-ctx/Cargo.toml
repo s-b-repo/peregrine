@@ -1,0 +1,20 @@
+[package]
+name = "peregrine-ctx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Dynamic Context Runtime — unlimited external state plus a small, planned working set (ported from subnext/DCR, zero-dependency)"
+license = "MIT"
+
+# No dependencies, deliberately — inherited from the upstream design: everything
+# the runtime needs (hashing, text scanning, JSON persistence, arg parsing) is
+# small enough to own, and the reference implementation reads end to end.
+[dependencies]
+
+[lib]
+name = "peregrine_ctx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "peregrine-ctx"
+path = "src/main.rs"

@@ -39,8 +39,20 @@ batched-submit / io-wq-worker-cap ownership the design needs.
   SQPOLL the tuner's `sq_full` signal reads near-zero (the kthread drains
   the SQ continuously); the read-µs EWMA remains the live signal.
 - **Registered buffers**: `register_read_buffers()` + `IORING_OP_READ_FIXED`
-  are implemented and tested, but **not reachable from the streaming path** —
-  nothing calls them outside tests, and `COLI_REGBUF` is read by no code.
+  serve the `COLI_IO_ENGINE=regbuf` measurement arm (`read_fixed_many`, one
+  in-flight op per registered buffer, sized from the batch's largest region
+  and grown once). Fixed buffers skip per-I/O page pinning but copy out of
+  the registered landing buffer, where `read_many` has the kernel write the
+  caller's buffer directly — at ~6 MB expert regions the copy plausibly costs
+  more than the pinning saves, so this stays a measurement engine, not a
+  default.
+- **Mirror striping** (`COLI_IO_MIRROR_ROOTS`): one logical range splits into
+  one chunk per mirror drive inside a single `read_striped` submit
+  (`StripedRead`), so every drive reads concurrently; sub-`n_drives×128 KiB`
+  ranges ride whole, round-robin. Buffered-only, byte-identical to the
+  `pread_striped` oracle; mirror fds register as fixed files next to shard
+  fds. The trunk loader (`SafeTensors::read_at`) and the MoE wave lane stripe
+  transparently; the owned-completion lane spreads whole regions round-robin.
 - **Batched submits**: `read_experts_batched()` issues one deep submit per claim.
   An expert costs **two SQEs when its regions coalesce, six when they do not** —
   its three weight tensors are contiguous on disk (18,874,368 bytes at int4,

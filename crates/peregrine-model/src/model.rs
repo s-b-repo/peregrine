@@ -20,6 +20,7 @@ use crate::attention::{
 use crate::draftdist::DraftDist;
 use crate::dsa::IndexerWeights;
 use crate::concurrent::{default_workers, experts_per_batch, moe_forward_dispatch, ForwardCtx};
+use crate::block_exec::BlockExecMode;
 use crate::gpu::{GpuTier, HeatTable};
 use crate::math::rmsnorm;
 use crate::mlp::{moe_forward, Mlp, MoeCfg};
@@ -526,6 +527,10 @@ pub struct Model {
     /// disk-queue coalescing win the tool's community detection is aiming for.
     /// Correctness-neutral: reorder ≠ different bytes.
     layout_schedule: Option<Vec<Vec<u32>>>,
+    /// Per-block execution mode (`COLI_BLOCK_EXEC=sync|mt|par`, default `par`).
+    /// Resolved once at load and threaded into every `ForwardCtx` so block
+    /// compute honors it without re-reading env per layer.
+    block_exec: BlockExecMode,
 }
 
 /// Per-sequence KV cache: one [`LayerKv`] per layer. Owned by the batching
@@ -3253,11 +3258,20 @@ fn project_logits(head: &QtWeight, x: &[f32], rows: usize, context: &str) -> Res
 /// to the serial loop (guarded by `rmsnorm_rows_parallel_matches_serial`). This is
 /// the highest-frequency hotspot — 2× per layer + the final norm.
 fn rmsnorm_rows(x: &[f32], w: &[f32], s_n: usize, d: usize, eps: f32) -> Vec<f32> {
+    rmsnorm_rows_in(x, w, s_n, d, eps, BlockExecMode::resolve())
+}
+
+/// [`rmsnorm_rows`] with an explicit execution mode. Block forwards pass
+/// `ctx.block_exec` so `COLI_BLOCK_EXEC=sync` forces every norm serial without
+/// depending on whether the global pool was already built at another width;
+/// standalone callers use the env-resolved wrapper above.
+fn rmsnorm_rows_in(x: &[f32], w: &[f32], s_n: usize, d: usize, eps: f32, mode: BlockExecMode) -> Vec<f32> {
     let mut out = vec![0f32; s_n * d];
     // Only parallelize when the row is wide enough that per-row work covers the pool
     // dispatch; narrow rows (the tiny test model, d=16) stay serial. Real GLM-5.2
     // (d=6144) clears this comfortably.
     let gate = if d >= 256 { peregrine_par::PAR_ROWS_MIN } else { usize::MAX };
+    let gate = mode.par_gate(gate);
     peregrine_par::par_rows_mut(&mut out, d, s_n, gate, |s, row| {
         // `out` is freshly allocated here and can never alias `x`, so the row can
         // be read straight from the source: the copy existed only to satisfy
@@ -3657,16 +3671,13 @@ fn forward_layer(
     let cfg = ctx.cfg;
     let d = cfg.hidden as usize;
     let eps = cfg.eps;
-    let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
+    let mode = ctx.block_exec;
+    let nrm = rmsnorm_rows_in(x, &l.in_ln, s_n, d, eps, mode);
     let attn = attn_dispatch(l, li, kv, gdn, ctx, AttnInput { nrm: &nrm, s_n, pos_base })?;
-    for z in 0..s_n * d {
-        x[z] += attn[z];
-    }
-    let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
+    mode.residual_add(x, &attn);
+    let nrm2 = rmsnorm_rows_in(x, &l.post_ln, s_n, d, eps, mode);
     let ffn = ffn_dispatch(l, li, ctx, &nrm2, s_n)?;
-    for z in 0..s_n * d {
-        x[z] += ffn[z];
-    }
+    mode.residual_add(x, &ffn);
     Ok(())
 }
 
@@ -3771,18 +3782,15 @@ fn forward_layer_batched(
     if l.hc_attn.is_some() {
         return forward_layer_batched_hc(l, li, caches, gstates, rows_at, ctx, x);
     }
-    let nrm = rmsnorm_rows(x, &l.in_ln, s_n, d, eps);
+    let mode = ctx.block_exec;
+    let nrm = rmsnorm_rows_in(x, &l.in_ln, s_n, d, eps, mode);
     let attn = attn_dispatch_batched(l, li, caches, gstates, rows_at, ctx, &nrm)?;
-    for z in 0..s_n * d {
-        x[z] += attn[z];
-    }
-    let nrm2 = rmsnorm_rows(x, &l.post_ln, s_n, d, eps);
+    mode.residual_add(x, &attn);
+    let nrm2 = rmsnorm_rows_in(x, &l.post_ln, s_n, d, eps, mode);
     // Same capture point as `forward_layer` — the batched rows are main
     // stream too (draft rows never reach here with `calib` set).
     let ffn = ffn_dispatch(l, li, ctx, &nrm2, s_n)?;
-    for z in 0..s_n * d {
-        x[z] += ffn[z];
-    }
+    mode.residual_add(x, &ffn);
     Ok(())
 }
 
@@ -3964,6 +3972,16 @@ impl Model {
         // Before any par_* call can lazily build the global pool: install the
         // NUMA-pinning worker hook (no-op unless COLI_NUMA_PIN=1).
         install_numa_pin_hook();
+        // Block execution mode first: `sync` dictates the global pool width to
+        // 1, and the pool is built once lazily — after the first par_* call the
+        // override cannot take.
+        let block_exec = BlockExecMode::resolve();
+        let pool_took = block_exec.apply_to_pool();
+        if !pool_took {
+            eprintln!(
+                "peregrine: [block] COLI_BLOCK_EXEC=sync requested but the compute pool already exists — running at its built width"
+            );
+        }
         let cfg = Cfg::load(dir)?;
         crate::qwen4::require_runtime(&cfg)?;
         let st = SafeTensors::open(dir)?;
@@ -4022,12 +4040,15 @@ impl Model {
 
         // Ring count, device-aware: one per physical device the shards span, so
         // every device gets a home ring under device-pure claims instead of one
-        // being served only by work stealing. Computed once here because the RAM
+        // being served only by work stealing. Mirror roots count too: every
+        // drive holding a copy serves striped chunks, so sizing by primaries
+        // alone would leave mirror-only drives reachable only by stealing.
+        // Computed once here because the RAM
         // projection below and the reactor construction further down must agree
         // — projecting for four rings and then building six is how a load passes
         // its own preflight and then gets OOM-killed.
         let n_io_rings = if stream_experts {
-            io_rings_for(st.n_devices(), host_mem_available_bytes(), max_expert_region_bytes(&st))
+            io_rings_for(st.n_devices().max(st.n_mirror_devices()), host_mem_available_bytes(), max_expert_region_bytes(&st))
         } else {
             io_rings()
         };
@@ -4159,8 +4180,12 @@ impl Model {
                     Reactor::new_streaming(256).ctx(|| "concurrent MoE io_uring reactor init".to_string())?;
                 // Fixed-file registration: reads whose fd is registered skip the
                 // per-op fd table lookup/refcount — the same shard fds are read
-                // every token. Non-fatal: on failure reads use the plain-fd path.
-                if let Err(e) = r.register_files(&st.shard_fds()) {
+                // every token. Mirror fds ride along so striped parallel reads
+                // across all drives take the same fast path. Non-fatal: on
+                // failure reads use the plain-fd path.
+                let mut reg_fds = st.shard_fds();
+                reg_fds.extend(st.mirror_fds_all());
+                if let Err(e) = r.register_files(&reg_fds) {
                     peregrine_io::note_advisory_err("register shard fds with io_uring (plain-fd reads)", &e);
                 }
                 v.push(Mutex::new(r));
@@ -4728,8 +4753,15 @@ impl Model {
             checkpoint_dir: dir.to_path_buf(),
             calib: None,
             layout_schedule: load_layout_schedule(dir),
+            block_exec,
             rlm: crate::rlm::RLMController::new(),
         };
+        eprintln!(
+            "peregrine: [block] exec={} pool_width={} mirrors={} (COLI_BLOCK_EXEC=sync|mt|par)",
+            block_exec.name(),
+            peregrine_par::worker_count(),
+            model.st.n_mirror_roots(),
+        );
         // Calibration capture (ideas #7): read per load, not through a
         // OnceLock latch — the seam `enable_calib_capture` is what tests and
         // the calib-capture subcommand use, this env spelling is for co-runs
@@ -5934,6 +5966,11 @@ impl Model {
         self.effective_workers.load(std::sync::atomic::Ordering::Relaxed).max(1)
     }
 
+    /// Per-block execution mode resolved at load (`COLI_BLOCK_EXEC`).
+    pub fn block_exec(&self) -> BlockExecMode {
+        self.block_exec
+    }
+
     /// Rebuild the affinity snapshot from the co-activation tracker: fused
     /// pairs at `COLI_FUSE_THRESHOLD` (default 0.9 co-rate) and hyperedge
     /// components (union-find over pairs at half the threshold). Arc-swapped so
@@ -6660,7 +6697,7 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, gdn, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, gpu_dense, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, calib, ..
+                cfg, layers, kv, gdn, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, gpu_dense, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, calib, block_exec, ..
             } = self;
             let sweep: &SweepClock = sweep;
             let ctx = ForwardCtx {
@@ -6689,6 +6726,7 @@ impl Model {
                 affinity: Some(aff.as_ref()),
                 expert_index: expert_index.as_ref(),
                 fd_devices: fd_device_table.as_ref(),
+                block_exec: *block_exec,
             };
             // Layer look-ahead: a shared prefetch view over the same field borrows, so
             // each layer's next-token prefetch is emitted the moment that layer
@@ -7085,6 +7123,7 @@ impl Model {
             affinity: None,
             expert_index: self.expert_index.as_ref(),
             fd_devices: self.fd_device_table.as_ref(),
+            block_exec: self.block_exec,
         }
     }
 
@@ -7457,6 +7496,7 @@ impl Model {
             affinity: Some(aff.as_ref()),
             expert_index: self.expert_index.as_ref(),
             fd_devices: self.fd_device_table.as_ref(),
+            block_exec: self.block_exec,
         };
         // Router look-ahead, on the same decode-only rule as `forward_hidden`. B == 1
         // *is* a decode step — the serving engine reaching this path with one live
@@ -7755,7 +7795,7 @@ impl Model {
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
 
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, block_exec, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft without an MTP head".into()))?;
         // One round per draft *call*, not per step: a call is the unit a
@@ -7807,6 +7847,7 @@ impl Model {
             // completion order cannot reach a position-keyed reduce.
             expert_index: expert_index.as_ref(),
             fd_devices: None, // drafts keep the blind claim cursor, like the rest of their tuning
+            block_exec: *block_exec,
         };
         let mut kv = LayerKv::new(kvl, qkr);
         let mut h = hlast.to_vec(); // pre-final-norm hidden
@@ -7920,7 +7961,7 @@ impl Model {
         let vocab = self.cfg.vocab as usize;
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, block_exec, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft_batched without an MTP head".into()))?;
         let pins_gen = mtp_pins.as_ref().is_some_and(|p| p.note_round());
@@ -7954,6 +7995,7 @@ impl Model {
             affinity: None,
             expert_index: expert_index.as_ref(),
             fd_devices: None,
+            block_exec: *block_exec,
         };
 
         let mut kvs: Vec<LayerKv> = (0..b).map(|_| LayerKv::new(kvl, qkr)).collect();
@@ -10222,6 +10264,37 @@ mod tests {
             par.iter().zip(&serial).all(|(a, b)| a.to_bits() == b.to_bits()),
             "rmsnorm_rows must be bit-identical parallel vs serial"
         );
+    }
+
+    #[test]
+    fn block_exec_modes_leave_norms_and_residuals_identical() {
+        // Every block mode must compute the same bits: norms across all three
+        // modes plus the serial oracle, residuals across all three modes.
+        use crate::block_exec::BlockExecMode;
+        let (s_n, d) = (9usize, 512usize);
+        let x: Vec<f32> = (0..s_n * d).map(|k| ((k * 13 + 1) as f32 * 0.017).sin()).collect();
+        let w: Vec<f32> = (0..d).map(|j| 0.5 + j as f32 * 0.01).collect();
+        let eps = 1e-5;
+        let oracle = rmsnorm_rows(&x, &w, s_n, d, eps);
+        for mode in [BlockExecMode::Sync, BlockExecMode::Mt, BlockExecMode::Par] {
+            let got = rmsnorm_rows_in(&x, &w, s_n, d, eps, mode);
+            assert_eq!(got.len(), oracle.len());
+            for (i, (a, b)) in got.iter().zip(&oracle).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "mode {:?} norm diverged at {i}", mode);
+            }
+            // Residuals at a size that engages threading (≥64K floats).
+            let n = 70_000usize;
+            let src: Vec<f32> = (0..n).map(|k| (k as f32 * 0.001).cos()).collect();
+            let mut dst = vec![2.0f32; n];
+            let mut expect = dst.clone();
+            for i in 0..n {
+                expect[i] += src[i];
+            }
+            mode.residual_add(&mut dst, &src);
+            for (i, (a, b)) in dst.iter().zip(&expect).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "mode {:?} residual diverged at {i}", mode);
+            }
+        }
     }
 
     #[test]

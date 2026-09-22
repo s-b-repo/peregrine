@@ -1,0 +1,4 @@
+0bbf428 qwen mmap and 1tk/s changes
+built 2026-09-20T19:02:04+02:00
+batch_sweep=1 4 16 steps=3 ecache=auto(dflt) model=/srv/m-sda/GLM-5.2-r5
+source: worktree /home/cortix/peregrine-wt-bench-2026-09-20 (clean at HEAD)

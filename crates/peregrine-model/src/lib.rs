@@ -15,6 +15,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod attention;
+pub mod block_exec;
 pub mod gdn;
 pub mod qwen4;
 pub mod hyper;
@@ -78,6 +79,7 @@ pub use attention::{
     mla_attention, mla_attention_absorb, mla_attention_batched, mla_attention_rows, AttnWeights, KvDtype, KvSpan,
     LayerKv, RowAttn, RowLayout,
 };
+pub use block_exec::BlockExecMode;
 pub use math::{
     layernorm, rmsnorm, rmsnorm_inplace, rope_interleave, rope_interleave_with, sigmoidf, siluf, silu_mul, softmax,
     RopeTable,

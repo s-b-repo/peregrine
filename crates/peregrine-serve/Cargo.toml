@@ -24,6 +24,10 @@ peregrine-core = { path = "../peregrine-core" }
 # workspace-path form as every other dependency here.
 peregrine-io = { path = "../peregrine-io" }
 peregrine-token = { path = "../peregrine-token" }
+# Context plane for over-budget prompts (COLI_CTX): the ported subnext/DCR
+# runtime plans a working set under budget. Text-level concern, so it lives
+# behind the HTTP layer rather than inside the token-level engine.
+peregrine-ctx = { path = "../peregrine-ctx" }
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
 axum = "0.7"

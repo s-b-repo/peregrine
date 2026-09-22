@@ -9,11 +9,12 @@
 //! shard pool, so each shard's pretoken memo cache warms **across requests**
 //! — a repeated chat-template prefix encodes from cache. One instance would
 //! serialize every concurrent request on a single lock; the pool spreads
-//! encodes round-robin instead (each shard's memo learns independently).
-//! Streaming decode does NOT take a shard per token: each stream takes a
-//! [`DecodeHandle`] (an `Arc` view of the immutable vocab) once and decodes
-//! at token rate with no shared state — N concurrent streams would otherwise
-//! contend at token frequency for what is a read of an immutable table.
+//! encodes across shards instead (each shard's memo learns independently,
+//! try-lock cascade dodges busy shards rather than queueing behind them).
+//! Decode takes no shard at all: [`TokenBackend`] holds one `Arc` view of
+//! the immutable vocab, so `decode`/`decode_handle` never lock — N
+//! concurrent streams and a long non-streaming decode proceed with no shared
+//! state, and neither can delay (or be delayed by) an encode.
 
 use peregrine_core::{Context, Error};
 use peregrine_token::{DecodeHandle, GigaTokenizer};
@@ -44,12 +45,14 @@ fn tokenizer_workers() -> usize {
 /// ids are unaffected — see `encode_batch`'s identical guarantee), and a
 /// round-robin cursor spreads concurrent encodes across shards. More
 /// concurrent encodes than shards share one exactly like before: never wrong,
-/// just briefly serial. Decode paths route through the same cursor; `decode`
-/// itself is `&self`-immutable, so even the lock acquisition is the only
-/// shared cost there.
+/// just briefly serial. Decode takes no shard at all: `decode_view` is a
+/// clone-cheap `Arc` of the immutable vocabulary, so `decode`/`decode_handle`
+/// never lock, never touch the atomic, and can never delay (or be delayed
+/// by) an encode.
 pub struct TokenBackend {
     shards: Box<[parking_lot::Mutex<GigaTokenizer>]>,
     cursor: std::sync::atomic::AtomicUsize,
+    decode_view: DecodeHandle,
 }
 
 impl TokenBackend {
@@ -76,21 +79,38 @@ impl TokenBackend {
 
     /// Pool `base` into `n` shards (shard 0 is `base` itself, the rest forks).
     /// `n` floors at 1. Forking is boot-time work; steady state pays nothing.
+    /// The decode view is cloned from `base` up front so no decode path ever
+    /// takes a shard lock (see the struct docs).
     fn sharded(base: GigaTokenizer, n: usize) -> TokenBackend {
+        let decode_view = base.decode_handle();
         let mut shards = vec![parking_lot::Mutex::new(base)];
         while shards.len() < n.max(1) {
             // One-time at construction; contention here is impossible yet.
             let forked = shards[0].lock().fork();
             shards.push(parking_lot::Mutex::new(forked));
         }
-        TokenBackend { shards: shards.into_boxed_slice(), cursor: std::sync::atomic::AtomicUsize::new(0) }
+        TokenBackend {
+            shards: shards.into_boxed_slice(),
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+            decode_view,
+        }
     }
 
-    /// Next shard, round-robin. Cursor overflow wraps (`fetch_add` wraps by
-    /// definition); the modulo keeps every value a valid index.
+    /// Next free shard: probe from the round-robin cursor with non-blocking
+    /// `try_lock` and take the first free one. Pure round-robin parks a
+    /// request behind a slow encode on its assigned shard while other shards
+    /// sit free (head-of-line blocking); the cascade only blocks when *every*
+    /// shard is busy, and then on the cursor shard — the one this request
+    /// would have taken historically. One probe pass, never a spin.
     fn shard(&self) -> parking_lot::MutexGuard<'_, GigaTokenizer> {
-        let i = self.cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.shards.len();
-        self.shards[i].lock()
+        let n = self.shards.len();
+        let start = self.cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
+        for offset in 0..n {
+            if let Some(guard) = self.shards[(start + offset) % n].try_lock() {
+                return guard;
+            }
+        }
+        self.shards[start].lock()
     }
 
     /// Encode `text` to token ids.
@@ -100,14 +120,23 @@ impl TokenBackend {
 
     /// Decode token ids to text (whole-stream form, used by the non-streaming
     /// path). Streaming callers want [`IncrementalDecoder`] instead.
+    ///
+    /// Lock-free: concatenating the immutable vocab rows is byte-identical to
+    /// `GigaTokenizer::decode` (same table, same skip-out-of-vocab filter),
+    /// so a long non-streaming decode never occupies an encode shard.
     pub fn decode(&self, ids: &[u32]) -> Result<String, Error> {
-        let bytes = self.shard().decode(ids);
+        let mut bytes = Vec::with_capacity(ids.len() * 4);
+        for &id in ids {
+            if let Some(b) = self.decode_view.token_bytes(id) {
+                bytes.extend_from_slice(b);
+            }
+        }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// A lock-free per-token decode view for one stream: one shard acquisition
-    /// here, then [`DecodeHandle::token_bytes`] at token rate with no lock
-    /// and no allocation. Token boundaries do not respect character
+    /// A lock-free per-token decode view for one stream: one `Arc` clone here,
+    /// then [`DecodeHandle::token_bytes`] at token rate with no lock, no
+    /// atomic, and no allocation. Token boundaries do not respect character
     /// boundaries, so streaming callers must join bytes through
     /// [`IncrementalDecoder`]. Out-of-vocab ids read as `None` (same lenient
     /// contract as [`Self::decode`]'s skip — a padded `lm_head` can sample one,
@@ -115,7 +144,43 @@ impl TokenBackend {
     /// what makes the documented lenient behavior true (a stale id must not kill
     /// the stream).
     pub fn decode_handle(&self) -> DecodeHandle {
-        self.shard().decode_handle()
+        self.decode_view.clone()
+    }
+
+    /// Decode many id sequences at once, in input order, byte-for-byte
+    /// identical to calling [`Self::decode`] per sequence. The batch is split
+    /// into one contiguous chunk per shard and each chunk decodes on its own
+    /// shard in a scoped thread — so shards (with their warm memo caches)
+    /// decode in parallel while no chunk ever waits on another shard's lock.
+    /// Small batches run serially on the cursor shard.
+    pub fn decode_batch(&self, batch: &[Vec<u32>]) -> Vec<String> {
+        let n = batch.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let nshards = self.shards.len();
+        if nshards <= 1 || n < 2 {
+            let refs: Vec<&[u32]> = batch.iter().map(Vec::as_slice).collect();
+            return self.shards[0].lock().decode_batch(&refs, 1).into_iter().map(|b| String::from_utf8_lossy(&b).into_owned()).collect();
+        }
+        let nchunks = nshards.min(n);
+        let chunk = n.div_ceil(nchunks);
+        let mut out: Vec<String> = Vec::with_capacity(n);
+        out.resize_with(n, String::new);
+        std::thread::scope(|s| {
+            for (shard_i, (out_c, batch_c)) in out.chunks_mut(chunk).zip(batch.chunks(chunk)).enumerate() {
+                let shard = &self.shards[shard_i % nshards];
+                s.spawn(move || {
+                    let guard = shard.lock();
+                    let refs: Vec<&[u32]> = batch_c.iter().map(Vec::as_slice).collect();
+                    let bytes = guard.decode_batch(&refs, 1);
+                    for (dst, b) in out_c.iter_mut().zip(bytes) {
+                        *dst = String::from_utf8_lossy(&b).into_owned();
+                    }
+                });
+            }
+        });
+        out
     }
 
     /// The active tokenizer name (for logs / health output).
@@ -259,11 +324,62 @@ mod tests {
         Ok(())
     }
 
+    /// `decode` through the lock-free view is byte-identical to the
+    /// tokenizer's own `decode` — same table, same out-of-vocab skip —
+    /// including ids past the vocabulary (a padded `lm_head` sampling).
+    #[test]
+    fn decode_matches_tokenizer_decode() -> Result<(), peregrine_core::Error> {
+        let mut tok = fixture_tokenizer()?;
+        let backend = TokenBackend::sharded(fixture_tokenizer()?, 4);
+        let mut ids = tok.encode("Hello, world! naïve 🦅");
+        let oov = u32::try_from(tok.vocab_size())
+            .map_err(|e| peregrine_core::Error::Format(format!("vocab size: {e}")))?
+            .saturating_add(5);
+        ids.push(oov);
+        ids.push(u32::MAX);
+        assert_eq!(backend.decode(&ids)?, String::from_utf8_lossy(&tok.decode(&ids)));
+        // The per-stream handle reads the same rows the whole decode does.
+        let handle = backend.decode_handle();
+        let mut bytes = Vec::new();
+        for &id in &ids {
+            if (id as usize) < tok.vocab_size() {
+                bytes.extend_from_slice(handle.token_bytes(id).ok_or_else(|| {
+                    peregrine_core::Error::Format("handle dropped an in-vocab id".into())
+                })?);
+            } else {
+                assert!(handle.token_bytes(id).is_none(), "OOV id {id} must read as None");
+            }
+        }
+        assert_eq!(bytes, tok.decode(&ids));
+        Ok(())
+    }
+
+    /// `decode_batch` fans out across shards but reads the same rows as
+    /// `decode`: empty, OOV-bearing, and unicode sequences all match their
+    /// single-decode reference in input order.
+    #[test]
+    fn decode_batch_matches_single_decodes() -> Result<(), peregrine_core::Error> {
+        let mut tok = fixture_tokenizer()?;
+        let backend = TokenBackend::sharded(fixture_tokenizer()?, 4);
+        let oov = u32::try_from(tok.vocab_size())
+            .map_err(|e| peregrine_core::Error::Format(format!("vocab size: {e}")))?
+            .saturating_add(5);
+        let mut batch: Vec<Vec<u32>> = sharding_texts().iter().map(|t| tok.encode(t)).collect();
+        batch.push(Vec::new());
+        batch.push(vec![oov, u32::MAX]);
+        let reference: Vec<String> =
+            batch.iter().map(|ids| backend.decode(ids)).collect::<Result<_, _>>()?;
+        assert_eq!(backend.decode_batch(&batch), reference);
+        // Single-sequence batch collapses to the same answer.
+        assert_eq!(backend.decode_batch(&batch[..1]), reference[..1]);
+        assert!(backend.decode_batch(&[]).is_empty());
+        Ok(())
+    }
+
     /// Concurrent encodes on one shared backend agree with the sequential
     /// reference: round-robin handout shares no mutable state between shards.
     #[test]
-    fn sharded_encode_agrees_concurrently() -> Result<(), peregrine_core::Error> {
-        use std::sync::Arc;
+    fn sharded_encode_agrees_concurrently() -> Result<(), peregrine_core::Error> {        use std::sync::Arc;
         let texts = sharding_texts();
         let backend = Arc::new(TokenBackend::sharded(fixture_tokenizer()?, 4));
         let single = TokenBackend::sharded(fixture_tokenizer()?, 1);

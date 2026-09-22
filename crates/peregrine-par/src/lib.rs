@@ -489,19 +489,49 @@ impl Drop for Pool {
     }
 }
 
+/// Process-wide override of [`global`]'s worker width, dictated **before** the
+/// pool's first use. Exists for the block-execution modes
+/// (`COLI_BLOCK_EXEC=sync`): the sync mode wants every op fully serial, and the
+/// pool is built exactly once on first use — so its width has to be dictated
+/// ahead of that, not re-read per call (channels and parked threads are fixed
+/// at construction).
+static GLOBAL_THREADS_OVERRIDE: OnceLock<usize> = OnceLock::new();
+
+/// Dictate [`global`]'s worker width (min 1). Must run before the pool's first
+/// `par_*` call — the pool is built lazily — and returns `false` when a pool
+/// already exists, in which case the override cannot take and the caller should
+/// say so rather than silently run at the old width.
+pub fn set_global_threads(w: usize) -> bool {
+    GLOBAL_THREADS_OVERRIDE.set(w.max(1)).is_ok()
+}
+
 /// The process-wide pool, sized to `min(cores, 16)` — or `COLI_PAR_THREADS` when
-/// set (`1` = fully serial, for A/B benchmarking or single-core deployments).
-/// Built on first use; lives for the process.
+/// set (`1` = fully serial, for A/B benchmarking or single-core deployments), or
+/// [`set_global_threads`]'s override when it was dictated before this first use
+/// (the override wins over the env, so a sync-mode load cannot be undone by an
+/// inherited `COLI_PAR_THREADS`). Built on first use; lives for the process.
 pub fn global() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let w = std::env::var("COLI_PAR_THREADS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n >= 1)
+        let w = GLOBAL_THREADS_OVERRIDE
+            .get()
+            .copied()
+            .or_else(|| {
+                std::env::var("COLI_PAR_THREADS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|&n| n >= 1)
+            })
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get().min(16)).unwrap_or(4));
         Pool::new(w)
     })
+}
+
+/// How many workers the pool runs — the width `par_*` dispatches across. For
+/// boot logs and the exec-mode report: a mode that claims "serial" has to be
+/// confirmable against the pool that actually runs.
+pub fn worker_count() -> usize {
+    global().job_txs.len()
 }
 
 /// [`Pool::par_rows_mut`] on the global pool.
@@ -739,5 +769,25 @@ mod tests {
         assert!(out.chunks(4).enumerate().all(|(i, r)| r.iter().all(|&v| v == i as f32)));
         // stride 0 would divide by zero — it degenerates to "no rows".
         pool.par_rows_mut(&mut out, 0, 4, 2, |_, _| {});
+    }
+
+    #[test]
+    fn global_override_is_total_and_the_pool_stays_correct() {
+        // The override wins over `COLI_PAR_THREADS` and over the default sizing,
+        // so a sync-mode load cannot be undone by an inherited env. Whether the
+        // override *took* depends on whether another test built the pool first
+        // (tests race on the process-wide pool). When it took with width 1 the
+        // pool is the serial pool — which parks no threads, so `worker_count`
+        // reads 0, not 1 — and every `par_*` runs inline; when another test won
+        // the race the pool keeps whatever width it was built with. Either way
+        // the pool must compute bit-identically, and a later set is a no-op.
+        let took = set_global_threads(1);
+        if took {
+            assert_eq!(worker_count(), 0, "a width-1 override must build the serial pool");
+        }
+        // worker_count() builds the pool, so any *later* set is a no-op by construction.
+        assert!(!set_global_threads(4), "the override is first-call-wins");
+        let out = par_map(9, 2, |i| i as f32 * 2.0);
+        assert_eq!(out, (0..9).map(|i| i as f32 * 2.0).collect::<Vec<_>>());
     }
 }

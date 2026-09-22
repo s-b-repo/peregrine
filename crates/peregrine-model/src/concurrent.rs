@@ -167,6 +167,10 @@ pub struct ForwardCtx<'a> {
     /// `None` = the historical device-blind single cursor. Bit-identical either
     /// way — only claim/submission order changes; the reduce keys on `pos`.
     pub fd_devices: Option<&'a HashMap<RawFd, u8>>,
+    /// Per-block execution mode (`COLI_BLOCK_EXEC`). Threaded from the model
+    /// so block compute honors `sync` without re-reading env per layer; the
+    /// I/O lane consults it to size claim parallelism (sync ⇒ single-claim).
+    pub block_exec: crate::block_exec::BlockExecMode,
 }
 
 /// Per-layer co-activation ordering hints, rebuilt periodically by the model
@@ -771,6 +775,69 @@ fn read_regions(mut r: Option<&mut Reactor>, regions: &[(RawFd, u64, usize)], di
     Ok(bufs.into_iter().map(Bytes::from).collect())
 }
 
+/// Read `regions` through the mirror-striped lane when it pays, else the
+/// plain [`read_regions`] path. Striping splits each large region across every
+/// drive holding a copy (`COLI_IO_MIRROR_ROOTS`) in one batched submit, so all
+/// drives read concurrently; small regions ride whole on one drive round-robin
+/// so per-request overhead never exceeds the parallelism it buys.
+///
+/// Buffered only and bit-identical to [`read_regions`]: same offsets, same
+/// bytes, only the serving fd per chunk differs (mirrors are full copies).
+/// O_DIRECT keeps the aligned single-fd path (an equal split breaks block
+/// alignment), as do the `mmap`/`regbuf` measurement arms.
+fn read_regions_maybe_striped(
+    mut r: Option<&mut Reactor>,
+    regions: &[(RawFd, u64, usize)],
+    direct: bool,
+    st: Option<&SafeTensors>,
+) -> Result<Vec<Bytes>, Error> {
+    let Some(st) = st else {
+        return read_regions(r, regions, direct);
+    };
+    if direct || !st.has_mirrors() || regions.is_empty() {
+        return read_regions(r, regions, direct);
+    }
+    // Resolve each region's mirror set once. Regions whose fd names no known
+    // shard (or whose shard has no copies) stay single-fd; when nothing
+    // stripes, keep the historical path exactly (same submit shape, same
+    // advisories the caller already issued).
+    let sets: Vec<Vec<RawFd>> = regions.iter().map(|&(fd, _, _)| st.mirror_fd_set_for_fd(fd)).collect();
+    if sets.iter().all(|s| s.len() <= 1) {
+        return read_regions(r, regions, direct);
+    }
+    if matches!(io_engine(), IoEngine::Mmap | IoEngine::RegBuf) {
+        return read_regions(r, regions, direct);
+    }
+    let mut bufs: Vec<Vec<u8>> = regions.iter().map(|&(_, _, len)| vec![0u8; len]).collect();
+    {
+        let mut reads: Vec<peregrine_io::StripedRead> = Vec::with_capacity(regions.len());
+        for (i, (buf, &( _fd, off, _))) in bufs.iter_mut().zip(regions).enumerate() {
+            reads.push(peregrine_io::StripedRead { fds: &sets[i], offset: off, buf: buf.as_mut_slice(), tag: 0 });
+        }
+        let res = match io_engine() {
+            IoEngine::Pread => peregrine_io::pread_striped_threaded(&mut reads, pread_threads()),
+            IoEngine::Uring => need_ring(r.as_deref_mut())?
+                .read_striped(&mut reads)
+                .ctx(|| "io_uring striped mirror expert read".to_string())?,
+            IoEngine::Mmap | IoEngine::RegBuf => {
+                return read_regions(r, regions, direct);
+            }
+        };
+        for (i, &n) in res.iter().enumerate() {
+            if n < 0 {
+                return Err(Error::Io(std::io::Error::from_raw_os_error((-n) as i32)));
+            }
+            let want = bufs[i].len() as i64;
+            if n != want {
+                return Err(Error::Format(format!(
+                    "striped mirror read short-completion for region {i}: got {n} of {want}"
+                )));
+            }
+        }
+    }
+    Ok(bufs.into_iter().map(Bytes::from).collect())
+}
+
 /// Which syscall shape the streaming lane uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IoEngine {
@@ -1065,7 +1132,12 @@ fn fadvise_drop_enabled() -> bool {
 /// completed per region, so the returned bytes are identical to [`read_expert`] —
 /// the streamed output stays bit-identical to the resident path. Slabs are returned
 /// in `plans` order.
-fn read_experts_batched(mut r: Option<&mut Reactor>, plans: &[&EPlan], direct: bool) -> Result<Vec<peregrine_io::ExpertSlab>, Error> {
+fn read_experts_batched(
+    mut r: Option<&mut Reactor>,
+    plans: &[&EPlan],
+    direct: bool,
+    st: Option<&SafeTensors>,
+) -> Result<Vec<peregrine_io::ExpertSlab>, Error> {
     let n = plans.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -1101,7 +1173,9 @@ fn read_experts_batched(mut r: Option<&mut Reactor>, plans: &[&EPlan], direct: b
     }
     // one deep submit for all 6·n regions (buffered) or per-region aligned DMA
     // (direct, zero-copy); bytes come back in region order, six per expert.
-    let bytes = match read_regions(r.as_deref_mut(), &regions, direct) {
+    // With mirrors the striped lane splits large regions across all drives in
+    // one submit; without them (or direct) this is the historical submit.
+    let bytes = match read_regions_maybe_striped(r.as_deref_mut(), &regions, direct, st) {
         Ok(b) => b,
         Err(e) if io_recovery_enabled() && !direct => {
             // Retry ladder: on a batched-read failure, re-issue each region as
@@ -1195,7 +1269,9 @@ fn read_regions_with_retry(mut r: Option<&mut Reactor>, regions: &[(RawFd, u64, 
 /// Default on; `COLI_IO_COMPLETION=0` restores the wave path byte-for-byte.
 /// `COLI_IO_ENGINE=pread|regbuf` also implies the wave path — those engines are
 /// wave-shaped measurement arms, and reshaping their requests would change what
-/// they measure.
+/// they measure. The mmap engine honors the same knob through per-expert
+/// streaming ([`stream_experts_mmap`]): no completion events exist there, so
+/// one expert's own regions are the delivery unit.
 fn completion_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -1223,6 +1299,7 @@ fn stream_experts_completion(
     r: &mut Reactor,
     plans: &[&EPlan],
     direct: bool,
+    st: Option<&SafeTensors>,
     mut forward: impl FnMut(usize, peregrine_io::ExpertSlab) -> bool,
 ) -> Result<bool, Error> {
     let n = plans.len();
@@ -1232,6 +1309,15 @@ fn stream_experts_completion(
     // One owned request per region; `tag` packs (expert k, region slot j) so a
     // completion routes back without a lookup table. Region counts differ per
     // expert (2 coalesced, 6 not) — `remaining` tracks each expert's countdown.
+    //
+    // With mirrors each whole region rides one drive, round-robin across the
+    // batch (`(k, j)` salt): mirrors hold identical bytes, so serving region
+    // (k,j) from any copy is byte-identical while every drive works in
+    // parallel within the claim. Whole-region (not split) deliberately: owned
+    // buffers are reactor-owned per region and cannot be re-split without a
+    // reassembly copy; the wave lane's `read_striped` does the splitting.
+    // O_DIRECT never mirrors (buffered-striping only).
+    let use_mirrors = !direct && st.is_some_and(|s| s.has_mirrors());
     let mut reqs: Vec<OwnedReadReq> = Vec::with_capacity(6 * n);
     let mut parts: Vec<Vec<Option<Bytes>>> = Vec::with_capacity(n);
     let mut remaining: Vec<usize> = Vec::with_capacity(n);
@@ -1241,7 +1327,13 @@ fn stream_experts_completion(
         remaining.push(regs.len());
         parts.push((0..regs.len()).map(|_| None).collect());
         for (j, &(fd, off, len)) in regs.iter().enumerate() {
-            reqs.push(OwnedReadReq { fd, offset: off, len, tag: ((k as u64) << 32) | j as u64 });
+            let serve = if use_mirrors {
+                let set = st.map(|s| s.mirror_fd_set_for_fd(fd)).unwrap_or_else(|| vec![fd]);
+                if set.len() <= 1 { fd } else { set[(k.wrapping_add(j)) % set.len()] }
+            } else {
+                fd
+            };
+            reqs.push(OwnedReadReq { fd: serve, offset: off, len, tag: ((k as u64) << 32) | j as u64 });
         }
         all_regions.extend_from_slice(&regs);
     }
@@ -1319,6 +1411,105 @@ fn stream_experts_completion(
         }
         Err(e) => Err(e),
     }
+}
+
+/// mmap per-expert streaming: the `IoEngine::Mmap` answer to
+/// [`stream_experts_completion`]. mmap has no completion events — the memcpy
+/// IS the I/O — so one expert's own regions are the smallest honest "as it
+/// completes" unit: each expert is `forward`ed the moment its regions land,
+/// letting the CPU pool start on expert 1 while the lane copies 2..N.
+///
+/// Bytes are identical to the [`read_experts_batched`] wave (same `mmap_many`
+/// primitive over the same [`expert_regions`], same [`pack_slab_from`]
+/// carve); only delivery timing differs, which the `pos`-keyed reduce absorbs
+/// by design. Not used for pread/regbuf: those are wave-shaped measurement
+/// arms whose request shape is what they measure. Not used under O_DIRECT
+/// either: direct reads need a ring submit, which is the wave's shape.
+///
+/// `forward(k, slab)` receives the index into `plans`; `false` stops the
+/// stream with `Ok(false)` (consumer gone).
+fn stream_experts_mmap(
+    mut r: Option<&mut Reactor>,
+    plans: &[&EPlan],
+    mut forward: impl FnMut(usize, peregrine_io::ExpertSlab) -> bool,
+) -> Result<bool, Error> {
+    if plans.is_empty() {
+        return Ok(true);
+    }
+    // One line so operators (and A/B harnesses) can tell this path ran; the
+    // uring twin's presence is visible in the ring telemetry, this one has
+    // no other marker.
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[io] mmap per-expert streaming: forwarding each expert as its regions land");
+    }
+    // Upfront readahead over the whole claim, exactly like the wave: the
+    // kernel pages later experts while the lane copies (and the CPU pool
+    // computes) the early ones. Advisory only — bytes are identical either
+    // way, and per-expert hints would arrive just in time to be useless.
+    if fadvise_main_enabled() {
+        let flat: Vec<(RawFd, u64, usize)> =
+            plans.iter().flat_map(|p| expert_regions(&p.entry, false)).collect();
+        let hinted = match r.as_deref_mut() {
+            Some(r) => r.fadvise_willneed_many(&flat),
+            None => peregrine_io::fadvise_many(&flat, peregrine_io::FADV_WILLNEED),
+        };
+        if let Err(e) = hinted {
+            peregrine_io::note_advisory_err("fadvise willneed (mmap per-expert readahead)", &e);
+        }
+    }
+    for (k, p) in plans.iter().enumerate() {
+        let regs = expert_regions(&p.entry, false);
+        let mut bufs: Vec<Vec<u8>> = regs.iter().map(|&(_, _, len)| vec![0u8; len]).collect();
+        {
+            let mut reqs: Vec<ReadReq> = Vec::with_capacity(regs.len());
+            for (buf, &(fd, off, _)) in bufs.iter_mut().zip(regs.iter()) {
+                reqs.push(ReadReq { fd, offset: off, buf: buf.as_mut_slice(), tag: 0 });
+            }
+            // One memcpy per region (no split: chunking changes fault
+            // granularity, never bytes, and there is no submit depth to
+            // feed here). A short count falls back to the same completion
+            // the pread retry path uses.
+            for (j, &n) in peregrine_io::mmap_many(&mut reqs).iter().enumerate() {
+                if n < 0 {
+                    return Err(Error::Io(std::io::Error::from_raw_os_error((-n) as i32)));
+                }
+                let (done, len) = (n as usize, regs[j].2);
+                if done < len {
+                    let (fd, off, _) = regs[j];
+                    complete_short_read(r.as_deref_mut(), fd, off + done as u64, &mut bufs[j][done..len])?;
+                }
+            }
+        }
+        let slab = pack_slab_from(&p.entry, bufs.into_iter().map(Bytes::from).collect())?;
+        if !forward(k, slab) {
+            return Ok(false);
+        }
+        if fadvise_drop_enabled() {
+            // Release just-read pages now rather than at chunk end like the
+            // wave: same advisory, strictly earlier. Regions are per-expert
+            // extents, so nothing later in the chunk re-faults them.
+            let dropped = match r.as_deref_mut() {
+                Some(r) => {
+                    let mut first_err = None;
+                    for &(fd, off, len) in &regs {
+                        if let Err(e) = r.fadvise_dontneed(fd, off, len) {
+                            first_err.get_or_insert(e);
+                        }
+                    }
+                    match first_err {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    }
+                }
+                None => peregrine_io::fadvise_many(&regs, peregrine_io::FADV_DONTNEED),
+            };
+            if let Err(e) = dropped {
+                peregrine_io::note_advisory_err("fadvise dontneed (page-cache release)", &e);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Re-stream one expert with the blocking oracle reader ([`pread_many`]),
@@ -1739,6 +1930,7 @@ pub fn moe_forward_concurrent(
     let plans_ref = &plans;
     let gplans_ref = &gplans;
     let x_ref = x;
+    let st_ref = st;
     let completed_ref = &completed;
     // Glm5Next: streamed experts clamp their SwiGLU pre-activations exactly
     // like resident ones (`Mlp::limit`); 0.0 on every other architecture.
@@ -1769,8 +1961,10 @@ pub fn moe_forward_concurrent(
     };
     // Completion lane vs wave, resolved once: pread/regbuf are wave-shaped
     // measurement arms whose request shape *is* what they measure, so only the
-    // uring engine streams per-expert. `COLI_IO_COMPLETION=0` is the escape
-    // hatch back to the wave on uring too.
+    // uring engine streams per-expert here. The mmap engine gets its own
+    // per-expert streaming at the wave call site below
+    // (`stream_experts_mmap`); `COLI_IO_COMPLETION=0` is the escape hatch
+    // back to the wave on both.
     let completion = completion_enabled() && matches!(io_engine(), IoEngine::Uring);
     // Fixed at cache construction; read once here so workers can run the zstd
     // encode (`WarmCache::prepare_insert`) without touching the cache lock.
@@ -1924,7 +2118,7 @@ pub fn moe_forward_concurrent(
                                 r.queue_willneed(&ahead);
                             }
                         }
-                        let streamed = stream_experts_completion(&mut r, &chunk_plans, use_direct, |k, slab| {
+                        let streamed = stream_experts_completion(&mut r, &chunk_plans, use_direct, Some(st_ref), |k, slab| {
                             job_tx.send(Job::Stream(miss[k], slab)).is_ok()
                         });
                         if let Some(t) = timings_ref {
@@ -1944,6 +2138,34 @@ pub fn moe_forward_concurrent(
                             }
                         }
                     }
+                    // mmap per-expert streaming vs the wave below, resolved with
+                    // the same knob as the completion lane: `COLI_IO_COMPLETION=0`
+                    // restores the whole-claim wave byte-for-byte. pread/regbuf
+                    // keep the wave unconditionally (measurement arms), and
+                    // O_DIRECT keeps it too (direct reads need a ring submit).
+                    if !use_direct && matches!(io_engine(), IoEngine::Mmap) && completion_enabled() {
+                        let mut guard = ring.map(|rg| rg.lock());
+                        let streamed =
+                            stream_experts_mmap(guard.as_deref_mut(), &chunk_plans, |k, slab| {
+                                job_tx.send(Job::Stream(miss[k], slab)).is_ok()
+                            });
+                        if let Some(t) = timings_ref {
+                            t.add_io(t_io.elapsed().as_micros() as u64);
+                        }
+                        observe_window(&chunk_plans, t_io.elapsed());
+                        match streamed {
+                            Ok(true) => continue,
+                            // Consumer gone: same early return as the wave's
+                            // send-failure path below.
+                            Ok(false) => return,
+                            Err(e) => {
+                                if res_tx.send(Err(e)).is_err() {
+                                    peregrine_io::note_advisory_err("io lane error forward", &"collector already gone");
+                                }
+                                return;
+                            }
+                        }
+                    }
                     // Wave path: the `COLI_IO_COMPLETION=0` escape hatch and the
                     // pread/regbuf measurement arms. One blocking submit for the
                     // whole claim; admission still runs on the worker
@@ -1953,7 +2175,7 @@ pub fn moe_forward_concurrent(
                         // needs no ring there, and holding one would only
                         // serialize lanes that are not sharing anything.
                         let mut guard = ring.map(|rg| rg.lock());
-                        read_experts_batched(guard.as_deref_mut(), &chunk_plans, use_direct)
+                        read_experts_batched(guard.as_deref_mut(), &chunk_plans, use_direct, Some(st_ref))
                     };
                     if let Some(t) = timings_ref {
                         t.add_io(t_io.elapsed().as_micros() as u64);
@@ -2602,6 +2824,7 @@ mod tests {
             affinity: None,
             expert_index: None,
             fd_devices,
+            block_exec: crate::block_exec::BlockExecMode::Par,
         };
         let blind =
             moe_forward_concurrent(&ctx_of(None), layer, &x, &router_w, &router_bias, None, s_n)?;
@@ -2701,6 +2924,7 @@ mod tests {
             affinity: None,
             expert_index: None,
             fd_devices,
+            block_exec: crate::block_exec::BlockExecMode::Par,
         };
 
         // Seed the clock so the ON arm runs with a non-prior model: without
@@ -3144,7 +3368,7 @@ mod tests {
         let eplans = [eplan(0, entry_a), eplan(1, entry_b)];
         let plan_refs: Vec<&EPlan> = eplans.iter().collect();
         let mut got: Vec<(usize, peregrine_io::ExpertSlab)> = Vec::new();
-        let all = stream_experts_completion(&mut reactor, &plan_refs, false, |k, slab| {
+        let all = stream_experts_completion(&mut reactor, &plan_refs, false, None, |k, slab| {
             got.push((k, slab));
             true
         })?;
@@ -3169,6 +3393,64 @@ mod tests {
         Ok(())
     }
 
+    /// mmap per-expert streaming must deliver exactly the bytes the wave path
+    /// delivers — same regions, same carve — with each expert forwarded
+    /// exactly once, in claim order. The oracle replicates the wave's mmap
+    /// behavior with the same primitives rather than calling
+    /// `read_experts_batched`, which dispatches on the process-global engine
+    /// (latched to uring in test processes): what is pinned here is this
+    /// function's wiring (partitioning, forward-once, early stop), while the
+    /// primitives themselves are covered by the completion-lane twin and the
+    /// io tests. Ringless by construction, so unlike that twin this test has
+    /// no skip path and runs everywhere the mmap primitive does.
+    #[test]
+    fn mmap_per_expert_bytes_identical_to_wave() -> Result<(), Error> {
+        let (_rf, path, entry_a, entry_b) = completion_fixture("mmap_ident")?;
+        // Oracle: the wave's mmap behavior — same regions, same primitive,
+        // same carve, whole claim at once.
+        let wave_mmap = |entry: &ExpertEntry| -> Result<peregrine_io::ExpertSlab, Error> {
+            let regs = expert_regions(entry, false);
+            let mut bufs: Vec<Vec<u8>> = regs.iter().map(|&(_, _, len)| vec![0u8; len]).collect();
+            let mut reqs: Vec<ReadReq> = Vec::with_capacity(regs.len());
+            for (buf, &(fd, off, _)) in bufs.iter_mut().zip(regs.iter()) {
+                reqs.push(ReadReq { fd, offset: off, buf: buf.as_mut_slice(), tag: 0 });
+            }
+            for (j, &n) in peregrine_io::mmap_many(&mut reqs).iter().enumerate() {
+                assert!(n as usize == regs[j].2, "fixture reads must land whole");
+            }
+            pack_slab_from(entry, bufs.into_iter().map(Bytes::from).collect())
+        };
+        let (want_a, want_b) = (wave_mmap(&entry_a)?, wave_mmap(&entry_b)?);
+
+        let eplans = [eplan(0, entry_a), eplan(1, entry_b)];
+        let plan_refs: Vec<&EPlan> = eplans.iter().collect();
+        let mut got: Vec<(usize, peregrine_io::ExpertSlab)> = Vec::new();
+        let all = stream_experts_mmap(None, &plan_refs, |k, slab| {
+            got.push((k, slab));
+            true
+        })?;
+        assert!(all, "every expert must be forwarded when the consumer stays");
+        let ks: Vec<usize> = got.iter().map(|(k, _)| *k).collect();
+        assert_eq!(ks, vec![0, 1], "claim order, each expert exactly once");
+        for ((_, got), want) in got.iter().zip([&want_a, &want_b]) {
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert_eq!(&g.0[..], &w.0[..], "weight bytes identical to the wave path");
+                assert_eq!(&g.1[..], &w.1[..], "scale bytes identical to the wave path");
+            }
+        }
+        // Consumer gone after the first expert: Ok(false), no second forward.
+        let mut second = 0usize;
+        let stopped = stream_experts_mmap(None, &plan_refs, |k, _| {
+            second += 1;
+            assert_eq!(k, 0, "early stop must halt before expert 1");
+            false
+        })?;
+        assert!(!stopped, "a gone consumer stops the stream");
+        assert_eq!(second, 1);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
     /// A consumer that disappears mid-stream (dropped channel → `forward`
     /// returns false) stops the stream with `Ok(false)` — and the quiesce on
     /// the way out leaves the ring reusable, not poisoned by in-flight owned
@@ -3187,7 +3469,7 @@ mod tests {
         let eplans = [eplan(0, entry_a), eplan(1, entry_b)];
         let plan_refs: Vec<&EPlan> = eplans.iter().collect();
         let mut forwards = 0usize;
-        let all = stream_experts_completion(&mut reactor, &plan_refs, false, |_, _| {
+        let all = stream_experts_completion(&mut reactor, &plan_refs, false, None, |_, _| {
             forwards += 1;
             false // consumer gone after the first delivery
         })?;
@@ -3197,6 +3479,62 @@ mod tests {
         let want_a = read_expert(Some(&mut reactor), &entry_a, false)?;
         assert_eq!(want_a[0].0.len(), entry_a.plans[0].w_len);
         std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// The mirror-aware batched wave with no mirror map (`st = None`) is the
+    /// historical wave exactly: same slabs as one-`read_expert`-at-a-time for
+    /// both the six-region and the coalesced two-region shapes.
+    #[test]
+    fn batched_wave_without_mirrors_matches_single_reads() -> Result<(), Error> {
+        let (_rf, path, entry_a, entry_b) = completion_fixture("nomirror")?;
+        let mut reactor = match Reactor::new(16) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: io_uring unavailable: {e}");
+                std::fs::remove_file(&path)?;
+                return Ok(());
+            }
+        };
+        let eplans = [eplan(0, entry_a), eplan(1, entry_b)];
+        let plan_refs: Vec<&EPlan> = eplans.iter().collect();
+        let slabs = read_experts_batched(Some(&mut reactor), &plan_refs, false, None)?;
+        assert_eq!(slabs.len(), 2);
+        for (slab, entry) in slabs.iter().zip([&entry_a, &entry_b]) {
+            let want = read_expert(Some(&mut reactor), entry, false)?;
+            for (g, w) in slab.iter().zip(want.iter()) {
+                assert_eq!(&g.0[..], &w.0[..], "weight bytes identical to single reads");
+                assert_eq!(&g.1[..], &w.1[..], "scale bytes identical to single reads");
+            }
+        }
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// `mirror_fd_set_for_fd` without mirrors is the identity: a known shard
+    /// fd maps to exactly itself, and an unknown fd passes through untouched
+    /// (so the striped lane degrades to the plain read, never an error).
+    #[test]
+    fn mirror_lookup_without_mirrors_is_identity() -> Result<(), Error> {
+        use peregrine_core::{Cfg, SafeTensors};
+        let dir = std::env::temp_dir().join(format!("peregrine_mirrorident_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
+        }
+        crate::testkit::build_tiny_model_seeded(&dir, 0x9E3779B9)?;
+        let cfg = Cfg::load(&dir)?;
+        let _ = cfg;
+        let st = SafeTensors::open(&dir)?;
+        assert!(!st.has_mirrors(), "fixture has no mirror roots without the env knob");
+        assert_eq!(st.n_mirror_roots(), 0);
+        let fd = st.region("model.embed_tokens.weight").map(|(fd, _, _)| fd).unwrap_or(-1);
+        if fd >= 0 {
+            assert_eq!(st.mirror_fd_set_for_fd(fd), vec![fd]);
+            assert!(st.file_idx_of_fd(fd).is_some());
+        }
+        assert_eq!(st.mirror_fd_set_for_fd(-1), vec![-1]);
+        assert!(st.file_idx_of_fd(-1).is_none());
+        std::fs::remove_dir_all(&dir).map_err(Error::Io)?;
         Ok(())
     }
 }

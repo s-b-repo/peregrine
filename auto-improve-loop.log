@@ -1,0 +1,481 @@
+[setup] Ollama model qwen3.8-27b verified.
+M	auto-improve-loop.log
+On branch improve-loop-2026
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   auto-improve-loop.log
+
+no changes added to commit (use "git add" and/or "git commit -a")
+=== Auto-improve loop started ===
+Branch: improve-loop-2026
+Target: 0.6 tok/s
+Max iterations: 84
+Total optimization goals: 28
+
+=== Iteration 1 / 84 ===
+[1/5] Restarting peregrine-serve...
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=available (CUDA backend linked (c/backend_cuda.cu), 1 device(s) visible)
+peregrine: pcie 0000:01:00.0 5.0 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 44.3 GB | resident 14.3 + KV 0.1 + stream 0.0 + slack 1.8 + cache 2.1 -> peak 18.3 GB
+[CUDA] device 0: NVIDIA GeForce RTX 3060, 12.5 GB VRAM, sm_86
+peregrine: CUDA contexts initialized: 1 (device 0)
+peregrine: [gpu-dense] 10.28 of 12.19 GB matmul weights resident (84%) — 64 fused MLPs + 167 projections [fit-to-free-VRAM: not reproducible across boots]
+peregrine: [gpu-dense] placed: 0.in_qkv 0.in_z 0.in_a 0.in_b 0.out 1.in_qkv 1.in_z 1.in_a 1.in_b 1.out 2.in_qkv 2.in_z (+155 more)
+peregrine: [gpu-dense] skipped: 30.in_qkv 30.in_z 30.out 31.q 31.o 32.in_qkv 32.in_z 32.out 33.in_qkv 33.in_z 33.out 34.in_qkv (+125 more)
+[tokenizer] gigatoken BPE active, vocab=248077
+peregrine: [spec] MTP head present but speculation is off — this arch needs recurrent-state rollback on reject (not yet wired)
+peregrine-serve listening on http://127.0.0.1:8132
+auth verified (401 without a key); Qwen serving on 127.0.0.1:8132
+[2/5] Running benchmark...
+Results saved to /home/cortix/peregrine/model-bench/results/20260818-222458.json
+Current speed: 0.50 tok/s
+[3/5] Running 28 optimization goals via OpenCode (Ollama engine)...
+
+>>> GOAL 1/28: Fix GPU dispatch (gpu.calls=0) — ensure CUDA kernels in cuda/backend_cuda.cu are invoked; check crate peregrine-sched lane balancer dispatch to GPU lane; reduce PCIe host-device copies
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Fix GPU dispatch (gpu.calls=0) — ensure CUDA kernels in cuda/backend_cuda.cu are invoked; check crate peregrine-sched lane balancer dispatch to GPU lane; reduce PCIe host-device copies at Tue Aug 18 10:25:27 PM SAST 2026
+>>> Goal 1/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 2/28: Implement REDUCE BYTES/TOKEN — expert-route speculative decoding: use GPU-resident hot experts for draft tokens, verify full model in one pass
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement REDUCE BYTES/TOKEN — expert-route speculative decoding: use GPU-resident hot experts for draft tokens, verify full model in one pass at Tue Aug 18 10:25:30 PM SAST 2026
+>>> Goal 2/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 3/28: Implement speculative routing: predict next 4-8 token routes, prefetch only predicted experts, draft→verify
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement speculative routing: predict next 4-8 token routes, prefetch only predicted experts, draft→verify at Tue Aug 18 10:25:33 PM SAST 2026
+>>> Goal 3/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 4/28: Implement expert-union future-token execution: load union of predicted experts once for multiple token positions
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement expert-union future-token execution: load union of predicted experts once for multiple token positions at Tue Aug 18 10:25:35 PM SAST 2026
+>>> Goal 4/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 5/28: Implement pre-fill/decode expert-union sharing: fuse prefill rows into decode batch to share expert reads
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement pre-fill/decode expert-union sharing: fuse prefill rows into decode batch to share expert reads at Tue Aug 18 10:25:38 PM SAST 2026
+>>> Goal 5/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 6/28: Implement GPU COMPUTE DISPATCH fix — ensure CUDA kernels actually invoked; reduce PCIe copies per token
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement GPU COMPUTE DISPATCH fix — ensure CUDA kernels actually invoked; reduce PCIe copies per token at Tue Aug 18 10:25:41 PM SAST 2026
+>>> Goal 6/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 7/28: Implement HOT-EXPERT RESIDENCY — keep hot experts resident in VRAM/RAM across tokens using 33.55% consecutive overlap for caching
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement HOT-EXPERT RESIDENCY — keep hot experts resident in VRAM/RAM across tokens using 33.55% consecutive overlap for caching at Tue Aug 18 10:25:43 PM SAST 2026
+>>> Goal 7/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 8/28: Implement ROUTE PRUNING / MINIMUM-SHARE GATING — prune low-contribution routes (<0.5% gate mass) while maintaining quality
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement ROUTE PRUNING / MINIMUM-SHARE GATING — prune low-contribution routes (<0.5% gate mass) while maintaining quality at Tue Aug 18 10:25:46 PM SAST 2026
+>>> Goal 8/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 9/28: Implement INT3 quantization (12.7% smaller than INT4)
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement INT3 quantization (12.7% smaller than INT4) at Tue Aug 18 10:25:48 PM SAST 2026
+>>> Goal 9/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 10/28: Implement KV-cache quantization (currently f32, 180MB/1000 tokens)
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement KV-cache quantization (currently f32, 180MB/1000 tokens) at Tue Aug 18 10:25:51 PM SAST 2026
+>>> Goal 10/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 11/28: Implement paged KV storage
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement paged KV storage at Tue Aug 18 10:25:54 PM SAST 2026
+>>> Goal 11/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 12/28: Implement GPUDirect Storage (hardware-level I/O bypass)
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement GPUDirect Storage (hardware-level I/O bypass) at Tue Aug 18 10:25:56 PM SAST 2026
+>>> Goal 12/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 13/28: Reduce redundant expert reads
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Reduce redundant expert reads at Tue Aug 18 10:25:59 PM SAST 2026
+>>> Goal 13/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 14/28: Implement expert fusion (store shared basis B_i, stream small deltas) — see docs/expert-decomposition.md
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement expert fusion (store shared basis B_i, stream small deltas) — see docs/expert-decomposition.md at Tue Aug 18 10:26:01 PM SAST 2026
+>>> Goal 14/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 15/28: Implement token equivalence classes — semantic memoization: if |h_a-h_b|<epsilon reuse cached continuation. See docs/token-equivalence-adaptive-precision.md
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement token equivalence classes — semantic memoization: if |h_a-h_b|<epsilon reuse cached continuation. See docs/token-equivalence-adaptive-precision.md at Tue Aug 18 10:26:04 PM SAST 2026
+>>> Goal 15/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 16/28: Implement adaptive precision via uncertainty propagation: delta_y ≈ J·delta_x, assign precision by sensitivity. See docs/token-equivalence-adaptive-precision.md
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement adaptive precision via uncertainty propagation: delta_y ≈ J·delta_x, assign precision by sensitivity. See docs/token-equivalence-adaptive-precision.md at Tue Aug 18 10:26:07 PM SAST 2026
+>>> Goal 16/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 17/28: Implement blockwise parallel decoding — predict next block of 4-8 tokens, draft-generate all, verify in 1 pass
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement blockwise parallel decoding — predict next block of 4-8 tokens, draft-generate all, verify in 1 pass at Tue Aug 18 10:26:09 PM SAST 2026
+>>> Goal 17/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 18/28: Implement Medusa/EAGLE-style lightweight prediction heads
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement Medusa/EAGLE-style lightweight prediction heads at Tue Aug 18 10:26:12 PM SAST 2026
+>>> Goal 18/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 19/28: Implement backward routing — estimate Jacobian sensitivity, deprioritize low-sensitivity experts
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement backward routing — estimate Jacobian sensitivity, deprioritize low-sensitivity experts at Tue Aug 18 10:26:14 PM SAST 2026
+>>> Goal 19/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 20/28: Implement geometric cache — cache by state distance not recency: d(x_t, x_cached) instead of time alone
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement geometric cache — cache by state distance not recency: d(x_t, x_cached) instead of time alone at Tue Aug 18 10:26:17 PM SAST 2026
+>>> Goal 20/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 21/28: Implement expert-address prediction — predict future storage addresses before routing finishes
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement expert-address prediction — predict future storage addresses before routing finishes at Tue Aug 18 10:26:20 PM SAST 2026
+>>> Goal 21/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 22/28: Implement compute-before-read scheduling — execute CPU-ready ops first, schedule SSD reads as async I/O
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement compute-before-read scheduling — execute CPU-ready ops first, schedule SSD reads as async I/O at Tue Aug 18 10:26:23 PM SAST 2026
+>>> Goal 22/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 23/28: Implement time-shifted inference — speculative future state reservoir with top-3 likely branches
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement time-shifted inference — speculative future state reservoir with top-3 likely branches at Tue Aug 18 10:26:25 PM SAST 2026
+>>> Goal 23/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 24/28: Implement probability-mass computation instead of top-K — error-budgeted router with dynamic expert count
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement probability-mass computation instead of top-K — error-budgeted router with dynamic expert count at Tue Aug 18 10:26:28 PM SAST 2026
+>>> Goal 24/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 25/28: Implement algebraic expert cancellation — compute low-rank shared basis B_j for experts, reconstruct weighted output
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement algebraic expert cancellation — compute low-rank shared basis B_j for experts, reconstruct weighted output at Tue Aug 18 10:26:31 PM SAST 2026
+>>> Goal 25/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 26/28: Implement residual-space routing — skip experts whose output is linearly dependent on already-loaded experts
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement residual-space routing — skip experts whose output is linearly dependent on already-loaded experts at Tue Aug 18 10:26:33 PM SAST 2026
+>>> Goal 26/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 27/28: Implement adaptive causal/non-causal switching — router entropy gates parallel-block vs sequential decoding
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement adaptive causal/non-causal switching — router entropy gates parallel-block vs sequential decoding at Tue Aug 18 10:26:36 PM SAST 2026
+>>> Goal 27/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 28/28: Implement expert-level non-causal execution — predict next K positions expert sets, execute union once
+>>> Requesting OpenCode optimization via Ollama engine...
+[0m
+> build · qwen3.8-27b
+[0m
+[91m[1mError: [0mNot Found: 404 page not found
+[ERROR] OpenCode optimization FAILED for goal: Implement expert-level non-causal execution — predict next K positions expert sets, execute union once at Tue Aug 18 10:26:39 PM SAST 2026
+>>> Goal 28/28 FAILED — will skip and continue to next goal
+Best speed: 0.50 tok/s
+[5/5] Committing final iteration result...
+[5a/5] Running final verification: cargo check...
+    Checking peregrine-serve v0.1.0 (/home/cortix/peregrine/crates/peregrine-serve)
+    Checking peregrine-engine v0.1.0 (/home/cortix/peregrine/crates/peregrine-engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.61s
+[5b/5] Running final verification: bug hunt...
+t(s) in 10.61s
+[5b/5] Running final verification: bug hunt...
+[setup] Ollama model qwen3.8-27b registered (will load when VRAM is free).
+=== Auto-improve loop started ===
+Branch: test-ollama-fix
+Target: 0.6 tok/s
+Max iterations: 1
+Total optimization goals: 28
+
+=== Iteration 1 / 1 ===
+[1/5] Restarting peregrine-serve...
+[2/5] Running benchmark...
+Results saved to /home/cortix/peregrine/model-bench/results/20260819-201703.json
+Current speed: 0.48 tok/s
+[3/5] Stopping peregrine-serve to free VRAM for AI optimization...
+[3a/5] Waiting for Ollama model to load in VRAM...
+[setup] Ollama model loaded and ready.
+[4/5] Running 28 optimization goals via OpenCode (Ollama engine)...
+
+>>> GOAL 1/28: Fix GPU dispatch (gpu.calls=0) — ensure CUDA kernels in cuda/backend_cuda.cu are invoked; check crate peregrine-sched lane balancer dispatch to GPU lane; reduce PCIe host-device copies
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Fix GPU dispatch (gpu.calls=0) — ensure CUDA kernels in cuda/backend_cuda.cu are invoked; check crate peregrine-sched lane balancer dispatch to GPU lane; reduce PCIe host-device copies at Wed Aug 19 08:23:10 PM SAST 2026
+>>> Goal 1/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 2/28: Implement REDUCE BYTES/TOKEN — expert-route speculative decoding: use GPU-resident hot experts for draft tokens, verify full model in one pass
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement REDUCE BYTES/TOKEN — expert-route speculative decoding: use GPU-resident hot experts for draft tokens, verify full model in one pass at Wed Aug 19 08:23:11 PM SAST 2026
+>>> Goal 2/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 3/28: Implement speculative routing: predict next 4-8 token routes, prefetch only predicted experts, draft→verify
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement speculative routing: predict next 4-8 token routes, prefetch only predicted experts, draft→verify at Wed Aug 19 08:23:12 PM SAST 2026
+>>> Goal 3/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 4/28: Implement expert-union future-token execution: load union of predicted experts once for multiple token positions
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement expert-union future-token execution: load union of predicted experts once for multiple token positions at Wed Aug 19 08:23:13 PM SAST 2026
+>>> Goal 4/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 5/28: Implement pre-fill/decode expert-union sharing: fuse prefill rows into decode batch to share expert reads
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement pre-fill/decode expert-union sharing: fuse prefill rows into decode batch to share expert reads at Wed Aug 19 08:23:14 PM SAST 2026
+>>> Goal 5/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 6/28: Implement GPU COMPUTE DISPATCH fix — ensure CUDA kernels actually invoked; reduce PCIe copies per token
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement GPU COMPUTE DISPATCH fix — ensure CUDA kernels actually invoked; reduce PCIe copies per token at Wed Aug 19 08:23:15 PM SAST 2026
+>>> Goal 6/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 7/28: Implement HOT-EXPERT RESIDENCY — keep hot experts resident in VRAM/RAM across tokens using 33.55% consecutive overlap for caching
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement HOT-EXPERT RESIDENCY — keep hot experts resident in VRAM/RAM across tokens using 33.55% consecutive overlap for caching at Wed Aug 19 08:23:16 PM SAST 2026
+>>> Goal 7/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 8/28: Implement ROUTE PRUNING / MINIMUM-SHARE GATING — prune low-contribution routes (<0.5% gate mass) while maintaining quality
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement ROUTE PRUNING / MINIMUM-SHARE GATING — prune low-contribution routes (<0.5% gate mass) while maintaining quality at Wed Aug 19 08:23:17 PM SAST 2026
+>>> Goal 8/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 9/28: Implement INT3 quantization (12.7% smaller than INT4)
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement INT3 quantization (12.7% smaller than INT4) at Wed Aug 19 08:23:18 PM SAST 2026
+>>> Goal 9/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 10/28: Implement KV-cache quantization (currently f32, 180MB/1000 tokens)
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement KV-cache quantization (currently f32, 180MB/1000 tokens) at Wed Aug 19 08:23:19 PM SAST 2026
+>>> Goal 10/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 11/28: Implement paged KV storage
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement paged KV storage at Wed Aug 19 08:23:20 PM SAST 2026
+>>> Goal 11/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 12/28: Implement GPUDirect Storage (hardware-level I/O bypass)
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement GPUDirect Storage (hardware-level I/O bypass) at Wed Aug 19 08:23:22 PM SAST 2026
+>>> Goal 12/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 13/28: Reduce redundant expert reads
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Reduce redundant expert reads at Wed Aug 19 08:23:23 PM SAST 2026
+>>> Goal 13/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 14/28: Implement expert fusion (store shared basis B_i, stream small deltas) — see docs/expert-decomposition.md
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement expert fusion (store shared basis B_i, stream small deltas) — see docs/expert-decomposition.md at Wed Aug 19 08:23:24 PM SAST 2026
+>>> Goal 14/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 15/28: Implement token equivalence classes — semantic memoization: if |h_a-h_b|<epsilon reuse cached continuation. See docs/token-equivalence-adaptive-precision.md
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement token equivalence classes — semantic memoization: if |h_a-h_b|<epsilon reuse cached continuation. See docs/token-equivalence-adaptive-precision.md at Wed Aug 19 08:23:25 PM SAST 2026
+>>> Goal 15/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 16/28: Implement adaptive precision via uncertainty propagation: delta_y ≈ J·delta_x, assign precision by sensitivity. See docs/token-equivalence-adaptive-precision.md
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement adaptive precision via uncertainty propagation: delta_y ≈ J·delta_x, assign precision by sensitivity. See docs/token-equivalence-adaptive-precision.md at Wed Aug 19 08:23:26 PM SAST 2026
+>>> Goal 16/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 17/28: Implement blockwise parallel decoding — predict next block of 4-8 tokens, draft-generate all, verify in 1 pass
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement blockwise parallel decoding — predict next block of 4-8 tokens, draft-generate all, verify in 1 pass at Wed Aug 19 08:23:27 PM SAST 2026
+>>> Goal 17/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 18/28: Implement Medusa/EAGLE-style lightweight prediction heads
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement Medusa/EAGLE-style lightweight prediction heads at Wed Aug 19 08:23:28 PM SAST 2026
+>>> Goal 18/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 19/28: Implement backward routing — estimate Jacobian sensitivity, deprioritize low-sensitivity experts
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement backward routing — estimate Jacobian sensitivity, deprioritize low-sensitivity experts at Wed Aug 19 08:23:29 PM SAST 2026
+>>> Goal 19/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 20/28: Implement geometric cache — cache by state distance not recency: d(x_t, x_cached) instead of time alone
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement geometric cache — cache by state distance not recency: d(x_t, x_cached) instead of time alone at Wed Aug 19 08:23:30 PM SAST 2026
+>>> Goal 20/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 21/28: Implement expert-address prediction — predict future storage addresses before routing finishes
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement expert-address prediction — predict future storage addresses before routing finishes at Wed Aug 19 08:23:31 PM SAST 2026
+>>> Goal 21/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 22/28: Implement compute-before-read scheduling — execute CPU-ready ops first, schedule SSD reads as async I/O
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement compute-before-read scheduling — execute CPU-ready ops first, schedule SSD reads as async I/O at Wed Aug 19 08:23:32 PM SAST 2026
+>>> Goal 22/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 23/28: Implement time-shifted inference — speculative future state reservoir with top-3 likely branches
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement time-shifted inference — speculative future state reservoir with top-3 likely branches at Wed Aug 19 08:23:33 PM SAST 2026
+>>> Goal 23/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 24/28: Implement probability-mass computation instead of top-K — error-budgeted router with dynamic expert count
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement probability-mass computation instead of top-K — error-budgeted router with dynamic expert count at Wed Aug 19 08:23:34 PM SAST 2026
+>>> Goal 24/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 25/28: Implement algebraic expert cancellation — compute low-rank shared basis B_j for experts, reconstruct weighted output
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement algebraic expert cancellation — compute low-rank shared basis B_j for experts, reconstruct weighted output at Wed Aug 19 08:23:35 PM SAST 2026
+>>> Goal 25/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 26/28: Implement residual-space routing — skip experts whose output is linearly dependent on already-loaded experts
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement residual-space routing — skip experts whose output is linearly dependent on already-loaded experts at Wed Aug 19 08:23:36 PM SAST 2026
+>>> Goal 26/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 27/28: Implement adaptive causal/non-causal switching — router entropy gates parallel-block vs sequential decoding
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement adaptive causal/non-causal switching — router entropy gates parallel-block vs sequential decoding at Wed Aug 19 08:23:38 PM SAST 2026
+>>> Goal 27/28 FAILED — will skip and continue to next goal
+
+>>> GOAL 28/28: Implement expert-level non-causal execution — predict next K positions expert sets, execute union once
+>>> Requesting OpenCode optimization via Ollama engine...
+[91m[1mError: [0mYou must provide a message or a command
+[ERROR] OpenCode optimization FAILED for goal: Implement expert-level non-causal execution — predict next K positions expert sets, execute union once at Wed Aug 19 08:23:39 PM SAST 2026
+>>> Goal 28/28 FAILED — will skip and continue to next goal
+[5/5] Restarting peregrine-serve after AI optimization...

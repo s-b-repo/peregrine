@@ -45,18 +45,37 @@ comments.
 
 - One process-persistent instance behind a mutex; encode is `&mut` because
   the pretoken memo cache learns — so the cache **warms across requests**,
-  and repeated chat-template prefixes encode from cache.
+  and repeated chat-template prefixes encode from cache. In practice serve
+  runs a **shard pool** (`TokenBackend`): N forked tokenizers with
+  independent memos, a try-lock cascade off a round-robin cursor (a request
+  takes the first free shard instead of queueing behind a slow encode), and
+  one shared lock-free decode view cloned up front.
 - **Streaming decode does not touch that mutex** (2026-08-13): each stream
   takes a `DecodeHandle` — a one-`Arc` immutable view of the vocab — and
   decodes per emitted token with no lock and no allocation
   (`token_bytes(id) -> Option<&[u8]>`; out-of-vocab is `None`, the lenient
   skip that keeps a padded-`lm_head` sample from killing a stream). Partial
   UTF-8 at token boundaries is still joined by `IncrementalDecoder`.
-- Per-worker *encode* forks were considered and deliberately **not** built:
-  after the decode handle, the mutex is held once per request for a µs-scale
-  whole-prompt encode against a seconds-per-token engine, and forking would
-  split the cross-request memo cache for no measurable win.
+  Whole-response decode goes through the same view (`TokenBackend::decode`),
+  and multi-sequence responses fan out across shards
+  (`TokenBackend::decode_batch`, in input order, per-sequence identical).
 - Boot prints `[tokenizer] gigatoken BPE active, vocab=<n>`.
+
+## Framework-compatible batch API
+
+The facade mirrors HuggingFace `PreTrainedTokenizerBase` naming so callers
+written against `transformers` port mechanically. Every pair is
+id-for-id / byte-for-byte identical by construction (pure table reads and
+memoized BPE — parallelism only changes which thread computes which row):
+
+| HuggingFace | peregrine | Notes |
+|---|---|---|
+| `encode` | `GigaTokenizer::encode` / `encode_into` | `encode_into` appends into a caller buffer (bulk fast path) |
+| `batch_encode_plus` | `batch_encode` → `encode_batch` | persistent forked-worker pool, 1 MiB/worker parallel gate, warm across calls |
+| `decode` | `GigaTokenizer::decode` | out-of-vocab ids skipped (padded-`lm_head` safe) |
+| `batch_decode` | `batch_decode` → `decode_batch` | scoped-thread fan-out, serial below 64 sequences, same OOV skip |
+| — | `TokenBackend::decode_batch` | serve fan-out across tokenizer shards for `[[ids], …]` |
+| — | `detokenize_batch {seqs} → {texts}` | hosted agent tool (`--host-tool detokenize_batch`), same purity contract as the other token tools |
 
 ## 2026-08-13 speed pass
 
@@ -107,8 +126,14 @@ differs is everything around the engine:
    scan, output alloc) that dominates ~50-byte inputs. One call over a whole
    document runs ~3× faster on the same core, same code.
 2. **Parallelism.** Upstream ships a batch layer (dropped in vendoring —
-   serve encodes one prompt at a time). The facade restores its shape as
-   [`encode_batch`](../crates/peregrine-token/src/lib.rs): ~16 contiguous
+   serve encodes one prompt at a time). The facade restores its shape twice:
+   [`encode_batch`](../crates/peregrine-token/src/lib.rs) for encoding and
+   [`decode_batch`](../crates/peregrine-token/src/lib.rs) for decoding
+   (scoped-thread fan-out over the immutable vocab, serial below 64
+   sequences), with HuggingFace spellings [`batch_encode` /
+   `batch_decode`](../crates/peregrine-token/src/lib.rs) on top — see
+   [Framework-compatible batch API](#framework-compatible-batch-api).
+   `encode_batch` details: ~16 contiguous
    chunks per worker (finer over the last ~20 % of bytes so the straggler
    tail is a quarter-chunk), handed out self-paced off an atomic cursor to a
    **persistent pool of `fork`ed workers** (pre-sized caches, built once,

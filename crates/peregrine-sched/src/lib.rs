@@ -478,6 +478,7 @@ mod tests {
             // the same bytes, which is the only property this test cares about.
             expert_index: None,
             fd_devices: None,
+            block_exec: peregrine_model::BlockExecMode::Par,
         };
         let production = moe_forward_concurrent(&ctx, layer, &x, &router_w, &router_bias, None, s_n)?;
 

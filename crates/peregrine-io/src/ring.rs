@@ -164,6 +164,141 @@ pub const FADV_WILLNEED: i32 = 3;
 /// `POSIX_FADV_DONTNEED` — drop a range from the page cache.
 pub const FADV_DONTNEED: i32 = 4;
 
+/// One logical read striped across **mirror fds** — byte-identical copies of the
+/// same content on distinct drives (a full mirror of the model per drive). The
+/// reader splits the byte range across the fds and issues every chunk in one
+/// batched submit, so all drives read concurrently: a single large region costs
+/// ~`1/n_mirrors` of its single-drive time instead of all of it. This is the
+/// read-side primitive behind mirrored-root streaming (`COLI_IO_MIRROR_ROOTS`);
+/// without mirrors a caller can still pass a one-fd slice and get a plain read.
+///
+/// **Buffered only, deliberately.** O_DIRECT requires the offset *and* length of
+/// every transfer to be block-aligned, and an equal split of one region across
+/// drives does not produce aligned chunk lengths (a 19 MB region over 5 drives
+/// splits at 3.8 MB). The aligned-superset-and-copy-out trick
+/// [`Reactor::read_direct_many`] uses would add a userspace copy per chunk and
+/// defeat the point. The buffered path already has the kernel write the caller's
+/// buffer — zero userspace copy — so the win here is drive parallelism, at the
+/// documented page-cache trade of every buffered read.
+pub struct StripedRead<'a> {
+    /// Every mirror fd for this content, index 0 = the primary. All must name
+    /// byte-identical bytes at the same offsets — mirrors are full copies, and a
+    /// mirror whose header differs is a layout error caught at open time.
+    pub fds: &'a [RawFd],
+    pub offset: u64,
+    pub buf: &'a mut [u8],
+    /// caller tag echoed back (unused by the reader; API parity with [`ReadReq`])
+    pub tag: u64,
+}
+
+/// Ranges below `n_mirrors × MIN_STRIP_BYTES` are not split: chunking a tiny
+/// range across drives costs more in per-request overhead (and per-drive seek)
+/// than the parallelism returns, so small regions ride whole on one drive —
+/// round-robin across the batch, which keeps every drive's queue full when a
+/// batch is many small regions (an expert claim is 2–6 regions × 16 experts).
+const MIN_STRIP_BYTES: usize = 128 * 1024;
+
+/// Portable fallback and correctness oracle for [`Reactor::read_striped`]: one
+/// `pread` per chunk, looped to a full read (`read_exact_at`). Returns
+/// per-request byte counts — always the full buffer length, or a negative errno
+/// — matching [`Reactor::read_striped`]'s contract, which completes short chunks
+/// internally so both paths return the same shape.
+pub fn pread_striped(reads: &mut [StripedRead]) -> Vec<i64> {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::FromRawFd;
+    reads
+        .iter_mut()
+        .enumerate()
+        .map(|(i, r)| {
+            if r.fds.is_empty() {
+                return -(22); // EINVAL: no mirror set is a caller bug, not a short read
+            }
+            let n = r.fds.len();
+            // Same split policy as the ring path, so the two are comparable and
+            // produce byte-identical results — only the syscall shape differs.
+            // Chunks accumulate as disjoint `split_at_mut` pieces reborrowed from
+            // the caller's buffer (never moved out), so the `StripedRead` is
+            // untouched by the call other than holding the bytes.
+            let total = r.buf.len();
+            // `sub` is the byte offset of the chunk inside the read's range; the
+            // chunk's file offset is `r.offset + sub`.
+            let chunks: Vec<(RawFd, u64, usize)> = if n == 1 || total < n * MIN_STRIP_BYTES {
+                // Small (or single-fd): whole range to one drive, round-robin
+                // across the batch so many small reads keep every drive busy.
+                vec![(r.fds[i % n], 0, total)]
+            } else {
+                let chunk = total.div_ceil(n);
+                let mut start = 0usize;
+                let mut out = Vec::with_capacity(n);
+                for &fd in r.fds.iter() {
+                    let end = (start + chunk).min(total);
+                    if end == start {
+                        break;
+                    }
+                    out.push((fd, start as u64, end - start));
+                    start = end;
+                }
+                out
+            };
+            let mut total_read = 0usize;
+            for (fd, sub, len) in chunks {
+                // SAFETY: `fd` is a live descriptor the caller keeps open for the
+                // duration of this call; we only read from it. `ManuallyDrop`
+                // stops `File`'s Drop from closing a descriptor we don't own.
+                let file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+                let sub = sub as usize;
+                if let Err(e) = file.read_exact_at(&mut r.buf[sub..sub + len], r.offset + sub as u64) {
+                    return -(e.raw_os_error().unwrap_or(5) as i64);
+                }
+                total_read += len;
+            }
+            total_read as i64
+        })
+        .collect()
+}
+
+/// [`pread_striped`] spread across `threads` OS threads, each taking a
+/// contiguous chunk of `reads`. Returns per-request byte counts in order.
+///
+/// The multi-threaded twin of [`pread_many_threaded`]: one large striped model
+/// load fans out across cores the same way N blocking preads do, so the
+/// `pread` engine (`COLI_IO_ENGINE=pread`) gets drive parallelism *and* core
+/// parallelism. Byte-identical to [`pread_striped`] — same split policy per
+/// read, only the calling thread differs. Threads capped at the request count
+/// and at 64; one thread runs inline with no spawn.
+pub fn pread_striped_threaded(reads: &mut [StripedRead], threads: usize) -> Vec<i64> {
+    let n = reads.len();
+    let t = threads.clamp(1, n.max(1)).min(64);
+    if t <= 1 || n <= 1 {
+        return pread_striped(reads);
+    }
+    let chunk = n.div_ceil(t);
+    let mut out: Vec<i64> = vec![0; n];
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(t);
+        for (i, part) in reads.chunks_mut(chunk).enumerate() {
+            handles.push((i, s.spawn(move || pread_striped(part))));
+        }
+        for (i, h) in handles {
+            let res = match h.join() {
+                Ok(v) => v,
+                Err(panic) => {
+                    crate::note_advisory_err("pread striped worker panicked; chunk reported as EIO", &format!("{panic:?}"));
+                    vec![-5i64; chunk]
+                }
+            };
+            let base = i * chunk;
+            for (k, v) in res.into_iter().enumerate() {
+                if let Some(slot) = out.get_mut(base + k) {
+                    *slot = v;
+                }
+            }
+        }
+    });
+    out
+}
+
 /// `posix_fadvise(2)` over a batch of regions, without a ring.
 ///
 /// [`Reactor`] issues these as `IORING_OP_FADVISE`, which is unavailable in
@@ -204,7 +339,7 @@ pub fn fadvise_many(regions: &[(RawFd, u64, usize)], advice: i32) -> std::io::Re
 
 #[cfg(target_os = "linux")]
 mod uring {
-    use super::{OwnedReadReq, ReadReq, RegionDone, WriteReq};
+    use super::{OwnedReadReq, ReadReq, RegionDone, StripedRead, MIN_STRIP_BYTES, WriteReq};
     use crate::slab::{align_down, align_up, AlignedBuf, Bytes, SlabHandle, SlabPool, ALIGN};
     use io_uring::{opcode, squeue, types, IoUring};
     use std::collections::{HashMap, VecDeque};
@@ -1110,6 +1245,117 @@ mod uring {
             Ok(out)
         }
 
+        /// Read every [`StripedRead`] striped across its mirror fds and wait for
+        /// every completion. Each read's byte range is split into contiguous
+        /// chunks — one per mirror fd (equal split, last absorbs the remainder) —
+        /// and all chunks are submitted in one batched wave, so every drive reads
+        /// concurrently. Ranges below `n_mirrors × [`MIN_STRIP_BYTES`]` ride whole
+        /// on one drive, round-robin across the batch.
+        ///
+        /// Short chunks are completed internally — the remainder is re-issued
+        /// through the same ring until full (a mirror holds the same bytes at the
+        /// same offsets, so any of them can finish the chunk) — so the returned
+        /// per-request counts are always the full buffer length, or an error.
+        /// Byte-identical to [`pread_striped`], the portable oracle, which is also
+        /// the off-Linux fallback shape.
+        ///
+        /// Buffered reads only: the O_DIRECT lane's aligned-transfer requirement
+        /// conflicts with an equal split (see [`StripedRead`]).
+        pub fn read_striped(&mut self, reads: &mut [StripedRead]) -> io::Result<Vec<i64>> {
+            // Same lane discipline as `read_many`: owned-lane traffic in flight
+            // would satisfy the wave's wait in place of a striped read.
+            if !self.owned_idle() {
+                return Err(Self::err_owned_busy("read_striped"));
+            }
+            // One chunk request per (mirror, sub-range). `plan` carries each
+            // chunk's file offset and serving fd, parallel to `reqs`, so a short
+            // chunk's remainder is re-issued from the same drive at the same
+            // offset without re-deriving either. `want` records each read's full
+            // length up front: after all borrows into the `StripedRead`s end, the
+            // struct's `buf.len()` is still the authoritative size — the reborrows
+            // below are never moved out.
+            let mut reqs: Vec<ReadReq> = Vec::new();
+            let mut plan: Vec<(u64, RawFd)> = Vec::new();
+            let mut want: Vec<usize> = Vec::with_capacity(reads.len());
+            for (i, r) in reads.iter_mut().enumerate() {
+                if r.fds.is_empty() {
+                    return Err(io::Error::other(format!(
+                        "striped read {i} has no mirror fds (index 0 must be the primary)"
+                    )));
+                }
+                let n = r.fds.len();
+                let total = r.buf.len();
+                want.push(total);
+                if n == 1 || total < n * MIN_STRIP_BYTES {
+                    let fd = r.fds[i % n];
+                    let off = r.offset;
+                    reqs.push(ReadReq { fd, offset: off, buf: &mut r.buf[..], tag: r.tag });
+                    plan.push((off, fd));
+                } else {
+                    // Disjoint chunks come out of a `split_at_mut` chain, which
+                    // is the only sound way to keep several `&mut` pieces of one
+                    // slice alive at once — reborrowing through the struct each
+                    // iteration would alias the previous chunk.
+                    let chunk = total.div_ceil(n);
+                    let mut rest: &mut [u8] = &mut r.buf[..];
+                    let mut start = 0usize;
+                    for &fd in r.fds.iter() {
+                        let take = chunk.min(rest.len());
+                        if take == 0 {
+                            break;
+                        }
+                        let (head, tail) = rest.split_at_mut(take);
+                        let off = r.offset + start as u64;
+                        reqs.push(ReadReq { fd, offset: off, buf: head, tag: r.tag });
+                        plan.push((off, fd));
+                        start += take;
+                        rest = tail;
+                    }
+                }
+            }
+            // One deep submit for every chunk of every read — reads across mirror
+            // fds on distinct devices are issued by the kernel concurrently, so
+            // all drives work in parallel within the wave.
+            let res = self.read_many(&mut reqs)?;
+            // Complete short chunks from the same mirror fd: a positioned read may
+            // return short on either path, and the chunk's remainder re-read is
+            // the same range of the same copy.
+            for (j, &n0) in res.iter().enumerate() {
+                if n0 < 0 {
+                    return Err(io::Error::from_raw_os_error((-n0) as i32));
+                }
+                let mut done = n0 as usize;
+                let want = reqs[j].buf.len();
+                let (base_off, fd) = plan[j];
+                while done < want {
+                    let mut sub = [ReadReq { fd, offset: base_off + done as u64, buf: &mut reqs[j].buf[done..], tag: 0 }];
+                    let r2 = self.read_many(&mut sub)?;
+                    let n1 = match r2.first().copied() {
+                        Some(n) => n,
+                        None => return Err(io::Error::other("striped chunk re-read lost its completion")),
+                    };
+                    if n1 < 0 {
+                        return Err(io::Error::from_raw_os_error((-n1) as i32));
+                    }
+                    let got = n1 as usize;
+                    if got == 0 {
+                        return Err(io::Error::other(format!(
+                            "striped chunk re-read made no progress @ off={} (fd {fd})",
+                            base_off + done as u64
+                        )));
+                    }
+                    done += got;
+                }
+            }
+            // Restore the requested lengths — every chunk of every read
+            // completed, so the counts are the full buffer lengths. The caller
+            // gets its buffers back because `reqs` drops here, ending the
+            // borrows into the `StripedRead` structs that own them.
+            drop(reqs);
+            // EIO on overflow: a >i64::MAX read would be nonsense anyway.
+            Ok(want.into_iter().map(|n| i64::try_from(n).unwrap_or(-5)).collect())
+        }
+
         /// Submit all `reqs` (chunked to the ring depth) and wait for every
         /// completion. Returns per-request result codes in `reqs` order — the
         /// write twin of [`Reactor::read_many`], with the same chunking, the same
@@ -2006,6 +2252,12 @@ impl Reactor {
     }
     pub fn read_many(&mut self, _reqs: &mut [ReadReq]) -> std::io::Result<Vec<i64>> {
         Self::unsupported()
+    }
+    /// API parity with the Linux path; this platform has no io_uring so the
+    /// portable [`pread_striped`] oracle serves the read directly — same bytes,
+    /// no ring. Lets mirror-striped callers stay platform-agnostic.
+    pub fn read_striped(&mut self, reads: &mut [StripedRead]) -> std::io::Result<Vec<i64>> {
+        Ok(super::pread_striped(reads))
     }
     pub fn read_exact(&mut self, _fd: RawFd, _off: u64, _buf: &mut [u8]) -> std::io::Result<()> {
         Self::unsupported()
@@ -3452,6 +3704,167 @@ mod tests {
         let res = mmap_many(&mut reqs);
         assert_eq!(res, vec![-(libc::EINVAL as i64); 2], "checked range must refuse overflow");
         std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// Three byte-identical copies of one file (the mirror layout). The mirror
+    /// roots mechanism assumes copies at identical offsets; `peregrine-mirror
+    /// --verify` guarantees it at creation, and this fixture is the same shape.
+    fn mirrored_files(
+        pattern: &[u8],
+        n: usize,
+        copies: usize,
+    ) -> std::io::Result<(Vec<std::fs::File>, Vec<std::path::PathBuf>, Vec<u8>)> {
+        let mut files = Vec::with_capacity(copies);
+        let mut paths = Vec::with_capacity(copies);
+        let mut data = None;
+        for _ in 0..copies {
+            let (f, path, d) = temp_file_with(pattern, n)?;
+            match &data {
+                Some(prev) => assert_eq!(d, *prev, "mirrors must be byte-identical copies"),
+                None => data = Some(d),
+            }
+            files.push(f);
+            paths.push(path);
+        }
+        Ok((files, paths, data.unwrap_or_default()))
+    }
+
+    #[test]
+    fn pread_striped_matches_pread_oracle() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        // 1.5 MB over 3 mirrors: the split threshold is 3 x MIN_STRIP = 393216, so
+        // the cases below straddle it from both sides.
+        let (files, paths, data) = mirrored_files(b"mirror-striping-", 1_500_000, 3)?;
+        let fds: Vec<RawFd> = files.iter().map(|f| f.as_raw_fd()).collect();
+        // Scattered offsets: one range large enough to split, one just below the
+        // threshold (rides whole), one exactly at it, and one single-fd read (an
+        // unmirrored shard's shape).
+        let cases: Vec<(u64, usize, usize)> = vec![
+            (0, 1_500_000, fds.len()),
+            (4096, 400_000, fds.len()),
+            (1 << 20, 3 * MIN_STRIP_BYTES, fds.len()),
+            (1 << 20, 3 * MIN_STRIP_BYTES - 1, fds.len()),
+            (0, 512, 1),
+        ];
+        let mut bufs: Vec<Vec<u8>> = cases
+            .iter()
+            .map(|&(_, len, _)| vec![0u8; len])
+            .collect();
+        let mut reads: Vec<StripedRead> = bufs
+            .iter_mut()
+            .zip(cases.iter())
+            .map(|(b, &(off, _, n))| StripedRead { fds: &fds[..n], offset: off, buf: b.as_mut_slice(), tag: 0 })
+            .collect();
+        let res = pread_striped(&mut reads);
+        for (r, &n) in reads.iter().zip(res.iter()) {
+            assert_eq!(n, r.buf.len() as i64, "pread_striped must fill every buffer");
+        }
+        for (r, &(off, len, _n)) in reads.iter().zip(cases.iter()) {
+            assert_eq!(len, r.buf.len());
+            let off = off as usize;
+            assert_eq!(&r.buf[..], &data[off..off + len], "striped bytes must match the source");
+        }
+        for p in &paths {
+            std::fs::remove_file(p)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uring_read_striped_matches_pread_oracle() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let (files, paths, data) = mirrored_files(b"uring-mirror-striping!", 1_200_000, 3)?;
+        let fds: Vec<RawFd> = files.iter().map(|f| f.as_raw_fd()).collect();
+        let mut reactor = match Reactor::new(8) {
+            Ok(r) => r,
+            Err(e) => {
+                skip_or_fail("uring_read_striped_matches_pread_oracle", &e);
+                for p in &paths {
+                    remove_temp_or_note("mirror temp file cleanup", p);
+                }
+                return Ok(());
+            }
+        };
+        // A batch mixing split and whole rides: > ring depth 8 chunk requests so
+        // the chunking loop is exercised, and enough small reads for the
+        // round-robin (4096 < 3 x MIN_STRIP rides whole; 450000 splits 3 ways).
+        let mut bufs: Vec<Vec<u8>> = (0..6usize).map(|i| vec![0u8; if i % 2 == 0 { 450_000 } else { 4_096 }]).collect();
+        let offs: Vec<u64> = (0..6usize).map(|i| ((i * 70_001) % 300_000) as u64).collect();
+        let mut reads: Vec<StripedRead> = bufs
+            .iter_mut()
+            .zip(offs.iter())
+            .map(|(b, &off)| StripedRead { fds: &fds, offset: off, buf: b, tag: off })
+            .collect();
+        let res = reactor.read_striped(&mut reads)?;
+        for (b, &n) in bufs.iter().zip(res.iter()) {
+            assert_eq!(n, b.len() as i64, "read_striped must fill every buffer");
+        }
+        for (b, &off) in bufs.iter().zip(offs.iter()) {
+            assert_eq!(&b[..], &data[off as usize..off as usize + b.len()], "ring-striped bytes must match the source");
+        }
+        for p in &paths {
+            std::fs::remove_file(p)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pread_striped_without_mirrors_is_einval() -> std::io::Result<()> {
+        // An empty mirror set is a caller bug (index 0 must be the primary): it
+        // must be refused loudly, not silently read from nowhere.
+        let mut b = vec![0u8; 16];
+        let mut reads = [StripedRead { fds: &[], offset: 0, buf: &mut b, tag: 0 }];
+        assert_eq!(pread_striped(&mut reads), vec![-22]);
+        Ok(())
+    }
+
+    #[test]
+    fn pread_striped_threaded_matches_serial_oracle() -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        // Same fixture shape as the serial oracle so the two are directly
+        // comparable: mixed split/whole rides across 3 mirrors, more reads
+        // than threads so chunking engages.
+        let (files, paths, data) = mirrored_files(b"striped-threaded-", 1_500_000, 3)?;
+        let fds: Vec<RawFd> = files.iter().map(|f| f.as_raw_fd()).collect();
+        let cases: Vec<(u64, usize, usize)> = vec![
+            (0, 1_500_000, fds.len()),
+            (4096, 400_000, fds.len()),
+            (1 << 20, 3 * MIN_STRIP_BYTES, fds.len()),
+            (0, 4096, fds.len()),
+            (777, 512, 1),
+            (12345, 70_000, fds.len()),
+        ];
+        let run = |threads: usize| -> std::io::Result<Vec<Vec<u8>>> {
+            let mut bufs: Vec<Vec<u8>> = cases.iter().map(|&(_, len, _)| vec![0u8; len]).collect();
+            let mut reads: Vec<StripedRead> = bufs
+                .iter_mut()
+                .zip(cases.iter())
+                .map(|(b, &(off, _, n))| StripedRead { fds: &fds[..n], offset: off, buf: b.as_mut_slice(), tag: 0 })
+                .collect();
+            let res = pread_striped_threaded(&mut reads, threads);
+            for (r, &n) in reads.iter().zip(res.iter()) {
+                assert_eq!(n, r.buf.len() as i64, "threaded striped must fill every buffer (threads={threads})");
+            }
+            Ok(bufs)
+        };
+        let serial = run(1)?;
+        for threads in [2, 4, 8] {
+            let par = run(threads)?;
+            assert_eq!(par.len(), serial.len());
+            for (i, (p, s)) in par.iter().zip(&serial).enumerate() {
+                assert_eq!(p, s, "threaded ({threads}) diverged from serial at read {i}");
+            }
+        }
+        // Bytes equal the source fixture, not just each other.
+        for (b, &(off, len, _)) in serial.iter().zip(cases.iter()) {
+            let off = off as usize;
+            assert_eq!(&b[..], &data[off..off + len]);
+        }
+        for p in &paths {
+            std::fs::remove_file(p)?;
+        }
         Ok(())
     }
 }

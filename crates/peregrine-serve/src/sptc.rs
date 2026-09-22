@@ -153,6 +153,7 @@ impl ToolRegistry {
         // each rather than moved into the first.
         let tok_enc = Arc::clone(tok);
         let tok_dec = Arc::clone(tok);
+        let tok_dec_batch = Arc::clone(tok);
         let tok_cnt = Arc::clone(tok);
         ToolRegistry::new()
             .register(crate::pure_tool!("tokenize", |args| {
@@ -164,6 +165,11 @@ impl ToolRegistry {
                 let ids = u32_vec_arg(args, "ids")?;
                 let text = tok_dec.decode(&ids)?;
                 Ok(json!({ "text": text }))
+            }))
+            .register(crate::pure_tool!("detokenize_batch", |args| {
+                let seqs = u32_seqs_arg(args, "seqs")?;
+                let texts = tok_dec_batch.decode_batch(&seqs);
+                Ok(json!({ "texts": texts }))
             }))
             .register(crate::pure_tool!("count_tokens", |args| {
                 let text = string_arg(args, "text")?;
@@ -196,6 +202,40 @@ fn u32_vec_arg(args: &Value, key: &str) -> Result<Vec<u32>, Error> {
         ))),
         None => Err(Error::Format(format!(
             "tool argument '{key}' is required: an array of token ids"
+        ))),
+    }
+}
+
+/// Array-of-arrays twin of [`u32_vec_arg`]: `{"seqs": [[ids], ...]}` for the
+/// batch detokenize tool. Each inner array parses with the same u32 rule, so
+/// one malformed entry fails the call with its sequence index named.
+fn u32_seqs_arg(args: &Value, key: &str) -> Result<Vec<Vec<u32>>, Error> {
+    match args.get(key) {
+        Some(Value::Array(a)) => a
+            .iter()
+            .enumerate()
+            .map(|(i, seq)| match seq {
+                Value::Array(ids) => ids
+                    .iter()
+                    .map(|v| {
+                        v.as_u64()
+                            .filter(|n| *n <= u32::MAX as u64)
+                            .map(|n| n as u32)
+                            .ok_or_else(|| {
+                                Error::Format(format!("tool argument '{key}[{i}]' must hold u32 token ids, found {v}"))
+                            })
+                    })
+                    .collect(),
+                other => Err(Error::Format(format!(
+                    "tool argument '{key}[{i}]' must be an array of token ids, found {other}"
+                ))),
+            })
+            .collect(),
+        Some(other) => Err(Error::Format(format!(
+            "tool argument '{key}' must be an array of id arrays, found {other}"
+        ))),
+        None => Err(Error::Format(format!(
+            "tool argument '{key}' is required: an array of id arrays"
         ))),
     }
 }
@@ -846,6 +886,29 @@ mod tests {
         // the second one served from the table.
         assert_eq!(shadow.verify(&call), Some(out), "same args, same answer");
         assert!(count > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn detokenize_batch_matches_single_decodes() -> Result<(), Error> {
+        let tok = test_tokenizer()?;
+        let shadow = ShadowRepl::build(ToolRegistry::token_tools(&tok), true);
+        // Name must be advertised: the closed tool set fails unknown names at
+        // boot, so an unlisted batch tool would be unreachable by construction.
+        assert!(ToolRegistry::token_tools(&tok).get("detokenize_batch").is_some());
+        let seqs = vec![vec![15496u32, 995], vec![], vec![15496, 995, 15496, 995]];
+        let call = ParsedCall { name: "detokenize_batch".into(), arguments: json!({ "seqs": seqs }) };
+        let out = shadow.verify(&call).ok_or_else(|| Error::Format("detokenize_batch must answer".into()))?;
+        let texts = out["texts"].as_array().ok_or_else(|| Error::Format(format!("texts array: {out}")))?;
+        assert_eq!(texts.len(), seqs.len());
+        for (got, ids) in texts.iter().zip(&seqs) {
+            let want = tok.decode(ids)?;
+            assert_eq!(got.as_str().unwrap_or("<non-string>"), want.as_str());
+        }
+        // Malformed entries fail loudly with their index, not silently skipped.
+        let bad = ParsedCall { name: "detokenize_batch".into(), arguments: json!({ "seqs": [[1], "nope"] }) };
+        let err = shadow.verify(&bad).ok_or_else(|| Error::Format("a failing tool still answers".into()))?;
+        assert!(err.get("error").is_some(), "malformed seqs must surface an error: {err}");
         Ok(())
     }
 

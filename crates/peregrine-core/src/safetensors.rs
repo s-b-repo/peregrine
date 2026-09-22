@@ -104,6 +104,86 @@ fn device_map(paths: &[PathBuf], devs: &[u64], overrides: Option<&str>) -> (Vec<
     (out, n)
 }
 
+/// The mirror roots — `COLI_IO_MIRROR_ROOTS`, comma-separated absolute or
+/// relative directories, each holding a full byte-identical copy of the model
+/// shards. Empty without the knob; the knob is resolved once via OnceLock so a
+/// later export does not change a model two loads in.
+///
+/// This is how "read the same model on all drives at once" is configured: a
+/// copy of every shard on every drive, so a logical read can be split into one
+/// chunk per drive and issued in parallel — the wall time for the region drops
+/// toward `1/n_drives` of the single-drive read instead of staying at it.
+fn mirror_roots_env() -> Vec<PathBuf> {
+    use std::sync::OnceLock;
+    static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            std::env::var("COLI_IO_MIRROR_ROOTS")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
+/// One device ordinal per mirror root — from `st_dev` of a same-named probe
+/// directory entry (the root dir itself), so the layout mirrors `devices`
+/// (per-shard) but for the mirrored fds. Stable across the load: fds are opened
+/// once and kept. The striping consumes these only as a scheduling hint (which
+/// chunk lives on which drive); the ordinal being right only matters to logs.
+fn mirror_devices_for(roots: &[PathBuf]) -> Vec<u8> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen: Vec<u64> = Vec::new();
+    let mut out: Vec<u8> = Vec::with_capacity(roots.len());
+    for r in roots {
+        let dev = std::fs::metadata(r).ok().map(|m| m.dev()).unwrap_or(0);
+        let idx = match seen.iter().position(|&d| d == dev) {
+            Some(i) => i,
+            None => {
+                seen.push(dev);
+                seen.len() - 1
+            }
+        };
+        out.push(idx.min(u8::MAX as usize) as u8);
+    }
+    out
+}
+
+/// A mirror copy must be byte-identical to its primary shard: if the copy were
+/// a different file, striped reads would assemble garbage from mixing its
+/// bytes with the primary's. Header bytes + size are checked cheaply at open
+/// (the full-body identity is the copy tool's job — see `peregrine-mirror`'s
+/// `--verify`; a hard failure is detected here only if the shape already
+/// diverges).
+fn verify_mirror(mirror: &File, primary: &File, mirror_path: &Path, primary_path: &Path) -> Result<bool, Error> {
+    let m_meta = mirror.metadata().ctx(|| mirror_path.display().to_string())?;
+    let p_meta = primary.metadata().ctx(|| primary_path.display().to_string())?;
+    if m_meta.len() != p_meta.len() {
+        return Ok(false);
+    }
+    // Compare the header: the 8-byte length prefix + the JSON header itself.
+    // It is KB–MB and already fails the moment a different model was mirrored.
+    use std::os::unix::fs::FileExt as _;
+    let mut h = [0u8; 8];
+    mirror.read_exact_at(&mut h, 0).ctx(|| mirror_path.display().to_string())?;
+    let hlen = u64::from_le_bytes(h);
+    if hlen > ST_MAX_HEADER {
+        return Ok(false);
+    }
+    let n = (8 + hlen) as usize;
+    let mut a = vec![0u8; n];
+    let mut b = vec![0u8; n];
+    mirror.read_exact_at(&mut a, 0).ctx(|| mirror_path.display().to_string())?;
+    primary.read_exact_at(&mut b, 0).ctx(|| primary_path.display().to_string())?;
+    Ok(a == b)
+}
+
 pub struct SafeTensors {
     tensors: Vec<TensorInfo>,
     index: HashMap<String, usize>,
@@ -116,6 +196,19 @@ pub struct SafeTensors {
     /// `devices[i]` = device ordinal of `files[i]`/`paths[i]` (see
     /// [`Self::device_of`]); computed once at open by [`device_map`].
     devices: Vec<u8>,
+    /// `devices[i]` = device ordinal of [`mirror_files`]`[i][j]`, parallel to
+    /// those fds. Empty when mirror roots were not configured.
+    mirror_devices: Vec<u8>,
+    /// `mirror_files[i][j]` is the mirror of shard `i` in mirror-root `j`
+    /// (`COLI_IO_MIRROR_ROOTS`, comma-separated dirs). Mirrors are byte-identical
+    /// copies of the whole model — one full copy per drive — so a mirrored read
+    /// can split one logical range across every drive and read in parallel.
+    ///
+    /// A shard with no mirror copies has an empty row (mixed layouts allowed: a
+    /// drive that failed to copy one shard does not take down the whole run).
+    mirror_files: Vec<Vec<File>>,
+    /// The resolved mirror-root directories (empty Vec when not configured).
+    mirror_roots: Vec<PathBuf>,
     /// `max ordinal + 1` — see [`Self::n_devices`].
     n_devices: usize,
     /// The io_uring lane every read goes through (interior mutability keeps the
@@ -167,6 +260,35 @@ impl SafeTensors {
                             &"short or failed direct read",
                         ),
                         Err(e) => peregrine_io::note_advisory_err("O_DIRECT trunk read (using buffered)", &e),
+                    }
+                }
+            }
+        }
+        // Mirrored striping — `COLI_IO_MIRROR_ROOTS` — splits this range across
+        // all drives holding a copy of this shard, in one io_uring submit, so
+        // they read in parallel. The win is the wall time of one cold load or one
+        // expert miss against `n_roots` drives vs 1. Reading the same fd through
+        // the same reactor stays correct — the mirror fds are same-content
+        // copies, so chunk boundaries are still byte-identical; the method is a
+        // pure drop-in at this choke point.
+        if !buf.is_empty() {
+            if let Some(reactor) = self.reactor.as_ref() {
+                let fds = self.mirror_fd_set(file_idx);
+                if fds.len() > 1 {
+                    let mut req = [peregrine_io::ring::StripedRead { fds: &fds, offset: off, buf, tag: 0 }];
+                    let res = reactor.lock().read_striped(&mut req).ctx(|| {
+                        format!("{}: striped mirror read @ {off}", self.paths[file_idx].display())
+                    })?;
+                    // read_striped's contract: full-fill counts (or an error),
+                    // so a short count here is its own invariant breach.
+                    match res.first().copied() {
+                        Some(n) if n == buf.len() as i64 => return Ok(()),
+                        _ => {
+                            return Err(Error::Format(format!(
+                                "{}: striped read short-completion @ {off}",
+                                self.paths[file_idx].display()
+                            )))
+                        }
                     }
                 }
             }
@@ -448,6 +570,63 @@ impl SafeTensors {
             }
         };
         let (devices, n_devices) = device_map(&shard_paths, &shard_devs, map_env.as_deref());
+
+        // Mirror roots (`COLI_IO_MIRROR_ROOTS`): each is a directory holding a
+        // full, byte-identical copy of this model — the layout
+        // `peregrine-mirror` produces. Per shard, every root is opened on the
+        // same file name as the primary and cross-checked against it (header
+        // bytes + size), because a wrong-shard mirror would feed the striped
+        // reader garbage; the striping itself is byte-identity-agnostic, so the
+        // correct-by-construction check has to happen here at open.
+        //
+        // A shard missing from some roots keeps a shorter mirror row for that
+        // shard only and a per-shard advisory — a drive that failed to ship one
+        // shard should degrade gracefully to reading that shard single-drive, not
+        // refuse the whole load.
+        let mirror_roots = mirror_roots_env();
+        let mut mirror_files: Vec<Vec<File>> = (0..files.len()).map(|_| Vec::new()).collect();
+        let mut mirror_devices: Vec<u8> = Vec::new();
+        if !mirror_roots.is_empty() {
+            let mirror_devs = mirror_devices_for(&mirror_roots);
+            mirror_devices = mirror_devs;
+            for (i, primary) in files.iter().enumerate() {
+                let Some(name) = shard_paths.get(i).and_then(|p| p.file_name()) else {
+                    continue;
+                };
+                let mut copies = Vec::with_capacity(mirror_roots.len());
+                for root in &mirror_roots {
+                    let path = root.join(name);
+                    let f = match File::open(&path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            peregrine_io::note_advisory_err(&format!("mirror shard {} in {}", name.to_string_lossy(), root.display()), &e);
+                            continue;
+                        }
+                    };
+                    match verify_mirror(&f, primary, &path, &shard_paths[i]) {
+                        Ok(true) => copies.push(f),
+                        Ok(false) => {
+                            eprintln!(
+                                "peregrine: mirror copy {} differs from the primary — ignored (striping stays byte-true only if every drive holds the same bytes)",
+                                path.display()
+                            );
+                        }
+                        Err(e) => {
+                            peregrine_io::note_advisory_err(&format!("verify mirror {}", path.display()), &e);
+                        }
+                    }
+                }
+                mirror_files[i] = copies;
+            }
+            let n_mirrored = mirror_files.iter().filter(|r| !r.is_empty()).count();
+            eprintln!(
+                "peregrine: [io] mirror roots={} shards_mirrored={}/{} (striped parallel reads over all drives)",
+                mirror_roots.len(),
+                n_mirrored,
+                files.len(),
+            );
+        }
+
         Ok(SafeTensors {
             tensors,
             index,
@@ -456,6 +635,9 @@ impl SafeTensors {
             paths: shard_paths,
             devices,
             n_devices,
+            mirror_devices,
+            mirror_files,
+            mirror_roots,
             reactor: reactor.map(Mutex::new),
         })
     }
@@ -494,6 +676,23 @@ impl SafeTensors {
     /// ordinals.
     pub fn n_devices(&self) -> usize {
         self.n_devices
+    }
+
+    /// Distinct physical devices the mirror roots span (`st_dev` first-seen
+    /// order per root, parallel to [`Self::n_devices`]). `0` when mirrors are
+    /// off. The io lane sizes its ring pool by `max(n_devices,
+    /// n_mirror_devices)` so every drive holding a copy gets a home ring —
+    /// sizing by primaries alone would leave mirror-only drives served only by
+    /// work stealing.
+    pub fn n_mirror_devices(&self) -> usize {
+        self.mirror_devices.iter().map(|&o| o as usize + 1).max().unwrap_or(0)
+    }
+
+    /// Device ordinal of mirror root `root_idx` (first-seen `st_dev` order).
+    /// Out of range → `0`, so the accessor is infallible like
+    /// [`Self::device_of`].
+    pub fn mirror_device_of(&self, root_idx: usize) -> u8 {
+        self.mirror_devices.get(root_idx).copied().unwrap_or(0)
     }
 
     /// The fd → device table for io-lane consumers whose plans carry
@@ -575,6 +774,67 @@ impl SafeTensors {
             .map(|f| f.as_raw_fd())
             .chain(self.direct_files.iter().flatten().map(|f| f.as_raw_fd()))
             .collect()
+    }
+
+    /// The number of mirror roots configured (`COLI_IO_MIRROR_ROOTS`), 0 when
+    /// the feature is off. Reported at load so the boot log says how many
+    /// drives the model lives on.
+    pub fn n_mirror_roots(&self) -> usize {
+        self.mirror_roots.len()
+    }
+
+    /// Whether at least one shard has any mirror copy.
+    pub fn has_mirrors(&self) -> bool {
+        self.mirror_files.iter().any(|r| !r.is_empty())
+    }
+
+    /// Every mirror fd everyone should know about — for registration with the
+    /// io_uring async-completion ring (parallel to [`Self::shard_fds`]); only
+    /// the **buffered** mirror of each shard appears (no O_DIRECT twin: the
+    /// striping is a buffered-path optimization — see [`StripedRead`]).
+    pub fn mirror_fds_all(&self) -> Vec<RawFd> {
+        self.mirror_files
+            .iter()
+            .flat_map(|row| row.iter().map(|f| f.as_raw_fd()))
+            .collect()
+    }
+
+    /// The fd set for striping one range of shard `file_idx` — `[primary, mirrors
+    /// ...]` in stable order (primary first so round-robin tie-breaking starts
+    /// there). Never empty; `len() == 1` when the shard has no mirror copies.
+    /// The [*same* bytes at the same offsets] on every fd is the whole
+    /// contract — [`peregrine_io::Reactor::read_striped`] splits by position, not
+    /// by identity.
+    pub fn mirror_fd_set(&self, file_idx: usize) -> Vec<RawFd> {
+        let mut out = Vec::with_capacity(self.mirror_files.get(file_idx).map_or(0, Vec::len) + 1);
+        if let Some(f) = self.files.get(file_idx) {
+            out.push(f.as_raw_fd());
+        }
+        if let Some(row) = self.mirror_files.get(file_idx) {
+            out.extend(row.iter().map(|f| f.as_raw_fd()));
+        }
+        out
+    }
+
+    /// Reverse-map a buffered shard fd to its shard index. Scans the primary
+    /// shard files (O(shards), shards are tens of files, called per region —
+    /// the streaming lane batches tens of regions, so this is noise).
+    /// Returns `None` for O_DIRECT twins, mirror fds, and unknown fds; those
+    /// callers fall back to the single-fd read, which is always correct.
+    pub fn file_idx_of_fd(&self, fd: RawFd) -> Option<usize> {
+        self.files.iter().position(|f| f.as_raw_fd() == fd)
+    }
+
+    /// The fd set for striping one range currently addressed by buffered shard
+    /// fd `fd` — `[primary, mirrors ...]` for its shard, or `vec![fd]` when
+    /// `fd` names no known shard. Never empty. Lets the streaming lane resolve
+    /// mirrors from the `(fd, off, len)` plans it already holds, without
+    /// re-deriving file indices per expert.
+    pub fn mirror_fd_set_for_fd(&self, fd: RawFd) -> Vec<RawFd> {
+        match self.file_idx_of_fd(fd) {
+            Some(idx) => self.mirror_fd_set(idx),
+            None => vec![fd],
+        }
     }
 
     /// The compression scheme applied to `name` (`Compression::None` for

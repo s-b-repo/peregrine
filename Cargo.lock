@@ -1460,6 +1460,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "peregrine-ctx"
+version = "0.1.0"
+
+[[package]]
 name = "peregrine-cuda"
 version = "0.1.0"
 dependencies = [
@@ -1531,6 +1535,7 @@ dependencies = [
  "clap",
  "parking_lot",
  "peregrine-core",
+ "peregrine-ctx",
  "peregrine-io",
  "peregrine-model",
  "peregrine-sched",

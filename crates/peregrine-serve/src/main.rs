@@ -16,6 +16,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod batch;
+mod ctxplane;
 mod kvstore;
 mod memo;
 mod sptc;
@@ -64,9 +65,27 @@ struct Args {
     /// Public model id reported by /v1/models and in responses.
     #[arg(long, default_value = "glm-5.2")]
     model_id: String,
+    /// vLLM spelling of `--model-id`: scripts written for `vllm serve` pass
+    /// `--served-model-name`; when set it wins over `--model-id`.
+    #[arg(long = "served-model-name")]
+    served_model_name: Option<String>,
     /// Max sequences decoded together per batched step (continuous-batching width).
     #[arg(long, default_value_t = 32)]
     max_batch: usize,
+    /// vLLM spelling of the batch width (`--max-num-seqs`); when set it wins
+    /// over `--max-batch`.
+    #[arg(long = "max-num-seqs")]
+    max_num_seqs: Option<usize>,
+    /// vLLM spelling of the context cap (`--max-model-len`); when set it wins
+    /// over `--max-prompt-tokens`. The generation cap (`--max-tokens`) is
+    /// separate, exactly as in vLLM.
+    #[arg(long = "max-model-len")]
+    max_model_len: Option<usize>,
+    /// vLLM script compat: accepted and reported. There is no remote code in
+    /// a safetensors checkpoint — no Python, no pickle — so there is nothing
+    /// to trust; the flag exists so launch scripts don't fail to parse.
+    #[arg(long = "trust-remote-code")]
+    trust_remote_code: bool,
     /// Benchmark the tokenizer backends on a text file and exit: encodes the
     /// file through the gigatoken tokenizer, reports MB/s. Needs
     /// `<model>/tokenizer.json`; no model weights are loaded.
@@ -112,6 +131,11 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     max_tokens: Option<usize>,
+    /// Newer OpenAI spelling of `max_tokens` (o1-era clients send this
+    /// instead). Falls back exactly like `max_tokens`; when both arrive,
+    /// `max_tokens` wins.
+    #[serde(default)]
+    max_completion_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
@@ -459,7 +483,42 @@ async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
-    let prompt = build_prompt(&req.messages, active_tools(req), state.inner.chatml_prompt);
+    let tools = active_tools(req);
+    let raw_prompt = build_prompt(&req.messages, tools, state.inner.chatml_prompt);
+    // Context plane (`COLI_CTX=1`): the prompt the model sees is the DCR
+    // working set assembled from the turns — context, not compression. With
+    // the knob off (or when assembly yields nothing) the raw prompt serves
+    // exactly as before.
+    let prompt = if ctxplane::ctx_enabled() {
+        let mut turns: Vec<(String, String)> = Vec::with_capacity(req.messages.len() + 1);
+        let preamble = tools::render_preamble(tools);
+        if !preamble.trim().is_empty() {
+            turns.push(("system".to_string(), preamble));
+        }
+        for m in &req.messages {
+            turns.push((m.role.clone(), m.text()));
+        }
+        let query = req
+            .messages
+            .iter()
+            .rev()
+            .map(|m| m.text())
+            .find(|t| !t.trim().is_empty())
+            .unwrap_or_default();
+        match ctxplane::assemble_context(&turns, &query, state.inner.args.max_prompt_tokens) {
+            Some(assembled) => {
+                eprintln!(
+                    "peregrine: [ctx] serving planned working set ({} raw chars → {} assembled chars)",
+                    raw_prompt.len(),
+                    assembled.len()
+                );
+                assembled
+            }
+            None => raw_prompt,
+        }
+    } else {
+        raw_prompt
+    };
     // Encode is CPU-bound, so it runs on the blocking pool rather than the
     // runtime workers the SSE pump tasks and every other endpoint are
     // scheduled on (parking_lot does not yield to tokio). Within the pool,
@@ -468,7 +527,8 @@ async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>
     // lock — a burst of B arrivals computes in parallel up to the shard
     // count, parking only on shard collisions past it.
     let tokenizer = state.inner.tokenizer.clone();
-    let ids = tk(tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
+    let prompt_for_encode = prompt.clone();
+    let ids = tk(tokio::task::spawn_blocking(move || tokenizer.encode(&prompt_for_encode))
         .await
         .map_err(|e| ApiError::internal(format!("encode task: {e}")))?)?;
     if ids.len() > state.inner.args.max_prompt_tokens {
@@ -478,7 +538,12 @@ async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>
             format!("prompt is {} tokens; max is {}", ids.len(), state.inner.args.max_prompt_tokens),
         ));
     }
-    let max_new = req.max_tokens.unwrap_or(256).min(state.inner.args.max_tokens).max(1);
+    let max_new = req
+        .max_tokens
+        .or(req.max_completion_tokens)
+        .unwrap_or(256)
+        .min(state.inner.args.max_tokens)
+        .max(1);
     let temperature = req.temperature.unwrap_or(0.0).clamp(0.0, 2.0);
     let top_p = req.top_p.unwrap_or(0.95).clamp(0.0, 1.0);
     // `0` is "no rank cutoff", which is both the historical behaviour and what
@@ -911,9 +976,9 @@ async fn chat_completions(
         if let Some(key) = memo_key {
             state.inner.memo.lock().insert(key, out_ids.clone());
         }
-        // Decode is CPU-bound like encode (and takes a shard lock like it),
-        // so it belongs on the blocking pool for the same reason
-        // (see `resolve_params`).
+        // Decode is CPU-bound like encode, so it belongs on the blocking
+        // pool for the same reason (see `resolve_params`) — though unlike
+        // encode it takes no tokenizer lock at all (lock-free vocab view).
         let n_out = out_ids.len();
         let decoded = tokio::task::spawn_blocking(move || tokenizer.decode(&out_ids))
             .await
@@ -1359,6 +1424,26 @@ fn install_moe_engine() {
     }
 }
 
+/// Fold other-frameworks' spellings into the canonical args. Pure so the
+/// precedence is unit-testable without parsing a real command line:
+/// explicit vLLM names win over the native ones, and `OPENAI_API_KEY` backs
+/// `PEREGRINE_API_KEY` so existing client/export setups authenticate.
+fn resolve_compat_args(mut args: Args) -> Args {
+    if let Some(name) = args.served_model_name.take() {
+        args.model_id = name;
+    }
+    if let Some(n) = args.max_num_seqs {
+        args.max_batch = n;
+    }
+    if let Some(n) = args.max_model_len {
+        args.max_prompt_tokens = n;
+    }
+    if args.api_key.as_ref().is_none_or(|k| k.is_empty()) {
+        args.api_key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty());
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cap glibc arenas before the model spawns its worker pools, so the server no
@@ -1367,6 +1452,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{}", peregrine_model::startup_banner());
     install_moe_engine();
     let args = Args::parse();
+    let args = resolve_compat_args(args);
+    if args.trust_remote_code {
+        eprintln!(
+            "peregrine-serve: --trust-remote-code accepted for vLLM script compat; \
+             nothing to trust (safetensors checkpoints carry no executable code)"
+        );
+    }
     let dir = std::path::PathBuf::from(&args.model);
     // Tokenizer throughput bench: encode a text file through both backends and
     // exit — no model weights loaded, so it runs anywhere tokenizer.json does.
@@ -1516,6 +1608,56 @@ mod tests {
                 "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
             }
         }]))
+    }
+
+    /// vLLM launch lines map onto the native flags: explicit counterpart
+    /// names win, and anything unset keeps its default.
+    #[test]
+    fn vllm_spellings_override_native_flags() -> Result<(), String> {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "peregrine-serve",
+            "--model",
+            "/m",
+            "--served-model-name",
+            "qwen3",
+            "--max-num-seqs",
+            "8",
+            "--max-model-len",
+            "4096",
+        ])
+        .map_err(|e| format!("compat flags must parse: {e}"))?;
+        let args = resolve_compat_args(args);
+        assert_eq!(args.model_id, "qwen3");
+        assert_eq!(args.max_batch, 8);
+        assert_eq!(args.max_prompt_tokens, 4096);
+        // Native flags alone keep working.
+        let args = Args::try_parse_from(["peregrine-serve", "--model", "/m"])
+            .map_err(|e| format!("native flags must parse: {e}"))?;
+        let args = resolve_compat_args(args);
+        assert_eq!(args.model_id, "glm-5.2");
+        assert_eq!(args.max_batch, 32);
+        Ok(())
+    }
+
+    /// Newer OpenAI clients send `max_completion_tokens` instead of
+    /// `max_tokens`; both spellings deserialize, and `max_tokens` wins ties.
+    #[test]
+    fn max_completion_tokens_is_accepted() -> Result<(), serde_json::Error> {
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 99
+        }))?;
+        assert_eq!(r.max_tokens, None);
+        assert_eq!(r.max_completion_tokens, Some(99));
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 50,
+            "max_completion_tokens": 99
+        }))?;
+        // resolve_params prefers max_tokens: mirror the precedence here.
+        assert_eq!(r.max_tokens.or(r.max_completion_tokens), Some(50));
+        Ok(())
     }
 
     #[test]

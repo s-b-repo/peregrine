@@ -9,9 +9,11 @@
 #   peregrine-model    MLA, router, MoE, DSA, MTP + top-level Model
 #   peregrine-sched    concurrent MoE scheduler: io_uring streaming || CPU
 #   peregrine-engine   binary `peregrine`: CLI + stdio serve protocol
+#   peregrine-ctx      Dynamic Context Runtime (ported from subnext/DCR): unlimited
+#                      external state + small planned working set for RLM context
 [workspace]
 resolver = "2"
-members = ["crates/peregrine-core", "crates/peregrine-kernels", "crates/peregrine-model", "crates/peregrine-io", "crates/peregrine-sched", "crates/peregrine-engine", "crates/peregrine-cuda", "crates/peregrine-serve", "crates/peregrine-par", "crates/peregrine-tools", "crates/peregrine-token"]
+members = ["crates/peregrine-core", "crates/peregrine-kernels", "crates/peregrine-model", "crates/peregrine-io", "crates/peregrine-sched", "crates/peregrine-engine", "crates/peregrine-cuda", "crates/peregrine-serve", "crates/peregrine-par", "crates/peregrine-tools", "crates/peregrine-token", "crates/peregrine-ctx"]
 
 [workspace.package]
 edition = "2021"

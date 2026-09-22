@@ -232,6 +232,67 @@ impl GigaTokenizer {
         self.inner.decode(&toks).collect()
     }
 
+    /// Decode many id sequences in parallel across `workers` OS threads.    /// Outputs are in input order and byte-for-byte identical to serial
+    /// [`Self::decode`] — lookups are pure reads of the immutable vocab, so
+    /// per-thread partitioning cannot change bytes. Out-of-vocabulary ids are
+    /// skipped per sequence, same lenient contract as `decode`.
+    ///
+    /// Small batches run serially on this thread: thread dispatch only pays
+    /// past ~64 sequences (below that the spawn/join costs more than the
+    /// table lookups it parallelizes).
+    pub fn decode_batch(&self, batch: &[&[u32]], workers: usize) -> Vec<Vec<u8>> {
+        let n = batch.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let w = workers.clamp(1, n);
+        if w <= 1 || n < 64 {
+            return batch.iter().map(|ids| self.decode(ids)).collect();
+        }
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
+        out.resize_with(n, Vec::new);
+        let vocab_ref = &self.inner.vocab;
+        // Scoped threads over disjoint output slots; each sequence decoded once.
+        std::thread::scope(|s| {
+            let chunk = n.div_ceil(w);
+            for (out_c, batch_c) in out.chunks_mut(chunk).zip(batch.chunks(chunk)) {
+                s.spawn(move || {
+                    for (dst, ids) in out_c.iter_mut().zip(batch_c.iter()) {
+                        let mut len = 0usize;
+                        for &id in ids.iter() {
+                            if let Some(tok) = vocab_ref.get(id as usize) {
+                                len += tok.len();
+                            }
+                        }
+                        dst.reserve(len);
+                        for &id in ids.iter() {
+                            if let Some(tok) = vocab_ref.get(id as usize) {
+                                dst.extend_from_slice(tok.as_ref());
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        out
+    }
+
+    /// HuggingFace `PreTrainedTokenizerBase.batch_encode_plus` spelling for
+    /// bulk encoding: id-for-id identical to calling [`Self::encode`] per
+    /// text. Delegates to [`Self::encode_batch`] (same persistent forked-worker
+    /// pool, same 1 MiB/worker parallel gate).
+    pub fn batch_encode(&mut self, texts: &[&str], workers: usize) -> Vec<Vec<u32>> {
+        self.encode_batch(texts, workers)
+    }
+
+    /// HuggingFace `PreTrainedTokenizerBase.batch_decode` spelling for bulk
+    /// decoding: byte-for-byte identical to calling [`Self::decode`] per
+    /// sequence (same out-of-vocabulary skip). Delegates to
+    /// [`Self::decode_batch`].
+    pub fn batch_decode(&self, batch: &[&[u32]], workers: usize) -> Vec<Vec<u8>> {
+        self.decode_batch(batch, workers)
+    }
+
     /// A new tokenizer sharing the immutable model data with a fresh memo
     /// cache — for per-worker encoding without cache contention.
     pub fn fork(&self) -> GigaTokenizer {
@@ -387,6 +448,44 @@ mod facade_tests {
         assert_eq!(via_handle, t.decode(&ids), "handle bytes must equal decode bytes");
         assert!(h.token_bytes(t.vocab_size() as u32).is_none(), "out-of-vocab is None");
         assert!(h.token_bytes(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn decode_batch_matches_serial_decode() {
+        let mut t = gpt2();
+        let texts = [
+            "Hello world",
+            "",
+            "The quick brown fox jumps over the lazy dog.",
+            "naïve façade — ünïcodé ✓ 🦀🦅",
+            "fn main() { println!(\"{}\", 42); }",
+            "  multiple   spaces\tand\nnewlines ",
+        ];
+        let batch: Vec<Vec<u32>> = texts.iter().map(|s| t.encode(s)).collect();
+        // Pad one sequence with out-of-vocab ids: the lenient skip must hold
+        // in batch form too (a padded lm_head sampling past the vocab).
+        let mut padded = batch.clone();
+        let oov = t.vocab_size() as u32;
+        padded[0].push(oov);
+        padded[0].push(u32::MAX);
+        let refs: Vec<&[u32]> = padded.iter().map(Vec::as_slice).collect();
+        let serial: Vec<Vec<u8>> = refs.iter().map(|ids| t.decode(ids)).collect();
+        // Few sequences: serial path, still identical.
+        assert_eq!(t.decode_batch(&refs, 4), serial);
+        // HuggingFace spellings delegate to the same implementations.
+        assert_eq!(t.batch_decode(&refs, 4), serial);
+        assert_eq!(t.batch_encode(&texts, 4), batch);
+        // Many sequences: parallel path (≥64) with several worker counts.
+        let mut big: Vec<Vec<u32>> = Vec::with_capacity(130);
+        for i in 0..130 {
+            big.push(padded[i % padded.len()].clone());
+        }
+        let big_refs: Vec<&[u32]> = big.iter().map(Vec::as_slice).collect();
+        let big_serial: Vec<Vec<u8>> = big_refs.iter().map(|ids| t.decode(ids)).collect();
+        for workers in [1, 2, 8] {
+            assert_eq!(t.decode_batch(&big_refs, workers), big_serial, "workers={workers}");
+        }
+        assert!(t.decode_batch(&[], 4).is_empty());
     }
 
     #[test]

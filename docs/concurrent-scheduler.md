@@ -31,7 +31,9 @@ thread. Rings atomically claim expert batches off a shared `AtomicUsize`
 cursor (`io_work.fetch_add` — lock-free work stealing) and issue a deep
 batched submit of up to `COLI_IO_BATCH` experts × 2–6 regions per expert
 (regions coalesce when the expert's tensors are contiguous on disk). On the
-default **owned-completion lane** (`COLI_IO_COMPLETION`, uring engine only)
+default **owned-completion lane** (`COLI_IO_COMPLETION`, uring engine — and
+per-expert streaming on the mmap engine, which has no completion events so
+one expert's own regions are the delivery unit)
 the lane submits every region with Reactor-owned landing buffers, reaps
 completions incrementally, and forwards each expert to the CPU pool **the
 moment its last region lands** — expert 1 computes while experts 2..N are
@@ -68,6 +70,15 @@ The lesson generalises: **any fixed claim size larger than the work list
 serialises a work-stealing loop onto one worker**, silently, and the
 thread-summed lane counters cannot see it — see
 [Measurement discipline](measurement.md).
+
+**Mirror striping.** With `COLI_IO_MIRROR_ROOTS` (one full copy of the model
+per drive) the wave path splits each large region into one chunk per drive in
+a single `read_striped` submit — wall time toward `1/n_drives` — while the
+owned-completion lane spreads whole regions round-robin across drives; small
+regions (`< n_drives × 128 KiB`) always ride whole. Buffered-only (splits break
+O_DIRECT alignment), byte-identical via the `pread_striped` oracle, with the
+ring pool sized over shard *and* mirror devices. Detail:
+[configuration](configuration.md#coli_io_mirror_roots).
 
 **CPU lane.** A worker pool computes each streamed expert's SwiGLU as bytes
 land: fused gate+up → silu·up → down → weighted scatter. A streamed expert's

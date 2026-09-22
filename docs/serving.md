@@ -22,13 +22,28 @@ graceful on Ctrl-C / SIGINT (in-flight connections drain; no SIGTERM handler).
 | `--model <dir>` | **required** (env: `COLI_MODEL`) | model dir with `config.json`, `*.safetensors`, `tokenizer.json` |
 | `--host <host>` | `127.0.0.1` | localhost-only by default |
 | `--port <port>` | `8080` | |
-| `--api-key <key>` | unset (env: `PEREGRINE_API_KEY`) | enables bearer auth when set |
+| `--api-key <key>` | unset (env: `PEREGRINE_API_KEY`, fallback `OPENAI_API_KEY`) | enables bearer auth when set |
 | `--max-tokens <n>` | `1024` | hard server cap on generated tokens per request |
 | `--max-prompt-tokens <n>` | `8192` | hard cap on encoded prompt tokens (413 above it) |
 | `--model-id <id>` | `glm-5.2` | id reported by `/v1/models` and echoed in responses |
 | `--max-batch <n>` | `32` | continuous-batching width ceiling |
 | `--bench-tokenizer <file>` | unset | tokenizer throughput bench, then exit (no weights loaded) |
-| `--host-tool <name>` | none (repeatable) | server-hosted tools (`tokenize`, `detokenize`, `count_tokens`) executed when the model calls them, speculated while the call streams — [sPTC](sptc.md); unknown name = boot error |
+| `--host-tool <name>` | none (repeatable) | server-hosted tools (`tokenize`, `detokenize`, `detokenize_batch`, `count_tokens`) executed when the model calls them, speculated while the call streams — [sPTC](sptc.md); unknown name = boot error |
+
+### vLLM-compatible spellings
+
+Launch lines written for `vllm serve` map over directly:
+
+| vLLM | peregrine | Notes |
+|---|---|---|
+| `--served-model-name <id>` | `--model-id` | wins when both are set |
+| `--max-model-len <n>` | `--max-prompt-tokens` | context cap; generation cap stays `--max-tokens` |
+| `--max-num-seqs <n>` | `--max-batch` | wins when both are set |
+| `--trust-remote-code` | — | accepted with a loud note; safetensors checkpoints carry no executable code, so there is nothing to trust |
+| `--api-key` | `--api-key` | identical spelling; `OPENAI_API_KEY` also works as env fallback |
+
+Requests accept newer OpenAI fields too: `max_completion_tokens` alongside
+`max_tokens` (`max_tokens` wins ties), and `top_k` next to `top_p`.
 
 ## Endpoints
 

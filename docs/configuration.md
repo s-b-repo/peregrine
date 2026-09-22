@@ -32,11 +32,11 @@ unmodified configuration before you rely on it:
 | [`COLI_MLA_ABSORB`](#coli_mla_absorb) | absorb and dense agree algebraically, not numerically |
 | [`COLI_RLM`](#coli_rlm--recursive-refinement-at-contested-decode-positions) | recursive refinement of contested decode positions, may shift the argmax |
 | [`COLI_CUDA_FUSED_REDUCE`](#coli_cuda_fused_reduce) | low bits only — `f32 +=` is not associative |
+| [`COLI_CTX`](context-plane.md) | the model sees a planned working set instead of the raw prompt — different prompt, different tokens |
 
 > Earlier revisions of this page opened by claiming *"every one of them affects
 > performance only: the token stream is unchanged"*. That was never true of the
-> five above, four of which said so in their own entries. The invariant holds for
-> everything else on this page.
+> table above. The invariant holds for everything else on this page.
 
 ---
 
@@ -105,7 +105,7 @@ Error: ... 6.8 GB short, so the kernel would OOM-kill this run part-way through 
 | `COLI_IO_RINGS` | 4 | io_uring rings, each on its own thread — [note](#coli_io_rings) |
 | `COLI_IO_BATCH` | 16 | **upper bound** on experts claimed per ring — [note](#coli_io_batch) |
 | `COLI_IO_ENGINE` | auto | `uring` \| `pread` \| `mmap` \| `regbuf`; unset probes io_uring and falls back to `pread` — [note](#coli_io_engine) |
-| `COLI_IO_COMPLETION` | on | forward each expert as its own reads complete (uring only); `0` restores the blocking whole-wave submit — [note](#coli_io_completion) |
+| `COLI_IO_COMPLETION` | on | forward each expert as its own reads complete (uring completion lane; per-expert streaming on mmap); `0` restores the blocking whole-wave submit — [note](#coli_io_completion) |
 | `COLI_IO_PROCFS` | ring | whether `/proc` and `/sys` reads go through the ring; `direct` restores a plain `read(2)` — [note](#coli_io_procfs) |
 | `COLI_SQPOLL` | off | kernel submission-polling thread on the streaming rings: no enter syscall per submit — [note](#coli_sqpoll) |
 | `COLI_SQPOLL_IDLE_MS` | 2000 | how long the SQPOLL kthread busy-polls before sleeping (the next submit wakes it transparently) |
@@ -126,6 +126,7 @@ Error: ... 6.8 GB short, so the kernel would OOM-kill this run part-way through 
 | `COLI_MOE_ENGINE` | `concurrent` | `concurrent` (3-lane) or `sched` — [note](#coli_moe_engine) |
 | `COLI_IO_DEVICE_SCHED` | off | device-aware ring scheduling: claims are grouped per physical device instead of taken off one device-blind cursor, with cross-device work stealing. Built only when it can differ — streaming, >1 ring, shards genuinely on >1 device |
 | `COLI_IO_DEVICE_MAP` | probed | override the shard→device-ordinal mapping the above schedules on, for a topology the prober reads wrongly. Read once per model open, not latched |
+| `COLI_IO_MIRROR_ROOTS` | unset (off) | comma-separated dirs, each holding a full byte-identical copy of the model shards — one logical read fans out across **all** drives in parallel — [note](#coli_io_mirror_roots) |
 | `COLI_SSD_AWARE_SCHED` | off | learned SSD clock: per-device bandwidth EWMA from completed claim windows, then (a) shortest-job-first claim order **within** each device-pure group and (b) ring homes spread by predicted **seconds** instead of expert count — a slow device earns more rings per byte. Reorders queued work only; output is bit-identical (`ssd_aware_scheduling_is_bit_identical_to_the_blind_cursor`). Weights equal the historical ones until the clock has measured a spread |
 | `COLI_ROUTER_LOOKAHEAD_K` | 1 | how many layers ahead the router look-ahead reaches: at the end of layer `L`, layers `L+1…L+k`' routers are applied to `L`'s output and each ranking warms its own layer. Horizon 1 is the historical Δ=1 behaviour slot-for-slot; deeper horizons halve the window each step out (`6 → 3 → 1 → 0`), trading residual-stream drift for schedule lead, bounded by the stale-drop gate. Advisory only — cannot change a token |
 
@@ -273,7 +274,9 @@ Byte-identical to the wave by construction: same regions, same carve, and the
 reduce keys on `pos`, never arrival order. `0` restores the blocking wave
 path. `COLI_IO_ENGINE=pread|regbuf` also implies the wave — those measurement
 arms are wave-shaped on purpose, and reshaping their requests would change
-what they measure.
+what they measure. On `COLI_IO_ENGINE=mmap` the same knob drives per-expert
+streaming instead (mmap has no completion events, so one expert's own regions
+are the delivery unit); `0` restores the whole-claim wave there too.
 
 ### `COLI_SQPOLL`
 
@@ -298,24 +301,69 @@ read-µs EWMA remains live.
 exists as a runtime A/B against an independently written second implementation that
 the oracle test already compares. `COLI_IO_DEPTH` sets its ring depth.
 
+### `COLI_IO_MIRROR_ROOTS`
+
+Comma-separated directories, each holding a **full byte-identical copy** of the
+model shards — the same model on every drive at once. Set it to read a cold
+load or an expert miss at ~`1/n_drives` of the single-drive time: each large
+region is split into one contiguous chunk per drive and issued in **one**
+batched io_uring submit (`Reactor::read_striped`), so all drives work
+concurrently; ranges below `n_drives × 128 KiB` ride whole on one drive,
+round-robin across the batch, so small reads never pay split overhead. The
+owned-completion lane spreads whole regions round-robin the same way.
+
+Buffered reads only — an equal split breaks O_DIRECT block alignment, so the
+direct lane keeps its single-fd path. Byte-identical either way: mirrors are
+verified at open (size + header bytes; a diverging copy is ignored loudly, not
+read), and `pread_striped` is the portable oracle both paths assert against.
+The ring pool sizes itself by `max(shard devices, mirror devices)`, mirror fds
+register as fixed files alongside shard fds, and `SafeTensors::read_at` stripes
+transparently — no other knob changes. Copy with `cp -a`/`rsync -a` per shard
+file name into each root; a shard missing from some roots degrades that shard
+to single-drive reads, never a failed load.
+
 ---
 
 ## Compute & scheduling
 
 | Var | Default | Effect |
 |---|---|---|
-| `COLI_PAR_THREADS` | ncpus (≤ 16) | `peregrine-par` pool size; `1` = fully serial (the A/B baseline) |
+| `COLI_BLOCK_EXEC` | `par` | per-block thread shape: `sync` (single-thread) \| `mt` (scoped OS threads) \| `par` (persistent pool) — [note](#coli_block_exec) |
+| `COLI_PAR_THREADS` | ncpus (≤ 16) | `peregrine-par` pool size; `1` = fully serial (the A/B baseline). `COLI_BLOCK_EXEC=sync` dictates width 1 ahead of the pool's first use and wins over this |
 | `COLI_LANE_BALANCE` | off | `LaneBalancer` overrides static residency: downgrade cold GPU residents to CPU when GPU is bottlenecked |
 | `COLI_REPLICATE_K` | 0 | top-K hottest GPU-residents also warmed into the CPU warm cache each `reheat` |
 | `COLI_NUMA_PIN` | off | pin workers round-robin across NUMA nodes; hierarchical pool dispatch; NUMA-bind ≥ 2 MB buffers |
 | `COLI_SHAPE_SPECIALIZE` | off | per-shape probe-then-memoize serial-vs-parallel matmul dispatch |
 | `COLI_PREFILL_CHUNK_DIV` | **4** (2026-08-13) | prefill chunk becomes `max(64, pos/d)`; `0` = fixed 64 — [note](#coli_prefill_chunk_div) |
+| `COLI_CTX` | off | context plane: the model sees the DCR-planned working set instead of the raw prompt — [note](context-plane.md) |
 
 ### `COLI_PREFILL_CHUNK_DIV`
 
 A fixed chunk makes prefill quadratic in prompt length, since attention re-derives
 every cached position per call. Chunk size cannot change output — only how long one
 prefill step blocks decode.
+
+### `COLI_BLOCK_EXEC`
+
+Which thread shape every transformer block executes with — `sync`, `mt`, or
+`par` (default). Output is bit-identical in all three (disjoint row
+partitions, fixed reduce/residual order), so this is a pure token-generation
+throughput knob and A/B arm:
+
+- `sync` — fully serial single thread: every `par_*` gate is forced shut and
+  the global pool is dictated to width 1 **before its first use** (the pool
+  builds once, lazily — a later export cannot shrink it, and the load says so
+  rather than claiming serial). The oracle baseline.
+- `mt` — multi-threaded with scoped OS threads for elementwise block work
+  (residual adds) and the shared pool for heavy kernels. Same bytes as `par`,
+  no pool dispatch on the hottest tiny ops.
+- `par` — the historical path: the persistent `peregrine-par` pool everywhere.
+
+Resolved once at load, threaded into every forward context, and reported on
+the `[block]` boot line alongside the pool width it actually runs
+(`exec=sync pool_width=0` reads 0 because the serial pool parks no threads —
+that *is* the serial confirmation). Norms, attention, FFN/MoE, and both
+residual adds honor it; prefill, batched, and draft paths carry the same mode.
 
 ---
 

@@ -58,9 +58,12 @@ harnesses that know it save their own round trip. A tool that failed reports
 `"peregrine_result": {"error": "…"}`; a failure is cached like a hit, because
 a pure tool's failure is as deterministic as its success.
 
-The three built-ins are tokenizer queries over the server's own tokenizer
+The four built-ins are tokenizer queries over the server's own tokenizer
 (same ids `/v1/debug/tokenize` reports): `tokenize {text} → {ids, count}`,
-`detokenize {ids} → {text}`, `count_tokens {text} → {count}`. An agent that
+`detokenize {ids} → {text}`, `count_tokens {text} → {count}`, plus the batch
+twin `detokenize_batch {seqs: [[ids], …]} → {texts: […]}` — sharded parallel
+decode in input order, per-sequence identical to `detokenize` (malformed
+entries fail with their index named). An agent that
 budgets `max_tokens` before writing a call no longer has to guess.
 
 ## Knobs and lifecycle
