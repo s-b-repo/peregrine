@@ -2955,12 +2955,19 @@ struct LayerSite<'a> {
     sparse: Option<bool>,
 }
 
-fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Result<LayerW, Error> {
-    load_layer_at(st, i, cfg, stream_experts, LayerSite::default())
+fn load_layer(
+    st: &SafeTensors,
+    reference: Option<&SafeTensors>,
+    i: usize,
+    cfg: &Cfg,
+    stream_experts: bool,
+) -> Result<LayerW, Error> {
+    load_layer_at(st, reference, i, cfg, stream_experts, LayerSite::default())
 }
 
 fn load_layer_at(
     st: &SafeTensors,
+    reference: Option<&SafeTensors>,
     i: usize,
     cfg: &Cfg,
     stream_experts: bool,
@@ -2973,6 +2980,9 @@ fn load_layer_at(
     let qkr = cfg.qk_rope as usize;
     let pre = site.prefix.map_or_else(|| layer_prefix(cfg, i), |s| s.to_string());
     let p = |s: &str| format!("{pre}{s}");
+    let qload = |name: &str, o: usize, cols: usize| {
+        QtWeight::load_hybrid(st, reference, name, o, cols)
+    };
     let sparse = site.sparse.unwrap_or(i >= cfg.first_dense as usize);
     // Full-attention vs the arch's linear/MLA lane, overridable for off-stack layers.
     let is_full_attn = site
@@ -2983,13 +2993,13 @@ fn load_layer_at(
     // layers and the MTP head layer — NoPE there, so `qkr` is simply 0).
     let load_mla = |st: &SafeTensors| -> Result<LayerAttn, Error> {
         Ok(LayerAttn::Mla {
-            q_a: QtWeight::load(st, &p("self_attn.q_a_proj.weight"), ql, d)?,
+            q_a: qload(&p("self_attn.q_a_proj.weight"), ql, d)?,
             q_a_ln: load_f32(st, &p("self_attn.q_a_layernorm.weight"), ql)?,
-            q_b: QtWeight::load(st, &p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
-            kv_a: QtWeight::load(st, &p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d)?,
+            q_b: qload(&p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
+            kv_a: qload(&p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d)?,
             kv_a_ln: load_f32(st, &p("self_attn.kv_a_layernorm.weight"), kvl)?,
-            kv_b: QtWeight::load(st, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
-            o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, h * vh)?,
+            kv_b: qload(&p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
+            o: qload(&p("self_attn.o_proj.weight"), d, h * vh)?,
         })
     };
     let attn = match cfg.arch {
@@ -3006,19 +3016,19 @@ fn load_layer_at(
                 conv.extend(load_f32(st, &p(&format!("self_attn.{t}.weight")), qkv * taps)?);
             }
             LayerAttn::Kda(Box::new(KdaW {
-                q: QtWeight::load(st, &p("self_attn.q_proj.weight"), qkv, d)?,
-                k: QtWeight::load(st, &p("self_attn.k_proj.weight"), qkv, d)?,
-                v: QtWeight::load(st, &p("self_attn.v_proj.weight"), qkv, d)?,
+                q: qload(&p("self_attn.q_proj.weight"), qkv, d)?,
+                k: qload(&p("self_attn.k_proj.weight"), qkv, d)?,
+                v: qload(&p("self_attn.v_proj.weight"), qkv, d)?,
                 conv,
-                f_a: QtWeight::load(st, &p("self_attn.f_a_proj.weight"), ld, d)?,
-                f_b: QtWeight::load(st, &p("self_attn.f_b_proj.weight"), qkv, ld)?,
+                f_a: qload(&p("self_attn.f_a_proj.weight"), ld, d)?,
+                f_b: qload(&p("self_attn.f_b_proj.weight"), qkv, ld)?,
                 dt_bias: load_f32(st, &p("self_attn.dt_bias"), qkv)?,
                 a_log: load_f32(st, &p("self_attn.A_log"), lh)?,
-                b: QtWeight::load(st, &p("self_attn.b_proj.weight"), lh, d)?,
-                g_a: QtWeight::load(st, &p("self_attn.g_a_proj.weight"), ld, d)?,
-                g_b: QtWeight::load(st, &p("self_attn.g_b_proj.weight"), qkv, ld)?,
+                b: qload(&p("self_attn.b_proj.weight"), lh, d)?,
+                g_a: qload(&p("self_attn.g_a_proj.weight"), ld, d)?,
+                g_b: qload(&p("self_attn.g_b_proj.weight"), qkv, ld)?,
                 o_norm: load_f32(st, &p("self_attn.o_norm.weight"), ld)?,
-                o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, qkv)?,
+                o: qload(&p("self_attn.o_proj.weight"), d, qkv)?,
             }))
         }
         Arch::DenseGqa | Arch::HybridGdn | Arch::Qwen4Exp if is_full_attn => {
@@ -3027,10 +3037,10 @@ fn load_layer_at(
             // gate rows, the flat-chunk layout (Track C contract, gate-pinned).
             let q_rows = if cfg.attn_gate { 2 * nh * hd } else { nh * hd };
             LayerAttn::Gqa {
-                wq: QtWeight::load(st, &p("self_attn.q_proj.weight"), q_rows, d)?,
-                wk: QtWeight::load(st, &p("self_attn.k_proj.weight"), nkv * hd, d)?,
-                wv: QtWeight::load(st, &p("self_attn.v_proj.weight"), nkv * hd, d)?,
-                o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, nh * hd)?,
+                wq: qload(&p("self_attn.q_proj.weight"), q_rows, d)?,
+                wk: qload(&p("self_attn.k_proj.weight"), nkv * hd, d)?,
+                wv: qload(&p("self_attn.v_proj.weight"), nkv * hd, d)?,
+                o: qload(&p("self_attn.o_proj.weight"), d, nh * hd)?,
                 q_norm: if cfg.arch == Arch::HybridGdn {
                     load_norm_zero_centered(st, &p("self_attn.q_norm.weight"), hd)?
                 } else {
@@ -3064,13 +3074,13 @@ fn load_layer_at(
                 (dummy_qt(), dummy_qt(), dummy_qt())
             } else {
                 (
-                    QtWeight::load(st, &p("linear_attn.in_proj_z.weight"), vh_l * vd, d)?,
-                    QtWeight::load(st, &p("linear_attn.in_proj_a.weight"), vh_l, d)?,
-                    QtWeight::load(st, &p("linear_attn.in_proj_b.weight"), vh_l, d)?,
+                    qload(&p("linear_attn.in_proj_z.weight"), vh_l * vd, d)?,
+                    qload(&p("linear_attn.in_proj_a.weight"), vh_l, d)?,
+                    qload(&p("linear_attn.in_proj_b.weight"), vh_l, d)?,
                 )
             };
             LayerAttn::Gdn {
-                in_qkv: QtWeight::load(st, &p("linear_attn.in_proj_qkv.weight"), conv_dim, d)?,
+                in_qkv: qload(&p("linear_attn.in_proj_qkv.weight"), conv_dim, d)?,
                 in_z,
                 in_a,
                 in_b,
@@ -3078,7 +3088,7 @@ fn load_layer_at(
                 a_log: load_f32(st, &p("linear_attn.A_log"), vh_l)?,
                 dt_bias: load_f32(st, &p("linear_attn.dt_bias"), vh_l)?,
                 norm: load_f32(st, &p("linear_attn.norm.weight"), vd)?,
-                out: QtWeight::load(st, &p("linear_attn.out_proj.weight"), d, vh_l * vd)?,
+                out: qload(&p("linear_attn.out_proj.weight"), d, vh_l * vd)?,
             }
         }
     };
@@ -3088,9 +3098,9 @@ fn load_layer_at(
     if !sparse {
         let di = cfg.dense_inter as usize;
         dense = Some(Mlp {
-            gate: QtWeight::load(st, &p("mlp.gate_proj.weight"), di, d)?,
-            up: QtWeight::load(st, &p("mlp.up_proj.weight"), di, d)?,
-            down: QtWeight::load(st, &p("mlp.down_proj.weight"), d, di)?,
+            gate: qload(&p("mlp.gate_proj.weight"), di, d)?,
+            up: qload(&p("mlp.up_proj.weight"), di, d)?,
+            down: qload(&p("mlp.down_proj.weight"), d, di)?,
             limit: cfg.swiglu_limit,
         });
     } else {
@@ -3116,9 +3126,9 @@ fn load_layer_at(
             load_f32(st, &p("mlp.gate.e_score_correction_bias"), e_n)?
         };
         shared = Some(Mlp {
-            gate: QtWeight::load(st, &p("mlp.shared_experts.gate_proj.weight"), si, d)?,
-            up: QtWeight::load(st, &p("mlp.shared_experts.up_proj.weight"), si, d)?,
-            down: QtWeight::load(st, &p("mlp.shared_experts.down_proj.weight"), d, si)?,
+            gate: qload(&p("mlp.shared_experts.gate_proj.weight"), si, d)?,
+            up: qload(&p("mlp.shared_experts.up_proj.weight"), si, d)?,
+            down: qload(&p("mlp.shared_experts.down_proj.weight"), d, si)?,
             limit: cfg.swiglu_limit,
         });
         for e in 0..e_n {
@@ -3134,9 +3144,9 @@ fn load_layer_at(
                 }
             } else {
                 experts.push(Mlp {
-                    gate: QtWeight::load(st, &pe("gate_proj.weight"), mi, d)?,
-                    up: QtWeight::load(st, &pe("up_proj.weight"), mi, d)?,
-                    down: QtWeight::load(st, &pe("down_proj.weight"), d, mi)?,
+                    gate: qload(&pe("gate_proj.weight"), mi, d)?,
+                    up: qload(&pe("up_proj.weight"), mi, d)?,
+                    down: qload(&pe("down_proj.weight"), d, mi)?,
                     limit: cfg.swiglu_limit,
                 });
             }
@@ -3940,6 +3950,16 @@ impl Model {
         Self::load_inner(dir, Some(stream), None, None)
     }
 
+    /// Load a quantized model with an optional full-precision reference model.
+    /// The quantized checkpoint wins for every tensor it can load; the reference
+    /// is consulted only for missing/unrepresentable matrix weights.
+    pub fn load_hybrid(
+        dir: &std::path::Path,
+        reference_dir: Option<&std::path::Path>,
+    ) -> Result<Model, Error> {
+        Self::load_inner_with_reference(dir, None, None, None, reference_dir)
+    }
+
     /// Load with streaming forced and an explicit warm-cache byte budget
     /// (`0` disables the cache). Bypasses `COLI_ECACHE_GB` so tests can toggle the
     /// cache deterministically without touching process env (which races under
@@ -3961,12 +3981,37 @@ impl Model {
         force_ecache: Option<usize>,
         force_direct: Option<bool>,
     ) -> Result<Model, Error> {
+        Self::load_inner_with_reference(dir, force_stream, force_ecache, force_direct, None)
+    }
+
+    fn load_inner_with_reference(
+        dir: &std::path::Path,
+        force_stream: Option<bool>,
+        force_ecache: Option<usize>,
+        force_direct: Option<bool>,
+        explicit_reference_dir: Option<&std::path::Path>,
+    ) -> Result<Model, Error> {
         // Before any par_* call can lazily build the global pool: install the
         // NUMA-pinning worker hook (no-op unless COLI_NUMA_PIN=1).
         install_numa_pin_hook();
         let cfg = Cfg::load(dir)?;
         crate::qwen4::require_runtime(&cfg)?;
         let st = SafeTensors::open(dir)?;
+
+        // Optional non-quantized reference checkpoint for hybrid inference.
+        // The quantized checkpoint remains authoritative whenever a tensor is
+        // present and computable; the reference is consulted only for missing
+        // or non-quantized matrix tensors.
+        let reference_dir = explicit_reference_dir
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("COLI_REFERENCE_DIR").map(std::path::PathBuf::from));
+        let reference_st = match reference_dir.as_deref() {
+            Some(path) => Some(SafeTensors::open(path)?),
+            None => None,
+        };
+        if reference_st.is_some() {
+            eprintln!("[peregrine] hybrid reference weights enabled via COLI_REFERENCE_DIR");
+        }
 
         // Decide whether routed experts must be streamed from disk: sum their
         // on-disk payload and compare to available RAM (leaving headroom for
@@ -4112,8 +4157,8 @@ impl Model {
             Arch::Qwen4Exp => ("model.embed_tokens.weight", "model.hyper_connection_mixer.hc_norm.weight"),
             Arch::HybridGdn => ("model.language_model.embed_tokens.weight", "model.language_model.norm.weight"),
         };
-        let embed = QtWeight::load(&st, embed_name, vocab, d)?;
-        let lm_head = QtWeight::load(&st, "lm_head.weight", vocab, d)?;
+        let embed = QtWeight::load_hybrid(&st, reference_st.as_ref(), embed_name, vocab, d)?;
+        let lm_head = QtWeight::load_hybrid(&st, reference_st.as_ref(), "lm_head.weight", vocab, d)?;
         // Qwen4Exp has no trunk final norm — the checkpoint's
         // `hyper_connection_mixer.hc_norm` is `[hidden*hc]` (the global mixer's
         // own norm, loaded as `qwen4_mixer` below) and cannot serve as the
@@ -4134,7 +4179,7 @@ impl Model {
 
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
         for i in 0..cfg.n_layers as usize {
-            layers.push(load_layer(&st, i, &cfg, stream_experts)?);
+            layers.push(load_layer(&st, reference_st.as_ref(), i, &cfg, stream_experts)?);
         }
 
         let kv = (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, kv_dtype())).collect();
