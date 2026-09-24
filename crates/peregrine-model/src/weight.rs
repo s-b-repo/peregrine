@@ -31,6 +31,9 @@ pub enum QuantFmt {
     /// [`QuantFmt::Int2`] all four levels carry weight, because the bias is the
     /// group's own zero-point rather than a fixed `-2`.
     Int2G64,
+    /// Full-precision fallback/reference weight loaded from a companion
+    /// SafeTensors model when the primary quantized checkpoint lacks a tensor.
+    Full,
 }
 
 impl QuantFmt {
@@ -98,6 +101,9 @@ pub struct QtWeight {
     /// on time and keeps f32 throughout; batched shapes stay on the CPU path,
     /// which is already parallel over output rows.
     dev: Option<DevMatrix>,
+    /// Optional full-precision fallback. Used only when the primary quantized
+    /// checkpoint does not contain a requested tensor.
+    full: Option<Vec<f32>>,
 }
 
 /// `COLI_ACT_F32=1`: compute quantized matmuls against **f32** activations
@@ -124,19 +130,61 @@ impl QtWeight {
             "QtWeight::new is for formats with an implicit group layout (got {fmt:?}); \
              use new_grouped for grouped int4, whose group size is a runtime value"
         );
-        QtWeight { fmt, o, i, q: q.into(), scale, gs: 0, dev: None }
+        QtWeight { fmt, o, i, q: q.into(), scale, gs: 0, dev: None, full: None }
     }
 
     /// Build a grouped-int4 weight: `scale` holds `o*ceil(i/gs)` entries laid out
     /// `scale[o*ng + g]`.
     pub fn new_grouped(o: usize, i: usize, q: impl Into<Bytes>, scale: Vec<f32>, gs: usize) -> QtWeight {
         debug_assert!(gs > 0 && gs.is_multiple_of(16), "grouped-int4 gs must be a positive multiple of 16");
-        QtWeight { fmt: QuantFmt::Int4Grouped, o, i, q: q.into(), scale, gs, dev: None }
+        QtWeight { fmt: QuantFmt::Int4Grouped, o, i, q: q.into(), scale, gs, dev: None, full: None }
     }
 
     /// Load a container weight `[O, I]` (`name` + `name.qs`) from a model dir.
     pub fn load(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<QtWeight, Error> {
         Self::load_into(st, name, o, i, false)
+    }
+
+    /// Load a weight from the primary quantized checkpoint, falling back to a
+    /// companion full-precision checkpoint when the primary tensor is absent
+    /// or is not represented in Peregrine's quantized container format.
+    ///
+    /// The fallback is intentionally kept as f32 in this weight object. This
+    /// preserves the reference tensor instead of silently requantizing it, so
+    /// missing/sensitive tensors can execute at full precision while the bulk
+    /// of the model remains quantized.
+    pub fn load_hybrid(
+        primary: &SafeTensors,
+        reference: Option<&SafeTensors>,
+        name: &str,
+        o: usize,
+        i: usize,
+    ) -> Result<QtWeight, Error> {
+        match Self::load(primary, name, o, i) {
+            Ok(w) => Ok(w),
+            Err(primary_err) => {
+                let Some(reference) = reference else {
+                    return Err(primary_err);
+                };
+                if !reference.has(name) {
+                    return Err(primary_err);
+                }
+                let mut full = vec![0.0f32; o.checked_mul(i).ok_or_else(|| {
+                    Error::Format(format!("weight '{name}': shape overflow for [{o},{i}]"))
+                })?];
+                reference.read_f32(name, &mut full)?;
+                Ok(QtWeight {
+                    fmt: QuantFmt::Full,
+                    o,
+                    i,
+                    q: Bytes::Vec(Vec::new()),
+                    scale: Vec::new(),
+                    gs: 0,
+                    dev: None,
+                    full: Some(full),
+                })
+            }
+        }
     }
 
     /// [`Self::load`], but the quantized payload lands in a **page-aligned**
@@ -257,6 +305,10 @@ impl QtWeight {
     /// `y[s_n, O] = apply(self, x[s_n, I])`. Caller provides int8 activation
     /// scratch `xq[s_n*I]`, per-row scale scratch `sx[s_n]`, and output `y`.
     pub fn apply(&self, x: &[f32], s_n: usize, xq: &mut [i8], sx: &mut [f32], y: &mut [f32]) {
+        if let Some(full) = &self.full {
+            peregrine_kernels::matmul_f32(y, x, full, s_n, self.i, self.o);
+            return;
+        }
         match self.fmt {
             QuantFmt::Int8 => matmul_i8_from_f32(y, x, self.as_i8(), &self.scale, MatShape::new(s_n, self.i, self.o), ActScratch { xq, sx }),
             QuantFmt::Int4 => matmul_i4_from_f32(y, x, &self.q[..], &self.scale, MatShape::new(s_n, self.i, self.o), ActScratch { xq, sx }),
@@ -320,6 +372,10 @@ impl QtWeight {
                     }
                 }
             }
+            QuantFmt::Full => {
+                // Full-precision fallback is handled before entering this match.
+                // Keep the enum exhaustive without introducing a panic path.
+            }
         }
     }
 
@@ -365,6 +421,9 @@ impl QtWeight {
     /// Packed bytes this weight occupies in RAM — the denominator for "how
     /// much of the model is on the device".
     pub fn packed_bytes(&self) -> usize {
+        if let Some(full) = &self.full {
+            return full.len().saturating_mul(std::mem::size_of::<f32>());
+        }
         self.q.len() + 4 * self.scale.len()
     }
 
@@ -384,6 +443,11 @@ impl QtWeight {
     }
 
     pub fn apply_vec(&self, x: &[f32], s_n: usize) -> Vec<f32> {
+        if let Some(full) = &self.full {
+            let mut y = vec![0.0f32; s_n * self.o];
+            peregrine_kernels::matmul_f32(&mut y, x, full, s_n, self.i, self.o);
+            return y;
+        }
         // Decode against a VRAM-resident weight: the device GEMV is both faster
         // (measured 6.7x on a real layer shape) and more accurate (f32
         // throughout, rms 1.1e-7 vs the CPU path's 3.0e-3 — this path never
@@ -517,6 +581,14 @@ impl QtWeight {
             return;
         }
         let out = &mut out[..self.i];
+        if let Some(full) = &self.full {
+            let start = o.saturating_mul(self.i);
+            let end = start.saturating_add(self.i);
+            if end <= full.len() {
+                out.copy_from_slice(&full[start..end]);
+            }
+            return;
+        }
         match self.fmt {
             QuantFmt::Int8 => {
                 let s = self.scale[o];
