@@ -278,7 +278,7 @@ impl QtWeight {
             QuantFmt::Int8 => Some((self.i, 1)),
             QuantFmt::Int4 => Some((self.i.div_ceil(2), 1)),
             QuantFmt::Int4Grouped => Some((self.i.div_ceil(2), self.i.div_ceil(self.gs))),
-            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 => None,
+            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 | QuantFmt::Full => None,
         }
     }
 
@@ -298,7 +298,7 @@ impl QtWeight {
             QuantFmt::Int4 => matmul_i4_from_f32(y, x, q, sc, shape, act),
             QuantFmt::Int4Grouped => matmul_i4g_from_f32(y, x, q, sc, shape, self.gs, act),
             // `row_pitch` returned None for these, so they never reach here.
-            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 => {}
+            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 | QuantFmt::Full => {}
         }
     }
 
