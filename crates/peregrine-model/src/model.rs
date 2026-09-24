@@ -2983,6 +2983,20 @@ fn load_layer_at(
     let qload = |name: &str, o: usize, cols: usize| {
         QtWeight::load_hybrid(st, reference, name, o, cols)
     };
+    let fload = |name: &str, n: usize| -> Result<Vec<f32>, Error> {
+        match fload(name, n) {
+            Ok(v) => Ok(v),
+            Err(primary_err) => {
+                let Some(reference) = reference else {
+                    return Err(primary_err);
+                };
+                if !reference.has(name) {
+                    return Err(primary_err);
+                }
+                load_f32(reference, name, n)
+            }
+        }
+    };
     let sparse = site.sparse.unwrap_or(i >= cfg.first_dense as usize);
     // Full-attention vs the arch's linear/MLA lane, overridable for off-stack layers.
     let is_full_attn = site
@@ -2994,10 +3008,10 @@ fn load_layer_at(
     let load_mla = |st: &SafeTensors| -> Result<LayerAttn, Error> {
         Ok(LayerAttn::Mla {
             q_a: qload(&p("self_attn.q_a_proj.weight"), ql, d)?,
-            q_a_ln: load_f32(st, &p("self_attn.q_a_layernorm.weight"), ql)?,
+            q_a_ln: fload(&p("self_attn.q_a_layernorm.weight"), ql)?,
             q_b: qload(&p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
             kv_a: qload(&p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d)?,
-            kv_a_ln: load_f32(st, &p("self_attn.kv_a_layernorm.weight"), kvl)?,
+            kv_a_ln: fload(&p("self_attn.kv_a_layernorm.weight"), kvl)?,
             kv_b: qload(&p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
             o: qload(&p("self_attn.o_proj.weight"), d, h * vh)?,
         })
@@ -3013,7 +3027,7 @@ fn load_layer_at(
             let (qkv, taps) = (lh * ld, cfg.lin_conv_k as usize);
             let mut conv = Vec::with_capacity(3 * qkv * taps);
             for t in ["q_conv1d", "k_conv1d", "v_conv1d"] {
-                conv.extend(load_f32(st, &p(&format!("self_attn.{t}.weight")), qkv * taps)?);
+                conv.extend(fload(&p(&format!("self_attn.{t}.weight")), qkv * taps)?);
             }
             LayerAttn::Kda(Box::new(KdaW {
                 q: qload(&p("self_attn.q_proj.weight"), qkv, d)?,
@@ -3022,12 +3036,12 @@ fn load_layer_at(
                 conv,
                 f_a: qload(&p("self_attn.f_a_proj.weight"), ld, d)?,
                 f_b: qload(&p("self_attn.f_b_proj.weight"), qkv, ld)?,
-                dt_bias: load_f32(st, &p("self_attn.dt_bias"), qkv)?,
-                a_log: load_f32(st, &p("self_attn.A_log"), lh)?,
+                dt_bias: fload(&p("self_attn.dt_bias"), qkv)?,
+                a_log: fload(&p("self_attn.A_log"), lh)?,
                 b: qload(&p("self_attn.b_proj.weight"), lh, d)?,
                 g_a: qload(&p("self_attn.g_a_proj.weight"), ld, d)?,
                 g_b: qload(&p("self_attn.g_b_proj.weight"), qkv, ld)?,
-                o_norm: load_f32(st, &p("self_attn.o_norm.weight"), ld)?,
+                o_norm: fload(&p("self_attn.o_norm.weight"), ld)?,
                 o: qload(&p("self_attn.o_proj.weight"), d, qkv)?,
             }))
         }
@@ -3044,12 +3058,12 @@ fn load_layer_at(
                 q_norm: if cfg.arch == Arch::HybridGdn {
                     load_norm_zero_centered(st, &p("self_attn.q_norm.weight"), hd)?
                 } else {
-                    load_f32(st, &p("self_attn.q_norm.weight"), hd)?
+                    fload(&p("self_attn.q_norm.weight"), hd)?
                 },
                 k_norm: if cfg.arch == Arch::HybridGdn {
                     load_norm_zero_centered(st, &p("self_attn.k_norm.weight"), hd)?
                 } else {
-                    load_f32(st, &p("self_attn.k_norm.weight"), hd)?
+                    fload(&p("self_attn.k_norm.weight"), hd)?
                 },
             }
         }
@@ -3084,10 +3098,10 @@ fn load_layer_at(
                 in_z,
                 in_a,
                 in_b,
-                conv: load_f32(st, &p("linear_attn.conv1d.weight"), conv_dim * cfg.lin_conv_k as usize)?,
-                a_log: load_f32(st, &p("linear_attn.A_log"), vh_l)?,
-                dt_bias: load_f32(st, &p("linear_attn.dt_bias"), vh_l)?,
-                norm: load_f32(st, &p("linear_attn.norm.weight"), vd)?,
+                conv: fload(&p("linear_attn.conv1d.weight"), conv_dim * cfg.lin_conv_k as usize)?,
+                a_log: fload(&p("linear_attn.A_log"), vh_l)?,
+                dt_bias: fload(&p("linear_attn.dt_bias"), vh_l)?,
+                norm: fload(&p("linear_attn.norm.weight"), vd)?,
                 out: qload(&p("linear_attn.out_proj.weight"), d, vh_l * vd)?,
             }
         }
@@ -3116,14 +3130,14 @@ fn load_layer_at(
                 (cfg.moe_inter * cfg.n_shared) as usize
             },
         );
-        router = load_f32(st, &p("mlp.gate.weight"), e_n * d)?;
+        router = fload(&p("mlp.gate.weight"), e_n * d)?;
         // Qwen4Exp routes by plain softmax (`qwen4::route`) — the checkpoint
         // carries no `e_score_correction_bias`. Requiring it here would refuse
         // every Qwen4 model at load for a tensor its forward never reads.
         router_bias = if cfg.arch == Arch::Qwen4Exp {
             Vec::new()
         } else {
-            load_f32(st, &p("mlp.gate.e_score_correction_bias"), e_n)?
+            fload(&p("mlp.gate.e_score_correction_bias"), e_n)?
         };
         shared = Some(Mlp {
             gate: qload(&p("mlp.shared_experts.gate_proj.weight"), si, d)?,
@@ -3181,14 +3195,14 @@ fn load_layer_at(
         } else if cfg.arch == Arch::HybridGdn {
             load_norm_zero_centered(st, &p("input_layernorm.weight"), d)?
         } else {
-            load_f32(st, &p("input_layernorm.weight"), d)?
+            fload(&p("input_layernorm.weight"), d)?
         },
         post_ln: if cfg.arch == Arch::Qwen4Exp {
             vec![1.0; d]
         } else if cfg.arch == Arch::HybridGdn {
             load_norm_zero_centered(st, &p("post_attention_layernorm.weight"), d)?
         } else {
-            load_f32(st, &p("post_attention_layernorm.weight"), d)?
+            fload(&p("post_attention_layernorm.weight"), d)?
         },
         attn,
         sparse,
