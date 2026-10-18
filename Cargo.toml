@@ -11,9 +11,10 @@
 #   peregrine-engine   binary `peregrine`: CLI + stdio serve protocol
 #   peregrine-ctx      Dynamic Context Runtime (ported from subnext/DCR): unlimited
 #                      external state + small planned working set for RLM context
+#   peregrine-verify   numerical certificate suite (the `verify` gate)
 [workspace]
 resolver = "2"
-members = ["crates/peregrine-core", "crates/peregrine-kernels", "crates/peregrine-model", "crates/peregrine-io", "crates/peregrine-sched", "crates/peregrine-engine", "crates/peregrine-cuda", "crates/peregrine-serve", "crates/peregrine-par", "crates/peregrine-tools", "crates/peregrine-token", "crates/peregrine-ctx"]
+members = ["crates/peregrine-core", "crates/peregrine-kernels", "crates/peregrine-model", "crates/peregrine-io", "crates/peregrine-sched", "crates/peregrine-engine", "crates/peregrine-cuda", "crates/peregrine-serve", "crates/peregrine-par", "crates/peregrine-tools", "crates/peregrine-token", "crates/peregrine-ctx", "crates/peregrine-verify"]
 
 [workspace.package]
 edition = "2021"

@@ -351,6 +351,11 @@ impl DecisionPolicy {
     ) -> Option<NodeIdx> {
         let mut best: Option<(f32, &crate::planner::Admission)> = None;
         for entry in &context.entries {
+            // A skill exists at L2 only — there is no richer level to escalate
+            // to, and forcing one would drop it from the re-plan entirely.
+            if entry.kind == Kind::Skill {
+                continue;
+            }
             let score = overlap(query, &entry.rendered);
             if best.is_none_or(|(top, _)| score > top) {
                 best = Some((score, entry));

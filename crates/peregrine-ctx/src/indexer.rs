@@ -338,11 +338,53 @@ fn prefixed_value<'a>(line: &'a str, prefixes: &[&str]) -> Option<&'a str> {
         }
         let value = rest.trim_start_matches([':', ' ', '\t']).trim();
         let chars = value.chars().count();
-        if (3..=160).contains(&chars) {
+        if (MIN_CLAUSE_CHARS..=160).contains(&chars) && reads_as_clause(value) {
             return Some(value);
         }
     }
     None
+}
+
+/// Shortest value admitted as a goal / constraint / decision.
+///
+/// The old floor was 3 characters, which is short enough for a bare word. On
+/// a conversation that is harmless; on a 208k-document security corpus it is
+/// not, because the corpora are full of YAML and tables of contents whose
+/// lines begin with a word that happens to be a prefix. `target: CPU`,
+/// `aim: industries,` and `goal: = name` each became a `goal` node at
+/// confidence 0.90, and the planner — ranking 822k nodes of mostly-shared
+/// vocabulary — served those back as the working set for a question about file
+/// uploads. A node the extractor cannot tell from a table-of-contents entry is
+/// not a goal, whatever the line it came from was labelled.
+const MIN_CLAUSE_CHARS: usize = 12;
+
+/// Whether a value reads as a statement rather than a fragment.
+///
+/// Deliberately cheap and literal, because every rule added here is one more
+/// thing that can silently drop a real goal. Each clause below was read off a
+/// corpus node that the planner admitted for an unrelated question.
+fn reads_as_clause(value: &str) -> bool {
+    // A single token is a label, not a statement. "CPU", "Selection",
+    // "LOCATIONS" all reached the planner from here.
+    if value.split_whitespace().count() < 2 {
+        return false;
+    }
+    // `= name`, `> quoted` — an assignment or a quote, not a goal.
+    if value.starts_with(['=', '>', '|', '*', '#', '-', '+']) {
+        return false;
+    }
+    // A dangling comma or colon is a list item that got cut mid-enumeration.
+    if value.ends_with([',', ':', ';']) {
+        return false;
+    }
+    // Three or more spaces in a row is a column layout — a markdown table, an
+    // ASCII diagram, a padded console dump. Prose does not do this, so the
+    // rule is general rather than written against one corpus. `details
+    //                    2` reached the planner from exactly here.
+    if value.contains("   ") {
+        return false;
+    }
+    true
 }
 
 /// Next `=`, `:` or copula that could act as a key/value separator.
@@ -355,11 +397,17 @@ fn next_separator(text: &str, from: usize) -> Option<(usize, usize)> {
             b if b.is_ascii_alphabetic() => {
                 let start = i;
                 let mut end = i;
-                while end < bytes.len() && is_word_char(bytes[end] as char) {
+                // ASCII only: `bytes[x] as char` widens a *byte*, and a lead
+                // byte like 0xE2 widens to 'â' — alphanumeric — so a
+                // Unicode-aware word check would happily advance `end` into
+                // the middle of a multibyte character and slice a non-boundary.
+                while end < bytes.len() && bytes[end].is_ascii() && is_word_char(bytes[end] as char)
+                {
                     end += 1;
                 }
                 let word = text[start..end].to_lowercase();
-                let boundary = start == 0 || !is_word_char(bytes[start - 1] as char);
+                let boundary = start == 0
+                    || (bytes[start - 1].is_ascii() && !is_word_char(bytes[start - 1] as char));
                 if boundary {
                     // Longest match first, so "was replaced by" is not read as
                     // the copula "was" with "replaced by ..." as its value.
@@ -371,7 +419,7 @@ fn next_separator(text: &str, from: usize) -> Option<(usize, usize)> {
                             && text
                                 .as_bytes()
                                 .get(stop)
-                                .is_none_or(|b| !is_word_char(*b as char))
+                                .is_none_or(|b| !(b.is_ascii() && is_word_char(*b as char)))
                         {
                             return Some((start, stop));
                         }
@@ -393,7 +441,7 @@ fn next_separator(text: &str, from: usize) -> Option<(usize, usize)> {
 fn skip_ws(text: &str, from: usize) -> usize {
     let bytes = text.as_bytes();
     let mut i = from;
-    while i < bytes.len() && (bytes[i] as char).is_whitespace() && bytes[i] != b'\n' {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() && bytes[i] != b'\n' {
         i += 1;
     }
     i
@@ -406,7 +454,7 @@ fn skip_ws(text: &str, from: usize) -> usize {
 fn key_before(text: &str, sep_start: usize) -> Option<(usize, String)> {
     let bytes = text.as_bytes();
     let mut end = sep_start;
-    while end > 0 && (bytes[end - 1] as char).is_whitespace() {
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
         end -= 1;
     }
     if end == 0 {
@@ -416,7 +464,10 @@ fn key_before(text: &str, sep_start: usize) -> Option<(usize, String)> {
     let mut cursor = end;
     for _ in 0..3 {
         let word_end = cursor;
-        while cursor > 0 && (is_word_char(bytes[cursor - 1] as char) || bytes[cursor - 1] == b'-') {
+        while cursor > 0
+            && ((bytes[cursor - 1].is_ascii() && is_word_char(bytes[cursor - 1] as char))
+                || bytes[cursor - 1] == b'-')
+        {
             cursor -= 1;
         }
         if cursor == word_end {
@@ -473,23 +524,47 @@ fn is_left_boundary(text: &str, key_start: usize) -> bool {
 ///
 /// A value ends at a clause boundary, not at the first period — otherwise every
 /// dotted identifier (10.0.4.12, api.v2.stats) is truncated.
+/// The largest character boundary at or below `i`.
+///
+/// Rust's string slicing panics rather than truncating, so every index that
+/// comes out of a byte scan and will be used as a slice bound goes through
+/// here. ASCII — the overwhelming majority of the corpus — is returned
+/// unchanged, so the common path costs one comparison.
+fn floor_char_boundary(text: &str, i: usize) -> usize {
+    if i >= text.len() || text.is_char_boundary(i) {
+        return i.min(text.len());
+    }
+    let mut j = i;
+    while j > 0 && !text.is_char_boundary(j) {
+        j -= 1;
+    }
+    j
+}
+
 fn clause_end(text: &str, from: usize, max_chars: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut i = from;
     let mut chars = 0usize;
     while i < bytes.len() {
         if chars > max_chars {
-            return Some(i);
+            // Floored to a character boundary: the separator arms only ever
+            // stop on ASCII, but the budget arm can stop anywhere, and a
+            // caller that slices with this index must not be handed the inside
+            // of a character.
+            return Some(floor_char_boundary(text, i));
         }
         match bytes[i] {
             b',' | b';' | b'\n' => return Some(i),
-            b'.' if i + 1 >= bytes.len() || (bytes[i + 1] as char).is_whitespace() => {
+            b'.' if i + 1 >= bytes.len() || bytes[i + 1].is_ascii_whitespace() => {
                 return Some(i);
             }
             b' ' | b'\t' => {
                 let word_start = i + 1;
                 let mut word_end = word_start;
-                while word_end < bytes.len() && is_word_char(bytes[word_end] as char) {
+                while word_end < bytes.len()
+                    && bytes[word_end].is_ascii()
+                    && is_word_char(bytes[word_end] as char)
+                {
                     word_end += 1;
                 }
                 let word = text[word_start..word_end].to_lowercase();
@@ -499,8 +574,19 @@ fn clause_end(text: &str, from: usize, max_chars: usize) -> Option<usize> {
             }
             _ => {}
         }
-        i += 1;
-        chars += 1;
+        // Advance by the whole character, not the byte. Walking bytes through a
+        // multi-byte character leaves `i` inside it, and the caller slices
+        // `text[..i]` — which panics on a non-boundary index. The corpus is
+        // not all ASCII: a Japanese character in a driver-detection rule
+        // stopped the whole ingest at `end byte index 302 is not a char
+        // boundary`.
+        match text[i..].chars().next() {
+            Some(c) => {
+                chars += 1;
+                i += c.len_utf8();
+            }
+            None => break,
+        }
     }
     Some(text.len())
 }
@@ -536,7 +622,7 @@ fn matches_word(text: &str, at: usize, word: &str) -> bool {
     }
     text.as_bytes()
         .get(end)
-        .is_none_or(|b| !is_word_char(*b as char))
+        .is_none_or(|b| !(b.is_ascii() && is_word_char(*b as char)))
 }
 
 /// A coordinated clause that restates the subject's *current* value:
@@ -983,4 +1069,138 @@ fn same_value(a: &str, b: &str) -> bool {
             .collect::<String>()
     };
     norm(a) == norm(b)
+}
+
+#[cfg(test)]
+mod char_boundary_tests {
+    use super::*;
+
+    /// Multibyte text must not produce a slice index inside a character.
+    ///
+    /// The corpus is not all ASCII, and the byte walk that finds a clause end
+    /// used to stop inside a three-byte character: a Japanese character in a
+    /// driver-detection rule panicked the whole ingest. The index is used as a
+    /// slice bound by the caller, so it has to be a boundary or nothing works.
+    #[test]
+    fn clause_end_never_lands_inside_a_character() {
+        for sample in [
+            "設定 = はい",
+            "the key = 値 with more text after it",
+            "a = 技",
+            "mixed = 設定値 and then some trailing prose that goes on for a while",
+            "x = 🦀🦀🦀",
+            "短い = 値",
+        ] {
+            for from in 0..sample.len() {
+                if !sample.is_char_boundary(from) {
+                    continue;
+                }
+                for max_chars in 0..12 {
+                    if let Some(end) = clause_end(sample, from, max_chars) {
+                        assert!(
+                            end <= sample.len() && sample.is_char_boundary(end),
+                            "clause_end({sample:?}, {from}, {max_chars}) = {end}, which is not a \
+                             character boundary"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same guard for the boundary helper itself, on the exact shape that
+    /// panicked: an index landing two bytes into a three-byte character.
+    #[test]
+    fn the_floor_lands_on_a_boundary_not_inside_the_character() {
+        let text = "ab技cd";
+        assert!(!text.is_char_boundary(3), "3 is inside the 3-byte char");
+        assert_eq!(floor_char_boundary(text, 3), 2);
+        // Already-aligned and out-of-range inputs are returned unchanged.
+        assert_eq!(floor_char_boundary(text, 2), 2);
+        assert_eq!(floor_char_boundary(text, text.len()), text.len());
+        assert_eq!(floor_char_boundary(text, 999), text.len());
+    }
+}
+
+#[cfg(test)]
+mod clause_floor_tests {
+    use super::*;
+
+    /// Values that reached the planner as goals and should never have.
+    ///
+    /// Each is verbatim from a node the planner served for "file upload
+    /// restriction bypass" out of the 208k-document corpus — all at
+    /// confidence 0.90, all answering a question they had nothing to do with.
+    #[test]
+    fn table_rows_labels_and_fragments_are_not_clauses() {
+        for junk in [
+            "CPU",
+            "industries,",
+            "= name",
+            "Selection",
+            "LOCATIONS",
+            "DETAILS",
+            "details                    2",
+            "- bullet item that is quite long",
+            "SPECIFICATION:",
+        ] {
+            assert!(
+                !reads_as_clause(junk),
+                "{junk:?} is a fragment, not a goal, and must not be admitted"
+            );
+        }
+    }
+
+    /// Shapes the floor deliberately does **not** catch.
+    ///
+    /// Both of these reached the planner as goals for an unrelated question.
+    /// Neither is separable from a real statement by any general lexical rule:
+    /// each is a short noun phrase or a clause fragment that reads exactly
+    /// like something worth keeping. `the deadline is 2024-01-01` is a real
+    /// constraint and must survive; `ObjID time: 12/27/2012 10:55:02.540
+    /// [UTC]` is a YAML record and must not — and the difference is not in the
+    /// words. A rule written to catch them would be written against this one
+    /// corpus, and the cost of that is a rule that silently drops real
+    /// statements elsewhere.
+    ///
+    /// Asserted rather than left implicit so that a future change to the floor
+    /// is a decision someone makes, not an accident.
+    #[test]
+    fn shapes_the_floor_cannot_catch_are_still_admitted() {
+        assert!(reads_as_clause("the deadline is 2024-01-01"));
+        assert!(reads_as_clause("ObjID time: 12/27/2012 10:55:02.540 [UTC]"));
+        assert!(reads_as_clause("region. This assumption breaks when we"));
+    }
+
+    /// Real statements must survive. The floor is only worth having if it
+    /// keeps the things the graph exists to hold.
+    #[test]
+    fn real_statements_are_clauses() {
+        for real in [
+            "identify and defeat enemy leaders responsible for the breach",
+            "files and components whose corruption would cause instability",
+            "must be a Domain Controller for the attack to succeed",
+            "the retry budget is 5 attempts per minute",
+        ] {
+            assert!(reads_as_clause(real), "{real:?} is a statement");
+        }
+    }
+
+    /// End to end through the extractor, not just the predicate.
+    #[test]
+    fn the_extractor_drops_a_table_of_contents_line() {
+        let extractor = HeuristicExtractor::default();
+        let junk = extractor.extract("target: CPU\ngoal: = name\naim: industries,");
+        assert!(
+            junk.is_empty(),
+            "three fragment lines produced {} goal node(s): {junk:?}",
+            junk.len()
+        );
+
+        let real = extractor.extract("target: identify and defeat enemy leaders responsible for the breach");
+        assert!(
+            real.iter().any(|p| p.kind == Kind::Goal),
+            "a real goal must still be extracted"
+        );
+    }
 }

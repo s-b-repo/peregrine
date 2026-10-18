@@ -9,12 +9,13 @@ use crate::compress::{decode, Compression};
 use crate::dtype::{bf16_to_f32, f16_to_f32, Dtype};
 use crate::{Context, Error};
 use parking_lot::Mutex;
-use peregrine_io::Reactor;
+use peregrine_io::{MmapFile, Reactor};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Cap on the safetensors header size — real headers are KB..a few MB. A crafted
 /// file declaring a huge `hlen` would force a giant allocation before any read.
@@ -28,8 +29,8 @@ pub struct TensorInfo {
     /// absolute byte offset of the data within the file
     pub off: u64,
     /// On-disk byte length. Equals the logical tensor size for uncompressed
-    /// entries; equals the compressed payload size when [`Self::compression`]
-    /// is [`Compression::Zstd`].
+    /// entries; equals the compressed payload size when [`Self::compression`] is
+    /// [`Compression::Zstd`].
     pub nbytes: i64,
     pub dtype: Dtype,
     pub numel: i64,
@@ -45,6 +46,65 @@ pub struct TensorInfo {
     /// transposed, auto-converted back to native by `read_raw`.
     pub layout: Option<(String, usize)>,
 }
+
+#[derive(Clone)]
+pub struct MmapTensor {
+    file: Arc<MmapFile>,
+    offset: usize,
+    len: usize,
+    dtype: Dtype,
+    numel: usize,
+}
+
+impl MmapTensor {
+    pub fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    pub fn numel(&self) -> usize {
+        self.numel
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.file.as_bytes()[self.offset..self.offset + self.len]
+    }
+
+    pub fn read_f32(&self, out: &mut [f32]) -> Result<(), Error> {
+        if out.len() != self.numel {
+            return Err(Error::Format(format!(
+                "mmap tensor read_f32: output has {} values, expected {}",
+                out.len(),
+                self.numel
+            )));
+        }
+        convert_f32(self.dtype, self.bytes(), out)
+    }
+
+    pub fn read_f32_range(&self, elem_off: usize, count: usize, out: &mut [f32]) -> Result<(), Error> {
+        if out.len() != count {
+            return Err(Error::Format(format!(
+                "mmap tensor read_f32_range: output has {} values, expected {}",
+                out.len(),
+                count
+            )));
+        }
+        let end = elem_off.checked_add(count).ok_or_else(|| Error::Format("mmap tensor range overflow".into()))?;
+        if end > self.numel {
+            return Err(Error::Format(format!(
+                "mmap tensor range [{elem_off},{end}) exceeds {} elements",
+                self.numel
+            )));
+        }
+        let byte_off = elem_off
+            .checked_mul(self.dtype.elem_size())
+            .ok_or_else(|| Error::Format("mmap tensor byte offset overflow".into()))?;
+        let byte_len = count
+            .checked_mul(self.dtype.elem_size())
+            .ok_or_else(|| Error::Format("mmap tensor byte length overflow".into()))?;
+        convert_f32(self.dtype, &self.bytes()[byte_off..byte_off + byte_len], out)
+    }
+}
+
 
 /// Index over all `*.safetensors` shards in a model directory.
 /// Device-ordinal mapping for a set of shard paths (Track A Seam 1) — pure so
@@ -219,6 +279,7 @@ pub struct SafeTensors {
     /// positioned reads, so `pread` is an exact substitute here; it is the
     /// streaming lane that cares which engine it gets.
     reactor: Option<Mutex<Reactor>>,
+    mmap_files: Mutex<Vec<Option<Arc<MmapFile>>>>,
 }
 
 impl SafeTensors {
@@ -627,6 +688,7 @@ impl SafeTensors {
             );
         }
 
+        let n_files = files.len();
         Ok(SafeTensors {
             tensors,
             index,
@@ -639,6 +701,7 @@ impl SafeTensors {
             mirror_files,
             mirror_roots,
             reactor: reactor.map(Mutex::new),
+            mmap_files: Mutex::new(vec![None; n_files]),
         })
     }
 
@@ -755,6 +818,56 @@ impl SafeTensors {
         let t = self.find(name)?;
         let df = self.direct_files.get(t.file_idx)?.as_ref()?;
         Some((df.as_raw_fd(), t.off, t.nbytes as usize))
+    }
+
+    fn mmap_file(&self, file_idx: usize) -> Result<Arc<MmapFile>, Error> {
+        let mut cache = self.mmap_files.lock();
+        if let Some(Some(file)) = cache.get(file_idx) {
+            return Ok(file.clone());
+        }
+        let path = self
+            .paths
+            .get(file_idx)
+            .ok_or_else(|| Error::Format(format!("safetensors shard index {file_idx} is out of range")))?;
+        let file = Arc::new(MmapFile::open(path).ctx(|| path.display().to_string())?);
+        if let Some(slot) = cache.get_mut(file_idx) {
+            *slot = Some(file.clone());
+        }
+        Ok(file)
+    }
+
+    pub fn mmap_tensor(&self, name: &str) -> Result<MmapTensor, Error> {
+        let t = self.tensor(name)?;
+        if t.compression != Compression::None {
+            return Err(Error::Format(format!("mmap tensor '{name}' is compressed")));
+        }
+        if t.layout.is_some() {
+            return Err(Error::Format(format!("mmap tensor '{name}' has a non-native layout")));
+        }
+        if matches!(t.dtype, Dtype::U8 | Dtype::I64) {
+            return Err(Error::Format(format!("mmap tensor '{name}' is not a native float tensor")));
+        }
+        if t.numel < 0 || t.uncompressed_nbytes < 0 {
+            return Err(Error::Format(format!("mmap tensor '{name}' has a negative extent")));
+        }
+        let offset = usize::try_from(t.off).map_err(|_| Error::Format(format!("mmap tensor '{name}' offset overflow")))?;
+        let len = usize::try_from(t.uncompressed_nbytes)
+            .map_err(|_| Error::Format(format!("mmap tensor '{name}' length overflow")))?;
+        let numel = usize::try_from(t.numel)
+            .map_err(|_| Error::Format(format!("mmap tensor '{name}' element count overflow")))?;
+        let expected_len = numel
+            .checked_mul(t.dtype.elem_size())
+            .ok_or_else(|| Error::Format(format!("mmap tensor '{name}' byte length overflow")))?;
+        if expected_len != len {
+            return Err(Error::Format(format!(
+                "mmap tensor '{name}' declares {numel} elements but carries {len} bytes"
+            )));
+        }
+        let file = self.mmap_file(t.file_idx)?;
+        if offset.checked_add(len).is_none_or(|end| end > file.as_bytes().len()) {
+            return Err(Error::Format(format!("mmap tensor '{name}' lies outside its shard")));
+        }
+        Ok(MmapTensor { file, offset, len, dtype: t.dtype, numel })
     }
 
     /// Whether any shard opened a working O_DIRECT fd (so the direct path is usable).
@@ -1268,6 +1381,46 @@ mod tests {
         let mut junk = [0f32; 4];
         assert!(st.read_f32("w.qs", &mut junk).is_err());
 
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mmap_tensor_reads_match_positioned_reads() -> Result<(), Error> {
+        let dir = tmpdir("mmap_tensor");
+        let values = [1.25f32, -2.5, 3.75, 4.0];
+        write_safetensors(
+            &dir,
+            &[
+                Blob { name: "f32", dtype: "F32", shape: vec![2, 2], bytes: f32_bytes(&values) },
+                Blob { name: "packed", dtype: "U8", shape: vec![4], bytes: vec![1, 2, 3, 4] },
+            ],
+        )?;
+        let st = SafeTensors::open(&dir)?;
+        let mapped = st.mmap_tensor("f32")?;
+        let mut all = [0.0f32; 4];
+        mapped.read_f32(&mut all)?;
+        assert_eq!(all, values);
+        let mut range = [0.0f32; 2];
+        mapped.read_f32_range(1, 2, &mut range)?;
+        assert_eq!(range, values[1..3]);
+        assert!(st.mmap_tensor("packed").is_err());
+        assert!(st.mmap_tensor("missing").is_err());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mmap_tensor_reads_native_float_bytes_without_copying_the_file() -> Result<(), Error> {
+        let dir = tmpdir("mmap_tensor_bf16");
+        write_safetensors(&dir, &[Blob { name: "w", dtype: "BF16", shape: vec![2, 2], bytes: bf16_bytes(&[1.0, -2.0, 3.5, 4.0]) }])?;
+        let st = SafeTensors::open(&dir)?;
+        let tensor = st.mmap_tensor("w")?;
+        let mut got = [0f32; 4];
+        tensor.read_f32(&mut got)?;
+        assert_eq!(got, [1.0, -2.0, 3.5, 4.0]);
+        assert_eq!(tensor.numel(), 4);
+        assert_eq!(tensor.dtype(), Dtype::Bf16);
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

@@ -170,7 +170,55 @@ impl IndexerWeights {
         }))
     }
 
-    /// Width of one cached indexer key.
+    pub fn load_hybrid(
+        resolver: &crate::hybrid::WeightResolver<'_>,
+        layer: usize,
+        cfg: &Cfg,
+    ) -> Result<Option<IndexerWeights>, Error> {
+        let base = format!("model.layers.{layer}.self_attn");
+        let wqn = format!("{base}.indexer_projections.wq_b");
+        if !resolver.has(&wqn) {
+            return Ok(None);
+        }
+        let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
+        let (hidden, ql) = (cfg.hidden as usize, cfg.q_lora as usize);
+        let mut k_norm_w = vec![0f32; hd];
+        let mut k_norm_b = vec![0f32; hd];
+        resolver.read_f32(&format!("{base}.indexer.k_norm.weight"), &mut k_norm_w)?;
+        resolver.read_f32(&format!("{base}.indexer.k_norm.bias"), &mut k_norm_b)?;
+        let kpool = if cfg.index_kpool > 0 && cfg.arch == peregrine_core::Arch::Glm5Next {
+            let gate_name = format!("{base}.indexer.index_kpool_compress_gate");
+            if !resolver.has(&gate_name) {
+                return Err(Error::Format(format!(
+                    "config declares index_kpool={} but {gate_name} is missing",
+                    cfg.index_kpool
+                )));
+            }
+            let k = cfg.index_kpool as usize;
+            let mut ape = vec![0f32; k * hd];
+            resolver.read_f32(&format!("{base}.indexer.index_kpool_compress_ape"), &mut ape)?;
+            Some(KpoolWeights {
+                k,
+                tail: cfg.index_kpool_tail,
+                gate: resolver.load_matrix(&gate_name, hd, hidden)?,
+                ape,
+            })
+        } else {
+            None
+        };
+        Ok(Some(IndexerWeights {
+            wq: resolver.load_matrix(&wqn, nh * hd, ql)?,
+            wk: resolver.load_matrix(&format!("{base}.indexer_projections.wk"), hd, hidden)?,
+            wp: resolver.load_matrix(&format!("{base}.indexer_projections.weights_proj"), nh, hidden)?,
+            k_norm_w,
+            k_norm_b,
+            nh,
+            hd,
+            topk: cfg.index_topk.max(0) as usize,
+            kpool,
+        }))
+    }
+
     pub fn hd(&self) -> usize {
         self.hd
     }

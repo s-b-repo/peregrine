@@ -209,3 +209,21 @@ fn ingest_is_idempotent() {
         .unwrap();
     assert_eq!(rt.graph.len(), before);
 }
+
+/// The separator scanner walks bytes but widened each byte to a char for the
+/// word check; a lead byte like 0xE2 widens to 'â' (alphanumeric), so the
+/// word scan ran into the middle of a multibyte character and sliced a
+/// non-boundary. Ingesting any document with box-drawing or accented text
+/// panicked. Regression test: unicode content must ingest cleanly.
+#[test]
+fn ingest_does_not_panic_on_multibyte_text() {
+    let mut rt = peregrine_ctx::runtime::Dcr::new(800);
+    rt.ingest(
+        "┌──────────┐\n│ architecture diagram │\n└──────────┘\n\
+         The server ip is 10.0.4.12. Ümläuts and café au lait.",
+        Some("unicode"),
+    )
+    .expect("unicode ingest must not fail");
+    let answer = rt.ask("what is the server ip?", None);
+    assert!(answer.text.contains("10.0.4.12"), "{:?}", answer.text);
+}

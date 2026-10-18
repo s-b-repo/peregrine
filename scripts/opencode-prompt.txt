@@ -14,5 +14,8 @@ Focus areas:
 4. Batch processing in crates/peregrine-sched/ and crates/peregrine-engine/
 
 Verify with: cargo build --release --features cuda (CUDA_HOME=/opt/cuda)
-Quality gate: bash scripts/audit-bad-patterns.sh must pass after changes.
+Quality gates: bash scripts/audit-bad-patterns.sh --strict and
+  cargo run -p peregrine-verify --release -- verify
+must both pass after changes. The certificate gate is not optional: a numerical
+identity that stops holding changes tokens, silently.
 Target: >= 0.6 tok/s token generation speed.

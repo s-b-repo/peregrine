@@ -41,19 +41,24 @@ With 33.55% consecutive-token overlap, the union of 4 tokens is roughly:
   states are geometrically close, they likely share expert sets — prime targets for
   union execution.
 
-## Implementation plan
+## Shipped path
 
-1. **Router prediction** (peregrine-router): extend `router_ranks_for` to predict top-K
-   expert sets for K future positions, not just one.
+The optional runtime path is `COLI_FUTURE_PREFETCH=history|learned|both`. It runs after
+speculative tokens are proposed and before their verify forward:
 
-2. **Union computation**: compute the set-union of predicted expert IDs across K positions.
+1. The pending token and every draft path are projected through route history,
+   a learned token-context table, or both.
+2. Candidate experts are unioned and ranked per layer.
+3. The deduplicated union is submitted in bounded deep batches on the existing
+   prefetch rings (`COLI_PREFETCH_BATCH`).
+4. The normal verify forward still owns routing, computation, acceptance, and KV
+   commit; speculative reads can only help or be wasted.
 
-3. **Preload**: issue a single batched SSD read for the union (already exists in
-   `read_experts_batched`, just needs to be called with the larger set).
+The learned artifact is built with:
 
-4. **Multi-position execution**: compute all K speculative positions using the union,
-   but only execute the divergent expert portions separately. Shared experts compute
-   once.
+```bash
+peregrine build-router-predictor /path/to/model 4096 --text corpus.txt
+```
 
-5. **Verification**: verify all K positions, discard incorrect ones. Use existing
-   flip-rate gate to validate quality.
+The default remains off until a workload-specific table and bandwidth measurement
+justify enabling it. See [configuration](configuration.md#coli_future_prefetch).

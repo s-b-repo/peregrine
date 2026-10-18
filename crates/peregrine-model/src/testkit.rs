@@ -585,6 +585,7 @@ fn build_tiny_gqa_family_inner(
 /// The tiny Qwen3.8-Flash-Next (`qwen4_exp`) config: layer 0 GDN, layer 1 QSA
 /// full attention, PLE on layer 0, MoE with a shared expert — every mechanism
 /// at toy dims, one indexed layer exercising the indexer.
+#[cfg(test)]
 pub(crate) fn tiny_qwen4_cfg_json() -> serde_json::Value {
     serde_json::json!({
         "model_type": "qwen4_exp_text", "hidden_size": 8, "vocab_size": 32,
@@ -609,6 +610,7 @@ pub(crate) fn tiny_qwen4_cfg_json() -> serde_json::Value {
 /// Write a tiny random `qwen4_exp` model into `dir`: the importer's container
 /// contract (trunk `model.`, per-expert expert tensors, one PLE table per PLE
 /// layer at per-head row width) at the tiny config's shapes.
+#[cfg(test)]
 pub(crate) fn build_tiny_qwen4_model(dir: &Path, seed: u64) -> Result<(), Error> {
     let cfg_json = tiny_qwen4_cfg_json();
     let cfg: Cfg = Cfg::from_json(&cfg_json)?;

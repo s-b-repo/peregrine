@@ -1489,6 +1489,7 @@ version = "0.1.0"
 dependencies = [
  "io-uring",
  "libc",
+ "memmap2",
  "zstd",
 ]
 
@@ -1576,6 +1577,19 @@ dependencies = [
  "peregrine-core",
  "peregrine-model",
  "serde_json",
+]
+
+[[package]]
+name = "peregrine-verify"
+version = "0.1.0"
+dependencies = [
+ "peregrine-core",
+ "peregrine-ctx",
+ "peregrine-io",
+ "peregrine-kernels",
+ "peregrine-model",
+ "peregrine-par",
+ "peregrine-token",
 ]
 
 [[package]]

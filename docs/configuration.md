@@ -343,6 +343,47 @@ A fixed chunk makes prefill quadratic in prompt length, since attention re-deriv
 every cached position per call. Chunk size cannot change output — only how long one
 prefill step blocks decode.
 
+Growing the chunk has a second, opposite effect on the **head**: a chunk of `C`
+rows used to cost `C` `lm_head` projections while the engine read exactly one of
+them, and `C` grows geometrically here (`max(64, pos/4)`). Both prefill paths now
+project only the rows they actually read, so the head cost of a prefill step is
+`O(1)` in the chunk length rather than `O(C)` — at `hidden = 4096`,
+`vocab = 154880` that is 1.27 GFLOP per discarded row. Measured on this box, the
+head work drops 49× at a 64-row chunk and 856× at 1024 rows.
+
+The **fused** tick (`COLI_FUSE_PREFILL`, on by default) is narrowed the same way. A
+fused tick's batch is the decode rows followed by the prefill chunk's rows, and of
+the chunk only its final row is ever sampled — the rest are computed to fill the KV
+and then discarded. It projects every **decode** row (speculative verify reads its
+draft rows) plus the chunk's final row, and nothing else, so the chunk's other
+`chunk_len - 1` head rows are no longer paid for either. Decode rows keep their own
+output indices, so every existing `logits[row * vocab ..]` read is unchanged.
+
+Both narrowings are **bit-identical, not approximate**: `lm_head` is row-separable
+(`qrow_i8` quantizes per row; `y[s][o] = dot(w_o, xq_s)·scale_o·sx_s`), so the kept
+rows run the identical dot products in the identical order. `lm_head` is also never
+uploaded to the GPU, so the `s_n == 1` device GEMV — which is deliberately *more*
+accurate than the CPU path — cannot be entered by either narrow form. Pinned by
+`projecting_a_subset_of_rows_is_bit_identical_to_projecting_all` (the row
+restriction itself, including that a non-finite value in a *dropped* row is still
+reported), `prefill_last_row_is_bit_identical_to_the_full_projection` (the prefill
+narrow form), and `the_engine_serves_the_same_tokens_with_the_narrow_prefill` /
+`the_fused_tick_serves_the_same_tokens_with_a_narrowed_projection` (served tokens,
+unfused and fused).
+
+The same narrowing applies to the model-resident single-sequence entry points
+`Model::generate` and `Model::generate_speculative`, which prefilled a whole prompt
+and projected every position to read one — `plen - 1` discarded head rows on a
+prompt that can be thousands of tokens. Pinned by
+`generate_and_speculative_agree_with_teacher_forcing_after_the_narrowing`, which
+checks them against `teacher_forcing` — a reference that still projects every row,
+so it is a genuine cross-check rather than a self-comparison. The speculative
+**verify** pass still projects all its rows: it reads each one to decide acceptance.
+
+All of this narrows the **head only**. The transformer layers are untouched, which is
+why the end-to-end effect is bounded at roughly 7 % of a prefill token — the head is
+~1.27 GFLOP against ~18.1 GFLOP for the 45-layer routed stack.
+
 ### `COLI_BLOCK_EXEC`
 
 Which thread shape every transformer block executes with — `sync`, `mt`, or
@@ -454,7 +495,7 @@ which has no such gate — kept admitting everything. It now treats a missing ta
 | `COLI_PREFETCH_PROTECT` | **auto** | protect the predicted set from eviction — [note](#coli_prefetch_protect) |
 | `COLI_PREFETCH_MIN_READS` / `COLI_PREFETCH_MIN_YIELD` | 512 / 2 | self-limit — [note](#coli_prefetch_min_reads--coli_prefetch_min_yield) |
 | `COLI_PREFETCH_VERIFY` | off | re-read + byte-compare each speculative load; accuracy log at shutdown |
-| `COLI_ROUTER_LOOKAHEAD` | on | ask layer L+1's router early — [note](#coli_router_lookahead) |
+| `COLI_ROUTER_LOOKAHEAD` | **on when resident, off when streaming** (2026-10-06) | ask layer L+1's router early — [note](#coli_router_lookahead) |
 | `COLI_ROUTER_LOOKAHEAD_N` | 6 | how many ranked experts the look-ahead streams — a *window*, not a tuning constant |
 | `COLI_ROUTER_LOOKAHEAD_BATCH` | on | extend the look-ahead to batched decode (B > 1); `0` restores B == 1 only (`model.rs`) |
 | `COLI_PREDICT_SOURCE` | unset | force `momentum` or `phase-aware` — [note](#coli_predict_source) |
@@ -520,6 +561,29 @@ the router's past answers, **this asks the router**. Correctness-neutral — the
 authoritative router still runs at `L+1` and still decides, so this only changes
 *when* bytes are read (`router_lookahead_cannot_move_a_token`).
 
+**The default follows the workload** (changed 2026-10-06): **on** when the routed
+experts are resident, **off** when they are streamed. The knob's cost is one device
+read per predicted candidate, and the two workloads cannot afford it the same way:
+
+| workload | cost of a predicted-candidate read | default |
+|---|---|---|
+| resident | free memory readahead; hides compute latency | **on** |
+| streaming | a real I/O op queued on the *same per-device ring* as the read the token waits for — one ring per device, FIFO, so it delays that read by its own service time | **off** |
+
+Measured on GLM-5.3-Flash over three SSDs, interleaved serial arms, CUDA profile,
+aggregate tok/s: B=1 **0.095 → 0.163** (+72%), B=8 **0.193 → 0.308** (+60%),
+B=16 no difference. End to end on the shipped profile, median **0.244 against
+0.095** — 2.6×. Raw runs: `bench-data/2026-10-06-lookahead/`.
+
+The previous unconditional default was measured on a *four*-drive stripe that
+included a 5.4 kRPM HDD and has not reproduced since; a prefetch policy is a
+statement about bytes and queues, so it is a statement about the storage. Set
+`=1` to force it on for a streaming model, `=0` to force it off for a resident
+one — both always win over the default. The streaming default also costs cache
+warmth (re-read-after-eviction 1.8% → 11.3% of disk traffic at B=1) and still wins;
+`COLI_PREFETCH_HINT_PATHS=64` buys the warmth back as a page-cache `fadvise`
+instead of a device read.
+
 `COLI_ROUTER_LOOKAHEAD_N` is a window, not a tuning constant — the right value is
 however many reads fit in the layer boundary, a property of your disk and model.
 Widening past the boundary buys steadily worse guesses that displace reads the
@@ -564,6 +628,10 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_SPEC_GDN_MAX_B` | 0 | batch width above which `COLI_SPEC_GDN` stops drafting; `0` = uncapped |
 | `COLI_SPEC_CONF` | 0 | confidence floor for MTP drafting: stop a draft early when the head's top-token probability drops under it — [note](#coli_spec_conf) |
 | `COLI_DRAFT_NGRAM` | 0 | prompt-lookup drafting: match suffixes up to this length — [note](#coli_draft_ngram) |
+| `COLI_FUTURE_PREFETCH` | off | future-position expert prefetch: `off` / `history` / `learned` / `both` — [note](#coli_future_prefetch) |
+| `COLI_FUTURE_PREFETCH_WIDTH` | 8 | maximum predicted experts warmed per layer per sequence — [note](#coli_future_prefetch) |
+| `COLI_FUTURE_PREFETCH_MAX_PENDING` | 1024 | distinct future expert reads queued or in flight across prefetch lanes; hard maximum 65536 — [note](#coli_future_prefetch) |
+| `COLI_PREFETCH_BATCH` | 8 | experts submitted together by one prefetch ring; bounded to 10 — [note](#coli_prefetch_batch) |
 | `COLI_SPEC_UNION_MAX` | 0 | ceiling on a tick's projected routed-expert union, in expert-read requests — [note](#coli_spec_union_max) |
 | `COLI_DRAFT_TREE` | off | verify both draft sources as a token tree instead of choosing one — [note](#coli_draft_tree) |
 | `COLI_MTP_HEAT` | off | let the MTP head's experts accumulate residency heat — [note](#coli_mtp_heat) |
@@ -675,9 +743,11 @@ Every knob in this section is a **quality trade**. Gate each with
 
 ### `COLI_GPU_DENSE`
 
-Place a **dense** model's MLP weights in VRAM and compute them on the device.
-Refused when the checkpoint carries routed experts — this is the dense-model
-counterpart of the expert tier, not a replacement for it.
+Place dense-model MLP weights in VRAM and compute them on the device. GLM-5.3
+also uses this fused tier for its per-layer shared expert while routed experts
+remain on the concurrent streaming lane. `COLI_GPU_DENSE_MAX_BATCH` limits the
+fused path by current row count; the GLM-5.3 production profile sets it to `1`
+because B=1 gained about 30% while B=16 was faster on the CPU shared path.
 
 **It changes token values, and not by a rounding error.** The device path is far
 more accurate than the CPU one: measured **rms 1.1e-7 against 3.0e-3** at decode,
@@ -807,6 +877,54 @@ unaffected — `accept_run` still decides by argmax identity, asserted by
 `prompt_lookup_drafts_do_not_change_the_served_token_stream` and, on a headless
 checkpoint, `prompt_lookup_speculates_without_an_mtp_head`.
 
+
+### `COLI_FUTURE_PREFETCH`
+
+This is the early expert-union path. Once a speculative draft exists, the engine
+predicts the expert sets for the pending token and each drafted position, unions
+those sets per layer, deduplicates them, and submits the union to the existing
+prefetch rings before the verify forward. The demand forward remains authoritative:
+a bad prediction only causes an unnecessary read and can never change a token.
+
+`history` iterates the existing routing predictor over the draft horizon.
+`learned` uses `token_routes.json`, a small token-context-to-expert table built by
+`peregrine build-router-predictor`; it falls back from a two-token context to a
+one-token context when the longer key is unseen. `both` merges the learned and
+history candidates by occurrence and expert-id tie-break. The default is `off`
+because future reads are speculative bandwidth and the value depends on the
+workload.
+
+Build a learned table from representative text before selecting `learned` or
+`both`:
+
+```bash
+peregrine build-router-predictor /path/to/model 4096 \
+  --text corpus.txt --out /path/to/model/token_routes.json
+```
+
+Use it with the existing draft sources, for example:
+
+```bash
+COLI_DRAFT=5 COLI_DRAFT_NGRAM=3 COLI_SPEC_CONF=0.65 \
+COLI_FUTURE_PREFETCH=both COLI_FUTURE_PREFETCH_WIDTH=4 \
+COLI_PREFETCH_BATCH=8 ./peregrine-serve --model /path/to/model
+```
+
+`COLI_FUTURE_PREFETCH_WIDTH` is per layer and per sequence. The warm-cache budget,
+stale-drop gate, and existing prefetch yield guard still bound the resulting
+bandwidth. `COLI_FUTURE_PREFETCH_MAX_PENDING` bounds distinct future expert reads
+queued or in flight across the prefetch pool (default 1024, hard maximum 65536);
+duplicate keys are coalesced across lanes. The feature is a no-op for resident
+models or when no prefetch pool is available. `/metrics` exposes
+`future_prefetch.plans`, `.items`,
+`.history_hits`, and `.learned_hits`; the shutdown log prints the same counters.
+
+### `COLI_PREFETCH_BATCH`
+
+The prefetch worker submits this many experts in one deep ring read (maximum 10).
+The default is 8, which keeps a six-region expert batch within the 64-entry
+prefetch ring while allowing several experts to be in flight together. It changes
+read scheduling only; prefetched slabs are byte-identical to demand reads.
 
 ### `COLI_SPEC_CONF`
 
@@ -1174,9 +1292,10 @@ on a CPU-only binary.
 | `COLI_CUDA_TC_W4A16_MIN` | 16 | minimum rows before the W4A16 arm is taken |
 | `COLI_CUDA_W4_PACKED` | **on** | packed-W4 arm when every expert is int4; `=0` falls through to the generic kernel |
 | `COLI_CUDA_DUAL_PROJ` | **on** | in the packed-W4 arm, compute gate and up in one fused kernel; `=0` runs two passes |
-| `COLI_GPU_DENSE` | off | place a **dense** model's MLP weights in VRAM and run them on the device. Gated on the *value* (`=0` means off — it once read `is_ok()`, so `=0` enabled it). Dense containers only: refused when the checkpoint has routed experts. **Changes token values** — see [below](#coli_gpu_dense) |
+| `COLI_GPU_DENSE` | off | place dense MLPs in VRAM and run them on the device; GLM-5.3 also uses the tier for shared experts. Gated on the *value* (`=0` means off). **Changes token values** — see [below](#coli_gpu_dense) |
 | `COLI_GPU_DENSE_LAYERS` | fit to free VRAM | pin the resident layer count instead of taking whatever fits. **Set this for any measurement arm**: fitting to free VRAM makes placement depend on whatever else holds the card, so two boots of one container can differ |
 | `COLI_GPU_DENSE_HEADROOM_MB` | 1024 | VRAM the dense tier refuses to spend, leaving room for activations and the context |
+| `COLI_GPU_DENSE_MAX_BATCH` | unlimited | largest forward row count that uses fused dense/shared MLPs; the GLM-5.3 profile sets `1` from its B=1/B=16 measurements |
 | `COLI_GPU_SPILL` | off | act on the lane balancer's `GpuSpill` verdicts by queueing the spilled `(layer, expert)` pairs for the next residency generation. Off = the verdict stays advisory, the historical behaviour |
 | `COLI_CUDA_GEMV` | **on** | decode-shaped GEMV kernel for M=1 (a GEMM wastes M there); `=0` falls back to the general path |
 | `COLI_CUDA_GRAPH` | off | capture/replay `expert_group` launches — [note](#coli_cuda_graph) |

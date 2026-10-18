@@ -277,6 +277,107 @@ fn qwen4_rename(name: &str) -> String {
     stem.replace(".mlp.shared_expert.", ".mlp.shared_experts.")
 }
 
+fn qwen35moe_rename(name: &str) -> String {
+    qwen4_rename(name).replace(".mlp.shared_expert_gate.", ".mlp.shared_experts.shared_expert_gate.")
+}
+
+fn qwen35moe_contract(cfg: &Cfg) -> Result<BTreeMap<String, (Qwen4Tensor, Vec<i64>)>, Error> {
+    if cfg.arch != peregrine_core::Arch::Qwen35Moe {
+        return Err(Error::Format("qwen3_5_moe: missing validated config".into()));
+    }
+    let d = cfg.hidden;
+    let mut tensors = BTreeMap::new();
+    let f32 = Qwen4Tensor::Dense(Family::Float);
+    let int8 = Qwen4Tensor::Dense(Family::Int8Embed);
+    let int4 = Qwen4Tensor::Dense(Family::Int4);
+    tensors.insert("model.embed_tokens.weight".into(), (Qwen4Tensor::Dense(Family::Int8Embed), vec![cfg.vocab, d]));
+    tensors.insert("model.norm.weight".into(), (f32, vec![d]));
+    tensors.insert("lm_head.weight".into(), (int4, vec![cfg.vocab, d]));
+    for layer in 0..cfg.n_layers {
+        let p = |suffix: &str| format!("model.layers.{layer}.{suffix}");
+        tensors.insert(p("input_layernorm.weight"), (f32, vec![d]));
+        tensors.insert(p("post_attention_layernorm.weight"), (f32, vec![d]));
+        tensors.insert(p("mlp.gate.weight"), (f32, vec![cfg.n_experts, d]));
+        tensors.insert(p("mlp.shared_experts.shared_expert_gate.weight"), (f32, vec![1, d]));
+        tensors.insert(
+            p("mlp.experts.gate_up_proj"),
+            (
+                Qwen4Tensor::GateUp,
+                vec![cfg.n_experts, cfg.moe_inter.checked_mul(2).ok_or_else(|| Error::Format("qwen3_5_moe fused expert width overflow".into()))?, d],
+            ),
+        );
+        tensors.insert(p("mlp.experts.down_proj"), (Qwen4Tensor::Down, vec![cfg.n_experts, d, cfg.moe_inter]));
+        tensors.insert(p("mlp.shared_experts.gate_proj.weight"), (int4, vec![cfg.dense_inter, d]));
+        tensors.insert(p("mlp.shared_experts.up_proj.weight"), (int4, vec![cfg.dense_inter, d]));
+        tensors.insert(p("mlp.shared_experts.down_proj.weight"), (int4, vec![d, cfg.dense_inter]));
+        if cfg.full_attn[layer as usize] {
+            tensors.insert(
+                p("self_attn.q_proj.weight"),
+                (int4, vec![2 * cfg.n_heads * cfg.head_dim, d]),
+            );
+            tensors.insert(p("self_attn.k_proj.weight"), (int4, vec![cfg.n_kv_heads * cfg.head_dim, d]));
+            tensors.insert(p("self_attn.v_proj.weight"), (int4, vec![cfg.n_kv_heads * cfg.head_dim, d]));
+            tensors.insert(p("self_attn.o_proj.weight"), (int4, vec![d, cfg.n_heads * cfg.head_dim]));
+            tensors.insert(p("self_attn.q_norm.weight"), (f32, vec![cfg.head_dim]));
+            tensors.insert(p("self_attn.k_norm.weight"), (f32, vec![cfg.head_dim]));
+        } else {
+            let k = cfg.lin_k_heads.checked_mul(cfg.lin_k_dim).ok_or_else(|| Error::Format("qwen3_5_moe linear key width overflow".into()))?;
+            let v = cfg.lin_v_heads.checked_mul(cfg.lin_v_dim).ok_or_else(|| Error::Format("qwen3_5_moe linear value width overflow".into()))?;
+            let conv = k.checked_mul(2).and_then(|width| width.checked_add(v)).ok_or_else(|| Error::Format("qwen3_5_moe convolution width overflow".into()))?;
+            tensors.insert(p("linear_attn.in_proj_qkv.weight"), (int4, vec![conv, d]));
+            tensors.insert(p("linear_attn.out_proj.weight"), (int4, vec![d, v]));
+            tensors.insert(p("linear_attn.in_proj_z.weight"), (int8, vec![v, d]));
+            tensors.insert(p("linear_attn.in_proj_a.weight"), (int8, vec![cfg.lin_v_heads, d]));
+            tensors.insert(p("linear_attn.in_proj_b.weight"), (int8, vec![cfg.lin_v_heads, d]));
+            tensors.insert(p("linear_attn.conv1d.weight"), (f32, vec![conv, 1, cfg.lin_conv_k]));
+            tensors.insert(p("linear_attn.A_log"), (f32, vec![cfg.lin_v_heads]));
+            tensors.insert(p("linear_attn.dt_bias"), (f32, vec![cfg.lin_v_heads]));
+            tensors.insert(p("linear_attn.norm.weight"), (f32, vec![cfg.lin_v_dim]));
+        }
+    }
+    Ok(tensors)
+}
+
+fn qwen35moe_preflight(st: &SafeTensors, cfg: &Cfg) -> Result<(), Error> {
+    let expected = qwen35moe_contract(cfg)?;
+    let mut seen = BTreeSet::new();
+    for tensor in st.tensors() {
+        if tensor.name.starts_with("model.visual.") || tensor.name.starts_with("mtp.") {
+            continue;
+        }
+        let name = qwen35moe_rename(&tensor.name);
+        if !seen.insert(name.clone()) {
+            return Err(Error::Format(format!("qwen3_5_moe: rename collision for '{name}'")));
+        }
+        let (_, shape) = expected.get(&name).ok_or_else(|| {
+            Error::Format(format!("'{}': not in the qwen3_5_moe tensor contract", tensor.name))
+        })?;
+        if &tensor.shape != shape {
+            return Err(Error::Format(format!(
+                "'{}': qwen3_5_moe expected shape {shape:?}, got {:?}",
+                tensor.name, tensor.shape
+            )));
+        }
+        if !matches!(tensor.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32)
+            || tensor.compression != peregrine_core::compress::Compression::None
+            || tensor.layout.is_some()
+        {
+            return Err(Error::Format(format!(
+                "'{}': qwen3_5_moe requires uncompressed native BF16/F16/F32",
+                tensor.name
+            )));
+        }
+    }
+    for name in expected.keys() {
+        if !seen.contains(name) {
+            return Err(Error::Format(format!(
+                "qwen3_5_moe: missing required tensor '{name}'; refusing incomplete conversion"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn qwen4_contract(cfg: &Cfg) -> Result<BTreeMap<String, (Qwen4Tensor, Vec<i64>)>, Error> {
     let q = cfg.qwen4.as_ref().ok_or_else(|| Error::Format("qwen4_exp: missing validated Qwen4Cfg".into()))?;
     let mut tensors = BTreeMap::new();
@@ -545,13 +646,13 @@ fn qwen4_write_ple(st: &SafeTensors, plan: &Qwen4Ple, outdir: &Path, rep: &mut I
     Ok(())
 }
 
-fn qwen4_write_experts(
+fn write_fused_experts(
     st: &SafeTensors, name: &str, out_name: &str, cfg: &Cfg,
     writer: &mut ShardWriter, rep: &mut ImportReport,
 ) -> Result<(), Error> {
     let gate_up = out_name.ends_with(".gate_up_proj");
     let suffix = if gate_up { ".gate_up_proj" } else { ".down_proj" };
-    let prefix = out_name.strip_suffix(suffix).ok_or_else(|| Error::Format(format!("qwen4_exp: invalid fused expert '{name}'")))?;
+    let prefix = out_name.strip_suffix(suffix).ok_or_else(|| Error::Format(format!("invalid fused expert '{name}'")))?;
     let (rows, cols) = if gate_up { (cfg.moe_inter, cfg.hidden) } else { (cfg.hidden, cfg.moe_inter) };
     let count = rows.checked_mul(cols).ok_or_else(|| Error::Format(format!("'{name}': expert size overflow")))?;
     let mut dense = vec![0f32; usize::try_from(count).map_err(|_| Error::Format(format!("'{name}': expert too large")))?];
@@ -624,11 +725,25 @@ pub struct ImportReport {
     pub imported_int8: usize,
     pub imported_float: usize,
     pub skipped_visual: usize,
+    pub skipped_visual_names: Vec<String>,
     pub skipped_mtp: usize,
+    pub skipped_mtp_names: Vec<String>,
     pub imported_i64: usize,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub sidecars: Vec<String>,
+}
+
+impl ImportReport {
+    fn skip_visual(&mut self, name: &str) {
+        self.skipped_visual += 1;
+        self.skipped_visual_names.push(name.to_string());
+    }
+
+    fn skip_mtp(&mut self, name: &str) {
+        self.skipped_mtp += 1;
+        self.skipped_mtp_names.push(name.to_string());
+    }
 }
 
 /// Import every text-stack tensor of the HF checkpoint at `indir` into a
@@ -652,18 +767,46 @@ pub fn import_hf(indir: &Path, outdir: &Path, shard_bytes: u64) -> Result<Import
     } else {
         None
     };
-    let st = SafeTensors::open(indir).ctx(|| if qwen4.is_some() {
-        "qwen4_exp source: requires native BF16/F16/F32 weights and I64 PLE buffers".into()
+    let qwen35moe = if matches!(cfg_root.get("model_type").and_then(|v| v.as_str()), Some("qwen3_5_moe" | "qwen3_5_moe_text")) {
+        Some(Cfg::from_json(&cfg_root)?)
     } else {
-        format!("open {}", indir.display())
+        None
+    };
+    let st = SafeTensors::open(indir).ctx(|| {
+        if qwen4.is_some() {
+            "qwen4_exp source: requires native BF16/F16/F32 weights and I64 PLE buffers".into()
+        } else if qwen35moe.is_some() {
+            "qwen3_5_moe source: requires native BF16/F16/F32 weights".into()
+        } else {
+            format!("open {}", indir.display())
+        }
     })?;
     let ple = qwen4.as_ref().map(|cfg| qwen4_preflight(&st, cfg)).transpose()?.unwrap_or_default();
-    if qwen4.is_some() && outdir.exists() && std::fs::read_dir(outdir)?.next().is_some() {
-        return Err(Error::Format("qwen4_exp: output directory must be empty".into()));
+    if let Some(cfg) = &qwen35moe {
+        qwen35moe_preflight(&st, cfg)?;
+    }
+    if (qwen4.is_some() || qwen35moe.is_some())
+        && outdir.exists()
+        && std::fs::read_dir(outdir)?.next().is_some()
+    {
+        return Err(Error::Format("structured import: output directory must be empty".into()));
     }
     std::fs::create_dir_all(outdir).ctx(|| format!("create {}", outdir.display()))?;
-    let contract = if qwen4.is_some() { "qwen4-exp-foundation" } else if glm5next { "glm5-next" } else { "track-c-rev2" };
-    let skipped_mtp: Vec<_> = st.tensors().iter().filter(|t| qwen4.is_some() && qwen4_skip_mtp(&t.name)).map(|t| t.name.clone()).collect();
+    let contract = if qwen4.is_some() {
+        "qwen4-exp-foundation"
+    } else if qwen35moe.is_some() {
+        "qwen3.5-moe"
+    } else if glm5next {
+        "glm5-next"
+    } else {
+        "track-c-rev2"
+    };
+    let skipped_mtp: Vec<_> = st
+        .tensors()
+        .iter()
+        .filter(|t| (qwen4.is_some() && qwen4_skip_mtp(&t.name)) || (qwen35moe.is_some() && t.name.starts_with("mtp.")))
+        .map(|t| t.name.clone())
+        .collect();
     let mut w = ShardWriter::new(outdir, "model", shard_bytes).with_metadata(vec![
         ("peregrine.import.tool".into(), "peregrine-import-hf".into()),
         ("peregrine.import.contract".into(), contract.into()),
@@ -684,6 +827,7 @@ pub fn import_hf(indir: &Path, outdir: &Path, shard_bytes: u64) -> Result<Import
     }
     let ple_buffers: BTreeSet<_> = ple.iter().flat_map(|p| p.buffers.iter().map(|(name, _)| name.clone())).collect();
     let qwen4_tensors = qwen4.as_ref().map(qwen4_contract).transpose()?;
+    let qwen35_tensors = qwen35moe.as_ref().map(qwen35moe_contract).transpose()?;
 
     let meta: Vec<(String, Vec<i64>)> =
         st.tensors().iter().map(|t| (t.name.clone(), t.shape.clone())).collect();
@@ -691,13 +835,33 @@ pub fn import_hf(indir: &Path, outdir: &Path, shard_bytes: u64) -> Result<Import
         rep.tensors_total += 1;
         rep.bytes_in += st.uncompressed_nbytes(name).unwrap_or(0).max(0) as u64;
         // Resolve the output name and family per contract.
-        let (family, out_name) = if let (Some(cfg), Some(contract)) = (&qwen4, &qwen4_tensors) {
+        let (family, out_name) = if let (Some(cfg), Some(contract)) = (&qwen35moe, &qwen35_tensors) {
             if name.starts_with("model.visual.") {
-                rep.skipped_visual += 1;
+                rep.skip_visual(name);
+                continue;
+            }
+            if name.starts_with("mtp.") {
+                rep.skip_mtp(name);
+                continue;
+            }
+            let out_name = qwen35moe_rename(name);
+            let (kind, _) = contract
+                .get(&out_name)
+                .ok_or_else(|| Error::Format(format!("qwen3_5_moe: unplanned tensor '{name}'")))?;
+            match kind {
+                Qwen4Tensor::Dense(family) => (*family, out_name),
+                Qwen4Tensor::GateUp | Qwen4Tensor::Down => {
+                    write_fused_experts(&st, name, &out_name, cfg, &mut w, &mut rep)?;
+                    continue;
+                }
+            }
+        } else if let (Some(cfg), Some(contract)) = (&qwen4, &qwen4_tensors) {
+            if name.starts_with("model.visual.") {
+                rep.skip_visual(name);
                 continue;
             }
             if qwen4_skip_mtp(name) {
-                rep.skipped_mtp += 1;
+                rep.skip_mtp(name);
                 continue;
             }
             let out_name = qwen4_rename(name);
@@ -706,7 +870,7 @@ pub fn import_hf(indir: &Path, outdir: &Path, shard_bytes: u64) -> Result<Import
             match kind {
                 Qwen4Tensor::Dense(family) => (*family, out_name),
                 Qwen4Tensor::GateUp | Qwen4Tensor::Down => {
-                    qwen4_write_experts(&st, name, &out_name, cfg, &mut w, &mut rep)?;
+                    write_fused_experts(&st, name, &out_name, cfg, &mut w, &mut rep)?;
                     continue;
                 }
             }
@@ -714,7 +878,7 @@ pub fn import_hf(indir: &Path, outdir: &Path, shard_bytes: u64) -> Result<Import
             let out_name = match glm5next_rename(name) {
                 Some(n) => n,
                 None => {
-                    rep.skipped_visual += 1;
+                    rep.skip_visual(name);
                     continue;
                 }
             };
@@ -724,7 +888,7 @@ pub fn import_hf(indir: &Path, outdir: &Path, shard_bytes: u64) -> Result<Import
         };
         match family {
             Family::SkipVisual => {
-                rep.skipped_visual += 1;
+                rep.skip_visual(name);
                 continue;
             }
             // Consumed while dequantizing its base tensor below.
@@ -734,8 +898,9 @@ pub fn import_hf(indir: &Path, outdir: &Path, shard_bytes: u64) -> Result<Import
         // One dense read covers every family: `read_f32` widens bf16/f16/fp8
         // exactly, and `read_dense_dequant` folds FP8 block scales back in.
         let dense = read_dense_dequant(&st, name, shape)?;
-        if qwen4.is_some() && dense.iter().any(|v| !v.is_finite()) {
-            return Err(Error::Format(format!("'{name}': qwen4_exp non-finite tensor")));
+        if (qwen4.is_some() || qwen35moe.is_some()) && dense.iter().any(|v| !v.is_finite()) {
+            let family = if qwen4.is_some() { "qwen4_exp" } else { "qwen3_5_moe" };
+            return Err(Error::Format(format!("'{name}': {family} non-finite tensor")));
         }
         match family {
             Family::Int4 | Family::Int8Embed => {
@@ -847,6 +1012,154 @@ mod tests {
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("config.json"), serde_json::to_vec(cfg)?)?;
         write_safetensors(dir, blobs)?;
+        Ok(())
+    }
+
+    fn tiny_qwen35moe_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_act": "silu",
+                "hidden_size": 4,
+                "vocab_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 1,
+                "linear_key_head_dim": 2,
+                "linear_value_head_dim": 2,
+                "linear_conv_kernel_dim": 2,
+                "attn_output_gate": true,
+                "partial_rotary_factor": 0.5,
+                "rope_parameters": {"rope_theta": 10000.0, "partial_rotary_factor": 0.5},
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 3,
+                "shared_expert_intermediate_size": 2,
+                "rms_norm_eps": 1e-6,
+                "eos_token_id": 0
+            }
+        })
+    }
+
+    fn tiny_qwen35moe_blobs() -> Vec<Blob> {
+        let mut blobs = vec![
+            bf16_blob("model.language_model.embed_tokens.weight", vec![32, 4], 1),
+            bf16_blob("model.language_model.norm.weight", vec![4], 2),
+            bf16_blob("lm_head.weight", vec![32, 4], 3),
+            bf16_blob("model.visual.patch_embed.proj.weight", vec![2, 2], 4),
+            bf16_blob("mtp.fc.weight", vec![4, 8], 5),
+        ];
+        for layer in 0..2usize {
+            let p = |suffix: &str| format!("model.language_model.layers.{layer}.{suffix}");
+            for (suffix, shape) in [
+                ("input_layernorm.weight", vec![4]),
+                ("post_attention_layernorm.weight", vec![4]),
+                ("mlp.gate.weight", vec![2, 4]),
+                ("mlp.shared_expert_gate.weight", vec![1, 4]),
+                ("mlp.shared_expert.gate_proj.weight", vec![2, 4]),
+                ("mlp.shared_expert.up_proj.weight", vec![2, 4]),
+                ("mlp.shared_expert.down_proj.weight", vec![4, 2]),
+                ("mlp.experts.gate_up_proj", vec![2, 6, 4]),
+                ("mlp.experts.down_proj", vec![2, 4, 3]),
+            ] {
+                blobs.push(bf16_blob(&p(suffix), shape, 17));
+            }
+            if layer == 1 {
+                for (suffix, shape) in [
+                    ("self_attn.q_proj.weight", vec![8, 4]),
+                    ("self_attn.k_proj.weight", vec![4, 4]),
+                    ("self_attn.v_proj.weight", vec![4, 4]),
+                    ("self_attn.o_proj.weight", vec![4, 4]),
+                    ("self_attn.q_norm.weight", vec![4]),
+                    ("self_attn.k_norm.weight", vec![4]),
+                ] {
+                    blobs.push(bf16_blob(&p(suffix), shape, 19));
+                }
+            } else {
+                for (suffix, shape) in [
+                    ("linear_attn.in_proj_qkv.weight", vec![6, 4]),
+                    ("linear_attn.in_proj_z.weight", vec![2, 4]),
+                    ("linear_attn.in_proj_a.weight", vec![1, 4]),
+                    ("linear_attn.in_proj_b.weight", vec![1, 4]),
+                    ("linear_attn.out_proj.weight", vec![4, 2]),
+                    ("linear_attn.conv1d.weight", vec![6, 1, 2]),
+                    ("linear_attn.A_log", vec![1]),
+                    ("linear_attn.dt_bias", vec![1]),
+                    ("linear_attn.norm.weight", vec![2]),
+                ] {
+                    blobs.push(bf16_blob(&p(suffix), shape, 23));
+                }
+            }
+        }
+        blobs
+    }
+
+    #[test]
+    fn qwen35moe_import_splits_experts_skips_vision_mtp_and_generates() -> Result<(), Error> {
+        let (dir, out) = fixture_dirs("qwen35moe")?;
+        write_qwen4_fixture(&dir, &tiny_qwen35moe_config(), &tiny_qwen35moe_blobs())?;
+        let report = import_hf(&dir, &out, 64)?;
+        assert_eq!(report.skipped_visual, 1);
+        assert_eq!(report.skipped_visual_names, vec!["model.visual.patch_embed.proj.weight".to_string()]);
+        assert_eq!(report.skipped_mtp, 1);
+        assert_eq!(report.skipped_mtp_names, vec!["mtp.fc.weight".to_string()]);
+        let st = SafeTensors::open(&out)?;
+        let header_path = st.paths().first().ok_or_else(|| Error::Format("import fixture has no shard".into()))?.clone();
+        let header_bytes = std::fs::read(header_path)?;
+        let header_len = u64::from_le_bytes(
+            header_bytes[..8].try_into().map_err(|_| Error::Format("import fixture header".into()))?,
+        ) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes[8..8 + header_len])?;
+        assert_eq!(header["__metadata__"]["peregrine.import.skipped_mtp"], serde_json::json!("[\"mtp.fc.weight\"]"));
+        assert!(st.has("model.layers.0.mlp.experts.0.gate_proj.weight"));
+        assert!(st.has("model.layers.1.mlp.shared_experts.shared_expert_gate.weight"));
+        assert!(!st.has("model.visual.patch_embed.proj.weight"));
+        assert!(!st.has("mtp.fc.weight"));
+        let mut model = peregrine_model::Model::load_streaming(&out, false)?;
+        let mut sampler = peregrine_model::Sampler::new(0.0, 0.9, 1);
+        let resident = model.generate(&[1, 5, 9], 4, &mut sampler)?;
+        assert_eq!(resident.len(), 4);
+        assert!(resident.iter().all(|&token| (0..32).contains(&token)));
+        drop(model);
+        let mut model = peregrine_model::Model::load_streaming(&out, true)?;
+        let mut sampler = peregrine_model::Sampler::new(0.0, 0.9, 1);
+        let streamed = model.generate(&[1, 5, 9], 4, &mut sampler)?;
+        assert_eq!(streamed, resident);
+        let cfg = model.cfg.clone();
+        let mut first = peregrine_model::SeqKv::new(&cfg);
+        let mut second = peregrine_model::SeqKv::new(&cfg);
+        let batched = model.forward_rows_batched(&[1, 5], &[0, 1], &mut [&mut first, &mut second], &[0, 0], None)?;
+        let mut singles = peregrine_model::Model::load_streaming(&out, true)?;
+        let first_logits = singles.forward_step(&[1], 0)?;
+        singles.reset();
+        let second_logits = singles.forward_step(&[5], 0)?;
+        assert_eq!(&batched[..cfg.vocab as usize], first_logits);
+        assert_eq!(&batched[cfg.vocab as usize..], second_logits);
+        drop(singles);
+        drop(model);
+        std::fs::remove_dir_all(dir)?;
+        std::fs::remove_dir_all(out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn qwen35moe_import_refuses_unknown_tensors() -> Result<(), Error> {
+        let (dir, out) = fixture_dirs("qwen35moe_refuse")?;
+        let mut blobs = tiny_qwen35moe_blobs();
+        blobs.push(bf16_blob("model.language_model.layers.0.mystery.weight", vec![4, 4], 31));
+        write_qwen4_fixture(&dir, &tiny_qwen35moe_config(), &blobs)?;
+        let error = import_hf(&dir, &out, 64)
+            .err()
+            .ok_or_else(|| Error::Format("qwen3_5_moe unknown tensor unexpectedly accepted".into()))?
+            .to_string();
+        assert!(error.contains("mystery"), "{error}");
+        assert!(!out.exists());
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

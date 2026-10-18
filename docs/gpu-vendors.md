@@ -113,6 +113,17 @@ plenty for the whole kernel test suite.
 - `warpSize` on AMD is 64: the shared-memory reduction buffers are sized for
   ≤ 32 warps/block and every launch here uses ≤ 256 threads (4 waves), so
   the existing bounds hold with room.
-- Glm5Next (GLM-5.3-Flash) refuses the GPU expert tier on *both* vendors
-  until the kernels implement its SwiGLU clamp — see
-  [deployment-glm53-flash.md](deployment-glm53-flash.md).
+- ~~Glm5Next (GLM-5.3-Flash) refuses the GPU expert tier on *both* vendors
+  until the kernels implement its SwiGLU clamp~~ — **stale as of this tree.**
+  The clamp landed (`peregrine_cuda::set_swiglu_limit` at `model.rs:4846`) and is
+  what *gates* admission: a linked CUDA backend takes it, so the tier builds.
+  Measured on the RTX 3060 host with `--features cuda`, `COLI_GPU=1`,
+  `COLI_GPU_INT4=1`: "GPU tier holds 771 experts in VRAM (cold)", 771/771
+  pinned-async uploads, 0 refused. It was a **39% loss** at B=1 (0.133 tok/s vs
+  0.215-0.221 for the same container on the CPU lane in the same session) and cut
+  disk traffic by exactly nothing — 4.239 GB/token either way, because 771 of
+  12096 experts is 6.4% residency and a *cold* knapsack (no persisted heat) places
+  them round-robin rather than on the hot set. Available, therefore; unprofitable
+  at this VRAM/batch shape. The refusal is now only reachable on CPU-only builds
+  (`gpu_allowed = cfg.swiglu_limit == 0.0`), which is what keeps that branch live.
+  See [deployment-glm53-flash.md](deployment-glm53-flash.md).

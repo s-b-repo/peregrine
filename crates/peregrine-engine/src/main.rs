@@ -51,21 +51,19 @@ fn install_moe_engine() {
     // Matched through `as_deref()` — the idiom every other env gate in this
     // repo uses. `unwrap_or_default()` is a [P] hit and `Err(_)` a [B] one,
     // and both audits are right: neither says which case it is handling.
-    let var = std::env::var("COLI_MOE_ENGINE");
-    match var.as_deref() {
-        Ok("sched") => {}
-        // Unset, empty, or the default engine: nothing to install.
-        Ok("") | Ok("concurrent") => return,
-        Ok(other) => {
-            eprintln!("peregrine: COLI_MOE_ENGINE={other} is not a known engine (concurrent|sched); using concurrent");
+    let var = match std::env::var("COLI_MOE_ENGINE") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return,
+        Err(error) => {
+            eprintln!("peregrine: COLI_MOE_ENGINE unreadable ({error}); using concurrent");
             return;
         }
-        // Not present is the expected absence. A non-unicode value is an
-        // operator error: they asked for an engine by name and the wildcard
-        // this replaced silently served the default instead of saying so.
-        Err(std::env::VarError::NotPresent) => return,
-        Err(e) => {
-            eprintln!("peregrine: COLI_MOE_ENGINE unreadable ({e}); using concurrent");
+    };
+    match var.trim() {
+        "sched" => {}
+        "" | "concurrent" => return,
+        other => {
+            eprintln!("peregrine: COLI_MOE_ENGINE={other} is not a known engine (concurrent|sched); using concurrent");
             return;
         }
     }
@@ -126,6 +124,32 @@ fn run() -> Result<(), Error> {
             let out = Path::new(dir).join("automaton.json");
             peregrine_model::save_automaton(&table, &out)?;
             eprintln!("wrote automaton ({len}-token corpus) to {}", out.display());
+            Ok(())
+        }
+        Some("build-router-predictor") => {
+            let (dir, len, text, out) = router_predictor_args(&args)?;
+            let mut model = Model::load_streaming(Path::new(&dir), true)?;
+            model.suppress_route_stats_persistence();
+            let corpus = match &text {
+                Some(path) => encode_text_corpus(&dir, path, len, "build-router-predictor")?,
+                None => {
+                    eprintln!(
+                        "peregrine: build-router-predictor has no --text, so it is training on \
+                         uniform-random token ids; pass real text for a useful artifact"
+                    );
+                    synth_corpus(model.cfg.vocab as usize, len)
+                }
+            };
+            if corpus.len() < 2 {
+                return Err(Error::Format("build-router-predictor: corpus must contain at least 2 tokens".into()));
+            }
+            let table = model.build_token_route_table(&corpus)?;
+            table.save(Path::new(&out))?;
+            eprintln!(
+                "wrote token route predictor ({} contexts, {} observations) to {out}",
+                table.entries(),
+                table.observations()
+            );
             Ok(())
         }
         // `galactic <model-dir> [corpus-len]`: the one-shot offline preprocessing
@@ -233,6 +257,10 @@ fn run() -> Result<(), Error> {
             if let Some(v) = read_json("macrostates.json")? {
                 plan.insert("macrostates".into(), v);
                 parts.push("macrostates");
+            }
+            if let Some(v) = read_json("token_routes.json")? {
+                plan.insert("token_routes".into(), v);
+                parts.push("token_routes");
             }
             if let Some(v) = read_json("schedule.json")? {
                 plan.insert("schedule".into(), v);
@@ -704,7 +732,11 @@ fn run() -> Result<(), Error> {
                     "usage: peregrine <model-dir> [--draft N]  (or COLI_MODEL=<dir>)  |  peregrine demo".into(),
                 )
             })?;
-            let mut model = Model::load(Path::new(&dir))?;
+            let reference = flag_value(&args, "--reference").or_else(|| std::env::var("COLI_REFERENCE").ok());
+            let mut model = match reference {
+                Some(path) => Model::load_hybrid(Path::new(&dir), Path::new(&path))?,
+                None => Model::load(Path::new(&dir))?,
+            };
             // Speculative decode needs an MTP head, which only checkpoints
             // converted with `--mtp` carry. Refuse loudly rather than silently
             // decoding non-speculatively: an operator who asked for `--draft`
@@ -793,6 +825,54 @@ fn load_reference_dump(path: &Path) -> Result<ReferenceDump, Error> {
         )));
     }
     Ok(d)
+}
+
+fn router_predictor_args(args: &[String]) -> Result<(String, usize, Option<String>, String), Error> {
+    let usage = "usage: peregrine build-router-predictor <model-dir> [corpus-len] [--text FILE] [--out FILE]";
+    let dir = args
+        .get(2)
+        .filter(|value| !value.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| Error::Format(usage.into()))?;
+    let mut len = None;
+    let mut text = None;
+    let mut out = None;
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--text" | "--out" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .cloned()
+                    .ok_or_else(|| Error::Format(format!("build-router-predictor: {} needs a value", args[index])))?;
+                let slot = if args[index] == "--text" { &mut text } else { &mut out };
+                if slot.replace(value).is_some() {
+                    return Err(Error::Format(format!("build-router-predictor: {} appears twice", args[index])));
+                }
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(Error::Format(format!("build-router-predictor: unknown option {value}")));
+            }
+            value => {
+                if len.is_some() {
+                    return Err(Error::Format("build-router-predictor: corpus length appears twice".into()));
+                }
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| Error::Format(format!("build-router-predictor: invalid corpus length {value:?}")))?;
+                if parsed < 2 {
+                    return Err(Error::Format("build-router-predictor: corpus length must be at least 2".into()));
+                }
+                len = Some(parsed);
+                index += 1;
+            }
+        }
+    }
+    let len = len.unwrap_or(2048);
+    let out = out.unwrap_or_else(|| format!("{dir}/token_routes.json"));
+    Ok((dir, len, text, out))
 }
 
 fn flag_value(args: &[String], name: &str) -> Option<String> {
@@ -1017,6 +1097,15 @@ fn serve(model: &mut Model, draft: usize) -> Result<(), Error> {
         // on artifacts (`route_stats.json` transition history) that vary run to
         // run — say so, so a log can tell an automaton run from a baseline one.
         eprintln!("peregrine: prefetch predictor = automaton (from route-stats history)");
+    }
+    let future_prefetch = model.future_prefetch_settings();
+    if future_prefetch.mode.enabled() {
+        eprintln!(
+            "peregrine: future-expert prefetch = {} (width {} per layer, {} pending)",
+            future_prefetch.mode.as_str(),
+            future_prefetch.width,
+            future_prefetch.max_pending
+        );
     }
     out.write_all(READY)?;
     out.flush()?;
@@ -1613,5 +1702,24 @@ mod tests {
             assert_eq!(draft_depth(&argv(&["--draft", "banana", "/m"])), 0);
             assert_eq!(draft_depth(&argv(&["--draft"])), 0, "flag with no value");
         }
+    }
+
+    #[test]
+    fn router_predictor_arguments_are_strict() -> Result<(), Error> {
+        let parsed = router_predictor_args(&argv(&[
+            "build-router-predictor",
+            "/model",
+            "32",
+            "--text",
+            "corpus.txt",
+            "--out",
+            "/tmp/routes.json",
+        ]))?;
+        assert_eq!(parsed, ("/model".into(), 32, Some("corpus.txt".into()), "/tmp/routes.json".into()));
+        assert!(router_predictor_args(&argv(&["build-router-predictor", "/model", "--text"])).is_err());
+        assert!(router_predictor_args(&argv(&["build-router-predictor", "/model", "--text", "--out", "x"])).is_err());
+        assert!(router_predictor_args(&argv(&["build-router-predictor", "/model", "0"])).is_err());
+        assert!(router_predictor_args(&argv(&["build-router-predictor", "/model", "--wat", "x"])).is_err());
+        Ok(())
     }
 }

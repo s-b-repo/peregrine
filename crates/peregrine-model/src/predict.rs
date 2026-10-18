@@ -18,6 +18,7 @@ use std::sync::Arc;
 /// post-reduce point (exactly one writer → no race), read by the predictor. Storing
 /// owned `Vec<i32>` frames and rotating them is allocation-neutral versus the previous
 /// single-frame store — `batch_union` already allocates the set we take ownership of.
+#[derive(Clone)]
 pub struct RouteHistory {
     layers: Vec<VecDeque<Vec<i32>>>,
     depth: usize,

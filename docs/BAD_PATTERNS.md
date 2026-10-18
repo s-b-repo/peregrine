@@ -1,23 +1,80 @@
 # Bad-pattern catalogue
 
-A re-runnable quality gate for the peregrine workspace, adapted from the
-[rustsploit](https://github.com/s-b-repo/rustsploit) audit. It catches crash-vectors
-and UB that `cargo clippy` does not flag by default, workspace-wide (per-crate
-`#![deny(...)]` attributes can drift; this gate does not).
+A re-runnable quality gate for the peregrine workspace. It started from the
+[rustsploit](https://github.com/s-b-repo/rustsploit) audit and has since merged in
+the `unifur` matrix (`/home/cortix/Downloads/inc/unifur/audit-bad-patterns.sh`),
+which widens coverage from 8 sections to 17 and adds the per-section CLI. It
+catches crash-vectors and UB that `cargo clippy` does not flag by default,
+workspace-wide (per-crate `#![deny(...)]` attributes can drift; this gate does
+not).
 
 ```bash
-scripts/audit-bad-patterns.sh            # full report (shows offending lines)
-scripts/audit-bad-patterns.sh --strict   # exit non-zero on any strict hit — the CI gate
-scripts/audit-reachability.py --list     # the [R] pass, also invoked by the above
+scripts/audit-bad-patterns.sh                # full report (shows offending lines)
+scripts/audit-bad-patterns.sh --strict       # exit non-zero if a section is over budget — the CI gate
+scripts/audit-bad-patterns.sh --section A    # one section (repeatable; old letters accepted)
+scripts/audit-bad-patterns.sh --files f.txt  # scan only the .rs files listed, one per line
+scripts/audit-bad-patterns.sh --max-report 0 # every hit, instead of the first 20 per pattern
+scripts/audit-bad-patterns.sh --budgets      # print each section against its ratchet budget
+scripts/audit-reachability.py --list         # the [Z] pass, also invoked by the above
 ```
 
-Scope: Rust under `crates/*/src`; comment lines are ignored. Strict sections are
-**P, B, U, C, Q**; **I, L, R** are informational.
+Scope: **every** Rust file under `crates/` — `src/`, `tests/`, `examples/` and the
+`src/bin/` targets, excluding the two vendored crates (`peregrine-token`,
+`peregrine-ctx`) but **including** the three `peregrine-ctx` files peregrine
+authored (`src/lib.rs`, `src/main.rs`, `examples/ctxbench.rs`). See `[E]`.
+Integration tests and examples are *separate crates*: they inherit no crate-root
+`#![deny(...)]`, so nothing else enforces the law there. They were excluded until
+2026-10-06 for the honest reason that they had never been scanned; that added 240
+hits on the first run, which is the number the ratchet below starts from.
 
-## [P] Panicking error handling — **strict, must be zero**
+## Ratchet, not zeroes
+
+**`--strict` fails when a section's count *exceeds* its budget**, not when it is
+non-zero. Seven sections are at zero and gated absolutely (**J** secrets, **M**
+injection, **N** UB, **T** Cargo hygiene, **H**, **I**, **K**, **O**, **P**); the
+rest carry a budget equal to the debt they already have.
+
+That is a deliberate trade, and the reasoning is worth stating because the
+alternative looks stricter. Two of these sections contradict a documented house
+style outright: `[E]` reports ~2.3k numeric casts and `unsafe` sites, which the
+kernels need (they mirror the C ports line-for-line), and `[D]` reports ~480
+indexing sites in code where bounds are guaranteed by shape. Gating those at zero
+means rewriting the numerical core into a different style to satisfy a linter —
+and a gate that is red from the first second teaches the team to ignore it, which
+is the one failure mode a gate must not have. A ratchet has the opposite
+property: **new code cannot add a hit**, the existing debt is a visible number
+rather than a suppressed one, and the budget can only move down.
+
+Raising a budget is therefore a review conversation, not a bookkeeping update.
+
+**Letter map.** unifur's letters won the collision (its matrix is the superset),
+so three peregrine letters moved. The old letters still work as aliases to
+`--section`, and nothing in the tree depends on the old names.
+
+| Was | Now | Meaning |
+|---|---|---|
+| `P` | **A** | panicking error handling |
+| `B` | **B** | silent error swallowing (its old info-only `[L]` twin is now `[B]`, informational) |
+| `U` | **N** | UB / concurrency footguns |
+| `C` | **C** | lint suppression and lint-bypass idioms |
+| `Q` | **T** | Cargo.toml hygiene |
+| `I` | **E** | `unsafe` / numeric casts (informational) |
+| `R` | **Z** | shipped-but-unreachable (informational) |
+| `K` | **X** | the hand-run audits grep cannot do (`X1`–`X3` below) |
+| — | **D, F, G, H, I, J, K, M, O, P** | new, from the unifur matrix |
+
+**Waivers.** A line carrying `// audit-allow: <reason>` is dropped from the counts,
+and the reason is mandatory: a bare `// audit-allow:` with nothing after it is a
+strict `[C]` hit, because a silent exemption is indistinguishable from a rule
+nobody enforced. Every waiver in the tree is a token-count field name that the
+secret regexes (`[J]`) would otherwise read as a credential.
+
+## [A] Panicking error handling — **strict, must be zero**
 
 A panic in the streaming/scheduler/serve path takes the whole process down
-mid-inference. Return `Result::Err` (or `?` with `.ctx(|| …)`) instead.
+mid-inference. The release profile is `panic = "abort"`, so there is no unwinding
+and no partial recovery: an `unwrap` in the serve loop is a dead server and a
+dropped in-flight batch. Return `Result::Err` (or `?` with `.ctx(|| …)`) instead.
 
 | Pattern | Fix |
 |---|---|
@@ -25,6 +82,14 @@ mid-inference. Return `Result::Err` (or `?` with `.ctx(|| …)`) instead.
 | `.unwrap_or_default()` | it *lies* about errors (turns `Err` into `T::default()`) — handle the case |
 | `.unwrap_err()` / `.expect_err(` | `match` the `Result` |
 | `panic!` / `unreachable!` / `todo!` / `unimplemented!` | return a descriptive `Err` |
+
+Tests are **not** exempt: `clippy.toml` sets `allow-unwrap-in-tests = false`,
+`allow-expect-in-tests = false` and `allow-panic-in-tests = false`, and this gate
+reads the whole file, `#[cfg(test)]` regions included. The compound shapes from
+the unifur matrix — `.first().unwrap()`, `.lock().unwrap()`, `.parse().unwrap()`,
+`.chars().next().unwrap()`, `.position(..).unwrap()` — are all subsumed by
+`\.unwrap\(\)`; only the base patterns are listed so the counts stay comparable
+across runs.
 
 peregrine already `#![deny(clippy::unwrap_used, expect_used, panic)]` in its crates;
 this gate enforces it **uniformly** and also catches `unwrap_or_default`,
@@ -40,12 +105,17 @@ ignored binding cannot dodge the gate:
 | Pattern | Fix |
 |---|---|
 | `let _ = fallible()` / `let _named = fallible()` | `if let Err(e) = … { note_advisory_err("…", &e) }` for best-effort ops; or handle the case |
-| `if let Ok(x) = …` / `while let Ok(x) = …` | full `match` — the `Err` arm notes the failure or matches the concrete control-flow variant (`VarError::NotPresent`, `TryRecvError::Empty`) |
+| `if let Ok(x) = …` / `while let Ok(x) = …` / `if let Err(_) = …` | full `match` — the `Err` arm notes the failure or matches the concrete control-flow variant (`VarError::NotPresent`, `TryRecvError::Empty`) |
 | `Err(_) =>` / `Err(_e) =>` / `Err(..) =>` | bind the error and include it in the message/log |
 | `Err(e) => {}` (bound but empty arm) | do something with `e` — an empty arm is the same silent drop |
-| `map_err(\|_\| …)` / `or_else(\|_\| …)` (incl. `unwrap_or_else`/`map_or_else`) | bind and propagate the source error |
+| `map_err(\|_\| …)` / `or_else(\|_\| …)` / `unwrap_or_else(\|_\| …)` | bind and propagate the source error |
 | `.to_str().ok()` | explicit match documenting the lax handling |
-| `.ok();` / `.err();` as a statement | the whole `Result` is thrown away — handle or `note_advisory_err` |
+| `.ok();` / `.err();` / `.await.ok()` as a statement | the whole `Result` is thrown away — handle or `note_advisory_err` |
+
+`if let Err(_)` deliberately matches **only** the discarding form. `if let Err(e) = …`
+that then does something with `e` is handling the error, which is the entire point
+of the rule; gating the shape rather than the behaviour is what makes a gate
+teachable.
 
 One exemption: the RAII keep-alive idiom `let _g = gpu_guard();` (any
 `…guard()` callee) is *not* flagged — there the named binding is the point,
@@ -70,55 +140,10 @@ the file is corrupt (the operator wants to know), and the file is for a differen
 model (the fingerprint guard's job). `read_optional_artifact` now separates them
 — absent is silent, unreadable or malformed goes to `note_advisory_err`, stale
 stays silent because that guard exists to make mixing checkpoints a no-op. This
-closed twelve `[L]` findings (28 → 16), and `docs/model-format.md` no longer
+closed twelve let-else findings (28 → 16), and `docs/model-format.md` no longer
 claims malformed files are "silently ignored", which contradicted this section.
 
-## [U] UB / concurrency footguns — **strict, must be zero**
-
-`static mut`, `transmute`, `mem::forget`, `MaybeUninit::…assume_init()`,
-`unwrap_unchecked`. None belong in this codebase; the legitimate low-level work
-is confined to the crates below.
-
-## [C] Lint suppression — **strict, must be zero**
-
-`#[allow(...)]`, `#[deny(...)]` on an item, `#[ignore]` on a test.
-
-The workspace removed all 14 of its `#[allow]`s by fixing what each one hid
-(`too_many_arguments` by introducing `MatShape`/`RouterCfg`/`MoeCfg`,
-`should_implement_trait` by implementing `FromStr`, and so on). That was a
-claim in prose; this makes it a gate, so the next one has to be argued rather
-than merged. `#[deny]` belongs at the crate root, not per-item, and `#[ignore]`
-rots a test in place — delete it or fix it.
-
-## [Q] Cargo.toml hygiene — **strict, must be zero**
-
-A wildcard version (`dep = "*"`) or a git dependency without `rev`/`tag`/`branch`.
-
-Both make the build non-reproducible. That matters more here than in most
-projects: this engine's correctness rests on bit-identity anchors — SIMD kernels
-checked bit-for-bit against scalar references, `to_bits()`-exact parallel-vs-serial
-tests — and a transitive dependency moving under you can shift those without a
-commit to blame.
-
-## [I] `unsafe` outside the expected crates — informational
-
-`unsafe` is expected and reviewed in three domains only:
-- **peregrine-io** — io_uring submission, aligned-buffer (`AlignedBuf`) allocation, and the
-  OS-interface helpers: `madvise` hugepage/dontneed hints (`mem.rs`), `sched_setaffinity` /
-  `mbind` NUMA pinning (`mem.rs`), and the `perf_event_open` counter (`perf.rs`);
-- **peregrine-cuda** — the CUDA FFI;
-- **peregrine-kernels** — hand-written AVX2 / AVX-VNNI SIMD intrinsics;
-- **peregrine-token** — vendored third-party code (marcelroed/gigatoken, MIT):
-  upstream style is kept verbatim (unsafe SIMD, unwrap/expect in engine
-  internals and tests), so the whole crate is **excluded from this audit's
-  file set** — its correctness gate is the id-for-id parity suite against the
-  HF `tokenizers` oracle plus the vendored upstream tests.
-
-Any `unsafe` elsewhere is reported for review (the pure-logic crates —
-`peregrine-core`, `peregrine-model`, `peregrine-sched`, `peregrine-engine` — should
-have none; `peregrine-core` is `#![forbid(unsafe_code)]`).
-
-## [L] `let Ok(x) = … else { … }` — informational
+### [B/info] `let Ok(x) = … else { … }` — informational
 
 The let-else twin of the gated `if let Ok(`: the `else` arm drops the `Err` on
 the floor. The codebase uses it as the sanctioned style for best-effort reads
@@ -132,7 +157,187 @@ non-`NotFound` failure would otherwise be indistinguishable from "not present" �
 `engine/main.rs` (`compile-plan` now separates a corrupt artifact from a missing
 one). The remaining sites are genuine either-way probes.
 
-## [R] Shipped but unreachable — informational, and the one grep cannot see
+## [C] Lint suppression — **strict, must be zero**
+
+`#[allow(...)]`, `#[deny(...)]` on an item, `#[ignore]` on a test, and a bare
+`// audit-allow:` with no reason after it.
+
+The workspace removed all 14 of its `#[allow]`s by fixing what each one hid
+(`too_many_arguments` by introducing `MatShape`/`RouterCfg`/`MoeCfg`,
+`should_implement_trait` by implementing `FromStr`, and so on). That was a
+claim in prose; this makes it a gate, so the next one has to be argued rather
+than merged. `#[deny]` belongs at the crate root, not per-item, and `#[ignore]`
+rots a test in place — delete it or fix it.
+
+### [C/info] lint-bypass idioms — informational
+
+Underscore-prefixed parameters (`fn f(_device: &Device)`) hide a value from the
+unused-parameter lint. 52 sites, most of them real: phantom device handles,
+cfg-split signatures where one platform has no use for the argument. Informational
+because the fix — `_`-prefixing — is already the compiler-sanctioned answer; the
+review question is only whether the argument should have been dropped outright.
+
+## [T] Cargo.toml hygiene — **strict, must be zero**
+
+A wildcard version (`dep = "*"`) or a git dependency without `rev`/`tag`/`branch`.
+
+Both make the build non-reproducible. That matters more here than in most
+projects: this engine's correctness rests on bit-identity anchors — SIMD kernels
+checked bit-for-bit against scalar references, `to_bits()`-exact parallel-vs-serial
+tests, and the numerical certificates in `peregrine-verify` — and a transitive
+dependency moving under you can shift those without a commit to blame.
+
+## [E] `unsafe` and numeric casts — informational
+
+Numeric `as` casts are intentional here (the kernels mirror the C ports
+line-for-line, where PyTorch layouts and `f32`/`u8` boundaries are explicit), and
+`unsafe` is **expected** in four domains only:
+
+- **peregrine-io** — io_uring submission, aligned-buffer (`AlignedBuf`) allocation, and the
+  OS-interface helpers: `madvise` hugepage/dontneed hints (`mem.rs`), `sched_setaffinity` /
+  `mbind` NUMA pinning (`mem.rs`), and the `perf_event_open` counter (`perf.rs`);
+- **peregrine-cuda** — the CUDA FFI;
+- **peregrine-kernels** — hand-written AVX2 / AVX-VNNI SIMD intrinsics;
+- **peregrine-par** — one documented lifetime-erasure (a borrowed closure handed to a
+  persistent worker pool), made sound by a fork-join barrier and hidden behind a
+  safe API.
+
+`unsafe`, `extern "C"`, `*const`/`*mut` casts and `mem::zeroed` outside those
+crates are reported for review (the pure-logic crates — `peregrine-core`,
+`peregrine-model`, `peregrine-sched`, `peregrine-engine`, `peregrine-verify` —
+should have none; `peregrine-core` is `#![forbid(unsafe_code)]`). `mem::zeroed`
+is informational rather than a `[N]` hit on purpose: all four of its uses are
+zero-initialising a POD libc struct (`rlimit`, `cpu_set_t`, `stat`, `rusage`),
+which is the sanctioned use and the wrong thing to flag next to a real one.
+
+**peregrine-token** is vendored third-party code (marcelroed/gigatoken, MIT):
+upstream style is kept verbatim (unsafe SIMD, unwrap/expect in engine internals and
+tests), so the whole crate is **excluded from this audit's file set** — its
+correctness gate is the id-for-id parity suite against the HF `tokenizers` oracle
+plus the vendored upstream tests.
+
+**peregrine-ctx** is vendored the same way, and used to be scanned. It is a
+verbatim port of subnext/DCR (crate `dcr`, pinned at 609451b): of its 34 `src`
+files, 32 are byte-identical to upstream and the two that differ (`lib.rs`,
+`main.rs`) differ only by the `dcr::` → `peregrine_ctx::` prefix rename and the
+CLI binary name; its 22 tests and 2 of its 3 examples are upstream byte-for-byte
+after that same rename. Auditing ported files audits subnext, which peregrine has
+no mandate over — and "fixing" one is not a cleanup but a fork, because omni's
+`verify-cross-repo.sh` fails on any ported file that drifts. Its gate is that
+cross-repo check.
+
+Three files in `peregrine-ctx` are peregrine's own work and **stay in the file
+set**: `src/lib.rs`, `src/main.rs`, `examples/ctxbench.rs`. Those are the files
+to fix when a finding points into `peregrine-ctx`.
+
+Neither casts nor `unsafe` are gated: ~2.2k cast sites and ~120 unsafe sites,
+almost all intentional. Gating a construct this pervasive would produce thousands
+of hits and teach the team to ignore the audit — the failure mode a gate must not
+have. What *is* gated is the UB class they can imply ([N]).
+
+## [D] Panic vectors (indexing and slicing) — informational
+
+Literal indices, slice patterns, `split_at`, `chars().nth()`. The same reasoning
+as `[E]`: a kernel engine indexes deliberately, bounds are structurally guaranteed
+by `MatShape`/`RouterCfg`, and the house style is an explicit index loop that
+mirrors the C port for line-by-line verification.
+
+The signal is not the count, it is the **kind**: a slice built from a length that
+came off the wire, an mmap, or a tensor header is where a short-buffer panic lives,
+and that is worth a look when one appears here. `Option::get`-shaped code and
+`get(..n)` on a length-checked buffer are noise.
+
+## [F] Blocking calls — informational
+
+`std::thread::sleep`, `std::fs::*`, `std::process::Command`, `std::net::*`,
+`std::io::stdin`. The reactor exists to keep blocking syscalls off the hot path,
+so a blocking call in a request path is a finding; the same call in a bench, a
+setup path, or `peregrine-engine`'s deliberately-blocking engine thread is not.
+Grep cannot tell the two apart — that is what makes this informational — so when
+a `[F]` hit is on the hot path, the fix is to route it through
+`peregrine_io::{pread_many, mmap_many, fadvise_many}` rather than to silence it.
+
+## [G] Logging hygiene — informational
+
+`dbg!`, `format!("{:?}", … err)`, `.context("")`, `println!` in library code.
+`println!` is the interesting one: stdout is the serve protocol on stdout, so a
+stray print corrupts a response frame. Everything here is also a signal about
+*where errors are being dropped*, which `[B]` catches structurally.
+
+## [H] HTTP layer — informational
+
+A `reqwest::Client` built per request loses connection reuse; an unchecked status
+is a silent 500. **Zero hits is the expected result and that is the point** — the
+engine speaks its own JSON protocol over stdio and its own socket server, so this
+section is a tripwire against an HTTP client creeping into a path where the
+connection cost would be paid per request.
+
+## [I] Iterator glitches — informational
+
+`collect::<Result<Vec<_>, _>>().unwrap()`, `.zip(..).unwrap()`,
+`.iter().find(..).expect(..)` — panicking shapes that survived because they sit
+inside an iterator chain a reader skims past. Rare (zero at last run), kept because
+the cost of the regex is nil.
+
+## [J] Secrets — **strict** · style — informational
+
+Two different rules sharing one section, because both used to be one catalogue
+entry. The **strict** half is the one that matters: API keys, bearer tokens, AWS
+keys, GitHub and Slack tokens, `-----BEGIN … PRIVATE KEY-----` blocks, and
+`("admin","admin")`-shaped literals. Nothing in this tree may contain one, and
+`--strict` fails on a single line.
+
+The **informational** half is style: `== ""` instead of `is_empty()`,
+`.len() == 0`, double `.to_string().to_string()`, `Box<dyn …>` in a hot path,
+`use foo as _`. `Box<dyn>` is the interesting one here — trait objects in the
+request path are a real cost — but there are 15 of them in API surface that is
+either cold or behind a feature, so it reports rather than gates.
+
+The `TODO|FIXME|HACK` regex from the upstream matrix was **dropped on purpose**:
+comment lines are stripped before matching, so it could only ever fire on a
+non-comment line, i.e. never on the thing it was written for.
+
+## [K] Crypto — informational
+
+MD5, SHA-1, DES/3DES, RC4, ECB-mode AES, `rand::thread_rng()`, `rand::random()`.
+Zero hits at last run, and zero is the point: the Merkle tree in `peregrine-ctx`
+makes SHA-256 load-bearing for content addressing, and reproducible *test* RNGs
+(deterministic xorshift fixtures, `hash.rs`'s own counter) are how the
+bit-identity tests stay reproducible. A non-CSPRNG in a production path is a
+finding; in a fixture it is the mechanism.
+
+## [M] SQL / command injection — **strict, must be zero**
+
+`format!("SELECT … {…}")` (a formatted query string is a parameterisation that was
+not written), and shelling out through `/bin/sh -c` with an interpolated argument.
+There is no SQL in this workspace, so the query rules are a tripwire; the shell
+rules are not hypothetical — `scripts/` drives `bench-*`, `setup-*` and the serve
+wrappers, and a `Command::new("sh").arg("-c")` in a crate would be the first place
+an operator-supplied string reached a shell.
+
+## [N] UB / concurrency footguns — **strict, must be zero**
+
+`static mut`, `mem::forget`, `assume_init()`, `MaybeUninit::uninit()`,
+`unwrap_unchecked`, and `transmute` outside `peregrine-par`. None belong in this
+codebase; the legitimate low-level work is confined to the crates in `[E]`, and
+the one lifetime-erasure `peregrine-par` needs is encapsulated behind a safe API
+precisely so it can be listed here.
+
+## [O] Performance footguns — informational
+
+`.iter().count()`, `.clone().iter().enumerate()`, `with_capacity(0)`, nested
+`Box::new`, `Regex::new(..).unwrap`. All zero at last run. The rule that generalises:
+in an engine, a `clone()` on a hot path is a throughput decision, and the decision
+belongs in a comment or a certificate, not to be rediscovered in a profile.
+
+## [P] API hygiene — informational
+
+A `pub const … = "http…"` endpoint baked into a library, and credential-shaped
+field names in a `pub struct`. The second is the interesting one: a public struct
+with a `password`/`secret`/`api_key` field is a `Debug`-print hazard and an
+accidental-log hazard, and this section is where a new one shows up.
+
+## [Z] Shipped but unreachable — informational, and the one grep cannot see
 
 Code that compiles, passes its own unit tests, is documented as live, and **no
 production path reaches it**. Every other section here is a regex over lines;
@@ -194,8 +399,34 @@ the signal rather than the count.
 | Feature | Claimed | Reality |
 |---|---|---|
 | **LFRU eviction** (`tier.rs`) | six doc sites + two ✅ roadmap entries; `todo.md` specifically said "**not** plain LRU" | zero callers anywhere. The live policy is `warmcache.rs::evict_to_budget` — priority-weighted LRU. Heat never enters the victim score |
+
+> **Corrected 2026-10-06.** The LFRU row is stale and understates the code by a
+> long way. `peregrine-model/src/gpu.rs` calls `peregrine_io::pick_lfru` to pick
+> the hot-store swap (`COLI_GPU_TIER_SWAP=lfru`), with `gpu.rs`'s tests pinning
+> the hysteresis edge; the policy is reachable from the production GPU path and is
+> merely **off by default** (`COLI_GPU_TIER_SWAP` defaults to `replan`), and
+> `peregrine_io::tier::decay` has the same problem. It is now certified rather
+> than merely tested — see `tier` in `peregrine-verify`. Two *other* consequences
+> of that row being wrong are worth naming, because they are the general shape:
+> the reachability scanner cannot see a caller in another crate by bare name, and
+> "off by default" is invisible to it just as much as "never called" is.
 | **DSA sparse attention** (`dsa.rs`, `mla_attention_dsa`) | `DESIGN.md` M5, `model-format.md` "auto-detected", vs-colibrì feature table | `Indexer` is never constructed and nothing appends a key, so the path cannot run even if something called it |
+
+> **Corrected 2026-10-06.** Also stale. `model.rs` dispatches to
+> `mla_attention_dsa_indexed` whenever `IndexerWeights` load (the `dsa.rs` path
+> the row was written about is the older *stateful* `Indexer`, which the engine
+> does not use — it selects with `dsa::select_topk` per query instead), and
+> `qwen4.rs` calls that same selection. What is true is narrower and worth
+> saying precisely: the *sparse selection* is live, while the incremental
+> key-append index that would amortize it across tokens is not.
 | **`peregrine-sched`** | `README.md` status table: ✅, "`moe_streamed` overlaps io_uring streaming ∥ CPU compute" | **no crate depends on it.** Production MoE is `peregrine-model/concurrent.rs`. It is not used as an oracle either — no test compares the two *(resolved 2026-08-06: `streamed_matches_the_production_concurrent_path` now compares them over the same container bytes; still no dependents, which is now the point rather than the defect)* |
+
+> **Corrected 2026-10-06.** "No crate depends on it" is wrong: `peregrine-serve`
+> and `peregrine-engine` both list `peregrine-sched` as a dependency. The
+> remaining true part is that `moe_streamed` itself is still test-only, so the
+> crate is a dependency without carrying the feature the dependency is for —
+> which is a different, smaller, and more actionable claim than the one recorded
+> here.
 | **MTP speculative decode** | vs-colibrì: "MTP head wired" | `generate_speculative` has no caller in either binary; there is no `--draft` flag or `DRAFT` knob |
 
 All four doc sets are now corrected. The code is left in place: deleting a
@@ -220,7 +451,13 @@ does clippy: `pub` items are reachable by definition from outside the crate, so
 `dead_code` stays quiet. The audit's other sections are all "this line is
 dangerous"; this one is "this line never runs."
 
-## [K] A device kernel without an accuracy test — informational, and grep cannot see it either
+## [X] The hand-run audits — informational, and grep cannot see these either
+
+Everything above is a regex over lines. The three rules in this section are
+judgements: no script can apply them, so they are written down instead, and
+they are the ones that have actually cost time.
+
+### [X1] A device kernel without an accuracy test
 
 **A new GPU kernel ships with a test that compares it against a CPU or f32
 reference. A timing harness is not evidence of correctness, because it
@@ -250,7 +487,7 @@ Not a gate — "is there a test for this kernel" is a judgement, not a regex. Th
 signal is a `.cu` entry point whose only Rust-side exercise is a benchmark or an
 example.
 
-### [K2] …and it must prove the device actually ran
+### [X2] …and it must prove the device actually ran
 
 The companion failure, found the same week and strictly worse than a failing
 test: **a green test that certifies a path it never executed.** One device test
@@ -274,11 +511,11 @@ activations), so bit-identical output is proof of a fallback, and the test fails
 on it. Size fixtures past the entry's own validation, and drive the shape the
 dispatch actually takes.
 
-Together with [K]: a timing harness cannot see a kernel that is fast and wrong; a
+Together with [X1]: a timing harness cannot see a kernel that is fast and wrong; a
 correctness harness cannot see a kernel that never ran. A device test needs both
 guards.
 
-### [K3] Empty output is not evidence of broken decode
+### [X3] Empty output is not evidence of broken decode
 
 **A response filter that drops a region makes an empty completion a *legitimate*
 render.** `OutputFilter` removes `<think>…</think>` by design (reasoning is
@@ -300,7 +537,7 @@ result was real and the conclusion was not.
 fastest discriminator is not more instrumentation, it is *a prompt whose answer
 the filter cannot swallow*. Vary the input before you bisect the code.
 
-And the general form, which is the rule the whole [K] family serves: **a
+And the general form, which is the rule the whole [X] family serves: **a
 differential experiment is only as good as the axis you vary, and the axis worth
 varying is the one you are most confident does not matter.** The confound here
 sat in the axis held fixed — one prompt, reused all night for "verification",
@@ -313,37 +550,97 @@ in a list of ids and obvious beside its piece.
 
 ## What is intentionally NOT flagged
 
-The upstream rustsploit catalogue runs to 125+ patterns across A–Q. Most of its
-categories describe a different program — an async, network-facing module
-framework — and are omitted here rather than waived en masse:
+The upstream rustsploit catalogue runs to 125+ patterns. After the merge, most of
+its categories are present as **informational** sections rather than being waived
+en masse — a rule that reports is still a rule, and a rule that reports teaches
+nothing except by being read. What follows is the part that is genuinely absent:
 
-- **Network / HTTP / SQL / crypto / mass-scan wrappers** (its G2, H, K0, L, M):
-  no such surface exists in an inference engine.
-- **Async and blocking** (its F): peregrine's engine thread is *deliberately*
-  blocking and owns the model; `std::thread::sleep` and `std::fs` are correct
-  there, not defects.
-- **Numeric `as` casts** (its E1/E2) and **array indexing** (its D): pervasive and
-  intentional in kernel code, where bounds are structurally guaranteed by shape.
-  Gating them would produce thousands of hits and teach the team to ignore the
-  audit — the failure mode a gate must not have.
-- **`assert!` in production** (its A15): peregrine had exactly one, on KV-cache
-  append order, and it was removed for a different reason — the release profile
-  sets `panic = "abort"`, so an assert would have taken every concurrent sequence
-  down with the one bad request. It is now a propagated `Result`.
+- **`assert!` / `assert_eq!` in production code** (its A15): peregrine had exactly
+  one `assert!`, on KV-cache append order, and it was removed for a different
+  reason — the release profile sets `panic = "abort"`, so an assert would have
+  taken every concurrent sequence down with the one bad request. It is now a
+  propagated `Result`. `assert_eq!` and friends stay legal inside `#[cfg(test)]`
+  and are **not** gated there, because a test that cannot assert anything is not a
+  test.
+- **`Ok(_) => {}` arms**: ignoring a success *value* inside a full `match` is
+  normal. The `Err` arm is what the gate cares about, and it is covered.
+- **`unwrap_or(` / `unwrap_or_else(` with a *used* binding**: the grep cannot tell
+  an `Option` default from a `Result` swallow. The ignored-closure forms
+  `…or_else(|_e|` / `…map_err(|_e|` **are** gated.
+- **`todo!` / `unimplemented!` in a `#[cfg(feature = …)]` stub**: there are none.
+  If one appears, it is gated by `[A]` like any other — the point of a feature stub
+  is that the code behind it is unreachable *today*, not that its error handling
+  is exempt.
+- **The `TODO|FIXME|HACK` regex** — dropped outright, because comment lines are
+  stripped before matching and it could therefore only ever fire on a non-comment
+  line. A rule that cannot match its own motivating case is worse than no rule.
+- **Vendored code**: `peregrine-token` and the ported files of `peregrine-ctx`
+  are excluded from the file set (see `[E]`). The three `peregrine-ctx` files
+  peregrine authored are not vendored and are still scanned.
 
-What *was* worth adopting: **C** (lint suppression) and **Q** (Cargo hygiene),
-both mechanical and both already at zero, so gating them costs nothing and keeps
-prose claims honest. Also not flagged: `Ok(_) => {}` arms
-(ignoring a success *value* inside a full `match` is normal — the `Err` arm is
-what the gate cares about, and it is covered) and `unwrap_or(`/`unwrap_or_else(`
-with a used binding (the grep can't tell `Option` defaults from `Result`
-swallows; the ignored-closure form `…or_else(|_e|` *is* gated).
+What the merge added that is genuinely worth gating, and why these three:
+`[C]` (lint suppression, mechanical and at zero), `[T]` (Cargo hygiene, mechanical
+and at zero), and `[J]` secrets — the first two cost nothing to gate and keep a
+prose claim honest; the third is the only rule here whose violation is not
+recoverable by a later commit.
 
 ## Current status
 
-`--strict` is green: **P=0, B=0, U=0, C=0, Q=0, I=0** (informational: L=23
-let-else sites, R=21 unreferenced `pub fn`s; 62 files; `peregrine-token` excluded
-as vendored).
+Regenerate this block from `scripts/audit-bad-patterns.sh --budgets`; do not edit
+the numbers by hand. The gate reads the **working tree**, not the index, so "green"
+is a property of what is checked out — a green HEAD says nothing about a dirty
+tree, and a 2026-08-08 session proved it by regressing every strict section to
+`A=9, B=18, C=2` without touching a committed line.
+
+Measured 2026-10-16 over the full file set (120 files, `peregrine-token` and the
+ported files of `peregrine-ctx` excluded, the three `peregrine-ctx` files
+peregrine authored included), on a working tree with uncommitted work in
+`peregrine-ctx`, `peregrine-model`, `peregrine-serve`, `peregrine-tools`:
+
+```
+== peregrine bad-patterns audit (120 files) ==
+gated:   A/P=37  B=67  C=7  J=0  M=0  N/U=0  T/Q=0
+ratchet: D=425  E/I=2158  F=190  G=387  H=0  I=0
+         J/style=11  K=0  O=0  P=0  R/Z=46
+         B/let-else=33  C/bypass=48
+→ --strict exits 0 (every section at or under budget)
+```
+
+Read that honestly. The budgets did **not** move — they are still A=285, B=109,
+C=8, Z=65 — but the measured counts fell far below them, because exempting
+`peregrine-ctx`'s ported files removed 413 `[A]` hits of upstream code from the
+scanned set (the file set went 166 → 120 files, and `[Z]` went 67 → 46 with
+`audit-reachability.py` moved in step). So the ratchet is currently *loose*
+rather than tight: `[A]` has 248 hits of headroom. The honest follow-up is to
+regenerate these budgets with `--budgets` and move them down to the measured
+values in a separate change, because a scope edit and a budget edit should be
+argued separately. It has not been done yet.
+
+The previous measurement (2026-10-06, 166 files, `peregrine-ctx` still scanned)
+read `A=285 B=109 C=8 … R/Z=65`, i.e. every section exactly at its budget, which
+is what the ratchet was calibrated against. Of those 285 `[A]` hits, 240 were
+`.expect`/`.unwrap` in integration tests and examples, and most of them lived in
+the now-exempt `peregrine-ctx` port — which is why the count dropped by 248
+without a single line of code changing.
+
+Read that honestly. `[A]`/`[B]`/`[C]` are **not** at zero. The measured `[A]`=37
+splits 22 in examples, 8 in `src`, 7 in tests — still concentrated in
+integration tests and examples, which inherit no crate-root `#![deny(...)]`,
+which is why they were the first thing the audit was extended to cover. Five
+`[A]` hits were removed in the 2026-10-06 pass and the budget followed them down
+(290 → 285): the `.unwrap`/`.unwrap_err` sites that clippy's `deny` was *already*
+failing on, converted to named errors. A ratchet whose budget drifts upward is
+not a ratchet. `[J]` secrets, `[M]` injection, `[N]` UB and `[T]` Cargo hygiene
+**are** at zero — and `[M]` reached zero for a real reason that round: the
+extended scan found `iobench` shelling out to `sh -c 'ulimit -l'` to report
+`RLIMIT_MEMLOCK`, which is now a direct `getrlimit` through
+`peregrine_io::memlock_limit()`.
+
+`--strict` is green: **A=37, B=67, C=7, J=0, M=0, N=0, T=0**, every one at or
+under its ratchet budget (informational: 33 let-else sites, 46 unreferenced
+`pub fn`s; 120 files; `peregrine-token` and the ported `peregrine-ctx` files
+excluded as vendored). This line used the pre-ratchet letter scheme
+(`P=0, B=0, U=0, … 62 files`) and was left behind when the budget table landed.
 
 *These counts had drifted — this block read `L=16, R=50, 55 files` while the gate
 reported `L=23, R=21, 62 files`, which is the same failure the gate exists to
@@ -364,14 +661,16 @@ attribute, so `clippy.toml`'s `allow-expect-in-tests = false` is unenforced
 there and has to be kept by hand; the audit does not scan them either
 (`*/src/*` only).
 
-Of the R list, five entries were confirmed as genuine unreachable
-features and are catalogued in [R] above; the rest are library API the binaries
+Of the `[Z]` list, five entries were confirmed as genuine unreachable
+features and are catalogued in [Z] above; the rest are library API the binaries
 do not happen to call. Two of the five — the `perf_event_open` counter and the
 slab pool's generation tagging — were downgraded from ✅ to 🟡 in `todo.md` when
-this pass found them. **No `// audit-allow:`
+this pass found them. **No bare `// audit-allow:`
 waivers and no `#[allow(...)]` attributes remain anywhere in first-party code** —
 the waiver mechanism still exists, but every former use was replaced with real
-handling (see below). Note: the root-level `audit-bad-patterns.sh` was previously a stale
+handling (see below), and the ten that remain are all *reasoned*
+(`// audit-allow: LM token count, not a credential`) token-count field names that
+`[J]` would otherwise read as secrets. Note: the root-level `audit-bad-patterns.sh` was previously a stale
 copy that resolved its repo root incorrectly and scanned zero files — it is now
 a shim delegating to `scripts/audit-bad-patterns.sh`, the canonical gate.
 Beyond the gate, error plumbing is structured workspace-wide: every fallible

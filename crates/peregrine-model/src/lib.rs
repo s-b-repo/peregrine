@@ -19,6 +19,7 @@ pub mod block_exec;
 pub mod gdn;
 pub mod qwen4;
 pub mod hyper;
+pub mod hybrid;
 pub mod pinned;
 pub mod ngram;
 pub mod tree;
@@ -27,6 +28,7 @@ pub mod devices;
 pub mod draftdist;
 pub mod dsa;
 pub mod gpu;
+pub mod future;
 pub mod iotune;
 pub mod statefp;
 pub mod ledger;
@@ -80,6 +82,9 @@ pub use attention::{
     LayerKv, RowAttn, RowLayout,
 };
 pub use block_exec::BlockExecMode;
+pub use future::{
+    plan_future_routes, FuturePrefetchMode, FuturePrefetchSettings, FutureRoutePlan, TokenRouteTable,
+};
 pub use math::{
     layernorm, rmsnorm, rmsnorm_inplace, rope_interleave, rope_interleave_with, sigmoidf, siluf, silu_mul, softmax,
     RopeTable,
@@ -92,6 +97,7 @@ pub use model::{
     accept_run, accept_run_sampled, kv_dtype, lookahead_issued, save_automaton, save_macrostates, KvExport,
     KvLayerExport, Model, SeqKv, Verified,
 };
+pub use hybrid::{ExpertSource, HybridWeights, WeightPolicy, WeightPolicyConfig, WeightResolver};
 pub use iotune::{IoTuner, IowqCap};
 pub use lane::{Bias, BubbleTuner, LaneBalancer, LaneTimings, LaneTimingsAccum, Placement};
 pub use learn::{learn_mode, BanditScheduler, KnobArm, LearnMode, QAction, QScheduler, QState};

@@ -77,7 +77,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// deterministic and dependency-free, and a learned embedder is none of those.
 /// What changes is that replacing it is now a constructor argument rather than
 /// a patch.
-pub trait Embedder: std::fmt::Debug {
+pub trait Embedder: std::fmt::Debug + Send {
     fn embed(&self, text: &str) -> Vec<f32>;
 
     /// Dimensionality. Vectors from one embedder are never comparable with

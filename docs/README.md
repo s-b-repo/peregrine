@@ -34,7 +34,7 @@ engine that drives CPU, GPU, RAM, and SSD concurrently. New here? Start with
 | [The concurrent 3-lane scheduler](concurrent-scheduler.md) | task model, the GPU/CPU/I-O lanes, deterministic accumulation, dispatch-order shaping |
 | [Adaptive runtime](adaptive-runtime.md) | lane telemetry, bubble tuner & lane balancer, IoTuner, sensor governors, learned schedulers, cross-session persistence |
 | [Prefetch & caching](prefetch-and-caching.md) | the prediction spine, two-tier speculation, the warm RAM cache, GPU residency |
-| [I/O & storage](io-and-storage.md) | the io_uring reactor, O_DIRECT lane, slab pool, zstd, hugepages, NUMA, topology probe, perf counters, **per-read latency distribution** and device-geometry alignment |
+| [I/O & storage](io-and-storage.md) | the io_uring reactor, O_DIRECT lane, slab pool, zstd, hugepages, NUMA, topology probe, perf counters, **per-read latency distribution** and device-geometry alignment; plus the **bytes/token wall** measured on a SATA stripe — device ceiling, byte ledger, a 2026-09 SSD-MoE literature triage, and why async multi-stream is a trade rather than a multiplier |
 | [GPU / CUDA lane](gpu-cuda.md) | building with `cuda`, runtime gates, pinned staging & graphs, autotuning, what still needs hardware |
 | [GPU vendors](gpu-vendors.md) | one kernel source for NVIDIA (production) and AMD/HIP (compiles-by-construction, awaiting hardware): the WMMA/shuffle bracketing, build selection, and the first-run-on-ROCm validation runbook |
 | [Tokenizer](tokenizer.md) | the vendored gigatoken BPE fast path: what's vendored, what's dropped, parity gates |

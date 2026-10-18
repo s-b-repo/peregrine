@@ -2789,19 +2789,21 @@ pub fn run_subject_control(turns: usize, budget: usize) -> Result<(), DcrError> 
 // ---------------------------------------------------------------------------
 
 /// How much of each turn's assembled context is a byte-identical prefix of the
-/// previous turn's.
+/// previous turn's — under both renderers.
 ///
 /// External work on production context assembly treats cache-aware layout as a
 /// first-order concern: providers bill cached prefix tokens at a large discount,
 /// so a context whose stable material comes first is materially cheaper than one
 /// that is re-derived each turn, at the same token count.
 ///
-/// This runtime optimises the opposite quantity. It re-solves the knapsack every
-/// turn to assemble the cheapest *sufficient* context, which is by construction
-/// a different context. Nothing in the design tries to keep a stable prefix, and
-/// nothing in the reported cost model accounts for the discount that stability
-/// would earn. So "457 tokens per query" and "457 billable tokens per query" are
-/// not the same claim, and this measures the gap rather than assuming it away.
+/// The default renderer optimises the opposite quantity. It re-solves the
+/// knapsack every turn to assemble the cheapest *sufficient* context, leads
+/// with a per-turn header, and ranks entries by a utility score that moves
+/// every turn — so almost nothing is a reusable prefix. `render_prefix_stable`
+/// is the cache-aware alternative: turn-invariant header, content-addressed
+/// ordering, per-turn stats in a trailer. Both are measured on the *same*
+/// plans here, so layout is the only variable; what remains on the stable side
+/// is genuine membership churn, which is the knapsack's job.
 pub fn run_cache_layout(turns: usize, budget: usize) -> Result<(), DcrError> {
     let corpus = build_corpus(turns);
     let mut runtime = Dcr::new(budget);
@@ -2810,25 +2812,35 @@ pub fn run_cache_layout(turns: usize, budget: usize) -> Result<(), DcrError> {
     }
     let mut reasoner = LocalReasoner::new();
 
+    // Stickiness changes membership itself, not just layout, so it needs its
+    // own runtime and its own plans. Same corpus, same probes, weight on.
+    let mut sticky = Dcr::new(budget);
+    sticky.planner.weights.stickiness = 0.5;
+    sticky.prefix_stable = true;
+    for (doc_id, text) in &corpus.docs {
+        sticky.ingest(text, Some(doc_id))?;
+    }
+    let mut sticky_reasoner = LocalReasoner::new();
+
     println!("PROMPT-CACHE LAYOUT - {turns} turns, B_attention = {budget}");
     println!(
-        "Shared prefix between consecutive turns, in the order the context is actually rendered."
+        "Shared prefix between consecutive turns. ranked vs stable: same plans, only layout \
+         differs. sticky: own plans, stable layout plus a retention bonus (0.5)."
     );
     let header = format!(
-        "{:<38} {:>9} {:>14} {:>10}",
-        "probe", "tokens", "shared prefix", "cacheable"
+        "{:<38} {:>9} {:>16} {:>16} {:>16}",
+        "probe", "tokens", "ranked prefix", "stable prefix", "sticky prefix"
     );
     println!("{}", "-".repeat(header.len()));
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
 
-    let mut previous: Option<String> = None;
-    let (mut total_tokens, mut total_shared) = (0usize, 0usize);
-    for probe in &corpus.probes {
-        let answer = runtime.ask_with(probe.query, None, &mut reasoner);
-        let rendered = answer.context.render();
-        let tokens = estimate_tokens(&rendered);
-        let shared_chars = previous
+    // Shared prefix measured in tokens, priced against the layout's *own*
+    // token count: the three columns render different bytes (and the sticky
+    // column plans its own membership), so one shared denominator would
+    // compare percentages of different wholes.
+    let shared_tokens = |previous: &Option<String>, rendered: &str| -> usize {
+        let mut shared = previous
             .as_ref()
             .map(|prev| {
                 prev.as_bytes()
@@ -2838,27 +2850,67 @@ pub fn run_cache_layout(turns: usize, budget: usize) -> Result<(), DcrError> {
                     .count()
             })
             .unwrap_or(0);
+        // The common byte prefix of two UTF-8 strings can end inside a
+        // codepoint ('é' vs 'è' share a lead byte) — slice only at a boundary.
+        while shared > 0 && !rendered.is_char_boundary(shared) {
+            shared -= 1;
+        }
         // Price the shared run in tokens, so the number is comparable to k.
-        let shared_tokens = estimate_tokens(&rendered[..shared_chars.min(rendered.len())]);
-        total_tokens += tokens;
-        total_shared += shared_tokens;
+        estimate_tokens(&rendered[..shared])
+    };
+
+    let mut previous_ranked: Option<String> = None;
+    let mut previous_stable: Option<String> = None;
+    let mut previous_sticky: Option<String> = None;
+    let (mut total_ranked, mut total_stable, mut total_sticky) = (0usize, 0usize, 0usize);
+    let (mut tokens_ranked, mut tokens_stable, mut tokens_sticky) = (0usize, 0usize, 0usize);
+    for probe in &corpus.probes {
+        let answer = runtime.ask_with(probe.query, None, &mut reasoner);
+        let ranked = answer.context.render();
+        let stable = answer.context.render_prefix_stable();
+        let sticky_answer = sticky.ask_with(probe.query, None, &mut sticky_reasoner);
+        let sticky_rendered = sticky_answer.context.render_prefix_stable();
+        let tokens = estimate_tokens(&ranked);
+        let stable_tokens = estimate_tokens(&stable);
+        let sticky_tokens = estimate_tokens(&sticky_rendered);
+        let ranked_shared = shared_tokens(&previous_ranked, &ranked);
+        let stable_shared = shared_tokens(&previous_stable, &stable);
+        let sticky_shared = shared_tokens(&previous_sticky, &sticky_rendered);
+        tokens_ranked += tokens;
+        tokens_stable += stable_tokens;
+        tokens_sticky += sticky_tokens;
+        total_ranked += ranked_shared;
+        total_stable += stable_shared;
+        total_sticky += sticky_shared;
         println!(
-            "{:<38} {tokens:>9} {shared_tokens:>14} {:>9.1}%",
+            "{:<38} {tokens:>9} {:>15.1}% {:>15.1}% {:>15.1}%",
             probe.label,
-            shared_tokens as f64 / tokens.max(1) as f64 * 100.0
+            ranked_shared as f64 / tokens.max(1) as f64 * 100.0,
+            stable_shared as f64 / stable_tokens.max(1) as f64 * 100.0,
+            sticky_shared as f64 / sticky_tokens.max(1) as f64 * 100.0
         );
-        previous = Some(rendered);
+        previous_ranked = Some(ranked);
+        previous_stable = Some(stable);
+        previous_sticky = Some(sticky_rendered);
     }
     println!("{}", "-".repeat(header.len()));
     println!(
-        "overall cacheable prefix: {:.1}% of assembled tokens ({total_shared} of {total_tokens})",
-        total_shared as f64 / total_tokens.max(1) as f64 * 100.0
+        "overall cacheable prefix: ranked {:.1}% ({total_ranked} of {tokens_ranked}), \
+         stable {:.1}% ({total_stable} of {tokens_stable}), \
+         sticky {:.1}% ({total_sticky} of {tokens_sticky})",
+        total_ranked as f64 / tokens_ranked.max(1) as f64 * 100.0,
+        total_stable as f64 / tokens_stable.max(1) as f64 * 100.0,
+        total_sticky as f64 / tokens_sticky.max(1) as f64 * 100.0,
     );
     println!(
-        "A low number is not a bug — it is the cost of re-planning. It does mean the token\n\
-         counts elsewhere in this report are *assembled* tokens rather than *billable* ones,\n\
-         and that a cache-friendly assembler sending more tokens could still be cheaper per\n\
-         turn. Nothing here has measured that comparison."
+        "The ranked number is the cost of re-planning; the stable number is what a\n\
+         cache-aware layout recovers at the same membership; the sticky number is what\n\
+         a retention bonus adds on top. What stickiness costs in probe correctness is\n\
+         measured separately (`bench` and `bench --ablate` with the weight on) — a\n\
+         stability gain that bought itself with a wrong answer would not be one.\n\
+         Neither number makes the token counts elsewhere in this report *billable*\n\
+         rather than *assembled*: that takes a provider-side cache measurement this\n\
+         harness cannot see."
     );
     Ok(())
 }

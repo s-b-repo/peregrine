@@ -61,6 +61,7 @@ pub mod geometry;
 pub mod cache;
 pub mod latency;
 pub mod mem;
+pub mod mmap;
 pub mod perf;
 pub mod ring;
 pub mod sensors;
@@ -72,9 +73,10 @@ pub mod warmcache;
 pub use cache::ExpertCache;
 pub use mem::{
     advise_dontneed, advise_dontneed_slice, advise_hugepages, advise_hugepages_slice,
-    bind_local_if_enabled, current_numa_node, hugepage_disabled, mbind_to_node, page_size,
+    bind_local_if_enabled, current_numa_node, hugepage_disabled, mbind_to_node, memlock_limit, page_size,
     numa_pin_enabled, pin_current_thread, wire_resident, Wired,
 };
+pub use mmap::MmapFile;
 pub use perf::PerfCounter;
 pub use sensors::{energy_uj, max_temp_c, EnergyMeter};
 pub use ring::{

@@ -238,8 +238,13 @@ fn vm_locked_bytes() -> Option<u64> {
 }
 
 /// The `RLIMIT_MEMLOCK` soft limit in bytes, `u64::MAX` for unlimited.
+///
+/// Public because it is the number an operator has to see: `iobench`'s
+/// registered-buffer arm reports it in the failure it prints, and shelling out
+/// to `sh -c 'ulimit -l'` to get it there is a dependency on a shell that the
+/// engine itself does not have.
 #[cfg(target_os = "linux")]
-fn memlock_limit() -> u64 {
+pub fn memlock_limit() -> u64 {
     // SAFETY: `getrlimit` writes into the provided, fully-owned struct.
     unsafe {
         let mut rl: libc::rlimit = std::mem::zeroed();

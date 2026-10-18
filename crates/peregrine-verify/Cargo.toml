@@ -1,0 +1,24 @@
+[package]
+name = "peregrine-verify"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "peregrine's numerical certificate suite: every load-bearing identity stated as a theorem, measured as a residual, bounded by a tolerance taken from the arithmetic"
+
+[dependencies]
+peregrine-core = { path = "../peregrine-core" }
+peregrine-kernels = { path = "../peregrine-kernels" }
+peregrine-model = { path = "../peregrine-model" }
+peregrine-io = { path = "../peregrine-io" }
+peregrine-par = { path = "../peregrine-par" }
+peregrine-ctx = { path = "../peregrine-ctx" }
+peregrine-token = { path = "../peregrine-token" }
+
+[lib]
+name = "peregrine_verify"
+path = "src/lib.rs"
+
+[[bin]]
+name = "peregrine-verify"
+path = "src/bin/peregrine-verify.rs"

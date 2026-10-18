@@ -337,3 +337,277 @@ Measured expectation on real expert shapes: a ~3 MB region spans ~23 units, so
 starting mid-unit costs about **4 % more units for about 0.5 % more disk**. Small
 but real — and a unit count is not a latency, so the writer stays untouched
 until `iobench` confirms it on the real shards with a cold cache.
+## The bytes/token wall on a SATA stripe (2026-09-26, GLM-5.3-Flash)
+
+Issue #9 asks for ≥2 tok/s aggregate. This section records what the *host* in
+front of the engine can deliver for that model, and which of the 2026-09 SSD-MoE
+papers' levers survive contact with it. Everything below is measured on this box
+unless a line says `projected`.
+
+### What the three drives deliver
+
+`sda` + `sdb` + `sdd`, the HDD removed, expert shards physically split across all
+three (`GLM-5.3-Flash-4ssd/model_paths.json` → `glm53-experts` on each drive), so
+one token's sweep is a genuinely parallel read:
+
+| measurement | value |
+|---|---|
+| single device, cold sequential | ~0.40 GB/s |
+| **aggregate across the three, cold** | **1.10 – 1.23 GB/s** |
+| queue-depth scaling beyond 2 rings | **flat** |
+
+Flat beyond two rings is the important row: the ceiling is the *media*, not the
+submission path, so no amount of io_uring tuning, ring count, or batching buys
+bytes that the drives cannot serve. The engine's own lane accounting agrees —
+`io 72.2 s (91%)  cpu 6.9 s (9%)` — it is not doing anything except waiting.
+
+### What one token costs
+
+Locked configuration (`scripts/serve-glm53-flash-cuda.sh` defaults: lookahead 64,
+RSS guard 20 GB, `COLI_ECACHE_GB=6`, GPU expert tier off, prefetch-protect off),
+B=1, 4 tokens, byte ledger from `[ledger]`:
+
+| quantity | value |
+|---|---|
+| bytes per expert | 12,615,680 |
+| requested | 4.239 GB/token |
+| unique (union) | 4.239 GB/token — 0.0% saved by batch union at B=1 |
+| **cache-served** | **18.2% of unique** |
+| **from disk** | **3.469 GB/token** |
+| re-read (evicted) | 2.6% of disk traffic |
+| prefetch waste | 0.0% (prefetch off) |
+| working set vs cache | 4.04 GB routed against 6.00 GB = **148% of a pass** |
+| throughput | 0.144 tok/s cold, **0.24 tok/s warm** |
+
+### The arithmetic that closes single-stream 2 tok/s
+
+At 3.469 GB/token off the devices, the SATA ceiling allows **0.317–0.354 tok/s**.
+The warm measurement is 0.24, i.e. **~72% of the I/O-bound ceiling** — about 28%
+of remaining slack is overlap efficiency, and that is the *entire* inventory of
+software-side headroom that does not involve moving bytes.
+
+2 tok/s single-stream therefore needs **6.9 GB/s of device bytes**, or 8.5 GB/s
+if nothing were cached — **6–7× the media ceiling**. This is not a scheduling
+deficit and cannot be tuned out on SATA. Any claim of 2 tok/s at B=1 on this box
+is arithmetically false, and `docs/deployment-glm53-flash.md` should be read with
+that sentence beside it.
+
+A second, independent confirmation of the model comes from
+[arXiv 2608.18261](https://arxiv.org/abs/2608.18261), which measures 0.44 tok/s
+warm serving Qwen3-235B-A22B Q4_K_M on 8 GB of VRAM and notes it is "in exact
+agreement with a bytes-per-token ÷ bandwidth model". Same equation, different
+hardware, same agreement — which is why the division above is trusted here.
+
+### Which 2026-09 levers survive a 1.2 GB/s ceiling
+
+Five papers bear directly on this. Each is recorded with what it claims and what
+this box says about it — because two of them do not transfer, and the reason why
+is the useful part.
+
+**[2609.18110 SSD-LLaMA](https://arxiv.org/abs/2609.18110) — the critique that
+names our engine.** It benchmarks *Colibri* (peregrine's upstream) explicitly and
+finds that Colibri achieves **higher read bandwidth** than the proposed system
+while paying **higher per-token I/O traffic**; SSD-LLaMA moves 1.5× less data per
+token than KTransformers and 1.8× less than llama.cpp, and claims 77.7% of peak
+SSD read bandwidth against a 43.2% baseline. Read against the table above, the
+first half of that critique cannot apply here: peregrine runs at ~91% lane
+occupancy and ~72% of its own device ceiling, on SATA where the peak *is* ~1.2
+GB/s. It is not the bandwidth-inefficient case. The second half applies exactly —
+the bytes per token are the wall. Of its three mechanisms, pack layout with O(1)
+byte offsets is already in the tree (`[expertmap] indexed=19456 coalescing=98.7%
+→ 39936 reads per full sweep vs 116736 unmerged`), bit-width is a measured dead
+end *for data-free rounding* (below), and **partial-tensor tiering — keeping
+`gate`/`up` hot and `down` cold rather than caching an expert whole — is the one
+mechanism genuinely absent here.**
+
+**[2609.18063 Edge0](https://arxiv.org/abs/2609.18063) — prediction as routing,
+not prediction and verification.** Its claim is that a prerouter predicting the
+next layer's routing *one token ahead*, consumed *as* the routing so the staged
+set equals the routed set, reaches ~20 tok/s for a 35B MoE inside 3 GiB of peak
+active memory — and that the advantage is "conservation, not prediction quality".
+This is the one paper that explains a negative result of ours better than we
+did. Our predict-*and-verify* prefetch measured **+3 hits for 4034 extra reads
+and +41% wall time**, and our own scoreboard puts `router-lookahead` at **92.5%
+recall / 46.3% precision** at width 16. Under verify, that 46.3% precision is
+wasted I/O, which is exactly what was measured. Under *prediction-as-routing*,
+the same 92.5% recall is ~92.5% of the sweep staged before it is needed and 46.3%
+precision becomes a **quality** cost instead of an I/O cost. With those numbers
+the device bytes fall enough to reach 1–3 tok/s on this hardware — the only lever
+in this document that arithmetically reaches 2 tok/s at B=1. It is also the only
+one that requires training a recovery adapter: it changes which experts compute
+a token, so `peregrine flip-rate` gates it and a LoRA has to pay the loss back.
+It is a project, not a knob.
+
+**[2608.18261 — a negative result worth more than most positive ones](https://arxiv.org/abs/2608.18261).**
+Three numbers here land directly on open questions in this repo:
+
+- **Expert reuse between adjacent tokens is 2.0× chance.** Our own trace of
+  GLM-5.3-Flash gives 22% consecutive-token overlap against an 11.6% uniform-null
+  baseline — **1.9× chance**, on a different model, from different tooling. The
+  locality is real, weak, and now corroborated twice; it is also the hard ceiling
+  on single-stream caching, which is what the 18.2% served figure is bumping
+  against.
+- **Batching collapses.** The paper builds "a plausible request-batching scheme
+  that should amortize one disk sweep over many streams" and reports it collapses
+  at batch 32 under paging thrash. This is the scheme the ≥2 tok/s aggregate
+  target rests on, and it fails on *memory*, not bandwidth — which matches this
+  box exactly (`Swap: 15/15 GB used, 0 free` during a B=1 run).
+- **Routing locality is not trainable at acceptable cost.** Locality training cut
+  cache misses by up to 60% but *every* configuration failed a pre-registered
+  ≤1% perplexity gate; miss reduction and perplexity cost were tightly coupled.
+  That closes idea #6 ("router fine-tuning for locality") in
+  `docs/ideas-github-issue-7-2026-08-23.md` on external evidence, and it closes
+  it cheaply — no training run needs to be budgeted for it.
+
+**[2601.17063 FlashMoE](https://arxiv.org/abs/2601.17063) — and why its 2.6× is
+not ours.** An ML replacement policy combining recency and frequency improves hit
+rate by up to 51% over LRU/LFU and reports up to 2.6× speedup on a real desktop.
+The *mechanism* is one this repo already discovered from the other side, and
+harder: at sub-one-pass capacity, pure LRU returns **0 hits out of 9944** lookups
+while the cache sits 100% full, because a deterministic front-to-back layer sweep
+makes LRU retain exactly the complement of what is needed next (see
+`bench-data/2026-08-10-sweep-eviction/`). What does not transfer is the
+*magnitude*, and the reason is capacity regime: FlashMoE's gain is a
+below-threshold gain, and this configuration runs at **148% of a pass**, where
+plain recency already captures ~83% of the reuse that exists (18.2% served
+against a 22% overlap ceiling). Applying their +51% relative hit-rate gain to
+these numbers buys **~+13% tok/s, not 2.6×**. Replacement policy is the most
+cited lever in this literature and the least available here.
+
+**[2512.09277 METRO](https://arxiv.org/abs/2512.09277) — the right question,
+wrong substrate.** Balancing *activated experts* rather than tokens per worker
+reduces decode latency 11–22% (up to 4.11× decode throughput at fixed SLO) in
+expert-parallel GPU serving, because token-balancing inflates the distinct-expert
+count and memory-bound workers pay for the union. The insight is precisely the
+union amplification this box shows — at B=16 with k=8 of 288, the expected
+distinct set is ~105 experts, i.e. ~6.6 expert-equivalents per token instead of
+8. But it is about spreading a union across GPUs, and at B=1 there is no union to
+balance (`share=1.000x` by construction). Transferable as arithmetic, not as a
+mechanism to implement.
+
+### Is "many async streams" a throughput multiplier? Measured: no, it is a trade
+
+The question deserves the measured answer rather than the intuitive one, because
+the machinery already exists and has already been run on this model.
+
+`crates/peregrine-serve/src/batch.rs` is a continuous-batching engine: an async
+HTTP handler submits requests over two priority channels, **one** engine thread
+drains high- then normal-priority each tick, admits up to `MAX_BATCH` sequences,
+and runs **one batched step across all active rows**. The I/O under it is already
+fully async and already parallel — one io_uring ring per device, device-pure claim
+groups (`COLI_IO_DEVICE_SCHED`). Request-level concurrency, async submission, and
+parallel device reads are not missing features; they are the shipped shape.
+
+Measured on GLM-5.3-Flash (`docs/deployment-glm53-flash.md`, serialized runs):
+
+| Arm | tok/s | Per stream |
+|---|---:|---:|
+| sustained B=1 | **0.154** | 0.154 |
+| B=16, CPU shared path | **0.335** aggregate | 0.021 → **48 s/token/user** |
+| B=16, GPU shared path | 0.299 aggregate | 0.019 |
+
+16× the streams buys **2.2× the aggregate** and hands each user forty-eight
+seconds per token. Three walls explain why that is the whole of it:
+
+1. **Async removes waiting, not bytes.** Delivered bandwidth is ~0.83 GB/s
+   against a measured 1.10–1.23 GB/s ceiling, and the lane is already `io 91%`
+   occupied at B=1 — there is no idle bubble for a second stream to fill. The
+   three drives are DRAMless SATA parts (Kingston SA400, Acer RE100, Crucial
+   BX500) each at ~0.4 GB/s, so the stripe is delivering ~90% of the *sum of its
+   parts*; parallelism is not the missing ingredient, media is.
+2. **Union amortization is capped near 1.23×.** Batching's only byte-reducing
+   mechanism is that B streams share experts. At k=8 of 288, expected distinct
+   experts = 288·(1 − (1 − 8/288)^16) ≈ **104 of the 128 requested** = 0.815
+   bytes/token. That lifts the aggregate ceiling from 1.2/3.47 = 0.35 to
+   1.2/2.83 = **0.42 tok/s** — and the measured 0.335 sits below even that.
+3. **Memory is the wall that actually breaks it.** The batch's per-step routed
+   set is ~104 experts × 43 layers × 12 MB ≈ **56 GB** against a 6 GiB cache —
+   941% of a pass — on a box whose swap read `15/15 GB used, 0 free` during a
+   *B=1* run. This is exactly the failure 2608.18261 documented: a correctly
+   built request-batching scheme that "should amortize one disk sweep over many
+   streams" **collapsed at batch 32 under paging thrash**, dying on memory rather
+   than bandwidth. The serve script's own comment records the same event here at
+   B=16 with `COLI_ECACHE_GB=10`: MemAvailable 28.7 → 3.0 GB, swapping began,
+   which is why `COLI_RSS_GUARD_GB` exists and refuses rather than swaps.
+
+The shape to avoid is N separate B=1 server processes: that multiplies byte
+demand by N (N × 3.47 GB/token against one fixed 1.2 GB/s) and gives each
+process its own 4.04 GB working set to evict the others' with.
+
+There is, however, a real async gap the current design cannot close with streams
+at all. The engine runs **exactly one decode step at a time**, and step t+1's
+layer L cannot be fetched before step t computes it, because routing for L is
+produced by layer L−1. That is why cross-step prefetching failed here — predict
+*and verify* measured **+3 hits for 4034 extra reads and +41% wall time**. The
+version of "all work is async" that converts into bytes is prediction consumed
+*as* routing (2609.18063), where the speculation is used rather than checked.
+
+### Levers, ranked by measured magnitude
+
+| # | Lever | Effect on device GB/token | Status |
+|---|---|---|---|
+| 1 | **Reclaim RSS; stop the indexer** | none directly — unblocks 2 and 3 | `baloo_file` holds **4.38 GB** RSS and has read **107 GB** cumulatively with **nothing excluded** from indexing `/srv`. Needs consent to stop. |
+| 2 | **Calibrated int3-g64** | 3.47 → ~3.0 (**−13.8%**, the RTN-measured byte effect) → **+14% tok/s** | Code-complete (`pack.rs:192`, `peregrine-requantize --calib`), **unrun** — needs row 1's RAM. Voids if calibration cannot beat RTN's int3 `flip_rate` of 0.514. |
+| 3 | **Overlap out to distance 2–7** | unknown; moves the 22% ceiling up or confirms it | The one open question `bench-data/2026-08-10-sweep-eviction/` left. Cheap, and the only way caching gets big. |
+| 4 | **NVMe hot tier** | 600p adds **669 MB/s** → ceiling +54%, ideal 0.35 → 0.53 tok/s | Only **21 GB** free on `/srv/model600p`, and the census needed to size it **does not exist** (below). Must be iobench'd before any claim. |
+| 5 | **Partial-tensor tiering** | bounded by the 1/3 gate/up/down split | Unimplemented; the SSD-LLaMA mechanism genuinely absent here. |
+| 6 | **Prediction-as-routing + LoRA** | 92.5% recall staged → ~0.3 GB/token → **1–3 tok/s** | The only lever that reaches issue #9's target arithmetically. Changes computed routing, so it is a training project gated by `flip-rate`, not a knob. |
+| 7 | **Batch wide (B>1)** | −18.5% at B=16 → aggregate ceiling 0.42 tok/s | Measured and memory-gated; 48 s/token/user. For aggregate serving, not latency. |
+| 8 | **Better replacement policy** | 18.2% → 27.4% hit → 3.08 GB/token = **+13%** | Real but last: at 148% of a pass, plain recency already captures ~83% of the reuse that exists. |
+| 9 | **Faster media** | 3.47 GB/token at ~4 GB/s = **>1 tok/s** | The honest answer to "2 tok/s at B=1" is a different drive, not different code. |
+
+Rows 1–5 stacked optimistically reach **~0.4 tok/s**, not 2. Issue #9's target on
+this box needs row 6 or row 9, and that should be said plainly rather than
+discovered late.
+
+### Corrections recorded by this pass
+
+- **`bench-data/2026-09-22-4drive-split/README.md` calls the array "4 HDDs" and
+  explains its rates as "HDD-class". Three of the four devices are SATA SSDs.**
+  Per sysfs `rotational`: `sda` Kingston SA400S37960G = 0, `sdb` Acer RE100 = 0,
+  `sdd` Crucial CT1000BX500SSD1 = 0; the spinning parts are `sdc` (Hitachi
+  HTS547575) and `sde` (WDC WD10SPZX), both 1. The GLM-5.3 placement already
+  excludes `sdc`, which is why the three-SSD stripe measures **1.10–1.23 GB/s**
+  where that README recorded 0.87 GB/s aggregate: the straggler was removed, the
+  array was not improved. Its 85%-of-sum contention story should be re-derived
+  before it is cited.
+- **The "browsers/Steam holding ~16 GB of deleted tmpfs files" comment in
+  `scripts/serve-glm53-flash-cuda.sh` does not reproduce.** Deleted-but-still-open
+  descriptors across the top RSS processes total **under 1 MB**. The actual
+  holders are `baloo_file` at **4.38 GB** and this box's dev/agent tooling at
+  ~7.5 GB. The RSS guard's *policy* is right; only its stated rationale was stale.
+- **`route_stats.json` cannot size a hot tier.** `heat` and `learn` are `null`
+  and `hist` carries **4 positions per layer** (168 layer-positions, 962 of 12,384
+  slots). Fitting a concentration curve to that returns artifacts — a naive read
+  says "top 16 experts per layer cover 78.4% of volume", true only because 4
+  positions × 8 experts cannot produce more than 32 distinct experts per layer. A
+  hot-expert tier needs hundreds of positions, which the calibration run in row 2
+  produces as a side effect.
+- The container at `/srv/m-sdd/GLM-5.3-Flash-peregrine` (101 GB) is an **aborted
+  import** — 30 expert layers holding 47/103/288 slots, against the served
+  container's 43 × 288 — not a lower-bit sibling. Do not serve it. The served
+  manifest is `GLM-5.3-Flash-4ssd`, whose `model_paths.json` points at
+  `glm53-experts` on `m-sda`/`m-sdb`/`m-sdd`.
+
+### Standing caveats
+
+- Every byte-ledger figure here is a **4-token run**; token 1 is cold and pulls
+  the served fraction down. The warm 0.24 tok/s baseline is a separate measurement
+  from the 0.144 tok/s ledger run.
+- Throughput numbers are single runs. The retained profile's table in
+  `docs/deployment-glm53-flash.md` came from `scripts/bench-glm53-cuda-matrix.sh`
+  in fresh serialized processes; arms must not overlap.
+- Bandwidth ceilings come from `peregrine-io`'s `iobench` with O_DIRECT and no
+  root for cache drops; the 1.10–1.23 GB/s spread is run-to-run, not a confidence
+  interval.
+- `iobench` reports decimal GB/s while the byte ledger reports GiB. Mixing them
+  moves derived tok/s by ~7%; the ~72%-of-ceiling claim is not robust to that unit
+  sloppiness at the last significant digit.
+- Projected rows are arithmetic on measured bytes, not benchmarks.
+
+
+
+
+
+
+

@@ -25,6 +25,15 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Dialect {
+    #[default]
+    Glm,
+    Qwen,
+}
+
+pub const QWEN_REASONING_INSTRUCTION: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+
 /// One entry of the request's `tools` array. `type` is accepted and ignored:
 /// every value OpenAI defines here is `"function"`, and rejecting an unknown
 /// one would fail a request the model could have served.
@@ -109,6 +118,67 @@ pub fn render_preamble(tools: &[ToolDef]) -> String {
     s
 }
 
+pub fn render_preamble_for(dialect: Dialect, tools: &[ToolDef]) -> String {
+    match dialect {
+        Dialect::Glm => render_preamble(tools),
+        Dialect::Qwen => render_preamble_qwen_with_thinking(tools, false),
+    }
+}
+
+pub fn render_preamble_for_with_thinking(
+    dialect: Dialect,
+    tools: &[ToolDef],
+    reasoning_enabled: bool,
+) -> String {
+    if !reasoning_enabled {
+        return render_preamble_for(dialect, tools);
+    }
+    match dialect {
+        Dialect::Glm => render_preamble(tools),
+        Dialect::Qwen => render_preamble_qwen_with_thinking(tools, true),
+    }
+}
+
+#[cfg(test)]
+pub fn render_preamble_qwen(tools: &[ToolDef]) -> String {
+    render_preamble_qwen_with_thinking(tools, false)
+}
+
+pub fn render_preamble_qwen_with_thinking(tools: &[ToolDef], reasoning_enabled: bool) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    if reasoning_enabled {
+        s.push_str(QWEN_REASONING_INSTRUCTION);
+        s.push_str("\n\n");
+    }
+    s.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    for t in tools {
+        let card = json!({
+            "type": "function",
+            "function": {
+                "name": t.function.name,
+                "description": t.function.description.as_deref().unwrap_or(""),
+                "parameters": t.function.parameters.clone().unwrap_or_else(|| json!({})),
+            }
+        });
+        s.push('\n');
+        s.push_str(&card.to_string());
+    }
+    s.push_str(
+        "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>",
+    );
+    s
+}
+
+pub fn render_assistant_calls_for(dialect: Dialect, tool_calls: &[Value]) -> String {
+    match dialect {
+        Dialect::Glm => render_assistant_calls(tool_calls),
+        Dialect::Qwen => render_assistant_calls_qwen(tool_calls),
+    }
+}
+
 /// Render an assistant turn's tool calls back into GLM markup, so a
 /// multi-turn conversation replays to the model in the form it emitted.
 pub fn render_assistant_calls(tool_calls: &[Value]) -> String {
@@ -135,6 +205,37 @@ pub fn render_assistant_calls(tool_calls: &[Value]) -> String {
             }
         }
         s.push_str("</tool_call>");
+    }
+    s
+}
+
+pub fn render_assistant_calls_qwen(tool_calls: &[Value]) -> String {
+    let mut s = String::new();
+    let mut first = true;
+    for c in tool_calls {
+        let f = c.get("function").unwrap_or(c);
+        let Some(name) = f.get("name").and_then(Value::as_str) else { continue };
+        if !first {
+            s.push('\n');
+        }
+        first = false;
+        s.push_str("<tool_call>\n<function=");
+        s.push_str(name);
+        s.push_str(">\n");
+        let args: Value = match f.get("arguments").and_then(|value| value.as_str()) {
+            Some(raw) => serde_json::from_str(raw).unwrap_or(Value::Null),
+            None => f.get("arguments").cloned().unwrap_or(Value::Null),
+        };
+        if let Some(obj) = args.as_object() {
+            for (k, v) in obj {
+                s.push_str("<parameter=");
+                s.push_str(k);
+                s.push_str(">\n");
+                s.push_str(&value_to_text(v));
+                s.push_str("\n</parameter>\n");
+            }
+        }
+        s.push_str("</function>\n</tool_call>");
     }
     s
 }
@@ -174,14 +275,32 @@ pub struct OutputFilter {
     /// Declared parameter types, so an argument's JSON type comes from the
     /// tool's own schema instead of from what its text happens to look like.
     schemas: SchemaMap,
+    dialect: Dialect,
+    capture_reasoning: bool,
+    reasoning: String,
 }
 
 impl OutputFilter {
     /// A filter that types arguments from the request's tool schemas. Pass an
     /// empty slice for a request that declared none — the markup is still
     /// stripped, since a model can emit it whether or not it was asked to.
+    #[cfg(test)]
     pub fn with_tools(tools: &[ToolDef]) -> Self {
-        Self { schemas: schema_map(tools), ..Self::default() }
+        Self::with_tools_dialect(tools, Dialect::Glm, false)
+    }
+
+    #[cfg(test)]
+    pub fn with_qwen_tools(tools: &[ToolDef], capture_reasoning: bool) -> Self {
+        Self::with_tools_dialect(tools, Dialect::Qwen, capture_reasoning)
+    }
+
+    pub fn with_tools_dialect(tools: &[ToolDef], dialect: Dialect, capture_reasoning: bool) -> Self {
+        Self {
+            schemas: schema_map(tools),
+            dialect,
+            capture_reasoning,
+            ..Self::default()
+        }
     }
 
     /// Push a decoded chunk; returns the text safe to show the client now.
@@ -204,6 +323,10 @@ impl OutputFilter {
         std::mem::take(&mut self.calls)
     }
 
+    pub fn take_reasoning(&mut self) -> String {
+        std::mem::take(&mut self.reasoning)
+    }
+
     /// The name of the call currently open, before any argument parsing —
     /// the cheap probe (one `find` over the buffered body) that lets a
     /// speculator skip non-hosted tools without ever building a snapshot.
@@ -213,12 +336,20 @@ impl OutputFilter {
         if !self.in_call {
             return None;
         }
-        let cut = self.call_buf.find("<arg_key>").unwrap_or(self.call_buf.len());
-        let name = self.call_buf[..cut].lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-        if name.is_empty() || name.contains('<') {
-            return None;
+        match self.dialect {
+            Dialect::Glm => {
+                if looks_like_qwen_call(&self.call_buf) {
+                    return qwen_call_name(&self.call_buf);
+                }
+                let cut = self.call_buf.find("<arg_key>").unwrap_or(self.call_buf.len());
+                let name = self.call_buf[..cut].lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+                if name.is_empty() || name.contains('<') {
+                    return None;
+                }
+                Some(name)
+            }
+            Dialect::Qwen => qwen_call_name(&self.call_buf),
         }
-        Some(name)
     }
 
     /// The call the still-open `<tool_call>` determines so far — the
@@ -235,60 +366,67 @@ impl OutputFilter {
         if !self.in_call {
             return None;
         }
-        parse_call_prefix(&self.call_buf, Some(&self.schemas)).map(|c| SpecSnapshot { name: c.name, arguments: c.arguments })
+        parse_call_prefix_dialect(&self.call_buf, Some(&self.schemas), self.dialect)
+            .map(|c| SpecSnapshot { name: c.name, arguments: c.arguments })
+    }
+
+    fn capture(&mut self, text: &str) {
+        if self.capture_reasoning {
+            self.reasoning.push_str(text);
+        }
     }
 
     fn drain(&mut self, eof: bool) -> String {
         let mut out = String::new();
         loop {
             if self.in_call {
-                match self.pending.find("</tool_call>") {
-                    Some(i) => {
-                        self.call_buf.push_str(&self.pending[..i]);
-                        self.pending = self.pending[i + "</tool_call>".len()..].to_string();
-                        self.in_call = false;
-                        let buf = std::mem::take(&mut self.call_buf);
-                        if let Some(c) = parse_call(&buf, Some(&self.schemas)) {
-                            self.calls.push(c);
-                        }
-                        continue;
+                if let Some(i) = self.pending.find("</tool_call>") {
+                    self.call_buf.push_str(&self.pending[..i]);
+                    self.pending = self.pending[i + "</tool_call>".len()..].to_string();
+                    self.in_call = false;
+                    let buf = std::mem::take(&mut self.call_buf);
+                    if let Some(c) = parse_call_dialect(&buf, Some(&self.schemas), self.dialect) {
+                        self.calls.push(c);
                     }
-                    None => {
-                        if eof {
-                            self.call_buf.push_str(&self.pending);
-                            self.pending.clear();
-                            let buf = std::mem::take(&mut self.call_buf);
-                            if let Some(c) = parse_call(&buf, Some(&self.schemas)) {
-                                self.calls.push(c);
-                            }
-                            self.in_call = false;
-                        } else {
-                            // hold everything except a tail that cannot start the close tag
-                            let keep = tail_prefix_len(&self.pending, "</tool_call>");
-                            let take = self.pending.len() - keep;
-                            self.call_buf.push_str(&self.pending[..take]);
-                            self.pending = self.pending[take..].to_string();
-                        }
-                        break;
-                    }
+                    continue;
                 }
+                if eof {
+                    self.call_buf.push_str(&self.pending);
+                    self.pending.clear();
+                    let buf = std::mem::take(&mut self.call_buf);
+                    if let Some(c) = parse_call_dialect(&buf, Some(&self.schemas), self.dialect) {
+                        self.calls.push(c);
+                    }
+                    self.in_call = false;
+                } else {
+                    let keep = tail_prefix_len(&self.pending, "</tool_call>");
+                    let take = self.pending.len() - keep;
+                    self.call_buf.push_str(&self.pending[..take]);
+                    self.pending = self.pending[take..].to_string();
+                }
+                break;
             }
             if self.in_think {
-                match self.pending.find("</think>") {
-                    Some(i) => {
-                        self.pending = self.pending[i + "</think>".len()..].to_string();
-                        self.in_think = false;
-                        continue;
-                    }
-                    None => {
-                        let keep = tail_prefix_len(&self.pending, "</think>");
-                        let take = self.pending.len() - keep;
-                        self.pending = self.pending[take..].to_string();
-                        break;
-                    }
+                if let Some(i) = self.pending.find("</think>") {
+                    let body = self.pending[..i].to_string();
+                    self.pending = self.pending[i + "</think>".len()..].to_string();
+                    self.capture(&body);
+                    self.in_think = false;
+                    continue;
                 }
+                if eof {
+                    let body = std::mem::take(&mut self.pending);
+                    self.capture(&body);
+                    self.in_think = false;
+                    continue;
+                }
+                let keep = tail_prefix_len(&self.pending, "</think>");
+                let take = self.pending.len() - keep;
+                let body = self.pending[..take].to_string();
+                self.pending = self.pending[take..].to_string();
+                self.capture(&body);
+                break;
             }
-            // Outside any block: emit up to the next opening marker.
             let open_call = self.pending.find("<tool_call>");
             let open_think = self.pending.find("<think>");
             match earliest(open_call, open_think) {
@@ -308,7 +446,6 @@ impl OutputFilter {
                         out.push_str(&self.pending);
                         self.pending.clear();
                     } else {
-                        // Hold back only what could still become a marker.
                         let keep = MARKERS.iter().map(|m| tail_prefix_len(&self.pending, m)).max().unwrap_or(0);
                         let take = self.pending.len() - keep;
                         out.push_str(&self.pending[..take]);
@@ -351,6 +488,27 @@ fn tail_prefix_len(s: &str, marker: &str) -> usize {
     0
 }
 
+fn looks_like_qwen_call(body: &str) -> bool {
+    let function = body.find("<function=");
+    let argument = body.find("<arg_key>");
+    match (function, argument) {
+        (Some(function), Some(argument)) => function < argument,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn qwen_call_name(body: &str) -> Option<&str> {
+    let start = body.find("<function=")?;
+    let after = &body[start + "<function=".len()..];
+    let end = after.find('>')?;
+    let name = after[..end].trim();
+    if name.is_empty() || name.contains('<') {
+        return None;
+    }
+    Some(name)
+}
+
 /// A call as far as the still-open `<tool_call>` markup determines it: the
 /// name and every *terminated* argument pair, typed exactly as the closing
 /// parse will type them. Produced only by [`OutputFilter::speculation`] and
@@ -374,6 +532,21 @@ pub struct SpecSnapshot {
 /// A call with no name yields `None`: dropping a malformed call beats handing a
 /// client a tool invocation with an empty name.
 fn parse_call(body: &str, schemas: Option<&SchemaMap>) -> Option<ParsedCall> {
+    if looks_like_qwen_call(body) {
+        parse_qwen_call(body, schemas, false)
+    } else {
+        parse_glm_call(body, schemas)
+    }
+}
+
+fn parse_call_dialect(body: &str, schemas: Option<&SchemaMap>, dialect: Dialect) -> Option<ParsedCall> {
+    match dialect {
+        Dialect::Glm => parse_call(body, schemas),
+        Dialect::Qwen => parse_qwen_call(body, schemas, false),
+    }
+}
+
+fn parse_glm_call(body: &str, schemas: Option<&SchemaMap>) -> Option<ParsedCall> {
     let cut = body.find("<arg_key>").unwrap_or(body.len());
     let name = body[..cut].lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     if name.is_empty() || name.contains('<') {
@@ -408,6 +581,36 @@ fn parse_call(body: &str, schemas: Option<&SchemaMap>) -> Option<ParsedCall> {
     Some(ParsedCall { name: name.to_string(), arguments: Value::Object(args) })
 }
 
+fn parse_qwen_call(body: &str, schemas: Option<&SchemaMap>, prefix_only: bool) -> Option<ParsedCall> {
+    let name = qwen_call_name(body)?;
+    let function_start = body.find("<function=")?;
+    let after_function = &body[function_start + "<function=".len()..];
+    let function_end = after_function.find('>')?;
+    let mut cur = &after_function[function_end + 1..];
+    let props = schemas.and_then(|m| m.get(name));
+    let mut args = Map::new();
+    while let Some(relative) = cur.find("<parameter=") {
+        let after_open = &cur[relative + "<parameter=".len()..];
+        let Some(key_end) = after_open.find('>') else { break };
+        let key = after_open[..key_end].trim().to_string();
+        let after_value = &after_open[key_end + 1..];
+        let Some(value_end) = after_value.find("</parameter>") else {
+            if !prefix_only && !key.is_empty() {
+                let raw_end = after_value.find("</function>").unwrap_or(after_value.len());
+                let declared = props.and_then(|p| p.get(&key)).map(String::as_str);
+                args.insert(key, coerce(after_value[..raw_end].trim(), declared));
+            }
+            break;
+        };
+        if !key.is_empty() {
+            let declared = props.and_then(|p| p.get(&key)).map(String::as_str);
+            args.insert(key, coerce(after_value[..value_end].trim(), declared));
+        }
+        cur = &after_value[value_end + "</parameter>".len()..];
+    }
+    Some(ParsedCall { name: name.to_string(), arguments: Value::Object(args) })
+}
+
 /// The speculative twin of [`parse_call`]: parse a *still-open* call body
 /// (no `</tool_call>` yet) into the call its markup determines so far —
 /// the name, plus every **terminated** `<arg_key>/<arg_value>` pair, typed
@@ -423,6 +626,21 @@ fn parse_call(body: &str, schemas: Option<&SchemaMap>) -> Option<ParsedCall> {
 /// instead of trusted: the sPTC layer compares the close-time key against
 /// the speculated one, and a mismatch is a discard, never a wrong answer.
 fn parse_call_prefix(body: &str, schemas: Option<&SchemaMap>) -> Option<ParsedCall> {
+    if looks_like_qwen_call(body) {
+        parse_qwen_call(body, schemas, true)
+    } else {
+        parse_glm_call_prefix(body, schemas)
+    }
+}
+
+fn parse_call_prefix_dialect(body: &str, schemas: Option<&SchemaMap>, dialect: Dialect) -> Option<ParsedCall> {
+    match dialect {
+        Dialect::Glm => parse_call_prefix(body, schemas),
+        Dialect::Qwen => parse_qwen_call(body, schemas, true),
+    }
+}
+
+fn parse_glm_call_prefix(body: &str, schemas: Option<&SchemaMap>) -> Option<ParsedCall> {
     let cut = body.find("<arg_key>").unwrap_or(body.len());
     let name = body[..cut].lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     if name.is_empty() || name.contains('<') {
@@ -812,8 +1030,6 @@ mod tests {
 
     #[test]
     fn the_name_probe_costs_no_argument_parse_and_lies_about_nothing() -> Result<(), String> {
-        // A call whose name is known but whose first key has not arrived:
-        // open_call_name answers, speculation answers with empty args.
         let mut f = OutputFilter::with_tools(&[]);
         f.push("<tool_call>read\n");
         assert_eq!(f.open_call_name(), Some("read"));
@@ -822,5 +1038,85 @@ mod tests {
         let empty = snap.arguments.as_object().ok_or_else(|| "arguments are an object".to_string())?;
         assert!(empty.is_empty(), "no complete pairs yet: {snap:?}");
         Ok(())
+    }
+
+    #[test]
+    fn qwen_call_round_trip_uses_checkpoint_xml_and_schema_types() -> Result<(), String> {
+        let tools = vec![ToolDef {
+            function: FunctionDef {
+                name: "read".into(),
+                description: None,
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "count": {"type": "integer"},
+                        "enabled": {"type": "boolean"}
+                    }
+                })),
+            },
+        }];
+        let calls = vec![json!({
+            "function": {
+                "name": "read",
+                "arguments": "{\"path\":\"1.10\",\"count\":\"30\",\"enabled\":\"true\"}"
+            }
+        })];
+        let rendered = render_assistant_calls_qwen(&calls);
+        assert!(rendered.contains("<function=read>"), "{rendered}");
+        assert!(rendered.contains("<parameter=path>"), "{rendered}");
+        let mut f = OutputFilter::with_qwen_tools(&tools, false);
+        assert_eq!(f.push(&rendered), "");
+        assert_eq!(f.finish(), "");
+        let parsed = f.take_calls();
+        let call = parsed.first().ok_or_else(|| "qwen call must parse".to_string())?;
+        assert_eq!(call.name, "read");
+        assert_eq!(call.arguments["path"], json!("1.10"));
+        assert_eq!(call.arguments["count"], json!(30));
+        assert_eq!(call.arguments["enabled"], json!(true));
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_streaming_speculation_only_uses_complete_parameters() -> Result<(), String> {
+        let mut f = OutputFilter::with_tools_dialect(&[], Dialect::Qwen, false);
+        assert_eq!(f.push("<tool_call>\n<function=read>"), "");
+        assert_eq!(f.open_call_name(), Some("read"));
+        f.push("<parameter=path>\n/tmp/a</parameter>\n<parameter=count>\n7");
+        let snap = f.speculation().ok_or_else(|| "qwen prefix must speculate".to_string())?;
+        assert_eq!(snap.arguments["path"], json!("/tmp/a"));
+        assert!(snap.arguments.get("count").is_none(), "{snap:?}");
+        f.push("</parameter>\n</function>\n</tool_call>");
+        let calls = f.take_calls();
+        let call = calls.first().ok_or_else(|| "qwen close must parse".to_string())?;
+        assert_eq!(call.arguments["count"], json!(7));
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_reasoning_is_captured_only_when_enabled() {
+        let mut enabled = OutputFilter::with_tools_dialect(&[], Dialect::Qwen, true);
+        assert_eq!(enabled.push("<think>reason"), "");
+        assert_eq!(enabled.take_reasoning(), "reason");
+        assert_eq!(enabled.push("ing</think>answer"), "answer");
+        assert_eq!(enabled.take_reasoning(), "ing");
+        assert_eq!(enabled.finish(), "");
+
+        let mut default = OutputFilter::with_tools_dialect(&[], Dialect::Qwen, false);
+        assert_eq!(default.push("<think>hidden</think>answer"), "answer");
+        assert_eq!(default.take_reasoning(), "");
+        assert_eq!(default.finish(), "");
+    }
+
+    #[test]
+    fn qwen_preamble_matches_checkpoint_wording() {
+        let tools = vec![ToolDef {
+            function: FunctionDef { name: "bash".into(), description: Some("run".into()), parameters: None },
+        }];
+        let s = render_preamble_qwen(&tools);
+        assert!(s.starts_with("# Tools\n\nYou have access to the following functions:\n\n<tools>\n"), "{s}");
+        assert!(s.contains("<function=example_function_name>"), "{s}");
+        assert!(s.contains("<parameter=example_parameter_1>"), "{s}");
+        assert!(s.contains("</IMPORTANT>"), "{s}");
     }
 }

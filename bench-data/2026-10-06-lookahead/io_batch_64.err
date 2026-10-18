@@ -1,0 +1,21 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=available (CUDA (NVIDIA), 1 device(s) visible)
+peregrine: gpus present: nvidia×1, amd×1 (no backend — rebuild on a ROCm host (`PEREGRINE_GPU_BACKEND=hip`; hipcc compiles the same kernels) — see docs/gpu-vendors.md)
+peregrine: pcie 0000:01:00.0 8.0 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 34.5 GB | resident 5.2 + KV 0.2 + stream 13.5 + slack 0.6 + cache 6.4 -> peak 26.0 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: disk->GPU lane pinned (io_uring DMAs into cudaHostRegister'd pages)
+[CUDA] device 0: NVIDIA GeForce RTX 3060, 12.5 GB VRAM, sm_86
+peregrine: CUDA contexts initialized: 1 (devices [0])
+peregrine: GPU tier partitioned across 1 device(s): device 0: 790
+peregrine: GPU tier holds 790 experts in VRAM (heat-ranked)
+peregrine: expert uploads 790 pinned-async / 0 blocking; pinned staging 2370 buffers ever, 0 live / 0.0 MB (0 refused)
+peregrine: [gpu-dense] 1.61 of 3.81 GB matmul weights resident (42%) — 45 fused MLPs + 56 projections [fit-to-free-VRAM: not reproducible across boots]
+peregrine: [gpu-dense] placed: 0.q 0.k 0.v 0.o 1.q 1.k 1.v 1.o 2.q 2.k 2.v 2.o (+44 more)
+peregrine: [gpu-dense] skipped: 0.f_a 0.f_b 0.b 0.g_a 0.g_b 1.f_a 1.f_b 1.b 1.g_a 1.g_b 2.f_a 2.f_b (+293 more)
+peregrine: [workingset] one token routes 4.04 GB of experts against a 6.00 GB cache (148% of a pass) — recency alone can hold a pass; prefetch-protect off
+peregrine: [io] device-pure claims on (3 devices, 340 shard fds, one ring per device)
+peregrine: [block] exec=par pool_width=12 mirrors=0 (COLI_BLOCK_EXEC=sync|mt|par)
+peregrine bench: loaded 45 layers, vocab 154880, mtp=yes, draft=γ=0, in 40.9s
+    [ecache] disk_reads this batch: 1535

@@ -58,7 +58,11 @@ const CHECKPOINTS: &str = "checkpoints";
 const SIGNATURES: &str = "signatures";
 const QUARANTINE: &str = "quarantine";
 const INDEXES: &str = "indexes";
-const MANIFEST: &str = "manifest";
+/// The file whose presence makes a directory a container rather than a
+/// store file that has not been written yet. Public because a caller choosing
+/// *which* persistence a runtime uses has to make the same call this module
+/// does, and a second copy of the literal is a second thing to drift.
+pub const MANIFEST: &str = "manifest";
 const HWM: &str = "generation.hwm";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

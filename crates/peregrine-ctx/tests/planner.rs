@@ -275,3 +275,202 @@ fn the_vector_channel_is_swappable() {
         "a replaced embedder must still produce a plan"
     );
 }
+
+// -- prefix-stable layout ---------------------------------------------------
+
+use peregrine_ctx::planner::{ActiveContext, Admission, UtilityTerms};
+
+fn admission(node_id: &str, kind: Kind, utility: f32) -> Admission {
+    Admission {
+        node: 0,
+        node_id: node_id.to_string(),
+        kind,
+        label: node_id.to_string(),
+        level: Level::L2,
+        cost: 10,
+        utility,
+        reason: "test",
+        pinned: false,
+        rendered: format!("[{node_id} L2] {node_id} = value"),
+        terms: UtilityTerms::default(),
+    }
+}
+
+fn context(tokens: usize, qtype: QueryType, entries: Vec<Admission>) -> ActiveContext {
+    ActiveContext {
+        query: "q".to_string(),
+        qtype: Some(qtype),
+        budget: 800,
+        entries,
+        tokens,
+        considered: 42,
+        ..Default::default()
+    }
+}
+
+/// Same membership, different per-turn stats: the stable layout must be
+/// byte-identical up to the trailer, while the ranked layout differs from
+/// the first line — that first line is what kills the cached prefix today.
+#[test]
+fn prefix_stable_keeps_per_turn_data_out_of_the_prefix() {
+    let entries = vec![
+        admission("clai_b", Kind::Claim, 0.9),
+        admission("clai_a", Kind::Claim, 0.1),
+        admission("goal_1", Kind::Goal, 0.5),
+    ];
+    let turn1 = context(300, QueryType::ValueLookup, entries.clone());
+    let turn2 = context(650, QueryType::Justify, entries);
+
+    let stable1 = turn1.render_prefix_stable();
+    let stable2 = turn2.render_prefix_stable();
+    let trailer = "\n\n---\n";
+    let cut1 = stable1.find(trailer).expect("trailer");
+    let cut2 = stable2.find(trailer).expect("trailer");
+    assert_eq!(stable1[..cut1], stable2[..cut2]);
+    assert!(stable1[cut1..].contains("k=300/800 tokens"));
+    assert!(stable2[cut2..].contains("k=650/800 tokens"));
+    assert!(stable1[cut1..].contains("query type: value_lookup"));
+    assert!(stable2[cut2..].contains("query type: justify"));
+
+    assert_ne!(
+        turn1.render().lines().next(),
+        turn2.render().lines().next(),
+        "the ranked header is per-turn data at byte zero"
+    );
+}
+
+/// Within a kind, order follows the content address, never the per-turn
+/// utility — a node whose score moved keeps its place if its text did not.
+#[test]
+fn prefix_stable_orders_by_content_not_utility() {
+    let ctx = context(
+        100,
+        QueryType::Open,
+        vec![
+            admission("clai_b", Kind::Claim, 0.9),
+            admission("clai_a", Kind::Claim, 0.1),
+        ],
+    );
+    let stable = ctx.render_prefix_stable();
+    assert!(
+        stable.find("clai_a").unwrap() < stable.find("clai_b").unwrap(),
+        "content order, not utility order: {stable}"
+    );
+    let ranked = ctx.render();
+    assert!(
+        ranked.find("clai_b").unwrap() < ranked.find("clai_a").unwrap(),
+        "the ranked layout keeps utility order: {ranked}"
+    );
+    // Kind grouping is unchanged: goals still precede facts.
+    let ctx = context(
+        100,
+        QueryType::Open,
+        vec![
+            admission("clai_a", Kind::Claim, 0.9),
+            admission("goal_1", Kind::Goal, 0.1),
+        ],
+    );
+    let stable = ctx.render_prefix_stable();
+    assert!(stable.find("## GOALS").unwrap() < stable.find("clai_a").unwrap());
+}
+
+/// The runtime switch: `prefix_stable` changes what the reasoner is sent.
+#[test]
+fn prompt_uses_prefix_stable_layout_when_enabled() {
+    let mut rt = runtime();
+    rt.prefix_stable = true;
+    let context = rt.plan("what was the server ip?", None);
+    let prompt = rt.prompt_for(&context);
+    assert!(prompt.starts_with("# ACTIVE CONTEXT\n"), "{prompt}");
+    assert!(prompt.contains("\n\n---\nk="), "{prompt}");
+
+    rt.prefix_stable = false;
+    let context = rt.plan("what was the server ip?", None);
+    let prompt = rt.prompt_for(&context);
+    assert!(prompt.starts_with("# ACTIVE CONTEXT  (k="), "{prompt}");
+}
+
+// -- stickiness -------------------------------------------------------------
+
+/// The retention bonus keeps last turn's membership from oscillating: with
+/// stickiness on, a node admitted last turn wins a tie it would otherwise
+/// lose. Measured on the runtime so `last_assembly` tracking is exercised,
+/// not just the weight.
+#[test]
+fn stickiness_retains_the_previous_window() {
+    fn membership(stickiness: f32, queries: &[&str]) -> Vec<Vec<String>> {
+        let mut rt = runtime();
+        rt.planner.weights.stickiness = stickiness;
+        queries
+            .iter()
+            .map(|q| {
+                rt.plan(q, None)
+                    .node_ids()
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    // Two near-identical queries in a row: the second plan should overlap the
+    // first at least as much with the bonus on as with it off.
+    let queries = ["what was the server ip?", "what was the server ip address?"];
+    let off = membership(0.0, &queries);
+    let on = membership(0.9, &queries);
+    let overlap = |a: &[String], b: &[String]| a.iter().filter(|id| b.contains(id)).count();
+    assert!(
+        overlap(&on[0], &on[1]) >= overlap(&off[0], &off[1]),
+        "stickiness reduced retention: off={off:?} on={on:?}"
+    );
+}
+
+/// `prefix_reuse` is recorded per turn from the prompts actually sent, and is
+/// undefined — not zero — before two turns have run.
+#[test]
+fn prefix_reuse_is_measured_per_turn() {
+    let mut rt = runtime();
+    assert_eq!(rt.telemetry.report().prefix_reuse_mean, None);
+    rt.ask("what was the server ip?", None);
+    assert_eq!(rt.telemetry.report().prefix_reuse_mean, None);
+    rt.ask("what was the server ip address?", None);
+    let mean = rt.telemetry.report().prefix_reuse_mean;
+    assert!(mean.is_some(), "two turns in, the metric must exist");
+    let mean = mean.unwrap();
+    assert!((0.0..=1.0).contains(&mean), "not a fraction: {mean}");
+    // The stable layout must not reuse *less* than the ranked one on the same
+    // near-identical queries.
+    let mut stable = runtime();
+    stable.prefix_stable = true;
+    stable.ask("what was the server ip?", None);
+    stable.ask("what was the server ip address?", None);
+    let stable_mean = stable.telemetry.report().prefix_reuse_mean.unwrap();
+    assert!(
+        stable_mean >= mean,
+        "stable layout reused less ({stable_mean}) than ranked ({mean})"
+    );
+}
+
+/// The other half of the stickiness trade: the bonus is paid for with
+/// membership decisions, so correctness with the weight on must be asserted,
+/// not assumed. Same probes, same expectations, stickiness at the bench's
+/// operating point.
+#[test]
+fn stickiness_does_not_cost_probe_correctness() {
+    let corpus = peregrine_ctx::bench::build_corpus(300);
+    let mut rt = Dcr::new(1200);
+    rt.planner.weights.stickiness = 0.5;
+    for (id, text) in &corpus.docs {
+        rt.ingest(text, Some(id)).expect("ingest");
+    }
+    let mut reasoner = peregrine_ctx::llm::LocalReasoner::new();
+    for probe in &corpus.probes {
+        let answer = rt.ask_with(probe.query, None, &mut reasoner);
+        assert!(
+            answer.text.to_lowercase().contains(&probe.expected.to_lowercase()),
+            "stickiness lost probe {:?}: {:?}",
+            probe.label,
+            answer.text
+        );
+    }
+}

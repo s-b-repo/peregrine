@@ -18,6 +18,7 @@ set -euo pipefail
 
 ROOT="/home/cortix/peregrine"
 AUDIT="$ROOT/scripts/audit-bad-patterns.sh"
+CERTIFY="$ROOT/scripts/verify-certificates.sh"
 MAX_ITERS="${MAX_ITERS:-84}"
 TARGET_TOK_PER_SEC="${TARGET_TOK_PER_SEC:-0.6}"
 SLEEP_BETWEEN="${SLEEP_BETWEEN:-7200}"
@@ -171,6 +172,16 @@ print('yes' if float('${current_speed}') >= float('${TARGET_TOK_PER_SEC}') else 
 
     # --- Step 3: Quality gate (AUDIT) ---
     echo "[3/6] Running quality gate..." | tee -a "$LOG"
+    if ! bash "$CERTIFY"; then
+        echo "CERTIFICATES FAILED — requesting OpenCode fix..." | tee -a "$LOG"
+        opencode run "A peregrine numerical certificate failed. Run \`cargo run -p peregrine-verify --release -- verify\` and read the FAILED block: it names the group, the certificate, the claim, the residual and the tolerance. Fix the CODE so the claim holds — never widen the tolerance, and never delete the certificate. Do NOT modify scripts/audit-bad-patterns.sh." --auto 2>&1 | tee -a "$LOG" || true
+        if bash "$CERTIFY"; then
+            echo "Certificates green."
+        else
+            echo "Certificates still failing — continuing." | tee -a "$LOG"
+        fi
+    fi
+
     if ! bash "$AUDIT" "$ROOT"; then
         echo "AUDIT FAILED — requesting OpenCode fix..." | tee -a "$LOG"
         # OpenCode runs via Ollama engine, sandboxed — cannot modify loop scripts

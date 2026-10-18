@@ -18,7 +18,7 @@ sidecar artifact the runtime reads or writes.
 Optional sidecars are consumed automatically and best-effort — none of them can
 change what the engine computes, only how fast: `automaton.json`,
 `macrostates.json`, `route_stats.json`, `tiers.json`, `schedule.json`,
-`plan.json` — see [the artifact table](#runtime--offline-artifacts).
+`token_routes.json`, `plan.json` — see [the artifact table](#runtime--offline-artifacts).
 
 **A missing sidecar is silent; a broken one is not.** An absent file is the
 normal case and says nothing. A file that is present but unreadable or malformed
@@ -178,8 +178,8 @@ gave back 40% of the byte saving. The tool prints that ratio before converting.
 ## Runtime & offline artifacts
 
 All artifacts live in the model directory, are correctness-neutral, and load
-best-effort. Load order is automaton → macrostates → route_stats → tiers →
-**plan.json last** (a plan part wins over its standalone file).
+best-effort. Load order is automaton → macrostates → route_stats → token_routes →
+tiers → **plan.json last** (a plan part wins over its standalone file).
 
 | File | Written by | Read by | Shape (top level) |
 |---|---|---|---|
@@ -189,6 +189,7 @@ best-effort. Load order is automaton → macrostates → route_stats → tiers �
 | `schedule.json` | `peregrine-layout-reorg`, `galactic` | loader → disk-read ordering | `{version: 1, n_layers, order: [[expert_id…]…]}` |
 | `tiers.json` | `galactic` (with `COLI_TIER_*_MB`) | loader — **only the `ram` list** (prefetch-warm, capped at 256 entries) | `{version: 1, vram: [[layer, expert]…], ram: […]}` |
 | `route_stats.json` | `Model` at Drop (`COLI_ROUTE_STATS_PERSIST`), seeded by `galactic` | loader — warm-start | `{tag, hist, heat, coact, learn}`; `learn` is the bandit/Q policy |
+| `token_routes.json` | `peregrine build-router-predictor` | future-prefetch predictor | `{version: 1, tag, context_len: 2, n_layers, observations, layers: [[[context, [[expert, count]…]…]…]…]}` |
 | `plan.json` | `peregrine compile-plan` | loader, consumed atomically | `{version: 1, automaton?, macrostates?, schedule?, tiers?, learn?}` |
 | `kernel_tuning.json` | *(planned)* — `WmmaTuner` has the (de)serializers but no code path writes/reads the file yet | — | `{version: 1, rows: […]}` |
 
@@ -197,7 +198,8 @@ best-effort. Load order is automaton → macrostates → route_stats → tiers �
 `L5E8H128I32D3V256`). `automaton.json`, `macrostates.json`, the `hist` part of
 `route_stats.json`, and the automaton/macrostate parts of `plan.json` are
 rejected on tag mismatch (silently — the runtime falls back to its default
-behavior). `schedule.json` is guarded by `version == 1` only; `tiers.json`
+behavior), as is `token_routes.json` after its layer/expert shape is checked.
+`schedule.json` is guarded by `version == 1` only; `tiers.json`
 entries are validated per item.
 
 Kill switches: `COLI_ROUTE_STATS_PERSIST=0`, `COLI_LAYOUT_SCHEDULE=0`,

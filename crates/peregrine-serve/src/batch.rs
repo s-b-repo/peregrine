@@ -20,6 +20,9 @@ use std::thread::JoinHandle;
 use parking_lot::Mutex;
 use peregrine_core::Error;
 use peregrine_model::{Model, RouteHistory, Sampler, SeqKv};
+// The batched tick's head bundle: which rows record routing histories, and which
+// rows get an `lm_head` projection at all. See `Model::HeadRows`.
+use peregrine_model::model::HeadRows;
 use tokio::sync::mpsc;
 
 /// Batched decode steps between heat-ranked VRAM re-selections ([`Model::reheat`]).
@@ -372,6 +375,7 @@ pub struct EngineTelemetry {
     /// nothing else, so a run's throughput could only be computed after it ended.
     /// `None` without a warm cache.
     pub ecache: Option<(u64, u64, u64)>,
+    pub ecache_decode_failures: Option<u64>,
     pub prefetch_reads: u64,
     /// MTP speculation, cumulative: drafts proposed and drafts the model's
     /// accept rule kept. The ratio is the only number that says whether
@@ -394,6 +398,10 @@ pub struct EngineTelemetry {
     pub gdn_snapshot_bytes: u64,
     pub gdn_replays: u64,
     pub gdn_replay_rows: u64,
+    pub gdn_rollback_failures: u64,
+    pub gdn_replay_failures: u64,
+    pub client_disconnects: u64,
+    pub rlm_failures: u64,
     /// Prompt-lookup drafting (`COLI_DRAFT_NGRAM`), cumulative and **separate
     /// from `spec_*`**: the two sources cost so differently — a memcmp against
     /// a sparse-MoE layer per draft step — that one pooled accept rate would
@@ -401,6 +409,10 @@ pub struct EngineTelemetry {
     /// what lets an operator see that the free source is carrying the run.
     pub ngram_proposed: u64,
     pub ngram_accepted: u64,
+    pub future_prefetch_plans: u64,
+    pub future_prefetch_items: u64,
+    pub future_prefetch_history_hits: u64,
+    pub future_prefetch_learned_hits: u64,
     /// Tokens actually sent to clients, and decode rows actually forwarded,
     /// both cumulative. **These are the numerators the engine was missing.**
     ///
@@ -606,6 +618,8 @@ struct EngineKnobs {
     spec_gdn_max_b: usize,
     /// `COLI_DRAFT_NGRAM` — see [`draft_ngram`].
     draft_ngram: usize,
+    future_prefetch: peregrine_model::FuturePrefetchMode,
+    future_prefetch_width: usize,
     /// `COLI_SPEC_UNION_MAX` — see [`spec_union_max`].
     spec_union_max: u64,
     /// `COLI_DRAFT_TREE` — see [`draft_tree`].
@@ -623,6 +637,7 @@ struct EngineKnobs {
 impl EngineKnobs {
     /// The one place the engine reads its environment.
     fn from_env() -> EngineKnobs {
+        let future_prefetch = future_prefetch_settings();
         EngineKnobs {
             fuse_prefill: fuse_prefill(),
             prefill_chunk_div: prefill_chunk_div(),
@@ -634,6 +649,8 @@ impl EngineKnobs {
             spec_gdn: spec_gdn(),
             spec_gdn_max_b: spec_gdn_max_b(),
             draft_ngram: draft_ngram(),
+            future_prefetch: future_prefetch.mode,
+            future_prefetch_width: future_prefetch.width,
             spec_union_max: spec_union_max(),
             draft_tree: draft_tree(),
             max_batch_rows: max_batch_rows(),
@@ -696,6 +713,8 @@ struct SpecOverride {
     gdn: Option<bool>,
     /// `COLI_DRAFT_NGRAM`.
     ngram: Option<usize>,
+    future_prefetch: Option<peregrine_model::FuturePrefetchMode>,
+    future_prefetch_width: Option<usize>,
     /// `COLI_SPEC_UNION_MAX`.
     union_max: Option<u64>,
     /// `COLI_DRAFT_TREE`.
@@ -737,6 +756,12 @@ fn spawn_spec(
     }
     if let Some(n) = spec.ngram {
         knobs.draft_ngram = n;
+    }
+    if let Some(mode) = spec.future_prefetch {
+        knobs.future_prefetch = mode;
+    }
+    if let Some(width) = spec.future_prefetch_width {
+        knobs.future_prefetch_width = width;
     }
     if let Some(u) = spec.union_max {
         knobs.spec_union_max = u;
@@ -781,6 +806,16 @@ fn batch_sla_ms() -> Option<u64> {
 /// checkpoint converted without `--mtp` can speculate through this alone.
 fn draft_ngram() -> usize {
     std::env::var("COLI_DRAFT_NGRAM").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+}
+
+fn future_prefetch_settings() -> peregrine_model::FuturePrefetchSettings {
+    match peregrine_model::FuturePrefetchSettings::from_env() {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("peregrine: {error}; future prefetch is off");
+            peregrine_model::FuturePrefetchSettings::default()
+        }
+    }
 }
 
 /// Verify both draft sources as a **token tree** instead of choosing one
@@ -1259,6 +1294,28 @@ struct SeqState {
     toks: Vec<i32>,
 }
 
+fn future_draft_paths(state: &SeqState) -> Vec<Vec<i32>> {
+    if state.draft.is_empty() {
+        return Vec::new();
+    }
+    let Some(tree) = state.tree.as_ref() else { return vec![state.draft.clone()] };
+    let mut paths = Vec::new();
+    for node in 0..tree.tokens().len() {
+        if tree.children(node).next().is_some() {
+            continue;
+        }
+        let path = tree.path_to(node);
+        if path.len() > 1 {
+            paths.push(path.into_iter().skip(1).map(|index| tree.tokens()[index]).collect());
+        }
+    }
+    if paths.is_empty() {
+        vec![state.draft.clone()]
+    } else {
+        paths
+    }
+}
+
 /// The engine loop: admit + prefill new requests, then decode all active
 /// sequences one batched step at a time until each hits a stop id, its token
 /// budget, or a dropped client.
@@ -1287,12 +1344,19 @@ fn run(
     let mut gdn_snapshot_bytes: u64 = 0;
     let mut gdn_replays: u64 = 0;
     let mut gdn_replay_rows: u64 = 0;
+    let mut gdn_rollback_failures: u64 = 0;
+    let mut gdn_replay_failures: u64 = 0;
+    let mut delivery = DeliveryCounters::default();
     // Prompt-lookup accounting, split out from `spec_*` because the two draft
     // sources have completely different costs: an n-gram draft is a memcmp, an
     // MTP draft is a sparse-MoE layer. A single accept rate over both would
     // average a free source with an expensive one and mean nothing.
     let mut ngram_proposed: u64 = 0;
     let mut ngram_accepted: u64 = 0;
+    let mut future_prefetch_plans: u64 = 0;
+    let mut future_prefetch_items: u64 = 0;
+    let mut future_prefetch_history_hits: u64 = 0;
+    let mut future_prefetch_learned_hits: u64 = 0;
     // The decode-economics numerators — see `EngineTelemetry::tokens_emitted`.
     let mut tokens_emitted: u64 = 0;
     let mut decode_rows: u64 = 0;
@@ -1342,6 +1406,19 @@ fn run(
     // drafting sequence per tick at 27B dims and that price has to be measured
     // per batch width, not assumed.
     let ngram = peregrine_model::NgramDrafter::new(knobs.draft_ngram);
+    if knobs.future_prefetch.enabled() {
+        eprintln!(
+            "peregrine: future-expert prefetch = {} (width {} per layer)",
+            knobs.future_prefetch.as_str(),
+            knobs.future_prefetch_width
+        );
+        if knobs.future_prefetch.uses_learned() && !model.token_routes_loaded() {
+            eprintln!(
+                "peregrine: future-expert learned mode has no token_routes.json; run \
+                 peregrine build-router-predictor <model-dir> --text <corpus>"
+            );
+        }
+    }
     let gdn_rollback = !model.spec_reject_is_kv_only() && knobs.spec_gdn;
     let has_mtp = model.has_mtp() && (model.spec_reject_is_kv_only() || gdn_rollback);
     if model.has_mtp() && !model.spec_reject_is_kv_only() && !gdn_rollback {
@@ -1484,8 +1561,16 @@ fn run(
                     // A promoted sequence emits its first token here, and it
                     // counts: the ratio this feeds is per *served* token.
                     tokens_emitted +=
-                        prefill_step(&model, &mut pending, &mut active, vocab, &stop_ids, chunk_div, &mut prefix)
-                            as u64;
+                        prefill_step(
+                            &model,
+                            &mut pending,
+                            &mut active,
+                            vocab,
+                            &stop_ids,
+                            chunk_div,
+                            &mut prefix,
+                            &mut delivery,
+                        ) as u64;
                 }
             }
         }
@@ -1617,31 +1702,67 @@ fn run(
             // all pointing at the prefilling sequence's own history, which is why
             // `Prefilling` carries one from admission rather than getting one at
             // promotion.
+            // Rows of the fused chunk, captured here because `fused` is mutably
+            // borrowed just above to split the `Prefilling` fields; recomputing it
+            // from `fused` afterwards would need the borrow this block holds.
+            let mut chunk_rows = 0usize;
             if let Some((p, end)) = fused.as_mut() {
                 let rows = *end - p.pos;
+                chunk_rows = rows;
                 let Prefilling { seq, hist, .. } = p;
                 refs.push(seq);
                 for _ in 0..rows {
                     hists.push(&*hist);
                 }
             }
+            // Which rows get an `lm_head` projection: every decode row (its
+            // sampled row is that sequence's first, and speculative verify reads
+            // the decision row) plus the chunk's FINAL row, and nothing else.
+            //
+            // The output index of batch row `r` is its own position among the
+            // decode rows, so every decode-side `logits[row * vocab ..]` read
+            // below keeps working unchanged; the chunk's final row lands at
+            // `n_dec_rows`, which is exactly the offset `finish_prefill_chunk` is
+            // handed. The chunk's other `rows - 1` rows are computed to fill the
+            // KV and never read, so projecting them was pure waste that grew
+            // with the geometric chunk schedule.
+            let logit_rows: Option<Vec<usize>> = (chunk_rows > 0).then(|| {
+                let mut keep: Vec<usize> = (0..n_dec_rows).collect();
+                keep.push(n_dec_rows + chunk_rows - 1);
+                keep
+            });
             let out = if any_tree {
                 let rows = peregrine_model::TreeRows { rope_pos: &rope_of, sel: &sel };
-                model.forward_tree_rows_hidden(&tokens, &owner, &mut refs, &pos_of, rows, Some(&hists))
+                model.forward_tree_rows_hidden_projected(
+                    &tokens,
+                    &owner,
+                    &mut refs,
+                    &pos_of,
+                    rows,
+                    HeadRows { histories: Some(&hists), logit_rows: logit_rows.as_deref() },
+                )
             } else {
-                model.forward_rows_batched_hidden(&tokens, &owner, &mut refs, &pos_of, Some(&hists))
+                model.forward_rows_batched_hidden_projected(
+                    &tokens,
+                    &owner,
+                    &mut refs,
+                    &pos_of,
+                    HeadRows { histories: Some(&hists), logit_rows: logit_rows.as_deref() },
+                )
             };
             match out {
                 Ok(l) => l,
                 Err(e) => {
                     for s in &active {
                         if s.out.send(EngineOut::Error(e.to_string())).is_err() {
+                            delivery.client_disconnects += 1;
                             peregrine_core::note_advisory_err("batch error forward", &"client already disconnected");
                         }
                     }
                     active.clear();
                     if let Some((p, _)) = fused {
                         if p.out.send(EngineOut::Error(e.to_string())).is_err() {
+                            delivery.client_disconnects += 1;
                             peregrine_core::note_advisory_err("fused prefill error", &"client already disconnected");
                         }
                     }
@@ -1849,6 +1970,7 @@ fn run(
                     break;
                 }
                 if s.out.send(EngineOut::Token(tok as u32)).is_err() {
+                    delivery.client_disconnects += 1;
                     alive = false;
                     break;
                 }
@@ -1960,7 +2082,9 @@ fn run(
         for (i, e) in &gdn_failed {
             if let (Some(k), Some(st)) = (keep.get_mut(*i), active.get(*i)) {
                 *k = false;
+                gdn_rollback_failures += 1;
                 if st.out.send(EngineOut::Error(format!("recurrent state rollback failed: {e}"))).is_err() {
+                    delivery.client_disconnects += 1;
                     peregrine_core::note_advisory_err("gdn restore", &"client already disconnected");
                 }
             }
@@ -2001,12 +2125,12 @@ fn run(
             gdn_replays += 1;
             gdn_replay_rows += rtok.len() as u64;
             if let Err(e) = model.forward_rows_batched(&rtok, &rowner, &mut rrefs, &rpos, None) {
-                // The states are now neither pre- nor post-forward. Same
-                // reasoning as a failed restore: retire rather than serve on.
+                gdn_replay_failures += 1;
                 for &(i, _, _) in &gdn_replay {
                     if let (Some(k), Some(st)) = (keep.get_mut(i), active.get(i)) {
                         *k = false;
-                        if st.out.send(EngineOut::Error(e.to_string())).is_err() {
+                        if st.out.send(EngineOut::Error(format!("recurrent state replay failed: {e}"))).is_err() {
+                            delivery.client_disconnects += 1;
                             peregrine_core::note_advisory_err("gdn replay", &"client already disconnected");
                         }
                     }
@@ -2207,16 +2331,48 @@ fn run(
                     Err(e) => peregrine_core::note_advisory_err("mtp draft (batched)", &e),
                 }
             }
+            if knobs.future_prefetch.enabled() {
+                for state in active.iter() {
+                    let paths = future_draft_paths(state);
+                    if paths.is_empty() {
+                        continue;
+                    }
+                    let (plan, queued) = model.enqueue_future_prefetch(
+                        &state.hist,
+                        &state.toks,
+                        state.next_tok,
+                        &paths,
+                        state.seq_id,
+                        knobs.future_prefetch,
+                        knobs.future_prefetch_width,
+                    );
+                    if plan.layers.iter().any(|experts| !experts.is_empty()) {
+                        future_prefetch_plans += 1;
+                    }
+                    future_prefetch_items += queued as u64;
+                    future_prefetch_history_hits += plan.history_hits;
+                    future_prefetch_learned_hits += plan.learned_hits;
+                }
+            }
         }
 
-        // The chunk's logits are the rows after the decoders. Finishing it here,
-        // through the same `finish_prefill_chunk` the unfused path uses, is what
-        // keeps the two ticks observationally identical.
+        // The chunk's final row is the one row of the chunk that is read, and the
+        // narrow projection placed it at output row `n_dec_rows` (the decode rows
+        // kept their own indices), so that is the offset handed over. Finishing it
+        // here, through the same `finish_prefill_chunk` the unfused path uses, is
+        // what keeps the two ticks observationally identical.
         if let Some((p, end)) = fused {
             let out_cfg = OutputCfg { vocab, stop_ids: &stop_ids };
-            tokens_emitted +=
-                finish_prefill_chunk(p, end, &logits[n_dec_rows * vocab..], &mut pending, &mut active, out_cfg, &mut prefix)
-                    as u64;
+            tokens_emitted += finish_prefill_chunk(
+                p,
+                end,
+                &logits[n_dec_rows * vocab..n_dec_rows * vocab + vocab],
+                &mut pending,
+                &mut active,
+                out_cfg,
+                &mut prefix,
+                &mut delivery,
+            ) as u64;
         }
 
         // Periodically migrate the hottest experts into VRAM (heat-ranked
@@ -2247,6 +2403,7 @@ fn run(
             pending: pending.len(),
             steps: steps as u64,
             ecache: model.ecache_stats(),
+            ecache_decode_failures: model.ecache_decode_failures(),
             prefetch_reads: model.ecache_prefetch_reads().unwrap_or(0),
             spec_proposed,
             spec_accepted,
@@ -2254,8 +2411,16 @@ fn run(
             gdn_snapshot_bytes,
             gdn_replays,
             gdn_replay_rows,
+            gdn_rollback_failures,
+            gdn_replay_failures,
+            client_disconnects: delivery.client_disconnects,
+            rlm_failures: model.rlm_failures(),
             ngram_proposed,
             ngram_accepted,
+            future_prefetch_plans,
+            future_prefetch_items,
+            future_prefetch_history_hits,
+            future_prefetch_learned_hits,
             tokens_emitted,
             decode_rows,
             queue_wait_us,
@@ -2311,6 +2476,12 @@ fn run(
         eprintln!(
             "[spec] proposed={spec_proposed} accepted={spec_accepted} conf_stops={spec_conf_stops} accept_rate={:.1}%",
             spec_accepted as f64 / spec_proposed as f64 * 100.0
+        );
+    }
+    if future_prefetch_plans > 0 || future_prefetch_items > 0 {
+        eprintln!(
+            "[future-prefetch] plans={future_prefetch_plans} items={future_prefetch_items} \
+             history_hits={future_prefetch_history_hits} learned_hits={future_prefetch_learned_hits}"
         );
     }
     // RLM refinement accounting, same shape ((0,0) prints nothing).
@@ -2424,7 +2595,8 @@ fn run(
     if let Some((h, m, d)) = model.ecache_stats() {
         let hr = 100.0 * h as f64 / (h + m).max(1) as f64;
         let pf = model.ecache_prefetch_reads().unwrap_or(0);
-        eprintln!("[ecache] hits={h} misses={m} disk_reads={d} prefetch_reads={pf} hit_rate={hr:.1}%");
+        let decode_failures = model.ecache_decode_failures().unwrap_or(0);
+        eprintln!("[ecache] hits={h} misses={m} disk_reads={d} prefetch_reads={pf} decode_failures={decode_failures} hit_rate={hr:.1}%");
         // Occupancy, because a ~0% hit rate has two opposite causes and the line
         // above cannot distinguish them: a full cache is evicting the working set
         // before it can be reused; an empty one is not admitting in the first place.
@@ -2614,6 +2786,7 @@ fn prefill_step(
     stop_ids: &[i32],
     chunk_div: usize,
     prefix: &mut PrefixStore,
+    delivery: &mut DeliveryCounters,
 ) -> usize {
     let Some(mut p) = pending.pop_front() else {
         return 0;
@@ -2622,16 +2795,35 @@ fn prefill_step(
     // The chunk is a plain slice of the prompt; `seq` is a disjoint field, so no
     // per-step copy is needed to satisfy the borrow checker.
     let Prefilling { seq, prompt, pos, out, .. } = &mut p;
-    let logits = match model.forward_prefill_seq(&prompt[*pos..end], seq, *pos) {
+    // The narrow projection: this chunk contributes exactly one row of logits —
+    // the one `finish_prefill_chunk` samples from — so the other `C-1` are
+    // computed and dropped. Bit-identical to the full projection's last row
+    // (`Model::forward_prefill_seq_last`).
+    let logits = match model.forward_prefill_seq_last(&prompt[*pos..end], seq, *pos) {
         Ok(l) => l,
         Err(e) => {
             if out.send(EngineOut::Error(e.to_string())).is_err() {
+                delivery.client_disconnects += 1;
                 peregrine_core::note_advisory_err("prefill error forward", &"client already disconnected");
             }
             return 0; // drop this sequence
         }
     };
-    finish_prefill_chunk(p, end, &logits, pending, active, OutputCfg { vocab, stop_ids }, prefix)
+    finish_prefill_chunk(
+        p,
+        end,
+        &logits,
+        pending,
+        active,
+        OutputCfg { vocab, stop_ids },
+        prefix,
+        delivery,
+    )
+}
+
+#[derive(Default)]
+struct DeliveryCounters {
+    client_disconnects: u64,
 }
 
 /// The two things sampling needs, together — they are read as a pair
@@ -2698,6 +2890,21 @@ fn rlm_refine_row(
     }
 }
 
+/// Consume one prefill chunk's **final row** of logits: either queue the next
+/// chunk, or complete the prefill — snapshot it for the prefix cache, sample the
+/// first token, and promote the sequence into the decode batch.
+///
+/// `logits` is the chunk's last row, `[vocab]` wide — **not** the chunk's full
+/// `[chunk_len, vocab]`. That is what the unfused path produces
+/// (`Model::forward_prefill_seq_last`, one row because one row is all this
+/// function reads) and what the fused path slices out of its batched forward
+/// below. Both hand the same row, which is the point: `end < prompt.len()`
+/// returns before the row is touched at all, so a chunk that is not the last
+/// spends nothing on it.
+///
+/// Split out of [`prefill_step`] so the fused tick, which produces these logits
+/// inside the *decode* forward, finishes a chunk by exactly the same rules. The
+/// two paths differing here is how a fusion silently changes served output.
 fn finish_prefill_chunk(
     p: Prefilling,
     end: usize,
@@ -2706,10 +2913,15 @@ fn finish_prefill_chunk(
     active: &mut Vec<SeqState>,
     out_cfg: OutputCfg,
     prefix: &mut PrefixStore,
+    delivery: &mut DeliveryCounters,
 ) -> usize {
     let OutputCfg { vocab, stop_ids } = out_cfg;
-    let Prefilling { seq, prompt, pos, mut sampler, out, max_new, hist, seq_id, class } = p;
-    let chunk_len = end - pos;
+    // `pos` — the chunk's START — is deliberately not read: the re-queue below
+    // carries the chunk's *end* as the next start, and the row to sample from now
+    // arrives pre-sliced. Bound as `_` because the struct destructuring here is
+    // exhaustive (the fields are re-packed into a new `Prefilling` on the re-queue
+    // path), and dropping the binding outright does not compile.
+    let Prefilling { seq, prompt, pos: _, mut sampler, out, max_new, hist, seq_id, class } = p;
     if end < prompt.len() {
         // more chunks to go — round-robin with the others
         pending.push_back(Prefilling { seq, prompt, pos: end, sampler, out, max_new, hist, seq_id, class });
@@ -2719,16 +2931,23 @@ fn finish_prefill_chunk(
     // the next request sharing this prompt's head starts from here. No-op when
     // the cache is disabled or the prompt is too short to be worth copying.
     prefix.insert(&prompt, &seq);
-    // Sample the first token from the last prompt position. An empty chunk would
-    // mean an empty prompt, which `admit_pending` rejects.
-    let Some(last) = chunk_len.checked_sub(1).map(|c| c * vocab) else {
+    // Sample the first token from the last prompt position. A row short of `vocab`
+    // is a wiring error between a prefill path and this function, not an empty
+    // prompt: `admit_pending` rejects the latter and the forward above cannot
+    // produce the former, so it is reported rather than sampled from.
+    if logits.len() != vocab {
+        peregrine_core::note_advisory_err(
+            "prefill last-row logits width",
+            &format!("expected {vocab} floats for the chunk's final row, got {}", logits.len()),
+        );
         return 0;
-    };
-    let t0 = sampler.pick(&logits[last..last + vocab], -1) as i32;
+    }
+    let t0 = sampler.pick(logits, -1) as i32;
     if stop_ids.contains(&t0) {
         return 0; // first token is a stop → emit nothing
     }
     if out.send(EngineOut::Token(t0 as u32)).is_err() {
+        delivery.client_disconnects += 1;
         return 0; // client already gone — the token reached nobody
     }
     // Sent, so it counts from here whatever becomes of the sequence.
@@ -3875,6 +4094,57 @@ mod tests {
     }
 
     #[test]
+    fn future_prefetch_does_not_change_the_served_token_stream() -> Result<(), Error> {
+        let dir = tiny_dir("future_prefetch_engine")?;
+        let prompt = vec![1i32, 5, 9, 2, 7, 1, 5, 9, 2];
+        let run = |mode| -> Result<(Vec<u32>, EngineTelemetry), Error> {
+            let model = Model::load_streaming_ecache(&dir, true, 32 << 20)?;
+            let (handle, join) = spawn_spec(
+                model,
+                4,
+                false,
+                SpecOverride {
+                    depth: Some(4),
+                    ngram: Some(3),
+                    future_prefetch: Some(mode),
+                    future_prefetch_width: Some(4),
+                    ..SpecOverride::default()
+                },
+            )?;
+            let (tx, mut rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: prompt.clone(),
+                max_new: 24,
+                sampler: Sampler::new(0.0, 0.9, 1),
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            let mut output = Vec::new();
+            while let Some(message) = rx.blocking_recv() {
+                match message {
+                    EngineOut::Token(token) => output.push(token),
+                    EngineOut::Error(error) => return Err(Error::Format(error)),
+                }
+            }
+            let telemetry = handle.telemetry();
+            drop(handle);
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            Ok((output, telemetry))
+        };
+        let (off, off_telemetry) = run(peregrine_model::FuturePrefetchMode::Off)?;
+        let (on, on_telemetry) = run(peregrine_model::FuturePrefetchMode::History)?;
+        assert_eq!(on, off);
+        assert!(on_telemetry.future_prefetch_plans > 0);
+        assert!(on_telemetry.future_prefetch_history_hits > 0);
+        assert_eq!(off_telemetry.future_prefetch_plans, 0);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn prompt_lookup_speculates_without_an_mtp_head() -> Result<(), Error> {
         // The capability the n-gram source adds beyond cost: it needs no head
         // in the checkpoint. A hybrid container converted without `--mtp` could
@@ -4112,7 +4382,7 @@ mod tests {
             Ok(toks)
         };
 
-        let on = SpecOverride { depth: Some(4), sampled: Some(true), conf: None, gdn: None, ngram: None, union_max: None, tree: None };
+        let on = SpecOverride { depth: Some(4), sampled: Some(true), ..SpecOverride::default() };
         let got = run_engine(on)?;
         assert!(!got.is_empty(), "sampled speculation generated nothing");
         assert!(got.len() <= n, "served {} tokens for max_new {n}", got.len());
@@ -4126,7 +4396,7 @@ mod tests {
         // And the knob is a knob: with it off, the same request takes the
         // historical one-row path, whose stream differs precisely because the
         // RNG is consumed differently.
-        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), conf: None, gdn: None, ngram: None, union_max: None, tree: None })?;
+        let off = run_engine(SpecOverride { depth: Some(4), sampled: Some(false), ..SpecOverride::default() })?;
         assert!(!off.is_empty(), "the unspeculated path generated nothing");
         assert_ne!(
             off, got,
@@ -4175,10 +4445,10 @@ mod tests {
             Ok(toks)
         };
 
-        let base = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(0.0), gdn: None, ngram: None, union_max: None, tree: None })?;
+        let base = run_engine(SpecOverride { depth: Some(4), conf: Some(0.0), ..SpecOverride::default() })?;
         assert!(!base.is_empty(), "the baseline generated nothing");
         for floor in [0.65f32, 0.999] {
-            let gated = run_engine(SpecOverride { depth: Some(4), sampled: None, conf: Some(floor), gdn: None, ngram: None, union_max: None, tree: None })?;
+            let gated = run_engine(SpecOverride { depth: Some(4), conf: Some(floor), ..SpecOverride::default() })?;
             assert_eq!(gated, base, "a {floor} confidence floor changed a greedy stream");
         }
         std::fs::remove_dir_all(&dir)?;
@@ -4265,6 +4535,129 @@ mod tests {
         let fused = run_engine(true)?;
         assert!(plain.iter().all(|t| !t.is_empty()), "the reference run must actually generate");
         assert_eq!(fused, plain, "fusing a prefill chunk into the decode forward changed the token stream");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The fused tick's narrowed projection must not move a served token.
+    ///
+    /// `the_engine_serves_the_same_tokens_with_the_narrow_prefill` covers the
+    /// *unfused* prefill. This one runs with fusion **on** — the default — where
+    /// the chunk rides the decode batch's forward and the row the engine samples
+    /// from is placed by `logit_rows` rather than sliced out of a full projection.
+    /// The two index mistakes narrowing makes possible are a chunk row read from
+    /// the wrong offset (which emits a plausible but wrong token) and a
+    /// speculative draft row dropped (which would accept against an empty slice),
+    /// so the references here are whole-prompt greedy decodes.
+    #[test]
+    fn the_fused_tick_serves_the_same_tokens_with_a_narrowed_projection() -> Result<(), Error> {
+        let dir = tiny_dir("fusednarrow")?;
+        // One prompt long enough to prefill in chunks *while the other decodes* —
+        // that concurrency is the only way a chunk is ever fused, and so the only
+        // way this path runs at all.
+        let long: Vec<i32> = (0..150).map(|k| (k * 11 + 5) % 32).collect();
+        let short: Vec<i32> = vec![1, 5, 9, 2, 7];
+        let n = 8usize;
+        let ref_one = |p: &[i32]| -> Result<Vec<u32>, Error> {
+            let m = Model::load(&dir)?;
+            ref_decode(&m, p, n)
+        };
+        let (want_long, want_short) = (ref_one(&long)?, ref_one(&short)?);
+        assert!(!want_long.is_empty() && !want_short.is_empty(), "the references must actually generate");
+
+        let (handle, join) = spawn_fused(Model::load(&dir)?, 8, true)?;
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<EngineOut>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<EngineOut>();
+        // The long one first, so it is still prefilling when the short one joins
+        // the decode batch — that is what forces the fusion.
+        handle.submit(EngineRequest {
+            prompt: long.clone(),
+            max_new: n,
+            sampler: Sampler::new(0.0, 0.9, 1),
+            out: tx1,
+            priority: Priority::Normal,
+            class: peregrine_model::TokenClass::Prose,
+        })?;
+        handle.submit(EngineRequest {
+            prompt: short.clone(),
+            max_new: n,
+            sampler: Sampler::new(0.0, 0.9, 1),
+            out: tx2,
+            priority: Priority::Normal,
+            class: peregrine_model::TokenClass::Prose,
+        })?;
+        drop(handle);
+        // `unbounded_channel` yields an `UnboundedReceiver`, not a `Receiver` — the
+        // two are distinct types even though both are tokio's mpsc.
+        let drain = |mut rx: mpsc::UnboundedReceiver<EngineOut>| -> Result<Vec<u32>, Error> {
+            let mut toks = Vec::new();
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Error(e) => return Err(Error::Format(e)),
+                }
+            }
+            Ok(toks)
+        };
+        let (got_long, got_short) = (drain(rx1), drain(rx2));
+        if join.join().is_err() {
+            return Err(Error::Format("engine thread panicked".into()));
+        }
+        assert_eq!(got_long?, want_long, "fused narrowed projection changed the long stream");
+        assert_eq!(got_short?, want_short, "fused narrowed projection changed the short stream");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The narrow prefill projection must not move a single served token.
+    ///
+    /// `engine_chunked_prefill_matches_reference` already compares the engine
+    /// against a whole-prompt reference, but it went through the *same* narrow
+    /// path on both sides once this landed, so it could not catch a regression
+    /// here. This one pins the comparison to a reference built with the **full**
+    /// projection (`ref_decode` calls `forward_prefill_seq`), on a prompt long
+    /// enough to prefill in several chunks — so it fails if the row the engine
+    /// samples from is the wrong one, which is the only way this change could
+    /// have been wrong.
+    #[test]
+    fn the_engine_serves_the_same_tokens_with_the_narrow_prefill() -> Result<(), Error> {
+        let dir = tiny_dir("narrowprefill")?;
+        // Well past PREFILL_CHUNK (64) so the multi-chunk schedule is exercised,
+        // and past the 64-token prefix-cache floor so a cached head is in play.
+        let prompt: Vec<i32> = (0..150).map(|k| (k * 11 + 5) % 32).collect();
+        let n = 8usize;
+        // Reference: greedy decode whose first token came from a FULL projection
+        // of every prefill position.
+        let want = {
+            let m = Model::load(&dir)?;
+            ref_decode(&m, &prompt, n)?
+        };
+        assert!(!want.is_empty(), "the reference must actually generate");
+
+        for fuse in [false, true] {
+            let (handle, join) = spawn_fused(Model::load(&dir)?, 8, fuse)?;
+            let (tx, mut rx) = mpsc::unbounded_channel::<EngineOut>();
+            handle.submit(EngineRequest {
+                prompt: prompt.clone(),
+                max_new: n,
+                sampler: Sampler::new(0.0, 0.9, 1),
+                out: tx,
+                priority: Priority::Normal,
+                class: peregrine_model::TokenClass::Prose,
+            })?;
+            let mut got = Vec::new();
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    EngineOut::Token(t) => got.push(t),
+                    EngineOut::Error(e) => return Err(Error::Format(e)),
+                }
+            }
+            drop(handle);
+            if join.join().is_err() {
+                return Err(Error::Format("engine thread panicked".into()));
+            }
+            assert_eq!(got, want, "fuse={fuse}: narrow prefill projection changed the served tokens");
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

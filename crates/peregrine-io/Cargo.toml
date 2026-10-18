@@ -8,6 +8,7 @@ description = "colibrì expert streaming: io_uring reactor (I/O lane), slab aren
 
 [dependencies]
 zstd = { version = "0.13", default-features = false }
+memmap2 = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

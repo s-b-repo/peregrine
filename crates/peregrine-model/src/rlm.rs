@@ -29,6 +29,15 @@ pub fn rlm_enabled() -> bool {
     *ON.get_or_init(|| matches!(std::env::var("COLI_RLM").as_deref(), Ok("1") | Ok("true")))
 }
 
+pub fn ensure_no_recurrent_state(has_recurrent_state: bool) -> Result<(), peregrine_core::Error> {
+    if has_recurrent_state {
+        return Err(peregrine_core::Error::Format(
+            "RLM recursive refinement is not supported on recurrent architectures: the recurrent state cannot be replayed safely".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Maximum recursive passes per token (`COLI_RLM_DEPTH`, default 2, cap 4).
 pub fn rlm_max_depth() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -98,6 +107,7 @@ pub struct RLMController {
     passes_emitted: std::sync::atomic::AtomicU64,
     /// Total tokens that triggered at least one recursive pass.
     tokens_recursed: std::sync::atomic::AtomicU64,
+    failures: std::sync::atomic::AtomicU64,
 }
 
 impl RLMController {
@@ -108,6 +118,7 @@ impl RLMController {
             depth: 0,
             passes_emitted: std::sync::atomic::AtomicU64::new(0),
             tokens_recursed: std::sync::atomic::AtomicU64::new(0),
+            failures: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -167,6 +178,14 @@ impl RLMController {
     /// Session telemetry: total tokens that triggered at least one pass.
     pub fn tokens_recursed(&self) -> u64 {
         self.tokens_recursed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn note_failure(&self) {
+        self.failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn failures(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -229,6 +248,20 @@ mod tests {
     #[test]
     fn rlm_disabled_by_default() {
         assert!(!rlm_enabled(), "RLM must be off by default for correctness");
+    }
+
+    #[test]
+    fn recurrent_architecture_refusal_is_explicit() -> Result<(), peregrine_core::Error> {
+        assert!(ensure_no_recurrent_state(false).is_ok());
+        let error = ensure_no_recurrent_state(true).err().ok_or_else(|| {
+            peregrine_core::Error::Format("recurrent RLM check unexpectedly passed".into())
+        })?;
+        let message = error.to_string();
+        assert!(
+            message.contains("RLM") && message.contains("recurrent"),
+            "{message}"
+        );
+        Ok(())
     }
 
     #[test]

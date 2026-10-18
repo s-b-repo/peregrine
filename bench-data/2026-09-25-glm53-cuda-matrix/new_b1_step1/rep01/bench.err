@@ -1,0 +1,10 @@
+peregrine: cpu=x86_64 AVX2 (maddubs) | 12 logical CPUs, 1 NUMA node(s)
+peregrine: gpu=available (CUDA (NVIDIA), 1 device(s) visible)
+peregrine: gpus present: nvidia×1, amd×1 (no backend — rebuild on a ROCm host (`PEREGRINE_GPU_BACKEND=hip`; hipcc compiles the same kernels) — see docs/gpu-vendors.md)
+peregrine: pcie 0000:01:00.0 8.0 GT/s PCIe x16
+peregrine: pcie 0000:07:00.0 16.0 GT/s PCIe x16
+peregrine: [ram] avail 23.0 GB | resident 5.2 + KV 0.2 + stream 2.2 + slack 0.6 + cache 6.4 -> peak 14.7 GB
+peregrine: [io] rings=4 sqpoll=off fixed_files=registered
+peregrine: disk->GPU lane pinned (io_uring DMAs into cudaHostRegister'd pages)
+[CUDA] device 0: NVIDIA GeForce RTX 3060, 12.5 GB VRAM, sm_86
+peregrine: CUDA contexts initialized: 1 (devices [0])

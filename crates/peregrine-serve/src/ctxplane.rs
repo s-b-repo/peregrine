@@ -13,7 +13,135 @@
 //! An ingestion failure or empty assembly falls back to the raw prompt, never
 //! a partial context: a turn that fails to ingest aborts the whole assembly.
 
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
 use peregrine_ctx::Dcr;
+
+struct CacheEntry {
+    turns: Vec<(String, String)>,
+    query: String,
+    budget: usize,
+    output: String,
+    bytes: usize,
+    stamp: u64,
+}
+
+struct AssemblyCache {
+    entries: Vec<CacheEntry>,
+    max_entries: usize,
+    max_bytes: usize,
+    used: usize,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl AssemblyCache {
+    fn new() -> Self {
+        let max_entries = std::env::var("COLI_CTX_CACHE_ENTRIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(32);
+        let max_mb = std::env::var("COLI_CTX_CACHE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(16);
+        Self::with_limits(max_entries, max_mb.saturating_mul(1024 * 1024))
+    }
+
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries,
+            max_bytes,
+            used: 0,
+            clock: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get(&mut self, turns: &[(String, String)], query: &str, budget: usize) -> Option<String> {
+        self.clock = self.clock.wrapping_add(1);
+        let stamp = self.clock;
+        let index = self.entries.iter().position(|entry| {
+            entry.budget == budget && entry.query == query && entry.turns == turns
+        })?;
+        self.entries[index].stamp = stamp;
+        self.hits = self.hits.saturating_add(1);
+        Some(self.entries[index].output.clone())
+    }
+
+    fn insert(&mut self, turns: &[(String, String)], query: &str, budget: usize, output: String) {
+        if self.max_entries == 0 || self.max_bytes == 0 {
+            return;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        let stamp = self.clock;
+        let bytes = cache_entry_bytes(turns, query, budget, &output);
+        if bytes > self.max_bytes {
+            return;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.budget == budget && entry.query == query && entry.turns == turns)
+        {
+            self.used = self.used.saturating_sub(self.entries[index].bytes);
+            self.entries[index] = CacheEntry {
+                turns: turns.to_vec(),
+                query: query.to_string(),
+                budget,
+                output,
+                bytes,
+                stamp,
+            };
+            self.used = self.used.saturating_add(bytes);
+            self.evict();
+            return;
+        }
+        self.entries.push(CacheEntry {
+            turns: turns.to_vec(),
+            query: query.to_string(),
+            budget,
+            output,
+            bytes,
+            stamp,
+        });
+        self.used = self.used.saturating_add(bytes);
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.entries.len() > self.max_entries || self.used > self.max_bytes {
+            let Some(index) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.stamp)
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            let entry = self.entries.swap_remove(index);
+            self.used = self.used.saturating_sub(entry.bytes);
+        }
+    }
+}
+
+fn cache_entry_bytes(turns: &[(String, String)], query: &str, budget: usize, output: &str) -> usize {
+    turns
+        .iter()
+        .map(|(role, text)| role.len().saturating_add(text.len()).saturating_add(16))
+        .chain(std::iter::once(query.len().saturating_add(budget)))
+        .fold(output.len().saturating_add(64), usize::saturating_add)
+}
+
+fn assembly_cache() -> &'static Mutex<AssemblyCache> {
+    static CACHE: OnceLock<Mutex<AssemblyCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AssemblyCache::new()))
+}
 
 /// Context-plane master switch (`COLI_CTX=1`). Off by default: engagement
 /// changes tokens, so it must be asked for, like every other knob that can
@@ -31,7 +159,17 @@ pub fn assemble_context(turns: &[(String, String)], query: &str, budget: usize) 
     if !ctx_enabled() {
         return None;
     }
-    assemble_context_enabled(turns, query, budget)
+    if let Some(output) = assembly_cache().lock().get(turns, query, budget) {
+        return Some(output);
+    }
+    let mut cache = assembly_cache().lock();
+    cache.misses = cache.misses.saturating_add(1);
+    drop(cache);
+    let output = assemble_context_enabled(turns, query, budget);
+    if let Some(output) = &output {
+        assembly_cache().lock().insert(turns, query, budget, output.clone());
+    }
+    output
 }
 
 /// [`assemble_context`] without the env gate — the testable core. Same
@@ -71,6 +209,29 @@ pub fn assemble_context_enabled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assembly_cache_is_exact_and_bounded() {
+        let turns = vec![("user".to_string(), "hello".to_string())];
+        let mut cache = AssemblyCache::with_limits(2, 1024);
+        cache.insert(&turns, "hello", 128, "one".to_string());
+        assert_eq!(cache.get(&turns, "hello", 128).as_deref(), Some("one"));
+        assert!(cache.get(&turns, "different", 128).is_none());
+        assert!(cache.get(&turns, "hello", 129).is_none());
+        cache.insert(&turns, "second", 128, "two".to_string());
+        cache.insert(&turns, "third", 128, "three".to_string());
+        assert!(cache.entries.len() <= 2);
+        assert!(cache.used <= cache.max_bytes);
+    }
+
+    #[test]
+    fn oversized_assembly_is_not_cached() {
+        let turns = vec![("user".to_string(), "hello".to_string())];
+        let mut cache = AssemblyCache::with_limits(2, 8);
+        cache.insert(&turns, "hello", 128, "a".repeat(64));
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.used, 0);
+    }
 
     #[test]
     fn empty_input_never_assembles() {

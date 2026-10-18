@@ -225,6 +225,21 @@ impl MemoryGraph {
     }
 
     fn require_grounding(&self, node: &Node, raw: &RawStore) -> Result<(), DcrError> {
+        // A skill is a capability, not a claim: its provenance is the
+        // content-addressed artifact it names (an adapter hash in
+        // `meta.source`), not a text span. The grounding rule still binds — a
+        // skill with no artifact reference is the same failure as a fact with
+        // no span: a database row asserting something it cannot point at.
+        if node.kind == Kind::Skill {
+            return match node.meta.source.as_deref() {
+                Some(reference) if !reference.trim().is_empty() => Ok(()),
+                _ => Err(DcrError::Provenance(format!(
+                    "skill {} has no artifact reference; a capability with no \
+                     content-addressed adapter is a hallucination with a database row",
+                    node.id
+                ))),
+            };
+        }
         if node.kind == Kind::Evidence {
             if node.source_spans.is_empty() {
                 return Err(DcrError::Provenance(

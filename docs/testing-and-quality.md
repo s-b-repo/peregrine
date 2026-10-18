@@ -2,17 +2,18 @@
 
 # Testing & quality gates
 
-**604 tests passing (18 ignored), 0 warnings, clippy clean** (debug + release), plus a
-strict bad-patterns audit. This page is what to run, what each gate enforces,
-and the correctness philosophy behind the test suite.
+**1243 tests passing (19 ignored), 0 clippy errors**, plus a bad-patterns audit
+and a numerical certificate suite. This page is what to run, what each gate
+enforces, and the correctness philosophy behind the test suite.
 
 ## The gates
 
 ```bash
-cargo test --workspace                     # 765 tests, CPU-only, no GPU needed
-cargo clippy --workspace --all-targets     # 7 warnings (the documented baseline)
-scripts/audit-bad-patterns.sh --strict     # panic / UB / suppression / Cargo gate (CI)
-scripts/audit-reachability.py --list       # [R] shipped-but-unreachable pass
+cargo test --workspace                     # CPU-only, no GPU needed
+cargo clippy --workspace --all-targets     # 0 errors, 25 warning sites (the baseline)
+scripts/audit-bad-patterns.sh --strict     # bad-pattern gate: every section within its ratchet
+cargo run -p peregrine-verify --release -- verify   # numerical certificate gate, exit 0 required
+scripts/audit-reachability.py --list       # [Z] shipped-but-unreachable pass
 scripts/test-aarch64.sh                    # CPU kernels as real ARM code under qemu
 cargo check --features cuda --all-targets -p peregrine-model -p peregrine-cuda
 cargo test -p peregrine-cuda --features cuda   # GPU-gated tests (NVIDIA host only)
@@ -32,6 +33,44 @@ test targets, so a signature change can leave the `#[cfg(all(test, feature = "cu
 modules uncompilable while the check still reports success. That is exactly how the
 `GpuTier::build` call sites in `gpu.rs` went stale. It does not link (no `nvcc` needed),
 so it runs anywhere.
+
+## The certificate gate
+
+```bash
+scripts/verify-certificates.sh          # == cargo run -p peregrine-verify --release -- verify
+cargo run -p peregrine-verify -- verify --group kernels
+cargo run -p peregrine-verify -- list    # the theorems, without running them
+```
+
+`peregrine-verify` is a second gate beside this suite, and it exists because some
+failures **cannot** be caught by a test that asserts a fixed expectation. Every
+certificate states a claim as a theorem string, produces a **residual** — one
+number, zero exactly when the claim holds — and compares it against a **tolerance
+taken from the arithmetic** rather than from whatever the code currently
+produces. The check runs the production function, never a re-implementation of
+the formula, because a copy of the formula proves the formula, which was never in
+doubt.
+
+65 certificates in 10 groups at the time of writing:
+
+| Group | Certificates | What it pins |
+|---|---:|---|
+| `kernels` | 12 | SIMD integer dots bit-identical to their scalar references at every vector boundary; the packed row a quantizer writes is the row the kernel reads (the int4 bias convention — the class of bug in `[X1]`); `matmul_q_idot` bit-exact against the kernel it composes; parallel matmul bit-identical to serial |
+| `dtype` | 5 | f16 round-trips within half an ulp, idempotent, specials and signed zero intact; bf16 truncation loses at most one ulp — a full ulp, because it truncates |
+| `pack` | 6 | k-block transpose is its own inverse; zstd is byte-for-byte transparent at three levels; a written checkpoint reads back bit-identical including a compressed header; the group size is the finest candidate matching the scale count; every dequantized row lands within half a step |
+| `math` | 11 | RMSNorm at unit RMS, softmax a distribution, a masked row uniform rather than NaN, SwiGLU composes its two halves, RoPE identity at position 0, norm-preserving, the two layouts agreeing under the lane permutation, and positions composing additively |
+| `router` | 6 | renormalized gates are a distribution; `route` and `route_ranks` agree; the bias selects without weighting; `keff` bounded; `min_share` drops only a trailing tail; the expert budget only shrinks |
+| `sample` | 5 | argmax ties to the lowest index and skips NaN; batched greedy agrees per row; `top_prob` is a confidence in `(0, 1]`; a zero seed is not a degenerate RNG stream |
+| `tier` | 6 | one frequency count outranks all recency; the hysteresis edge is exactly where the doc says; a swap replaces the coldest pinned slot with the hottest expert; mismatched inputs decide nothing; LFRU reduces to frequency-only when recency is flat; `decay` only halves |
+| `ctx` | 6 | SHA-256 against five published vectors including the padding boundary; tagged hashing domain-separated and length-prefixed; Merkle root a function of the set; proofs verify and every forgery fails |
+| `io` | 4 | a mirror-striped read is byte-identical to a single-drive read, at an unaligned offset, past the split threshold; short regions ride whole; the expert cache evicts strictly LRU; `hit_rate` is the ratio it reports |
+| `token` | 3 | BPE encode/decode is lossless; the parallel batch encoder is id-for-id serial; encoding does not depend on history |
+
+Two design points worth copying. The `margin` column is residual ÷ tolerance, so a
+certificate drifting toward its bound is visible long before it fails. And a check
+that *could not run* is a **failure with the reason on stderr** — never a skip and
+never a panic — because a certificate that cannot be evaluated is not a passing
+certificate.
 
 ## Correctness philosophy
 
@@ -228,7 +267,7 @@ The suite is built around **bit-identity anchors** rather than tolerances:
 `scripts/audit-bad-patterns.sh` (`--strict` = the CI gate) is a re-runnable
 workspace-wide scan documented in [BAD_PATTERNS.md](BAD_PATTERNS.md):
 
-- **[P] Panicking error handling — must be zero.** `unwrap`/`expect`/
+- **[A] Panicking error handling — must be zero.** `unwrap`/`expect`/
   `panic!`/`unreachable!`/`todo!`/`unwrap_or_default` on the engine paths; a
   panic mid-inference takes the whole process down. The crates also
   `#![deny(clippy::unwrap_used, expect_used, panic)]`; the gate enforces it
@@ -238,27 +277,45 @@ workspace-wide scan documented in [BAD_PATTERNS.md](BAD_PATTERNS.md):
   `map_err`/`or_else`. Advisory operations (madvise/fadvise hints, NUMA
   pinning, route-stats persistence) stay correctness-neutral but must report
   through `note_advisory_err` (surfaced by `COLI_DEBUG=1`), never vanish.
-- **[U] UB / concurrency footguns — must be zero.** `static mut`,
+- **[N] UB / concurrency footguns — must be zero.** `static mut`,
   `transmute`, `mem::forget`, `assume_init`.
 - **[C] Lint suppression — must be zero.** `#[allow(...)]`, item-level
-  `#[deny(...)]`, `#[ignore]`. The workspace removed all 14 of its `#[allow]`s by
-  fixing what they hid; this keeps that true by gate rather than by prose.
-- **[Q] Cargo.toml hygiene — must be zero.** Wildcard versions and unpinned git
+  `#[deny(...)]`, `#[ignore]`, and a bare `// audit-allow:` with no reason. The
+  workspace removed all 14 of its `#[allow]`s by fixing what they hid; this keeps
+  that true by gate rather than by prose.
+- **[J] Secrets — must be zero.** API keys, bearer/AWS/GitHub/Slack tokens,
+  `PRIVATE KEY` blocks, `("admin","admin")` literals.
+- **[M] SQL / command injection — must be zero.** Formatted query strings and
+  `sh -c` with an interpolated argument.
+- **[T] Cargo.toml hygiene — must be zero.** Wildcard versions and unpinned git
   dependencies. A dependency moving under you can shift the bit-identity anchors
   this suite is built on without a commit to blame.
-- **[R] Shipped but unreachable — informational.** `pub fn`s no production path
+- **[Z] Shipped but unreachable — informational.** `pub fn`s no production path
   reaches, via `scripts/audit-reachability.py`. This is the one class greps
   cannot see and tests cannot catch — the code under test is correct, it simply
   runs nowhere, and `pub` keeps clippy's `dead_code` quiet. Five instances had
   shipped, each documented as live. **Run it before marking anything complete.**
-- **[I] `unsafe` outside the expected crates — informational.** `unsafe` is
-  expected only in `peregrine-io` (io_uring, madvise/mbind, perf),
-  `peregrine-cuda` (FFI), `peregrine-kernels` (SIMD); `peregrine-core` is
-  `#![forbid(unsafe_code)]`, and `peregrine-serve` too.
+- **[D][E][F][G][H][I][K][O][P] — informational.** panic vectors, `unsafe`/casts,
+  blocking calls, logging, HTTP, iterator shapes, crypto, performance, API
+  hygiene. `unsafe` is expected only in `peregrine-io` (io_uring, madvise/mbind,
+  perf), `peregrine-cuda` (FFI), `peregrine-kernels` (SIMD) and `peregrine-par`
+  (one documented lifetime-erasure); `peregrine-core` is `#![forbid(unsafe_code)]`,
+  and so are `peregrine-serve` and `peregrine-verify`.
 
-Current status: `--strict` green — **P=0, B=0, U=0, C=0, Q=0, I=0** (55 files;
-`peregrine-token` excluded as vendored — its gate is the parity suite).
-Waivers use `// audit-allow:` comments, and none remain in first-party code.
+Sections A/B/C/J/M/N/T are the gate (`--strict`); the rest report. Three letters
+moved when unifur's matrix was merged (P→A, U→N, Q→T, I→E, R→Z, K→X) — the old
+letters still work as `--section` aliases, and [BAD_PATTERNS.md](BAD_PATTERNS.md)
+has the full map. The script also gained `--section`, `--files` and
+`--max-report`, and each pattern now prints at most 20 offending lines
+(`--max-report 0` for all), which is what keeps a 2.2k-cast informational section
+readable.
+
+Current status: **not green** — on the current working tree
+**A=50, B=49, C=5** strict hits, **J=M=N=T=0** (123 files; `peregrine-token`
+excluded as vendored — its gate is the parity suite). Regenerate from
+`scripts/audit-bad-patterns.sh --strict` rather than by hand. Waivers use
+`// audit-allow: <reason>` comments; the ten that remain are all reasoned
+token-count field names.
 There are **zero production `assert!`s**: the last one (KV-cache append order)
 became `LayerKv::append -> Result`, so a violation fails that one request instead
 of aborting the process — the release profile sets `panic = "abort"`, which would

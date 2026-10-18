@@ -1,0 +1,17 @@
+  batch   steps   tokens    seconds     agg tok/s   tok/s   per-seq tok/s
+      1       6        6      68.66         0.087      0.087          0.0874
+[ledger] expert bytes over 6 token(s), 12615680 B/expert
+[ledger] requested                25.433 GB      4.239 GB/token
+[ledger] unique (union)           25.433 GB      4.239 GB/token   (0.0% saved by batch union)
+[ledger] cache-served              0.669 GB                      (2.6% of unique)
+[ledger] from disk                24.765 GB      4.127 GB/token
+[ledger] prefetch waste           13.297 GB                      (53.7% of disk traffic)
+[ledger] re-read (evicted)         7.910 GB                      (31.9% of disk traffic, inside `from disk`)
+[ledger] NOTE: every saving above is a BYTE figure with no quality figure beside it. 
+[ledger]   Gate any change that produced one with `peregrine flip-rate` before 
+[ledger]   quoting it. COLI_ROUTE_MIN_SHARE cut 12.5% of reads for 27.9% of top-1.
+[lane] 6 forwards: io 180.5s (97%) cpu 4.9s (3%) gpu 0.0s (0%) reduce 0.0s (0%)
+[ssdclock] learned device bandwidth (slowest first):
+[ssdclock]   dev-2     135.3 MB/s  (379 windows)
+[ssdclock]   dev-0     158.9 MB/s  (352 windows)
+[ssdclock]   dev-1     176.4 MB/s  (272 windows)

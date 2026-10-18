@@ -185,7 +185,20 @@ pub fn moe_streamed(
 ) -> Result<Vec<f32>, Error> {
     let MoeCfg { s_n, hidden, k: topk, norm_topk, routed_scale } = cfg;
     let e_n = experts.len();
-    let mut r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k: topk, norm_topk, routed_scale, min_share: 0.0 });
+    let mut r = route(
+        x,
+        router_w,
+        router_bias,
+        RouterCfg {
+            s_n,
+            d_n: hidden,
+            e_n,
+            k: topk,
+            norm_topk,
+            routed_scale,
+            min_share: peregrine_model::router::route_min_share(),
+        },
+    );
     apply_route_topp(&mut r, s_n, route_topp(), norm_topk, routed_scale);
     apply_expert_budget(&mut r, s_n, expert_budget(), norm_topk, routed_scale);
     let uniq = batch_union(&r, s_n);
@@ -278,8 +291,28 @@ impl peregrine_model::concurrent::MoeEngine for SchedEngine {
         call: peregrine_model::concurrent::MoeCall,
     ) -> Result<Vec<f32>, Error> {
         use peregrine_core::QtInfo;
-        let peregrine_model::concurrent::MoeCall { layer, x, router_w, router_bias, shared, s_n } = call;
+        let peregrine_model::concurrent::MoeCall {
+            layer,
+            x,
+            router_w,
+            router_bias,
+            shared,
+            shared_gate: _,
+            fallback_experts,
+            s_n,
+        } = call;
         let cfg = ctx.cfg;
+        if fallback_experts.is_some_and(|v| v.iter().any(Option::is_some)) {
+            return Err(Error::Format("peregrine-sched does not support BF16 fallback experts".into()));
+        }
+        if cfg.arch == peregrine_core::Arch::Qwen4Exp
+            || (ctx.stream_experts
+                && matches!(cfg.arch, peregrine_core::Arch::Qwen35Moe | peregrine_core::Arch::Glm5Next))
+        {
+            return Err(Error::Format(
+                "peregrine-sched does not implement qwen3_5_moe/qwen4_exp routing or glm5_next expert semantics".into(),
+            ));
+        }
         let hidden = cfg.hidden as usize;
         let mi = cfg.moe_inter as usize;
         let e_n = cfg.n_experts as usize;
@@ -421,7 +454,7 @@ mod tests {
     #[test]
     fn streamed_matches_the_production_concurrent_path() -> Result<(), peregrine_core::Error> {
         use peregrine_core::{Cfg, QtInfo, SafeTensors};
-        use peregrine_model::concurrent::{moe_forward_concurrent, ForwardCtx};
+        use peregrine_model::concurrent::{moe_forward_concurrent_call, ForwardCtx, MoeCall};
         use peregrine_model::testkit::build_tiny_model_seeded;
         use parking_lot::Mutex;
 
@@ -452,6 +485,7 @@ mod tests {
             // capture path.
             gate_trace: None,
             st: &st,
+            reference: None,
             absorb: false,
             dsa: false,
             reactors: &reactors,
@@ -480,7 +514,16 @@ mod tests {
             fd_devices: None,
             block_exec: peregrine_model::BlockExecMode::Par,
         };
-        let production = moe_forward_concurrent(&ctx, layer, &x, &router_w, &router_bias, None, s_n)?;
+        let production = moe_forward_concurrent_call(&ctx, MoeCall {
+            layer,
+            x: &x,
+            router_w: &router_w,
+            router_bias: &router_bias,
+            shared: None,
+            shared_gate: None,
+            fallback_experts: None,
+            s_n,
+        })?;
 
         // Point this crate's `DiskQt`s at the *same* container bytes. `region`
         // is what `tplan` uses; a scale tensor is always `<name>.qs`.

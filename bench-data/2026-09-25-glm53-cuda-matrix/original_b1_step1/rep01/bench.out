@@ -1,0 +1,8 @@
+  batch   steps   tokens    seconds     agg tok/s   tok/s   per-seq tok/s
+      1       1        1      15.65         0.064      0.064          0.0639
+[lane] 1 forwards: io 35.5s (85%) cpu 5.9s (14%) gpu 0.0s (0%) reduce 0.2s (1%)
+[ssdclock] learned device bandwidth (slowest first):
+[ssdclock]   dev-2      42.9 MB/s  (22 windows)
+[ssdclock]   dev-0     123.8 MB/s  (39 windows)
+[ssdclock]   dev-1     132.0 MB/s  (52 windows)
+[ssdclock]   dev-3     159.7 MB/s  (53 windows)

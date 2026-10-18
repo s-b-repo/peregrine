@@ -26,7 +26,7 @@ pub use durable::{commit_atomic, temp_sibling, write_atomic};
 pub use peregrine_io::note_advisory_err;
 pub use dtype::{bf16_to_f32, f16_to_f32, f32_to_f16, Dtype};
 pub use qt::{detect_group_size, QtFmt, QtInfo};
-pub use safetensors::{SafeTensors, TensorInfo};
+pub use safetensors::{MmapTensor, SafeTensors, TensorInfo};
 
 use thiserror::Error as ThisError;
 

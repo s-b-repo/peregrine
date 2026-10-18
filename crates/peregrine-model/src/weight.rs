@@ -7,7 +7,9 @@
 //! (fmt 1), per-row packed int4 (fmt 2), grouped packed int4 (fmt 4, the
 //! coherence-critical format for GLM-5.2), and packed int2 (fmt 3).
 
-use peregrine_core::{Error, QtFmt, QtInfo, SafeTensors};
+use std::sync::Arc;
+
+use peregrine_core::{bf16_to_f32, f16_to_f32, Dtype, Error, MmapTensor, QtFmt, QtInfo, SafeTensors};
 use peregrine_io::Bytes;
 use peregrine_kernels::{
     dot_i2i8, dot_i2i8_g64, dot_i3i8_g64, matmul_i4_from_f32, matmul_i4g_from_f32, matmul_i8_from_f32, qrow_i8, ActScratch, MatShape,
@@ -31,6 +33,7 @@ pub enum QuantFmt {
     /// [`QuantFmt::Int2`] all four levels carry weight, because the bias is the
     /// group's own zero-point rather than a fixed `-2`.
     Int2G64,
+    Full,
 }
 
 impl QuantFmt {
@@ -77,7 +80,92 @@ fn landing(nb: usize, aligned: bool) -> Bytes {
     Bytes::Vec(vec![0u8; nb])
 }
 
-/// One quantized weight matrix `[O, I]`.
+enum FullData {
+    Mmap(MmapTensor),
+    F32(Arc<[f32]>),
+}
+
+impl FullData {
+    fn row_into(&self, o: usize, i: usize, out: &mut [f32]) {
+        match self {
+            Self::Mmap(tensor) => {
+                if tensor.read_f32_range(o * i, i, out).is_err() {
+                    out.fill(f32::NAN);
+                }
+            }
+            Self::F32(values) => {
+                let start = o * i;
+                let end = start + i;
+                if end <= values.len() {
+                    out.copy_from_slice(&values[start..end]);
+                } else {
+                    out.fill(f32::NAN);
+                }
+            }
+        }
+    }
+
+    fn dot(&self, o: usize, i: usize, input: &[f32]) -> f32 {
+        let Some(input) = input.get(..i) else {
+            return f32::NAN;
+        };
+        match self {
+            Self::F32(values) => {
+                let start = o * i;
+                let Some(row) = values.get(start..start.saturating_add(i)) else {
+                    return f32::NAN;
+                };
+                let mut sum = 0.0;
+                for (a, b) in row.iter().zip(input) {
+                    sum += a * b;
+                }
+                sum
+            }
+            Self::Mmap(tensor) => {
+                let width = tensor.dtype().elem_size();
+                let start = o.saturating_mul(i).saturating_mul(width);
+                let len = i.saturating_mul(width);
+                let Some(bytes) = tensor.bytes().get(start..start.saturating_add(len)) else {
+                    return f32::NAN;
+                };
+                let mut sum = 0.0;
+                match tensor.dtype() {
+                    Dtype::Bf16 => {
+                        for (raw, value) in bytes.chunks_exact(2).zip(input) {
+                            sum += bf16_to_f32(u16::from_le_bytes([raw[0], raw[1]])) * value;
+                        }
+                    }
+                    Dtype::F16 => {
+                        for (raw, value) in bytes.chunks_exact(2).zip(input) {
+                            sum += f16_to_f32(u16::from_le_bytes([raw[0], raw[1]])) * value;
+                        }
+                    }
+                    Dtype::F32 => {
+                        for (raw, value) in bytes.chunks_exact(4).zip(input) {
+                            sum += f32::from_bits(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])) * value;
+                        }
+                    }
+                    Dtype::F8E4M3 => {
+                        for (raw, value) in bytes.iter().zip(input) {
+                            sum += peregrine_core::dtype::f8e4m3_to_f32(*raw) * value;
+                        }
+                    }
+                    Dtype::U8 | Dtype::I64 => return f32::NAN,
+                }
+                sum
+            }
+        }
+    }
+
+    fn bytes(&self, o: usize, i: usize) -> usize {
+        o.saturating_mul(i).saturating_mul(match self {
+            Self::Mmap(tensor) => tensor.dtype().elem_size(),
+            Self::F32(_) => 4,
+        })
+    }
+}
+
+/// One quantized or full-precision weight matrix `[O, I]`.
 pub struct QtWeight {
     pub fmt: QuantFmt,
     pub o: usize,
@@ -91,13 +179,10 @@ pub struct QtWeight {
     /// scales: `O` per-row (int8/int4/int2) or `O*ceil(I/gs)` grouped (fmt 4),
     /// laid out `scale[o*ng + g]`
     scale: Vec<f32>,
-    /// group size for [`QtFmt::Int4Grouped`] (weights per shared scale), else 0
+    /// group size for [`QuantFmt::Int4Grouped`] (weights per shared scale), else 0
     gs: usize,
-    /// A VRAM-resident copy, when this weight was uploaded ([`Self::upload_to_device`]).
-    /// Consulted only at `s_n == 1` — decode — where the device GEMV both wins
-    /// on time and keeps f32 throughout; batched shapes stay on the CPU path,
-    /// which is already parallel over output rows.
     dev: Option<DevMatrix>,
+    full: Option<FullData>,
 }
 
 /// `COLI_ACT_F32=1`: compute quantized matmuls against **f32** activations
@@ -115,6 +200,15 @@ fn act_f32() -> bool {
     *V.get_or_init(|| matches!(std::env::var("COLI_ACT_F32").as_deref(), Ok("1") | Ok("true")))
 }
 
+fn model_mmap_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("COLI_MMAP_MODEL").as_deref() {
+        Ok("0") | Ok("false") => false,
+        Ok("1") | Ok("true") => cfg!(target_os = "linux"),
+        _ => cfg!(target_os = "linux"),
+    })
+}
+
 impl QtWeight {
     /// Build from already-quantized per-row data (also the test constructor).
     /// For grouped-int4 use [`Self::new_grouped`].
@@ -124,14 +218,56 @@ impl QtWeight {
             "QtWeight::new is for formats with an implicit group layout (got {fmt:?}); \
              use new_grouped for grouped int4, whose group size is a runtime value"
         );
-        QtWeight { fmt, o, i, q: q.into(), scale, gs: 0, dev: None }
+        QtWeight { fmt, o, i, q: q.into(), scale, gs: 0, dev: None, full: None }
     }
 
     /// Build a grouped-int4 weight: `scale` holds `o*ceil(i/gs)` entries laid out
     /// `scale[o*ng + g]`.
     pub fn new_grouped(o: usize, i: usize, q: impl Into<Bytes>, scale: Vec<f32>, gs: usize) -> QtWeight {
         debug_assert!(gs > 0 && gs.is_multiple_of(16), "grouped-int4 gs must be a positive multiple of 16");
-        QtWeight { fmt: QuantFmt::Int4Grouped, o, i, q: q.into(), scale, gs, dev: None }
+        QtWeight { fmt: QuantFmt::Int4Grouped, o, i, q: q.into(), scale, gs, dev: None, full: None }
+    }
+
+    pub fn from_full(o: usize, i: usize, values: Vec<f32>) -> Result<QtWeight, Error> {
+        if o.checked_mul(i) != Some(values.len()) {
+            return Err(Error::Format(format!("full weight geometry [{o},{i}] does not match {} values", values.len())));
+        }
+        Ok(QtWeight {
+            fmt: QuantFmt::Full,
+            o,
+            i,
+            q: Bytes::Vec(Vec::new()),
+            scale: Vec::new(),
+            gs: 0,
+            dev: None,
+            full: Some(FullData::F32(Arc::from(values))),
+        })
+    }
+
+    pub fn load_mmap(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<QtWeight, Error> {
+        let tensor = st.mmap_tensor(name)?;
+        let info = st
+            .find(name)
+            .ok_or_else(|| Error::Format(format!("missing tensor: {name}")))?;
+        if info.shape != [o as i64, i as i64] {
+            return Err(Error::Format(format!(
+                "full tensor '{name}' has shape {:?}, expected [{o},{i}]",
+                info.shape
+            )));
+        }
+        if tensor.numel() != o.saturating_mul(i) {
+            return Err(Error::Format(format!("full tensor '{name}' has the wrong element count")));
+        }
+        Ok(QtWeight {
+            fmt: QuantFmt::Full,
+            o,
+            i,
+            q: Bytes::Vec(Vec::new()),
+            scale: Vec::new(),
+            gs: 0,
+            dev: None,
+            full: Some(FullData::Mmap(tensor)),
+        })
     }
 
     /// Load a container weight `[O, I]` (`name` + `name.qs`) from a model dir.
@@ -157,6 +293,23 @@ impl QtWeight {
 
     fn load_into(st: &SafeTensors, name: &str, o: usize, i: usize, aligned: bool) -> Result<QtWeight, Error> {
         let info = QtInfo::detect(st, name, o as i64, i as i64);
+        if info.fmt == QtFmt::F32 {
+            if model_mmap_enabled() {
+                match Self::load_mmap(st, name, o, i) {
+                    Ok(weight) => return Ok(weight),
+                    Err(error) => peregrine_io::note_advisory_err(
+                        "mmap full weight (using positioned read)",
+                        &error,
+                    ),
+                }
+            }
+            let count = o
+                .checked_mul(i)
+                .ok_or_else(|| Error::Format(format!("full weight '{name}' geometry overflow")))?;
+            let mut values = vec![0.0f32; count];
+            st.read_f32(name, &mut values)?;
+            return Self::from_full(o, i, values);
+        }
         let fmt = match QuantFmt::from_qt(info.fmt) {
             Some(f) => f,
             None if info.fmt == QtFmt::Unknown => {
@@ -168,8 +321,7 @@ impl QtWeight {
             }
             None => {
                 return Err(Error::Format(format!(
-                    "weight '{name}': no `.qs` scale sibling (runtime-f32 weights are not \
-                     supported on the quantized expert path)"
+                    "weight '{name}': no `.qs` scale sibling and the tensor is not a supported native float"
                 )))
             }
         };
@@ -179,23 +331,18 @@ impl QtWeight {
             QuantFmt::Int2 => o * (i.div_ceil(4)),
             QuantFmt::Int3G64 => o * i.div_ceil(peregrine_core::pack::I3_GROUP) * peregrine_core::pack::I3_GROUP_BYTES,
             QuantFmt::Int2G64 => o * i.div_ceil(peregrine_core::pack::I2G_GROUP) * peregrine_core::pack::I2G_GROUP_BYTES,
+            QuantFmt::Full => return Err(Error::Format(format!("weight '{name}' resolved to an invalid full format"))),
         };
         let mut q = landing(nb, aligned);
         {
-            // Both landing shapes are writable; `as_mut_slice` is `Option` only
-            // because the shared/view variants exist, and `landing` builds
-            // neither.
             let Some(b) = q.as_mut_slice() else {
                 return Err(Error::Format(format!("weight '{name}': landing buffer is not writable")));
             };
             st.read_raw(name, b)?;
         }
-        // The scales are a few KB against a multi-MB payload, so they stay a
-        // plain `Vec`: pinning them would cost a page-table walk to save a
-        // bounce the driver does in microseconds.
         let mut scale = vec![0f32; info.scale_count as usize];
         st.read_f32(&format!("{name}.qs"), &mut scale)?;
-        Ok(QtWeight { fmt, o, i, q, scale, gs: info.gs as usize, dev: None })
+        Ok(QtWeight { fmt, o, i, q, scale, gs: info.gs as usize, dev: None, full: None })
     }
 
     /// Whether the quantized payload sits in pinned memory — i.e. whether it
@@ -203,7 +350,15 @@ impl QtWeight {
     /// through [`Self::load_aligned`] on a build where the pin hook is installed
     /// and the driver accepted the buffer.
     pub fn is_pinned(&self) -> bool {
-        self.q.is_pinned()
+        !self.is_full() && self.q.is_pinned()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.fmt == QuantFmt::Full
+    }
+
+    pub fn full_bytes(&self) -> usize {
+        self.full.as_ref().map_or(0, |full| full.bytes(self.o, self.i))
     }
 
     /// Raw quantized payload: `(packed_bytes, per_row_scales)`. Lets the
@@ -230,7 +385,7 @@ impl QtWeight {
             QuantFmt::Int8 => Some((self.i, 1)),
             QuantFmt::Int4 => Some((self.i.div_ceil(2), 1)),
             QuantFmt::Int4Grouped => Some((self.i.div_ceil(2), self.i.div_ceil(self.gs))),
-            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 => None,
+            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 | QuantFmt::Full => None,
         }
     }
 
@@ -250,13 +405,56 @@ impl QtWeight {
             QuantFmt::Int4 => matmul_i4_from_f32(y, x, q, sc, shape, act),
             QuantFmt::Int4Grouped => matmul_i4g_from_f32(y, x, q, sc, shape, self.gs, act),
             // `row_pitch` returned None for these, so they never reach here.
-            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 => {}
+            QuantFmt::Int2 | QuantFmt::Int3G64 | QuantFmt::Int2G64 | QuantFmt::Full => {}
         }
+    }
+
+    fn apply_full_into(&self, x: &[f32], s_n: usize, y: &mut [f32]) {
+        let gate = if self.i.saturating_mul(self.o) >= 1 << 20 {
+            peregrine_par::PAR_MATMUL_MIN
+        } else {
+            usize::MAX
+        };
+        let (o, i) = (self.o, self.i);
+        if self.full.is_none() {
+            y.fill(f32::NAN);
+            return;
+        }
+        if s_n == 1 {
+            peregrine_par::par_chunks_mut(y, 1, o, gate, |start, _end, chunk| {
+                for (local, dst) in chunk.iter_mut().enumerate() {
+                    let out = start + local;
+                    *dst = self.full.as_ref().map_or(f32::NAN, |full| full.dot(out, i, x));
+                }
+            });
+        } else {
+            peregrine_par::par_chunks_mut(y, o, s_n, gate, |start, _end, chunk| {
+                for (local, dst) in chunk.iter_mut().enumerate() {
+                    let s = start + local / o;
+                    let out = local % o;
+                    let Some(input) = x.get(s * i..(s + 1) * i) else {
+                        *dst = f32::NAN;
+                        continue;
+                    };
+                    *dst = self.full.as_ref().map_or(f32::NAN, |full| full.dot(out, i, input));
+                }
+            });
+        }
+    }
+
+    fn apply_full_vec(&self, x: &[f32], s_n: usize) -> Vec<f32> {
+        let mut y = vec![0f32; s_n * self.o];
+        self.apply_full_into(x, s_n, &mut y);
+        y
     }
 
     /// `y[s_n, O] = apply(self, x[s_n, I])`. Caller provides int8 activation
     /// scratch `xq[s_n*I]`, per-row scale scratch `sx[s_n]`, and output `y`.
     pub fn apply(&self, x: &[f32], s_n: usize, xq: &mut [i8], sx: &mut [f32], y: &mut [f32]) {
+        if self.is_full() {
+            self.apply_full_into(x, s_n, y);
+            return;
+        }
         match self.fmt {
             QuantFmt::Int8 => matmul_i8_from_f32(y, x, self.as_i8(), &self.scale, MatShape::new(s_n, self.i, self.o), ActScratch { xq, sx }),
             QuantFmt::Int4 => matmul_i4_from_f32(y, x, &self.q[..], &self.scale, MatShape::new(s_n, self.i, self.o), ActScratch { xq, sx }),
@@ -320,6 +518,7 @@ impl QtWeight {
                     }
                 }
             }
+            QuantFmt::Full => self.apply_full_into(x, s_n, y),
         }
     }
 
@@ -365,7 +564,11 @@ impl QtWeight {
     /// Packed bytes this weight occupies in RAM — the denominator for "how
     /// much of the model is on the device".
     pub fn packed_bytes(&self) -> usize {
-        self.q.len() + 4 * self.scale.len()
+        if self.is_full() {
+            self.full_bytes()
+        } else {
+            self.q.len() + 4 * self.scale.len()
+        }
     }
 
     /// Bytes this weight occupies in VRAM (0 when it is not resident).
@@ -384,6 +587,9 @@ impl QtWeight {
     }
 
     pub fn apply_vec(&self, x: &[f32], s_n: usize) -> Vec<f32> {
+        if self.is_full() {
+            return self.apply_full_vec(x, s_n);
+        }
         // Decode against a VRAM-resident weight: the device GEMV is both faster
         // (measured 6.7x on a real layer shape) and more accurate (f32
         // throughout, rms 1.1e-7 vs the CPU path's 3.0e-3 — this path never
@@ -517,6 +723,14 @@ impl QtWeight {
             return;
         }
         let out = &mut out[..self.i];
+        if self.is_full() {
+            if let Some(full) = self.full.as_ref() {
+                full.row_into(o, self.i, out);
+            } else {
+                out.fill(f32::NAN);
+            }
+            return;
+        }
         match self.fmt {
             QuantFmt::Int8 => {
                 let s = self.scale[o];
@@ -575,6 +789,13 @@ impl QtWeight {
                     *dst = i2g_field(self.q[o * rb + g * I2G_GROUP_BYTES + (k >> 2)], k) as f32
                         * self.scale[si]
                         + self.scale[si + 1];
+                }
+            }
+            QuantFmt::Full => {
+                if let Some(full) = &self.full {
+                    full.row_into(o, self.i, out);
+                } else {
+                    out.fill(f32::NAN);
                 }
             }
         }
@@ -947,6 +1168,30 @@ mod tests {
     }
 
     #[test]
+    fn full_mmap_weight_matches_the_in_memory_matmul() -> Result<(), peregrine_core::Error> {
+        use peregrine_core::pack::{f32_bytes, write_safetensors, Blob};
+        let (o, i, s_n) = (5usize, 7usize, 3usize);
+        let mut rng = Lcg(0xF32);
+        let values: Vec<f32> = (0..o * i).map(|_| rng.f()).collect();
+        let dir = std::env::temp_dir().join(format!("peregrine_full_mmap_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        write_safetensors(
+            &dir,
+            &[Blob::new("w", "F32", vec![o as i64, i as i64], f32_bytes(&values))],
+        )?;
+        let st = peregrine_core::SafeTensors::open(&dir)?;
+        let mapped = QtWeight::load(&st, "w", o, i)?;
+        let memory = super::QtWeight::from_full(o, i, values)?;
+        let x: Vec<f32> = (0..s_n * i).map(|_| rng.f()).collect();
+        assert_eq!(mapped.apply_vec(&x, s_n), memory.apply_vec(&x, s_n));
+        assert_eq!(mapped.dequant(), memory.dequant());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn int2_g64_apply_matches_its_dequantized_matmul() {
         // Same contract as int3-g64 below, and it matters more here: the affine
         // form splits into `s·Σqx + z·Σx`, so a kernel that dropped the second
@@ -1168,6 +1413,24 @@ mod tests {
                 "window [{o0},{o1}) must equal that slice of the full matmul"
             );
         }
+    }
+
+    #[test]
+    fn full_weight_decode_and_batch_match_f32_matmul() -> Result<(), peregrine_core::Error> {
+        let (o, i) = (7usize, 19);
+        let values: Vec<f32> = (0..o * i).map(|n| (n as f32 * 0.13).sin()).collect();
+        let w = QtWeight::from_full(o, i, values.clone())?;
+        let x: Vec<f32> = (0..i).map(|n| (n as f32 * 0.21).cos()).collect();
+        let mut want = vec![0f32; o];
+        matmul_f32(&mut want, &x, &values, 1, i, o);
+        assert_eq!(w.apply_vec(&x, 1), want);
+        let x2: Vec<f32> = (0..2 * i).map(|n| (n as f32 * 0.17).cos()).collect();
+        let mut want2 = vec![0f32; 2 * o];
+        matmul_f32(&mut want2, &x2, &values, 2, i, o);
+        assert_eq!(w.apply_vec(&x2, 2), want2);
+        assert!(w.is_full());
+        assert_eq!(w.full_bytes(), o * i * 4);
+        Ok(())
     }
 }
 

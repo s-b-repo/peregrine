@@ -58,9 +58,23 @@ def test_mask(lines):
 
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
-    files = sorted(
-        p for p in root.glob("crates/*/src/**/*.rs") if "peregrine-token" not in str(p)
-    )
+    # Section [Z] of scripts/audit-bad-patterns.sh, so this file set must match
+    # that script's: both vendored crates are out of scope, because a `pub fn`
+    # upstream defines and peregrine merely ports is not peregrine's to wire up.
+    # peregrine-ctx contributes two files of peregrine's own — src/lib.rs and
+    # src/main.rs — and they stay in, same as in the audit proper.
+    ctx_src = root / "crates/peregrine-ctx/src"
+    ctx_authored = {str(ctx_src / "lib.rs"), str(ctx_src / "main.rs")}
+
+    def in_scope(p: Path) -> bool:
+        s = str(p)
+        if "peregrine-token" in s:
+            return False
+        if s.startswith(str(ctx_src)):
+            return s in ctx_authored
+        return True
+
+    files = sorted(p for p in root.glob("crates/*/src/**/*.rs") if in_scope(p))
     # Every definition site per name, not just the first. A symbol declared twice
     # — the `#[cfg(target_os = "linux")]` implementation and its
     # `#[cfg(not(...))]` stub — used to have its second declaration counted as a

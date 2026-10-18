@@ -40,9 +40,11 @@ Rules:
       #ESCALATE <node_id>
   and nothing else. The runtime will re-plan and give you that node at L0.
 - A fact marked status=stale must not be used; escalate instead.
+- Lines under SKILLS name capabilities the runtime has activated for this
+  turn. Treat them as available and cite their node id when you use one.
 "#;
 
-pub trait Reasoner {
+pub trait Reasoner: Send {
     fn complete(&mut self, prompt: &str, system: &str) -> String;
 }
 
@@ -264,4 +266,176 @@ impl Reasoner for CommandReasoner {
             Err(e) => format!("[reasoner {} failed: {e}]", self.program),
         }
     }
+}
+
+/// Reasoner backed by an OpenAI-compatible HTTP endpoint — peregrine-serve,
+/// vLLM, llama.cpp — over `std::net::TcpStream`.
+///
+/// Localhost only, deliberately: there is no TLS in this crate, and a local
+/// model server does not need it. `complete` maps to
+/// `POST /v1/chat/completions` non-streaming. This exists so the probe suite
+/// can run against a real model with zero dependencies — the validation
+/// ladder's first rung is plumbing, and plumbing should be boring.
+#[derive(Debug, Clone)]
+pub struct HttpReasoner {
+    /// `host:port`, e.g. `127.0.0.1:8000`.
+    pub endpoint: String,
+    /// Model name sent in the request body; most local servers serve one and
+    /// ignore this, but the field is required by the API shape.
+    pub model: String,
+    /// Per-call read/write timeout. Local decode can be slow; the default is
+    /// generous on purpose.
+    pub timeout: std::time::Duration,
+}
+
+impl HttpReasoner {
+    pub fn new(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            model: model.into(),
+            timeout: std::time::Duration::from_secs(300),
+        }
+    }
+}
+
+impl Reasoner for HttpReasoner {
+    fn complete(&mut self, prompt: &str, system: &str) -> String {
+        match self.roundtrip(prompt, system) {
+            Ok(text) => text,
+            // A transport failure must read as a failure, not as the model
+            // declining to answer — the runtime's consistency checks key off
+            // answer text.
+            Err(e) => format!("[reasoner {} failed: {e}]", self.endpoint),
+        }
+    }
+}
+
+impl HttpReasoner {
+    fn roundtrip(&self, prompt: &str, system: &str) -> Result<String, String> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let body = crate::json::Json::obj(vec![
+            ("model", crate::json::Json::str(self.model.clone())),
+            ("stream", crate::json::Json::Bool(false)),
+            (
+                "messages",
+                crate::json::Json::Arr(vec![
+                    crate::json::Json::obj(vec![
+                        ("role", crate::json::Json::str("system")),
+                        ("content", crate::json::Json::str(system)),
+                    ]),
+                    crate::json::Json::obj(vec![
+                        ("role", crate::json::Json::str("user")),
+                        ("content", crate::json::Json::str(prompt)),
+                    ]),
+                ]),
+            ),
+        ])
+        .to_json_string();
+
+        let mut stream = TcpStream::connect(&self.endpoint).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(|e| e.to_string())?;
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            self.endpoint,
+            body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).map_err(|e| e.to_string())?;
+        let split = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or("malformed HTTP response")?;
+        let head = String::from_utf8_lossy(&response[..split]);
+        let body = &response[split + 4..];
+
+        // A non-2xx status is a failure with a name, not a JSON parse error
+        // over an HTML error page.
+        let status = head.lines().next().unwrap_or("");
+        let code = status
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse::<u16>().ok())
+            .unwrap_or(0);
+        if !(200..300).contains(&code) {
+            return Err(format!(
+                "{status}: {}",
+                String::from_utf8_lossy(&body[..body.len().min(200)])
+            ));
+        }
+
+        // `Connection: close` usually buys an identity body, but HTTP/1.1
+        // servers may still answer chunked — decode rather than fail on the
+        // chunk frames.
+        let chunked = head.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && value.trim().eq_ignore_ascii_case("chunked")
+            })
+        });
+        let json = if chunked {
+            decode_chunked(body)?
+        } else {
+            String::from_utf8_lossy(body).into_owned()
+        };
+        let parsed = crate::json::parse(&json)?;
+        parsed
+            .get("choices")
+            .and_then(crate::json::Json::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(crate::json::Json::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("no choices[0].message.content in {json:.200}"))
+    }
+}
+
+/// Reassemble an HTTP/1.1 chunked body. Minimal by design — trailers are
+/// ignored, and any framing error is a named failure rather than a partial
+/// parse.
+fn decode_chunked(body: &[u8]) -> Result<String, String> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    loop {
+        let at = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("malformed chunk: no size line")?;
+        let size_text = std::str::from_utf8(&rest[..at])
+            .map_err(|e| format!("malformed chunk size: {e}"))?;
+        // A size line may carry chunk extensions after ';' — they are ignored.
+        let size_text = size_text.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|e| format!("malformed chunk size '{size_text}': {e}"))?;
+        rest = &rest[at + 2..];
+        if size == 0 {
+            break;
+        }
+        if rest.len() < size + 2 {
+            return Err("truncated chunk".to_string());
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size..];
+        if !rest.starts_with(b"\r\n") {
+            return Err("malformed chunk: missing CRLF".to_string());
+        }
+        rest = &rest[2..];
+    }
+    String::from_utf8(out).map_err(|e| format!("chunked body is not UTF-8: {e}"))
 }

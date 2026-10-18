@@ -41,6 +41,21 @@ pub struct Telemetry {
     pub prefetch_issued: u32,
     pub prefetch_hits: u32,
     pub wasted_builds: u32,
+    /// Per-turn shared-prefix fraction between consecutive prompts, summed so
+    /// the report can average it. This is the runtime-side view of what
+    /// `bench --cache` measures offline: whether the assembly layout earns a
+    /// prompt-cache discount. Zero turns recorded means the metric is
+    /// undefined, not zero.
+    pub prefix_reuse_sum: f64,
+    pub prefix_reuse_turns: u64,
+    /// Turns the fit gate served from raw history instead of planning. The
+    /// rate is the answer to "is DCR paying rent here": high means the store
+    /// is mostly below the window and the machinery is mostly overhead.
+    pub bypassed: u64,
+    /// Skill activations that failed after the plan admitted them. Never
+    /// silent: a nonzero count means the model answered at least one turn
+    /// believing a capability was live when the loader could not load it.
+    pub skill_load_failures: u64,
     /// What the naive baseline would have paid: every token ever ingested.
     pub history_tokens: usize,  // audit-allow: LM token count, not a credential
 }
@@ -63,6 +78,11 @@ impl Telemetry {
     pub fn record_explain(&mut self, complete: bool) {
         self.explain_calls += 1;
         self.explain_complete += u32::from(complete);
+    }
+
+    pub fn record_prefix_reuse(&mut self, fraction: f64) {
+        self.prefix_reuse_sum += fraction;
+        self.prefix_reuse_turns += 1;
     }
 
     pub fn report(&self) -> Report {
@@ -90,6 +110,9 @@ impl Telemetry {
             },
             prefetch_hit_rate: ratio(self.prefetch_hits as f64, self.prefetch_issued as f64),
             wasted_builds: self.wasted_builds,
+            prefix_reuse_mean: ratio(self.prefix_reuse_sum, self.prefix_reuse_turns as f64),
+            bypass_rate: ratio(self.bypassed as f64, turns as f64),
+            skill_load_failures: self.skill_load_failures,
         }
     }
 }
@@ -119,6 +142,16 @@ pub struct Report {
     /// "speculation is failing" rather than "speculation has not run".
     pub prefetch_hit_rate: Option<f64>,
     pub wasted_builds: u32,
+    /// Mean shared-prefix fraction across consecutive prompts. `None` until
+    /// two turns have run — the first prompt has no predecessor, so one turn
+    /// of data is not a rate.
+    pub prefix_reuse_mean: Option<f64>,
+    /// Fraction of turns the fit gate bypassed. `None` before any turn.
+    pub bypass_rate: Option<f64>,
+    /// Skill activations that failed after admission. Zero is the only
+    /// healthy value; anything else means the model was told a capability was
+    /// active that never loaded.
+    pub skill_load_failures: u64,
 }
 
 fn opt(value: Option<f64>, decimals: usize) -> String {
@@ -130,7 +163,7 @@ fn opt(value: Option<f64>, decimals: usize) -> String {
 
 impl std::fmt::Display for Report {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let rows: [(&str, String); 12] = [
+        let rows: [(&str, String); 15] = [
             ("turns", self.turns.to_string()),
             ("escalation_rate", opt(self.escalation_rate, 3)),
             ("stale_fact_read_rate", opt(self.stale_fact_read_rate, 3)),
@@ -152,6 +185,12 @@ impl std::fmt::Display for Report {
             ("compression_ratio", opt(self.compression_ratio, 1)),
             ("prefetch_hit_rate", opt(self.prefetch_hit_rate, 3)),
             ("wasted_builds", self.wasted_builds.to_string()),
+            ("prefix_reuse_mean", opt(self.prefix_reuse_mean, 3)),
+            ("bypass_rate", opt(self.bypass_rate, 3)),
+            (
+                "skill_load_failures",
+                self.skill_load_failures.to_string(),
+            ),
         ];
         let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
         for (key, value) in rows {

@@ -703,11 +703,16 @@ impl WarmCache {
     /// lookup re-streams clean bytes, and re-book the optimistic hit
     /// [`Self::get_hit`] counted as the miss it turned out to be.
     pub fn remove_corrupt(&mut self, key: (u32, u32)) {
-        crate::note_advisory_err("warm cache: undecodable slot dropped", &"zstd decode failed or wrong length");
+        let context = format!("layer={} expert={}", key.0, key.1);
+        eprintln!("[peregrine] warm cache: undecodable slot dropped {context}");
+        crate::note_advisory_err("warm cache decode", &"zstd decode failed or wrong length");
         self.decode_failures += 1;
         self.hits = self.hits.saturating_sub(1);
         self.misses += 1;
         if let Some(s) = self.map.remove(&key) {
+            if s.from_prefetch && s.ever_hit {
+                self.prefetch_used = self.prefetch_used.saturating_sub(1);
+            }
             self.used = self.used.saturating_sub(s.bytes);
             self.hint.remove(key);
         }
@@ -830,10 +835,12 @@ impl WarmCache {
     pub fn clear(&mut self) {
         self.map.clear();
         self.used = 0;
+        self.clock = 0;
         self.hint.reset();
         self.hint.fast_misses.store(0, Ordering::Relaxed);
         self.hits = 0;
         self.misses = 0;
+        self.decode_failures = 0;
         self.disk_reads = 0;
         self.prefetch_reads = 0;
         self.disk_reads_by_layer.clear();
@@ -846,6 +853,9 @@ impl WarmCache {
         self.verify_mismatch = 0;
         self.bloom_skips = 0;
         self.rereads_after_eviction = 0;
+        self.uncompressed_bytes_seen = 0;
+        self.compressed_bytes_seen = 0;
+        self.hits_since_decay = 0;
         // `clear()` is a test/sequence-reset, not an eviction: the re-read
         // attribution window closes here rather than counting every resident
         // key as "evicted".
@@ -1379,6 +1389,35 @@ mod tests {
         assert_eq!(c.decode_failures(), 1);
         assert!(!c.contains((3, 4)), "poisoned slot dropped, so the retry re-streams");
         Ok(())
+    }
+
+    #[test]
+    fn corrupt_prefetch_retracts_prefetch_used() -> Result<(), &'static str> {
+        let mut c = WarmCache::new(1 << 20).with_compression(true);
+        c.insert_prefetched((5, 6), patterned_slab(256, 32));
+        c.corrupt_slot_for_test((5, 6));
+        assert!(matches!(c.get_hit((5, 6)), Some(CacheHit::Compressed(_))));
+        assert_eq!(c.prefetch_used, 1);
+        c.remove_corrupt((5, 6));
+        assert_eq!(c.prefetch_used, 0);
+        assert_eq!(c.decode_failures(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn clear_resets_all_operational_counters() {
+        let mut c = WarmCache::new(1 << 20).with_compression(true);
+        c.insert((0, 0), patterned_slab(256, 32));
+        c.get_hit((0, 0));
+        c.note_disk_read(0, (0, 0));
+        c.note_prefetch_stale_dropped(1);
+        c.remove_corrupt((0, 0));
+        c.clear();
+        assert_eq!((c.hits, c.misses, c.decode_failures, c.disk_reads), (0, 0, 0, 0));
+        assert_eq!((c.prefetch_reads, c.prefetch_used, c.prefetch_wasted), (0, 0, 0));
+        assert_eq!((c.prefetch_stale_dropped, c.prefetch_deduped), (0, 0));
+        assert_eq!((c.uncompressed_bytes_seen, c.compressed_bytes_seen), (0, 0));
+        assert_eq!(c.used(), 0);
     }
 
     #[test]

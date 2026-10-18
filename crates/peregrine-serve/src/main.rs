@@ -47,6 +47,8 @@ struct Args {
     /// Model directory (config.json + *.safetensors + tokenizer.json). Falls back to $COLI_MODEL.
     #[arg(long, env = "COLI_MODEL")]
     model: String,
+    #[arg(long, env = "COLI_REFERENCE")]
+    reference: Option<std::path::PathBuf>,
     /// Bind host (default localhost for safety).
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -117,6 +119,7 @@ struct Inner {
     /// for GLM's `[gMASK]<sop>` markup. Captured at load from the model's arch
     /// before it moves into the engine thread; selects `build_prompt`'s dialect.
     chatml_prompt: bool,
+    reasoning_enabled: bool,
     /// The sPTC shadow executor when tools are hosted, `None` — with zero
     /// footprint — otherwise. Hosted tools execute when the model's call
     /// closes; pure ones have already run speculatively while it streamed.
@@ -170,6 +173,8 @@ struct ChatMessage {
     /// *only* tool calls carries no content at all, so this cannot be required.
     #[serde(default)]
     content: Option<MessageContent>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     /// Assistant turns replaying the model's own calls.
     ///
     /// A `role: "tool"` turn's `tool_call_id` needs no field here: serde ignores
@@ -189,9 +194,38 @@ enum MessageContent {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct ContentPart {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    image_url: Option<serde_json::Value>,
+    #[serde(default)]
+    input_audio: Option<serde_json::Value>,
+    #[serde(default)]
+    file: Option<serde_json::Value>,
+}
+
+fn ensure_text_only(messages: &[ChatMessage]) -> Result<(), ApiError> {
+    let supported = messages.iter().all(|message| match &message.content {
+        None | Some(MessageContent::Text(_)) => true,
+        Some(MessageContent::Parts(parts)) => parts.iter().all(|part| {
+            part.text.is_some()
+                && part.kind.as_deref().is_none_or(|kind| kind == "text" || kind == "input_text")
+                && part.image_url.is_none()
+                && part.input_audio.is_none()
+                && part.file.is_none()
+        }),
+    });
+    if supported {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "this Peregrine server accepts text content only; image, audio, video, and file parts are not supported",
+        ))
+    }
 }
 
 impl ChatMessage {
@@ -266,9 +300,26 @@ fn tk<T>(r: Result<T, peregrine_core::Error>) -> Result<T, ApiError> {
 /// them there); a conversation with no system turn gets one, since a tools
 /// block appended to a user turn reads to the model as the user quoting
 /// schemas at it.
+#[cfg(test)]
 fn build_prompt(messages: &[ChatMessage], tools: &[tools::ToolDef], chatml: bool) -> String {
     if chatml {
         return build_prompt_chatml(messages, tools);
+    }
+    build_prompt_with_settings(messages, tools, tools::Dialect::Glm, false)
+}
+
+fn qwen_thinking_enabled() -> bool {
+    matches!(std::env::var("COLI_QWEN_THINK").as_deref(), Ok("1") | Ok("true"))
+}
+
+fn build_prompt_with_settings(
+    messages: &[ChatMessage],
+    tools: &[tools::ToolDef],
+    dialect: tools::Dialect,
+    reasoning_enabled: bool,
+) -> String {
+    if matches!(dialect, tools::Dialect::Qwen) {
+        return build_prompt_chatml_with_settings(messages, tools, reasoning_enabled);
     }
     let mut s = String::from("[gMASK]<sop>");
     let preamble = if tools.is_empty() { String::new() } else { tools::render_preamble(tools) };
@@ -305,7 +356,7 @@ fn build_prompt(messages: &[ChatMessage], tools: &[tools::ToolDef], chatml: bool
         // An assistant turn that called tools replays as the markup it emitted.
         if m.role == "assistant" {
             if let Some(calls) = &m.tool_calls {
-                s.push_str(&tools::render_assistant_calls(calls));
+                s.push_str(&tools::render_assistant_calls_for(dialect, calls));
             }
         }
     }
@@ -317,65 +368,98 @@ fn build_prompt(messages: &[ChatMessage], tools: &[tools::ToolDef], chatml: bool
 /// per turn, ending with an open `<|im_start|>assistant\n` to generate into.
 /// GLM's `[gMASK]<sop>` markup is invalid here — feeding it to Qwen tokenizes to
 /// stray control tokens and degenerates the output, which is the bug this fixes.
+#[cfg(test)]
 fn build_prompt_chatml(messages: &[ChatMessage], tools: &[tools::ToolDef]) -> String {
+    build_prompt_chatml_with_settings(messages, tools, qwen_thinking_enabled())
+}
+
+fn build_prompt_chatml_with_settings(
+    messages: &[ChatMessage],
+    tools: &[tools::ToolDef],
+    reasoning_enabled: bool,
+) -> String {
     let mut s = String::new();
-    let preamble = if tools.is_empty() { String::new() } else { tools::render_preamble(tools) };
-    let mut preamble_placed = preamble.is_empty();
-    // A tools block with no system turn gets its own, so the model does not read
-    // it as the user quoting schemas (same rule as the GLM path).
-    if !preamble_placed && !messages.iter().any(|m| m.role == "system") {
+    let first_system = messages.first().filter(|m| m.role == "system");
+    if !tools.is_empty() {
         s.push_str("<|im_start|>system\n");
-        s.push_str(preamble.trim_start_matches('\n'));
-        s.push_str("<|im_end|>\n");
-        preamble_placed = true;
-    }
-    for m in messages {
-        let role = match m.role.as_str() {
-            "system" => "system",
-            "assistant" => "assistant",
-            "tool" => "tool",
-            _ => "user", // unknown roles are user content, never trusted as markup
-        };
-        s.push_str("<|im_start|>");
-        s.push_str(role);
-        s.push('\n');
-        if m.role == "tool" {
-            s.push_str("<tool_response>\n");
-            s.push_str(&m.text());
-            s.push_str("\n</tool_response>");
-        } else {
-            s.push_str(&m.text());
-        }
-        if m.role == "system" && !preamble_placed {
-            s.push('\n');
-            s.push_str(preamble.trim_start_matches('\n'));
-            preamble_placed = true;
-        }
-        if m.role == "assistant" {
-            if let Some(calls) = &m.tool_calls {
-                s.push_str(&tools::render_assistant_calls(calls));
+        s.push_str(&tools::render_preamble_qwen_with_thinking(tools, reasoning_enabled));
+        if let Some(message) = first_system {
+            let content = message.text();
+            let content = content.trim();
+            if !content.is_empty() {
+                s.push_str("\n\n");
+                s.push_str(content);
             }
         }
         s.push_str("<|im_end|>\n");
+    } else if let Some(message) = first_system {
+        let content = message.text();
+        let content = content.trim();
+        if reasoning_enabled || !content.is_empty() {
+            s.push_str("<|im_start|>system\n");
+            if reasoning_enabled {
+                s.push_str(tools::QWEN_REASONING_INSTRUCTION);
+                if !content.is_empty() {
+                    s.push_str("\n\n");
+                }
+            }
+            s.push_str(content);
+            s.push_str("<|im_end|>\n");
+        }
+    } else if reasoning_enabled {
+        s.push_str("<|im_start|>system\n");
+        s.push_str(tools::QWEN_REASONING_INSTRUCTION);
+        s.push_str("<|im_end|>\n");
+    }
+
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        match message.role.as_str() {
+            "system" => {
+                index += 1;
+            }
+            "assistant" => {
+                let content = message.text();
+                let content = content.trim();
+                let reasoning = message.reasoning_content.as_deref().unwrap_or("").trim();
+                s.push_str("<|im_start|>assistant\n<think>\n");
+                s.push_str(reasoning);
+                s.push_str("\n</think>\n\n");
+                s.push_str(content);
+                if let Some(calls) = &message.tool_calls {
+                    if !calls.is_empty() {
+                        if !content.is_empty() {
+                            s.push_str("\n\n");
+                        }
+                        s.push_str(&tools::render_assistant_calls_qwen(calls));
+                    }
+                }
+                s.push_str("<|im_end|>\n");
+                index += 1;
+            }
+            "tool" => {
+                s.push_str("<|im_start|>user");
+                while index < messages.len() && messages[index].role == "tool" {
+                    s.push_str("\n<tool_response>\n");
+                    s.push_str(messages[index].text().trim());
+                    s.push_str("\n</tool_response>");
+                    index += 1;
+                }
+                s.push_str("<|im_end|>\n");
+            }
+            _ => {
+                s.push_str("<|im_start|>user\n");
+                s.push_str(message.text().trim());
+                s.push_str("<|im_end|>\n");
+                index += 1;
+            }
+        }
     }
     s.push_str("<|im_start|>assistant\n");
-    // Pre-close the reasoning block — what the shipped chat_template.jinja
-    // emits for `enable_thinking=false`.
-    //
-    // Without it the model opens `<think>` itself (Qwen3.5 is trained to) and
-    // reasons, and this server's OutputFilter DROPS `<think>…</think>` by
-    // design. A request whose budget runs out before `</think>` then returns
-    // completion_tokens == max_tokens with an EMPTY string and no content
-    // deltas: the model worked, every token was reasoning, the filter
-    // discarded all of it. That is why the failure was content-dependent
-    // rather than length-dependent — it tracks how long the model reasons, not
-    // how long the prompt is — and why "/no_think" in the user text did
-    // nothing, since the model's own opening tag is not the user's to suppress.
-    //
-    // `COLI_QWEN_THINK=1` restores reasoning for callers who want it and will
-    // budget for it: with the filter dropping the block, a small max_tokens
-    // spends the whole budget on text nobody sees.
-    if !matches!(std::env::var("COLI_QWEN_THINK").as_deref(), Ok("1") | Ok("true")) {
+    if reasoning_enabled {
+        s.push_str("<think>\n");
+    } else {
         s.push_str("<think>\n\n</think>\n\n");
     }
     s
@@ -483,15 +567,26 @@ async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
+    ensure_text_only(&req.messages)?;
     let tools = active_tools(req);
-    let raw_prompt = build_prompt(&req.messages, tools, state.inner.chatml_prompt);
+    let dialect = if state.inner.chatml_prompt { tools::Dialect::Qwen } else { tools::Dialect::Glm };
+    let raw_prompt = build_prompt_with_settings(
+        &req.messages,
+        tools,
+        dialect,
+        state.inner.reasoning_enabled,
+    );
     // Context plane (`COLI_CTX=1`): the prompt the model sees is the DCR
     // working set assembled from the turns — context, not compression. With
     // the knob off (or when assembly yields nothing) the raw prompt serves
     // exactly as before.
     let prompt = if ctxplane::ctx_enabled() {
         let mut turns: Vec<(String, String)> = Vec::with_capacity(req.messages.len() + 1);
-        let preamble = tools::render_preamble(tools);
+        let preamble = tools::render_preamble_for_with_thinking(
+            dialect,
+            tools,
+            state.inner.reasoning_enabled,
+        );
         if !preamble.trim().is_empty() {
             turns.push(("system".to_string(), preamble));
         }
@@ -505,7 +600,13 @@ async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>
             .map(|m| m.text())
             .find(|t| !t.trim().is_empty())
             .unwrap_or_default();
-        match ctxplane::assemble_context(&turns, &query, state.inner.args.max_prompt_tokens) {
+        let context_budget = state.inner.args.max_prompt_tokens;
+        let assembled = tokio::task::spawn_blocking(move || {
+            ctxplane::assemble_context(&turns, &query, context_budget)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("context assembly task: {e}")))?;
+        match assembled {
             Some(assembled) => {
                 eprintln!(
                     "peregrine: [ctx] serving planned working set ({} raw chars → {} assembled chars)",
@@ -657,6 +758,7 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
         // load but to no lane timing.
         "ecache": t.ecache.map(|(h, m, d)| serde_json::json!({
             "hits": h, "misses": m, "disk_reads": d, "prefetch_reads": t.prefetch_reads,
+            "decode_failures": t.ecache_decode_failures,
         })),
         "routing_entropy_ewma": t.runtime.entropy_ewma,
         // The MTP head's pinned residency (`COLI_MTP_PIN_MB` /
@@ -719,7 +821,11 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
             "gdn_snapshot_bytes": t.gdn_snapshot_bytes,
             "gdn_replays": t.gdn_replays,
             "gdn_replay_rows": t.gdn_replay_rows,
+            "gdn_rollback_failures": t.gdn_rollback_failures,
+            "gdn_replay_failures": t.gdn_replay_failures,
         },
+        "client_disconnects": t.client_disconnects,
+        "rlm_failures": t.rlm_failures,
         // Prompt-lookup drafting (COLI_DRAFT_NGRAM), deliberately its own
         // block: an n-gram draft costs a backward scan and an MTP draft costs a
         // sparse-MoE layer, so pooling their accept rates would hide which
@@ -730,6 +836,12 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
             "accept_rate": if t.ngram_proposed > 0 {
                 t.ngram_accepted as f64 / t.ngram_proposed as f64
             } else { 0.0 },
+        },
+        "future_prefetch": {
+            "plans": t.future_prefetch_plans,
+            "items": t.future_prefetch_items,
+            "history_hits": t.future_prefetch_history_hits,
+            "learned_hits": t.future_prefetch_learned_hits,
         },
         // sPTC (null when no tools are hosted): speculation's hit rate is the
         // number to read. `speculated` counts enqueued guesses, `verified_hits`
@@ -796,6 +908,8 @@ async fn chat_completions(
 ) -> Result<Response, ApiError> {
     check_auth(&state, &headers)?;
     let (ids, max_new, sampling) = resolve_params(&state, &req).await?;
+    let dialect = if state.inner.chatml_prompt { tools::Dialect::Qwen } else { tools::Dialect::Glm };
+    let reasoning_enabled = state.inner.reasoning_enabled;
     let model_id = state.inner.args.model_id.clone();
     let priority = priority_from_header(headers.get("x-peregrine-priority").and_then(header_utf8));
     let class = classify_request(&req.messages);
@@ -814,7 +928,13 @@ async fn chat_completions(
         max_new,
         top_p_bits: sampling.top_p.to_bits(),
         top_k: sampling.top_k,
-        model: model_id.clone(),
+        model: format!(
+            "{model_id}|{}|{reasoning_enabled}",
+            match dialect {
+                tools::Dialect::Glm => "glm",
+                tools::Dialect::Qwen => "qwen",
+            }
+        ),
     });
     if let Some(key) = &memo_key {
         let hit = state.inner.memo.lock().get(key);
@@ -836,7 +956,16 @@ async fn chat_completions(
                 prompt_tokens,
             };
             return tokio::task::spawn_blocking(move || {
-                memo_response(stream, &tool_defs, &replay_tok, replay_sptc, &out_ids, &frame)
+                memo_response_with_settings(
+                    stream,
+                    dialect,
+                    reasoning_enabled,
+                    &tool_defs,
+                    &replay_tok,
+                    replay_sptc,
+                    &out_ids,
+                    &frame,
+                )
             })
             .await
             .map_err(|e| ApiError::internal(format!("memo replay task: {e}")))?;
@@ -869,7 +998,7 @@ async fn chat_completions(
             // Tool markup arrives split across tokens, so the decoded text goes
             // through the filter before any of it becomes a delta: a client must
             // never see half a `<tool_call>`.
-            let mut filter = tools::OutputFilter::with_tools(&stream_tools);
+            let mut filter = tools::OutputFilter::with_tools_dialect(&stream_tools, dialect, reasoning_enabled);
             // sPTC: while a hosted tool's call is still streaming, its complete
             // argument pairs are speculated in the background. `None` (no tools
             // hosted) makes both call sites no-ops on a code path that is
@@ -889,6 +1018,12 @@ async fn chat_completions(
                             continue; // token only extended an unfinished character
                         }
                         let delta = filter.push(&decoded);
+                        let reasoning = filter.take_reasoning();
+                        if !reasoning.is_empty()
+                            && sse_tx.send(Ok(reasoning_chunk_event(&cid, &mid, created, &reasoning))).await.is_err()
+                        {
+                            return;
+                        }
                         if let Some(shadow) = &sptc {
                             spec.observe(shadow, &filter);
                         }
@@ -935,14 +1070,16 @@ async fn chat_completions(
                 t.push_str(&filter.finish());
                 t
             };
-            let tail_ev = if tail.is_empty() {
-                None
-            } else {
-                Some(chunk_event(&cid, &mid, created, Some(&tail), None, None))
-            };
+            let reasoning = filter.take_reasoning();
             let mut hung_up = false;
-            if let Some(ev) = tail_ev {
-                hung_up = sse_tx.send(Ok(ev)).await.is_err();
+            if !reasoning.is_empty() {
+                hung_up = sse_tx.send(Ok(reasoning_chunk_event(&cid, &mid, created, &reasoning))).await.is_err();
+            }
+            if !hung_up && !tail.is_empty() {
+                hung_up = sse_tx
+                    .send(Ok(chunk_event(&cid, &mid, created, Some(&tail), None, None)))
+                    .await
+                    .is_err();
             }
             // A call closed only by end-of-generation still reaches the client.
             for c in filter.take_calls() {
@@ -983,10 +1120,16 @@ async fn chat_completions(
         let decoded = tokio::task::spawn_blocking(move || tokenizer.decode(&out_ids))
             .await
             .map_err(|e| ApiError::internal(format!("decode task: {e}")))?;
-        let (text, calls) = split_output(&tk(decoded)?, active_tools(&req));
+        let (text, reasoning, calls) = split_output_with_reasoning(
+            &tk(decoded)?,
+            active_tools(&req),
+            dialect,
+            reasoning_enabled,
+        );
         let frame = ReplayFrame { completion_id, model_id, created, prompt_tokens };
-        Ok(Json(json_completion(
+        Ok(Json(json_completion_with_reasoning(
             &text,
+            &reasoning,
             &calls,
             state.inner.sptc.as_deref(),
             &frame,
@@ -1015,7 +1158,14 @@ async fn debug_tokenize(
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     check_auth(&state, &headers)?;
-    let prompt = build_prompt(&req.messages, active_tools(&req), state.inner.chatml_prompt);
+    ensure_text_only(&req.messages)?;
+    let dialect = if state.inner.chatml_prompt { tools::Dialect::Qwen } else { tools::Dialect::Glm };
+    let prompt = build_prompt_with_settings(
+        &req.messages,
+        active_tools(&req),
+        dialect,
+        state.inner.reasoning_enabled,
+    );
     let tokenizer = state.inner.tokenizer.clone();
     let p2 = prompt.clone();
     let ids = tk(tokio::task::spawn_blocking(move || tokenizer.encode(&p2))
@@ -1042,8 +1192,20 @@ async fn debug_tokenize(
 /// tool answers the same from a speculation, a synchronous run, or a replay).
 /// The wire identity rides in one [`ReplayFrame`] rather than as four positional
 /// fields — the same shape a caller silently transposes.
+#[cfg(test)]
 fn json_completion(
     text: &str,
+    calls: &[tools::ParsedCall],
+    sptc: Option<&sptc::ShadowRepl>,
+    frame: &ReplayFrame,
+    completion_tokens: usize,
+) -> serde_json::Value {
+    json_completion_with_reasoning(text, "", calls, sptc, frame, completion_tokens)
+}
+
+fn json_completion_with_reasoning(
+    text: &str,
+    reasoning: &str,
     calls: &[tools::ParsedCall],
     sptc: Option<&sptc::ShadowRepl>,
     frame: &ReplayFrame,
@@ -1057,6 +1219,9 @@ fn json_completion(
         "content".into(),
         if text.is_empty() && !calls.is_empty() { serde_json::Value::Null } else { serde_json::json!(text) },
     );
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".into(), serde_json::json!(reasoning));
+    }
     if !calls.is_empty() {
         let arr: Vec<serde_json::Value> = calls
             .iter()
@@ -1117,8 +1282,22 @@ struct ReplayFrame {
 /// as one ready-made stream with no engine behind it. Hosted tools resolve their
 /// results on this path too, exactly as the live streaming task does — a replay
 /// must not drift in shape from a fresh stream.
+#[cfg(test)]
 fn memo_response(
     stream: bool,
+    tool_defs: &[tools::ToolDef],
+    tokenizer: &TokenBackend,
+    sptc: Option<Arc<sptc::ShadowRepl>>,
+    out_ids: &[u32],
+    frame: &ReplayFrame,
+) -> Result<Response, ApiError> {
+    memo_response_with_settings(stream, tools::Dialect::Glm, false, tool_defs, tokenizer, sptc, out_ids, frame)
+}
+
+fn memo_response_with_settings(
+    stream: bool,
+    dialect: tools::Dialect,
+    reasoning_enabled: bool,
     tool_defs: &[tools::ToolDef],
     tokenizer: &TokenBackend,
     sptc: Option<Arc<sptc::ShadowRepl>>,
@@ -1128,9 +1307,15 @@ fn memo_response(
     let (completion_id, model_id) = (frame.completion_id.as_str(), frame.model_id.as_str());
     let created = frame.created;
     if !stream {
-        let (text, calls) = split_output(&tk(tokenizer.decode(out_ids))?, tool_defs);
-        return Ok(Json(json_completion(
+        let (text, reasoning, calls) = split_output_with_reasoning(
+            &tk(tokenizer.decode(out_ids))?,
+            tool_defs,
+            dialect,
+            reasoning_enabled,
+        );
+        return Ok(Json(json_completion_with_reasoning(
             &text,
+            &reasoning,
             &calls,
             sptc.as_deref(),
             frame,
@@ -1143,7 +1328,7 @@ fn memo_response(
     let mut dec = tok::IncrementalDecoder::new();
     // The replay runs through the same filter as a live stream, so a memoized
     // tool call comes back as a call and not as the markup that produced it.
-    let mut filter = tools::OutputFilter::with_tools(tool_defs);
+    let mut filter = tools::OutputFilter::with_tools_dialect(tool_defs, dialect, reasoning_enabled);
     let mut emitted_calls = 0usize;
     let vocab = tokenizer.decode_handle();
     for &t in out_ids {
@@ -1152,6 +1337,10 @@ fn memo_response(
             continue;
         }
         let delta = filter.push(&decoded);
+        let reasoning = filter.take_reasoning();
+        if !reasoning.is_empty() {
+            events.push(Ok(reasoning_chunk_event(completion_id, model_id, created, &reasoning)));
+        }
         for c in filter.take_calls() {
             let call = c.to_openai(emitted_calls, &call_id(completion_id, emitted_calls));
             // Hosted tools resolve here exactly as on the live streaming path:
@@ -1172,6 +1361,10 @@ fn memo_response(
         t.push_str(&filter.finish());
         t
     };
+    let reasoning = filter.take_reasoning();
+    if !reasoning.is_empty() {
+        events.push(Ok(reasoning_chunk_event(completion_id, model_id, created, &reasoning)));
+    }
     if !tail.is_empty() {
         events.push(Ok(chunk_event(completion_id, model_id, created, Some(&tail), None, None)));
     }
@@ -1190,11 +1383,23 @@ fn memo_response(
 /// Split a whole generation into visible text and tool calls. The one-shot
 /// counterpart of the streaming filter, so both wire formats agree on what was
 /// content and what was markup.
+#[cfg(test)]
 fn split_output(raw: &str, tool_defs: &[tools::ToolDef]) -> (String, Vec<tools::ParsedCall>) {
-    let mut f = tools::OutputFilter::with_tools(tool_defs);
+    let dialect = if raw.contains("<function=") { tools::Dialect::Qwen } else { tools::Dialect::Glm };
+    let (text, _, calls) = split_output_with_reasoning(raw, tool_defs, dialect, false);
+    (text, calls)
+}
+
+fn split_output_with_reasoning(
+    raw: &str,
+    tool_defs: &[tools::ToolDef],
+    dialect: tools::Dialect,
+    reasoning_enabled: bool,
+) -> (String, String, Vec<tools::ParsedCall>) {
+    let mut f = tools::OutputFilter::with_tools_dialect(tool_defs, dialect, reasoning_enabled);
     let mut text = f.push(raw);
     text.push_str(&f.finish());
-    (text.trim().to_string(), f.take_calls())
+    (text.trim().to_string(), f.take_reasoning(), f.take_calls())
 }
 
 /// A tool call's id, derived from the completion id so it is unique per
@@ -1234,6 +1439,21 @@ fn chunk_event(
         "created": created,
         "model": model_id,
         "choices": [{ "index": 0, "delta": serde_json::Value::Object(delta_obj), "finish_reason": finish }]
+    });
+    Event::default().data(payload.to_string())
+}
+
+fn reasoning_chunk_event(id: &str, model_id: &str, created: u64, reasoning: &str) -> Event {
+    let payload = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_id,
+        "choices": [{
+            "index": 0,
+            "delta": { "reasoning_content": reasoning },
+            "finish_reason": serde_json::Value::Null
+        }]
     });
     Event::default().data(payload.to_string())
 }
@@ -1395,16 +1615,21 @@ fn install_moe_engine() {
     // Matched through `as_deref()` — the idiom every other env gate in this
     // repo uses. `unwrap_or_default()` is a [P] hit and `Err(_)` a [B] one,
     // and both audits are right: neither says which case it is handling.
-    let var = std::env::var("COLI_MOE_ENGINE");
-    match var.as_deref() {
-        Ok("sched") => {}
-        // Unset, empty, or the default engine: nothing to install.
-        Ok("") | Ok("concurrent") => return,
-        Ok(other) => {
+    let var = match std::env::var("COLI_MOE_ENGINE") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return,
+        Err(error) => {
+            eprintln!("peregrine: COLI_MOE_ENGINE unreadable ({error}); using concurrent");
+            return;
+        }
+    };
+    match var.trim() {
+        "sched" => {}
+        "" | "concurrent" => return,
+        other => {
             eprintln!("peregrine: COLI_MOE_ENGINE={other} is not a known engine (concurrent|sched); using concurrent");
             return;
         }
-        _ => return,
     }
     let depth: u32 = std::env::var("COLI_IO_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     match peregrine_sched::SchedEngine::new(depth) {
@@ -1466,7 +1691,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bench_tokenizer(&dir, file)?;
         return Ok(());
     }
-    let mut model = Model::load(&dir)?;
+    let mut model = match &args.reference {
+        Some(reference) => Model::load_hybrid(&dir, reference)?,
+        None => Model::load(&dir)?,
+    };
     // `COLI_PREDICT_SOURCE`: force a specific prefetch predictor. The stdio binary
     // has always honoured this and the server never did, so the one knob that can
     // select `PhaseAware` was unreachable from the **batched** engine — which is
@@ -1494,6 +1722,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Capture the prompt dialect before the model moves into the engine thread.
     let chatml_prompt = model.uses_chatml_prompt();
+    let reasoning_enabled = chatml_prompt && qwen_thinking_enabled();
 
     // One engine thread owns the model and continuously batches all requests.
     let (engine, engine_join) = batch::spawn(model, args.max_batch)?;
@@ -1506,6 +1735,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args,
             memo: parking_lot::Mutex::new(memo::ResponseMemo::from_env()),
             chatml_prompt,
+            reasoning_enabled,
             sptc,
         }),
     };
@@ -1809,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn content_may_be_a_string_an_array_of_parts_null_or_absent(
+    fn text_content_shapes_parse_and_non_text_parts_are_rejected(
     ) -> Result<(), serde_json::Error> {
         let m = msgs(json!([
             {"role": "user", "content": "plain"},
@@ -1818,9 +2048,17 @@ mod tests {
             {"role": "user"}
         ]))?;
         assert_eq!(m[0].text(), "plain");
-        assert_eq!(m[1].text(), "ab", "text parts concatenate; non-text parts are dropped");
+        assert_eq!(m[1].text(), "ab");
+        assert!(ensure_text_only(&m).is_err());
+        let text_only = msgs(json!([
+            {"role": "user", "content": [{"type": "input_text", "text": "a"}, {"type": "text", "text": "b"}]}
+        ]))?;
+        assert!(ensure_text_only(&text_only).is_ok());
         assert_eq!(m[2].text(), "");
         assert_eq!(m[3].text(), "");
+        assert!(msgs(json!([
+            {"role": "user", "content": [{"type": "text", "text": "caption", "video_url": {"url": "video"}}]}
+        ])).is_err());
         Ok(())
     }
 
@@ -1869,6 +2107,66 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["command"], json!("ls"), "declared string stays a string");
         Ok(())
+    }
+
+    #[test]
+    fn qwen_prompt_matches_checkpoint_history_tools_and_results() -> Result<(), serde_json::Error> {
+        let m = msgs(json!([
+            {"role": "system", "content": "be terse"},
+            {"role": "user", "content": "read it"},
+            {"role": "assistant", "content": "calling", "reasoning_content": "prior thought", "tool_calls": [{
+                "function": {"name": "read", "arguments": "{\"path\":\"/etc/hosts\"}"}
+            }]},
+            {"role": "tool", "content": "file contents"},
+            {"role": "user", "content": "continue"}
+        ]))?;
+        let p = build_prompt_with_settings(&m, &tool_defs()?, tools::Dialect::Qwen, true);
+        assert!(p.contains("# Tools\n\nYou have access to the following functions:"), "{p}");
+        assert!(p.contains("<|im_start|>system\nReasoning effort is set to xhigh."), "{p}");
+        assert!(p.contains("<|im_start|>assistant\n<think>\nprior thought\n</think>\n\ncalling\n\n<tool_call>\n<function=read>\n<parameter=path>\n/etc/hosts\n</parameter>\n</function>\n</tool_call><|im_end|>"), "{p}");
+        assert!(p.contains("<|im_start|>user\n<tool_response>\nfile contents\n</tool_response><|im_end|>\n"), "{p}");
+        assert!(!p.contains("<|im_start|>tool"), "{p}");
+        assert!(p.ends_with("<|im_start|>assistant\n<think>\n"), "{p}");
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_prompt_keeps_preclosed_default_and_opens_thinking_on_request() -> Result<(), serde_json::Error> {
+        let m = msgs(json!([{"role": "user", "content": "hi"}]))?;
+        let closed = build_prompt_with_settings(&m, &[], tools::Dialect::Qwen, false);
+        let open = build_prompt_with_settings(&m, &[], tools::Dialect::Qwen, true);
+        assert!(closed.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "{closed}");
+        assert!(open.ends_with("<|im_start|>assistant\n<think>\n"), "{open}");
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_reasoning_is_exposed_in_json_only_when_enabled() {
+        let frame = ReplayFrame {
+            completion_id: "chatcmpl-qwen".into(),
+            model_id: "qwen".into(),
+            created: 0,
+            prompt_tokens: 1,
+        };
+        let (text, reasoning, calls) = split_output_with_reasoning(
+            "<think>because</think>answer",
+            &[],
+            tools::Dialect::Qwen,
+            true,
+        );
+        let value = json_completion_with_reasoning(&text, &reasoning, &calls, None, &frame, 1);
+        assert_eq!(value["choices"][0]["message"]["content"], json!("answer"));
+        assert_eq!(value["choices"][0]["message"]["reasoning_content"], json!("because"));
+
+        let (text, reasoning, calls) = split_output_with_reasoning(
+            "<think>hidden</think>answer",
+            &[],
+            tools::Dialect::Qwen,
+            false,
+        );
+        let value = json_completion_with_reasoning(&text, &reasoning, &calls, None, &frame, 1);
+        assert_eq!(value["choices"][0]["message"]["content"], json!("answer"));
+        assert!(value["choices"][0]["message"].get("reasoning_content").is_none());
     }
 
     /// The committed GPT-2 fixture, for tests that need a real tokenizer

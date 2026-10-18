@@ -208,9 +208,7 @@ fn main() {
                                 "regbuf: cannot register {slots} x {} MB of pinned buffers ({e}). \
                                  RLIMIT_MEMLOCK is {} KB — raise it (ulimit -l) or use fewer/smaller blocks.",
                                 want / (1024 * 1024),
-                                std::process::Command::new("sh").arg("-c").arg("ulimit -l").output()
-                                    .ok().and_then(|o| String::from_utf8(o.stdout).ok())
-                                    .map(|s| s.trim().to_string()).unwrap_or_else(|| "?".into()),
+                                peregrine_io::memlock_limit() / 1024,
                             );
                             std::process::exit(1);
                         }

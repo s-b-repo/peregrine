@@ -449,6 +449,52 @@ fn piece_meta(t: &TensorInfo) -> PieceMeta {
     }
 }
 
+fn source_metadata(st: &SafeTensors) -> Result<Vec<(String, String)>, Error> {
+    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+    for path in st.paths() {
+        let file = std::fs::File::open(path).ctx(|| path.display().to_string())?;
+        let size = file.metadata().ctx(|| path.display().to_string())?.len();
+        if size < 8 {
+            return Err(Error::Format(format!("{}: safetensors file is too short", path.display())));
+        }
+        let mut length = [0u8; 8];
+        file.read_exact_at(&mut length, 0).ctx(|| path.display().to_string())?;
+        let header_len = u64::from_le_bytes(length);
+        if header_len > (512u64 << 20) || header_len > size - 8 {
+            return Err(Error::Format(format!("{}: invalid safetensors header length {header_len}", path.display())));
+        }
+        let header_len = usize::try_from(header_len)
+            .map_err(|_| Error::Format(format!("{}: safetensors header is too large", path.display())))?;
+        let mut bytes = vec![0u8; header_len];
+        file.read_exact_at(&mut bytes, 8).ctx(|| path.display().to_string())?;
+        let root: serde_json::Value = serde_json::from_slice(&bytes)
+            .ctx(|| format!("{}: header not JSON", path.display()))?;
+        let object = root
+            .as_object()
+            .ok_or_else(|| Error::Format(format!("{}: header is not a JSON object", path.display())))?;
+        let Some(value) = object.get("__metadata__") else { continue; };
+        let metadata = value
+            .as_object()
+            .ok_or_else(|| Error::Format(format!("{}: __metadata__ is not an object", path.display())))?;
+        for (key, value) in metadata {
+            let value = value
+                .as_str()
+                .ok_or_else(|| Error::Format(format!("{}: metadata '{key}' is not a string", path.display())))?;
+            if let Some(previous) = merged.get(key) {
+                if previous.as_str() != value {
+                    return Err(Error::Format(format!(
+                        "{}: conflicting metadata value for '{key}'",
+                        path.display()
+                    )));
+                }
+            } else {
+                merged.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    Ok(merged.into_iter().collect())
+}
+
 /// Lazily-opened plain fds onto the source shards, for chunked `pread` copies.
 /// (`SafeTensors` reads go through io_uring and materialise whole tensors; a
 /// verbatim copier wants bounded chunks, so it reads the files directly.)
@@ -507,6 +553,7 @@ pub fn write(model: &Path, out: &Path, plan: &Plan) -> Result<WriteReport, Error
         }
     }
 
+    let source_meta = source_metadata(&st)?;
     let mut src = SourceFiles::new(&st);
     let mut rep = WriteReport {
         files: Vec::new(),
@@ -524,10 +571,16 @@ pub fn write(model: &Path, out: &Path, plan: &Plan) -> Result<WriteReport, Error
             );
         }
         let pieces: Vec<PieceMeta> = infos.iter().map(piece_meta).collect();
-        let meta = vec![
-            ("peregrine.reshard.source".to_string(), model.display().to_string()),
-            ("peregrine.reshard.group".to_string(), plan.groups[fp.group].name.clone()),
-        ];
+        let mut metadata: BTreeMap<String, String> = source_meta.iter().cloned().collect();
+        metadata.insert(
+            "peregrine.reshard.source".to_string(),
+            model.display().to_string(),
+        );
+        metadata.insert(
+            "peregrine.reshard.group".to_string(),
+            plan.groups[fp.group].name.clone(),
+        );
+        let meta: Vec<(String, String)> = metadata.into_iter().collect();
         let path = out.join(&fp.file_name);
         write_streaming(&path, &meta, &pieces, |i, w| src.copy_region(&infos[i], w))?;
         rep.bytes_written += fp.bytes;
@@ -537,7 +590,7 @@ pub fn write(model: &Path, out: &Path, plan: &Plan) -> Result<WriteReport, Error
     // A directory of shards is not a model: once the group files are symlinked
     // back together, `Cfg::load` still needs `config.json` and serving needs
     // the tokenizer. Same sidecar set `peregrine-requantize` carries.
-    for side in ["config.json", "tokenizer.json", "generation_config.json", "tokenizer_config.json"] {
+    for side in ["config.json", "tokenizer.json", "generation_config.json", "tokenizer_config.json", "chat_template.jinja"] {
         let s = model.join(side);
         if s.exists() {
             std::fs::copy(&s, out.join(side)).ctx(|| format!("copy {side}"))?;
@@ -545,7 +598,7 @@ pub fn write(model: &Path, out: &Path, plan: &Plan) -> Result<WriteReport, Error
         }
     }
 
-    let manifest = manifest_json(model, plan);
+    let manifest = manifest_json(model, plan, &source_meta);
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| Error::Format(format!("manifest: {e}")))?;
     peregrine_core::durable::write_atomic(&rep.manifest, &bytes)?;
     Ok(rep)
@@ -553,7 +606,11 @@ pub fn write(model: &Path, out: &Path, plan: &Plan) -> Result<WriteReport, Error
 
 /// The auditable record: per group its files, bytes, and expected per-token
 /// share, plus the full layer → expert → group assignment.
-fn manifest_json(model: &Path, plan: &Plan) -> serde_json::Value {
+fn manifest_json(model: &Path, plan: &Plan, metadata: &[(String, String)]) -> serde_json::Value {
+    let metadata = metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+        .collect::<serde_json::Map<String, serde_json::Value>>();
     let groups: Vec<serde_json::Value> = plan
         .groups
         .iter()
@@ -583,6 +640,7 @@ fn manifest_json(model: &Path, plan: &Plan) -> serde_json::Value {
         "version": 1,
         "tool": "peregrine-reshard",
         "source": model.display().to_string(),
+        "metadata": metadata,
         "groups": groups,
         "assignment": assignment,
     })
@@ -726,6 +784,13 @@ mod tests {
     /// `ShardWriter` with a small budget so the source is genuinely
     /// multi-shard, like the real checkpoint.
     fn build_fixture(dir: &Path) -> Result<(), Error> {
+        build_fixture_with_metadata(dir, Vec::new())
+    }
+
+    fn build_fixture_with_metadata(
+        dir: &Path,
+        metadata: Vec<(String, String)>,
+    ) -> Result<(), Error> {
         std::fs::create_dir_all(dir)?;
         let cfg = serde_json::json!({
             "hidden_size": 16, "num_hidden_layers": 2, "num_attention_heads": 2,
@@ -750,7 +815,7 @@ mod tests {
             }
             Ok(())
         }
-        let mut w = ShardWriter::new(dir, "model", 1000);
+        let mut w = ShardWriter::new(dir, "model", 1000).with_metadata(metadata);
         push(&mut w, "model.embed_tokens.weight", "BF16", vec![8, 16], 256)?;
         for layer in 0..2usize {
             push(&mut w, &format!("model.layers.{layer}.input_layernorm.weight"), "F32", vec![16], 64)?;
@@ -986,6 +1051,50 @@ mod tests {
         assert!(write(&dir, &out, &p).is_err(), "a second write into a populated --out must refuse");
         std::fs::remove_dir_all(&dir)?;
         std::fs::remove_dir_all(&out)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reshard_preserves_source_metadata_and_chat_template() -> Result<(), Error> {
+        let (dir, out) = fixture_dirs("metadata");
+        build_fixture_with_metadata(
+            &dir,
+            vec![
+                (
+                    "peregrine.import.skipped_mtp".into(),
+                    r#"["mtp.fc.weight"]"#.into(),
+                ),
+                ("fixture.marker".into(), "kept".into()),
+            ],
+        )?;
+        let template = b"{% for message in messages %}{{ message }}{% endfor %}";
+        std::fs::write(dir.join("chat_template.jinja"), template)?;
+        let p = plan(&dir, &Options::new(groups3()?))?;
+        write(&dir, &out, &p)?;
+
+        let dst = SafeTensors::open(&out)?;
+        for path in dst.paths() {
+            let bytes = std::fs::read(path)?;
+            let header_len = u64::from_le_bytes(
+                bytes[..8].try_into().map_err(|_| Error::Format("fixture header".into()))?,
+            ) as usize;
+            let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len])?;
+            assert_eq!(
+                header["__metadata__"]["peregrine.import.skipped_mtp"],
+                serde_json::json!("[\"mtp.fc.weight\"]"),
+            );
+            assert_eq!(header["__metadata__"]["fixture.marker"], serde_json::json!("kept"));
+        }
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("manifest.json"))?)?;
+        assert_eq!(
+            manifest["metadata"]["peregrine.import.skipped_mtp"],
+            serde_json::json!("[\"mtp.fc.weight\"]"),
+        );
+        assert_eq!(manifest["metadata"]["fixture.marker"], serde_json::json!("kept"));
+        assert_eq!(std::fs::read(out.join("chat_template.jinja"))?, template.to_vec());
+        std::fs::remove_dir_all(dir)?;
+        std::fs::remove_dir_all(out)?;
         Ok(())
     }
 

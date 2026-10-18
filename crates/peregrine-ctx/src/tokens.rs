@@ -22,7 +22,7 @@ pub enum Estimator {
     Heuristic,
     /// Anything exact — a real tokenizer, or the Anthropic token-counting
     /// endpoint behind a cache.
-    Custom(Box<dyn Fn(&str) -> usize>),
+    Custom(Box<dyn Fn(&str) -> usize + Send>),
 }
 
 impl Estimator {

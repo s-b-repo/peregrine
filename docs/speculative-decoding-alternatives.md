@@ -31,8 +31,8 @@ rows below were mis-scored.
 | Medusa-style multiple heads | Yes | ~~High~~ **Low** | **Declined** — see [below](#closed-here-and-why) |
 | EAGLE-style draft heads | Yes | High | **Already present in EAGLE-1 form**: `MtpHead` drafts from the *hidden state*, which is EAGLE's defining move. The upgrade is EAGLE-2's dynamic tree |
 | Tree speculative decoding | Yes | Medium/high | **Built and wired** — `COLI_DRAFT_TREE` hedges prompt-lookup against the MTP head in one forward. **MLA only** — see below |
-| Draft-model routing prediction | Yes | Extremely interesting for MoE | Deferred — competes with a router look-ahead that already measures 92.5 % recall |
-| Expert-only speculative execution | Yes | Extremely interesting | Deferred, same reason |
+| Draft-model routing prediction | Yes | Extremely interesting for MoE | **Built as an opt-in future-expert predictor** — `COLI_FUTURE_PREFETCH=learned|both`; the native verify router remains authoritative |
+| Expert-only speculative execution | Yes | Extremely interesting | **Built as opt-in early expert warming** — predicted unions are prefetched in bounded parallel batches; execution still verifies normally |
 | Non-autoregressive generation | Yes | Potentially enormous | **Not buildable here** — needs a NAR checkpoint |
 | Mask-predict / iterative refinement | Yes | Potentially high | **Not buildable here.** Nearest in-tree analogue is RLM (`rlm.rs`), which already refines a hidden without appending KV |
 | Diffusion LLM decoding | Yes | Potentially huge | **Different model family** — [sized below](#closed-here-and-why), not dismissed |

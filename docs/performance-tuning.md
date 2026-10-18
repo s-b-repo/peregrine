@@ -54,6 +54,7 @@ only remaining levers are fewer bytes or a faster drive.
 | `COLI_FUSE_PREFILL=1` | 2 streams: **322 s vs 356 s**, output byte-identical | **adopt** |
 | Cache capacity (`COLI_ECACHE_GB`) | 3× cache → 3.8 % fewer reads, ~1 % wall | marginal |
 | Prefetch | **keep it on** — off measured *slower* | default |
+| Router look-ahead (`COLI_ROUTER_LOOKAHEAD`) | **streaming: turn it OFF** — B=1 +72%, B=8 +80% aggregate tok/s on GLM-5.3-Flash; resident: keep it on | re-measured per container |
 | `COLI_FORCE_ASYNC` | no resolvable effect | leave alone |
 | `COLI_DRAFT=4` | **1.57× slower** | **reject** |
 | `COLI_IO_RINGS=8` | refuses to load — RAM-capped | unavailable here |
@@ -92,6 +93,46 @@ documented output-neutrality has an empirical check, not only its two unit tests
 **The 1.11× understates it.** That test used `max_tokens=4`, which is ~68 % prefill
 (5,144 expert lookups against 2,400), and union sharing is a *decode* effect. Re-run
 at 16+ decode tokens before drawing conclusions about batching.
+
+### Streaming: the router look-ahead costs more than it saves
+
+`COLI_ROUTER_LOOKAHEAD` (default **on**, width 6) pre-streams the experts the
+next layer is predicted to route, up to `COLI_PREFETCH_WARM_PATHS` of them —
+**all** of them by default. On a resident model that is free readahead. On a
+**streaming** model the speculative read is a device read competing for the same
+per-device ring as the read the token is waiting for, and the ledger prices the
+bytes it wastes at ~13% of disk traffic.
+
+Measured 2026-10-06, GLM-5.3-Flash on three SSDs, interleaved arms, CUDA
+profile, aggregate tok/s (`docs/deployment-glm53-flash.md` has the full table):
+
+| | B=1 | B=8 | B=16 |
+|---|---:|---:|---:|
+| `N=64` | 0.095 | 0.193 | 0.275 |
+| off | **0.163** | **0.308** | 0.271 |
+
+Medians of 4/2/3 runs; the raw runs are in
+`bench-data/2026-10-06-lookahead/`. One of the four B=1 "off" runs came in at
+0.060 against 0.157–0.181 for the other three, so the B=1 gap rests on 3 clean
+runs plus two B=8 pairs rather than on 4/4.
+
+End to end — the shipped script after the change, B=1, three runs — **0.244 /
+0.148 / 0.246, median 0.244 tok/s** against the N=64 median of 0.095. The box is
+noisy enough that 0.148 and 0.246 came out of the same configuration in adjacent
+runs; quote the median and the run count, never the best run.
+
+Turning it off costs cache warmth — re-read-after-eviction goes from 1.8% to
+11.3% of disk traffic at B=1 — and still wins by 72%. The cache-warming benefit
+can be had without the device read: `COLI_PREFETCH_HINT_PATHS=64` issues a
+page-cache `fadvise` instead (inert under O_DIRECT, so it is the buffered lane
+that uses it).
+
+**The trap this sits in.** An earlier measurement on this same file said the
+opposite — "N=64 is the measured pick on this box (+14% over off)" — and it was
+right *for its container*: it was measured on a four-drive stripe that included a
+5.4k RPM HDD. Same engine, same box, different storage, opposite answer. A
+prefetch policy is a statement about bytes and queues, so it is a statement about
+the storage, and the storage is the thing most likely to change.
 
 ### Rejected: `COLI_DRAFT=4`
 

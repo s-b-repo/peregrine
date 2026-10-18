@@ -269,6 +269,7 @@ Built once, consumed automatically at load (all config-tagged):
 | File | Producer | Consumer effect |
 |---|---|---|
 | `automaton.json` | `peregrine build-automaton` / `galactic` | transition-FSA predictor blended with momentum |
+| `token_routes.json` | `peregrine build-router-predictor` | learned token-context → expert table for `COLI_FUTURE_PREFETCH=learned|both` |
 | `macrostates.json` | `galactic` | macro-state predictor (`PredictSource::WithMacro`) |
 | `route_stats.json` | saved at `Drop` (gate `COLI_ROUTE_STATS_PERSIST`) | warm-start history, heat, co-activation, learned policy |
 | `schedule.json` / `tiers.json` | [`peregrine-layout-reorg`](layout-tools.md) / `galactic` | disk-order read sorting; RAM-tier prefetch seeding (`COLI_TIER_SEED`) |

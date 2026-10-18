@@ -210,10 +210,26 @@ impl HeatTier {
         let bytes = std::fs::read(&path).ctx(|| format!("read {}", path.display()))?;
         let v: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| Error::Format(format!("route_stats.json: {e}")))?;
-        let arr = v
-            .get("heat")
-            .and_then(|h| h.as_array())
-            .ok_or_else(|| Error::Format("route_stats.json has no `heat` array".into()))?;
+        let arr = v.get("heat").and_then(|h| h.as_array()).ok_or_else(|| {
+            // Two ways this file can arrive without a census, and they need
+            // different replies. `heat: null` means the writing process had no
+            // HeatTable at all: any binary built before the 2026-09-26 fix on a
+            // CPU-only host (the table was allocated only when a GPU tier
+            // existed, so the streamed runs that *do* the routing produced null),
+            // or any run with COLI_ROUTE_STATS_PERSIST=0. A missing key entirely
+            // means a hand-edited or unrelated file.
+            let why = match v.get("heat") {
+                None => "the key is missing — this is not a file the engine wrote",
+                Some(serde_json::Value::Null) => "it is null — the run that wrote it had no \
+                     routing census to record. The census only exists in streaming mode \
+                     (it lives beside the warm cache) and only when route-stats persistence \
+                     is on; re-run `peregrine-engine` or `peregrine-serve` streamed against \
+                     this container without COLI_ROUTE_STATS_PERSIST=0, for enough tokens \
+                     that the counts mean something",
+                Some(_) => "it is neither an array nor null — the file is malformed",
+            };
+            Error::Format(format!("route_stats.json has no `heat` array: {why}"))
+        })?;
         let mut heat: Vec<u32> = arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect();
         let want = n_layers * n_experts;
         // The producer is one row longer than the consumer wants. `HeatTable` is
@@ -1145,6 +1161,56 @@ mod tests {
         let n_experts = 4;
         let heat: Vec<u32> = (0..3).flat_map(|_| (0..4).map(|e| 100 - e * 25)).collect();
         HeatTier { hot_frac, hot: Target::Int4, cold: Target::Int2, heat, n_experts }
+    }
+
+    #[test]
+    fn route_stats_census_parses_and_a_null_one_explains_itself() -> Result<(), Error> {
+        // The engine's routing census is the only input that can rank experts for
+        // precision, and a CPU-only run used to write it as `null` — so this
+        // reader's failure mode *was* the whole story for anyone trying to run the
+        // quantization lever, and the hint beside it told them to set a flag that
+        // could not help. Both halves get pinned: a real census parses (including
+        // the extra producer row), and its absence says why and where to fix it.
+        let dir = std::env::temp_dir().join(format!("peregrine_requant_census_{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("route_stats.json");
+        let (n_layers, n_experts) = (3usize, 4usize);
+
+        // Producer shape: `n_layers + 1` rows, the trailing one the MTP head.
+        let rows: Vec<u32> =
+            (0..=n_layers).flat_map(|l| (0..n_experts).map(move |e| (l * n_experts + e + 1) as u32)).collect();
+        std::fs::write(&path, serde_json::json!({ "heat": rows }).to_string())?;
+        let heat = HeatTier::from_route_stats(&dir, n_layers, n_experts)?;
+        assert_eq!(heat.len(), n_layers * n_experts, "the MTP row must be dropped, not misaligned");
+        assert_eq!(&heat[..4], &[1, 2, 3, 4], "layer 0 must keep its own counts");
+
+        std::fs::write(&path, serde_json::json!({ "heat": null }).to_string())?;
+        // The rejection *is* the assertion here, so the Ok arm is the failure and
+        // is reported as one rather than unwrapped.
+        let msg = match HeatTier::from_route_stats(&dir, n_layers, n_experts) {
+            Ok(_) => {
+                return Err(peregrine_core::Error::Format("a null census must be rejected, not accepted".into()));
+            }
+            Err(e) => e.to_string(),
+        };
+        let msg = msg.to_lowercase();
+        assert!(msg.contains("null"), "must name the shape it found: {msg}");
+        assert!(msg.contains("streaming"), "must say where a census does get recorded: {msg}");
+
+        std::fs::write(&path, serde_json::json!({ "hist": [] }).to_string())?;
+        let msg = match HeatTier::from_route_stats(&dir, n_layers, n_experts) {
+            Ok(_) => {
+                return Err(peregrine_core::Error::Format("a census-less file must be rejected, not accepted".into()));
+            }
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("missing"), "a file with no census key at all must say so: {msg}");
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]

@@ -19,10 +19,14 @@ pub enum Kind {
     Goal,
     Constraint,
     OpenQuestion,
+    /// A capability, not a fact: the node names a loadable resource (e.g. a
+    /// LoRA adapter, content-addressed in `meta.source`) whose admission into
+    /// the active context is the runtime's trigger to load it.
+    Skill,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 7] = [
+    pub const ALL: [Kind; 8] = [
         Kind::Evidence,
         Kind::Claim,
         Kind::Calculation,
@@ -30,6 +34,7 @@ impl Kind {
         Kind::Goal,
         Kind::Constraint,
         Kind::OpenQuestion,
+        Kind::Skill,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -41,6 +46,7 @@ impl Kind {
             Kind::Goal => "goal",
             Kind::Constraint => "constraint",
             Kind::OpenQuestion => "open_question",
+            Kind::Skill => "skill",
         }
     }
 

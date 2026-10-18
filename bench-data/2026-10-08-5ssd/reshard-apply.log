@@ -1,0 +1,639 @@
+== measured read bandwidth (O_DIRECT, 8M blocks, 3 rounds x 4 reads, median) ==
+./scripts/reshard-glm53-5ssd.sh: line 103: printf: 70.7: invalid number
+  sda  /srv/m-sda        255 MB/s   (min 70, max 479, 12 samples, spread 577%)
+  sdb  /srv/m-sdb        543 MB/s   (min 539, max 547, 12 samples, spread 1%)
+  sdc  /srv/m-sdc        563 MB/s   (min 562, max 564, 12 samples, spread 0%)
+  sdd  /srv/m-sdd        562 MB/s   (min 560, max 563, 12 samples, spread 0%)
+  sde  /srv/m-sde        551 MB/s   (min 548, max 551, 12 samples, spread 0%)
+groups: sda:255,sdb:543,sdc:563,sdd:562,sde:551
+
+== capacity ==
+  container 153917 MB; the stage needs about the same again
+  sda  /srv/m-sda       650378 MB free
+  sdb  /srv/m-sdb       379168 MB free
+  sdc  /srv/m-sdc       106364 MB free
+  sdd  /srv/m-sdd       307675 MB free
+  sde  /srv/m-sde       444494 MB free
+
+== plan ==
+peregrine-reshard: group 'sda' (weight 255): 44 file(s), 24.682 GB total (15.896 GB routed experts), expected per-token routed share 10.4%
+peregrine-reshard: group 'sdb' (weight 543): 42 file(s), 33.381 GB total (33.381 GB routed experts), expected per-token routed share 21.9%
+peregrine-reshard: group 'sdc' (weight 563): 42 file(s), 34.971 GB total (34.971 GB routed experts), expected per-token routed share 22.9%
+peregrine-reshard: group 'sdd' (weight 562): 42 file(s), 34.441 GB total (34.441 GB routed experts), expected per-token routed share 22.6%
+peregrine-reshard: group 'sde' (weight 551): 42 file(s), 33.911 GB total (33.911 GB routed experts), expected per-token routed share 22.2%
+peregrine-reshard: --dry-run, nothing written
+
+== re-striping (writes ~153917 MB and saturates the disks; keep the box idle) ==
+peregrine-reshard: group 'sda' (weight 255): 44 file(s), 24.682 GB total (15.896 GB routed experts), expected per-token routed share 10.4%
+peregrine-reshard: group 'sdb' (weight 543): 42 file(s), 33.381 GB total (33.381 GB routed experts), expected per-token routed share 21.9%
+peregrine-reshard: group 'sdc' (weight 563): 42 file(s), 34.971 GB total (34.971 GB routed experts), expected per-token routed share 22.9%
+peregrine-reshard: group 'sdd' (weight 562): 42 file(s), 34.441 GB total (34.441 GB routed experts), expected per-token routed share 22.6%
+peregrine-reshard: group 'sde' (weight 551): 42 file(s), 33.911 GB total (33.911 GB routed experts), expected per-token routed share 22.2%
+peregrine-reshard: wrote 212 file(s), 161.385 GB, manifest /srv/m-sdb/glm53-reshard-5/manifest.json
+peregrine-reshard: verify experts-l10-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l10-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l10-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l10-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l10-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l11-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l11-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l11-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l11-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l11-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l12-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l12-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l12-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l12-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l12-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l13-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l13-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l13-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l13-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l13-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l14-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l14-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l14-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l14-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l14-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l15-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l15-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l15-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l15-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l15-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l16-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l16-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l16-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l16-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l16-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l17-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l17-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l17-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l17-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l17-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l18-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l18-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l18-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l18-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l18-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l19-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l19-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l19-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l19-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l19-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l20-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l20-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l20-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l20-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l20-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l21-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l21-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l21-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l21-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l21-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l22-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l22-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l22-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l22-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l22-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l23-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l23-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l23-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l23-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l23-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l24-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l24-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l24-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l24-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l24-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l25-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l25-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l25-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l25-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l25-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l26-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l26-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l26-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l26-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l26-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l27-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l27-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l27-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l27-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l27-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l28-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l28-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l28-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l28-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l28-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l29-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l29-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l29-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l29-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l29-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l3-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l3-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l3-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l3-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l3-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l30-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l30-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l30-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l30-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l30-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l31-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l31-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l31-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l31-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l31-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l32-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l32-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l32-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l32-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l32-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l33-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l33-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l33-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l33-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l33-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l34-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l34-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l34-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l34-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l34-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l35-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l35-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l35-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l35-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l35-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l36-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l36-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l36-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l36-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l36-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l37-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l37-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l37-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l37-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l37-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l38-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l38-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l38-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l38-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l38-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l39-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l39-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l39-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l39-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l39-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l4-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l4-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l4-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l4-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l4-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l40-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l40-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l40-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l40-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l40-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l41-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l41-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l41-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l41-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l41-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l42-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l42-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l42-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l42-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l42-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l43-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l43-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l43-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l43-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l43-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l44-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l44-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l44-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l44-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l44-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l5-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l5-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l5-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l5-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l5-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l6-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l6-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l6-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l6-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l6-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l7-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l7-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l7-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l7-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l7-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l8-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l8-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l8-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l8-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l8-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify experts-l9-sda.safetensors OK (180 tensors)
+peregrine-reshard: verify experts-l9-sdb.safetensors OK (378 tensors)
+peregrine-reshard: verify experts-l9-sdc.safetensors OK (396 tensors)
+peregrine-reshard: verify experts-l9-sdd.safetensors OK (390 tensors)
+peregrine-reshard: verify experts-l9-sde.safetensors OK (384 tensors)
+peregrine-reshard: verify trunk-sda-00000.safetensors OK (1878 tensors)
+peregrine-reshard: verify trunk-sda-00001.safetensors OK (1766 tensors)
+peregrine-reshard: verification passed (byte-identical)
+copied '/srv/m-sdb/glm53-reshard-5/experts-l3-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l3-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l3-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l29-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l29-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l29-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l32-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l32-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l32-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l44-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l44-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l44-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l37-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l37-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l37-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l28-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l28-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l28-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l25-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l25-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l25-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l20-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l20-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l20-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l18-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l18-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l18-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l5-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l5-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l5-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l31-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l31-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l31-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l8-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l8-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l8-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l26-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l26-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l26-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l38-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l38-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l38-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l11-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l11-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l11-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l10-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l10-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l10-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l21-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l21-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l21-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l19-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l19-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l19-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l27-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l27-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l27-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l16-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l16-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l16-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l35-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l35-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l35-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l15-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l15-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l15-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l23-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l23-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l23-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l34-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l34-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l34-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l12-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l12-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l12-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l7-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l7-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l7-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l9-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l9-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l9-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l39-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l39-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l39-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l40-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l40-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l40-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l43-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l43-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l43-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l36-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l36-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l36-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l42-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l42-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l42-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l4-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l4-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l4-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l30-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l30-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l30-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l41-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l41-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l41-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l17-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l17-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l17-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l22-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l22-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l22-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l14-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l14-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l14-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l24-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l24-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l24-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l13-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l13-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l13-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l6-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l6-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l6-sda.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l33-sda.safetensors' -> '/srv/m-sda/glm53-experts-5ssd/experts-l33-sda.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l33-sda.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l31-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l31-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l26-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l26-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l5-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l5-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l34-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l34-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l30-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l30-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l40-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l40-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l11-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l11-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l42-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l42-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l37-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l37-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l12-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l12-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l44-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l44-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l27-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l27-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l39-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l39-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l19-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l19-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l7-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l7-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l22-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l22-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l13-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l13-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l32-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l32-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l18-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l18-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l24-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l24-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l4-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l4-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l20-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l20-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l3-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l3-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l29-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l29-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l33-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l33-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l25-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l25-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l36-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l36-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l23-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l23-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l28-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l28-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l17-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l17-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l41-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l41-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l16-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l16-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l9-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l9-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l6-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l6-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l43-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l43-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l38-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l38-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l8-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l8-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l14-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l14-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l21-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l21-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l35-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l35-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l10-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l10-sdb.safetensors'
+renamed '/srv/m-sdb/glm53-reshard-5/experts-l15-sdb.safetensors' -> '/srv/m-sdb/glm53-experts-5ssd/experts-l15-sdb.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l43-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l43-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l43-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l44-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l44-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l44-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l17-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l17-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l17-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l13-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l13-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l13-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l12-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l12-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l12-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l25-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l25-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l25-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l14-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l14-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l14-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l39-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l39-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l39-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l11-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l11-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l11-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l40-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l40-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l40-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l34-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l34-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l34-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l36-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l36-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l36-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l28-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l28-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l28-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l22-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l22-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l22-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l20-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l20-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l20-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l26-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l26-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l26-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l27-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l27-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l27-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l38-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l38-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l38-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l31-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l31-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l31-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l23-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l23-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l23-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l29-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l29-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l29-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l9-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l9-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l9-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l10-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l10-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l10-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l4-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l4-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l4-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l41-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l41-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l41-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l8-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l8-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l8-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l6-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l6-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l6-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l24-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l24-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l24-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l19-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l19-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l19-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l21-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l21-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l21-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l3-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l3-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l3-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l7-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l7-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l7-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l18-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l18-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l18-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l15-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l15-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l15-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l5-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l5-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l5-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l37-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l37-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l37-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l33-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l33-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l33-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l32-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l32-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l32-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l16-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l16-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l16-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l42-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l42-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l42-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l30-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l30-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l30-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l35-sdc.safetensors' -> '/srv/m-sdc/glm53-experts-5ssd/experts-l35-sdc.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l35-sdc.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l44-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l44-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l44-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l34-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l34-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l34-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l35-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l35-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l35-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l8-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l8-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l8-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l12-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l12-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l12-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l16-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l16-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l16-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l31-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l31-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l31-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l36-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l36-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l36-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l17-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l17-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l17-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l3-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l3-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l3-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l7-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l7-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l7-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l41-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l41-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l41-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l27-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l27-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l27-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l21-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l21-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l21-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l11-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l11-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l11-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l28-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l28-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l28-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l32-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l32-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l32-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l23-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l23-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l23-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l20-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l20-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l20-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l18-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l18-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l18-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l24-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l24-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l24-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l10-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l10-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l10-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l40-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l40-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l40-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l19-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l19-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l19-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l15-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l15-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l15-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l22-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l22-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l22-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l39-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l39-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l39-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l26-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l26-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l26-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l13-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l13-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l13-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l4-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l4-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l4-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l9-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l9-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l9-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l6-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l6-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l6-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l5-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l5-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l5-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l30-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l30-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l30-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l38-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l38-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l38-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l29-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l29-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l29-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l25-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l25-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l25-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l42-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l42-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l42-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l43-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l43-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l43-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l14-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l14-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l14-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l37-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l37-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l37-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l33-sdd.safetensors' -> '/srv/m-sdd/glm53-experts-5ssd/experts-l33-sdd.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l33-sdd.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l10-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l10-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l10-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l16-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l16-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l16-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l18-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l18-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l18-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l24-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l24-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l24-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l33-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l33-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l33-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l31-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l31-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l31-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l40-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l40-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l40-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l12-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l12-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l12-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l15-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l15-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l15-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l43-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l43-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l43-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l4-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l4-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l4-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l5-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l5-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l5-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l28-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l28-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l28-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l25-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l25-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l25-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l39-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l39-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l39-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l20-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l20-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l20-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l13-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l13-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l13-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l37-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l37-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l37-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l30-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l30-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l30-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l11-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l11-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l11-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l7-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l7-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l7-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l29-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l29-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l29-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l42-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l42-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l42-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l38-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l38-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l38-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l41-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l41-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l41-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l3-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l3-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l3-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l6-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l6-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l6-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l32-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l32-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l32-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l36-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l36-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l36-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l8-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l8-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l8-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l27-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l27-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l27-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l14-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l14-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l14-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l34-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l34-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l34-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l19-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l19-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l19-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l26-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l26-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l26-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l35-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l35-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l35-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l9-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l9-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l9-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l44-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l44-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l44-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l17-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l17-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l17-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l22-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l22-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l22-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l23-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l23-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l23-sde.safetensors'
+copied '/srv/m-sdb/glm53-reshard-5/experts-l21-sde.safetensors' -> '/srv/m-sde/glm53-experts-5ssd/experts-l21-sde.safetensors'
+removed '/srv/m-sdb/glm53-reshard-5/experts-l21-sde.safetensors'
+'/srv/m-sdd/GLM-5.3-Flash-4ssd/config.json' -> '/srv/m-sdd/GLM-5.3-Flash-5ssd/config.json'
+'/srv/m-sdd/GLM-5.3-Flash-4ssd/generation_config.json' -> '/srv/m-sdd/GLM-5.3-Flash-5ssd/generation_config.json'
+'/srv/m-sdd/GLM-5.3-Flash-4ssd/tokenizer.json' -> '/srv/m-sdd/GLM-5.3-Flash-5ssd/tokenizer.json'
+'/srv/m-sdd/GLM-5.3-Flash-4ssd/tokenizer_config.json' -> '/srv/m-sdd/GLM-5.3-Flash-5ssd/tokenizer_config.json'
+'/srv/m-sdd/GLM-5.3-Flash-4ssd/chat_template.jinja' -> '/srv/m-sdd/GLM-5.3-Flash-5ssd/chat_template.jinja'
+'/srv/m-sdd/GLM-5.3-Flash-4ssd/route_stats.json' -> '/srv/m-sdd/GLM-5.3-Flash-5ssd/route_stats.json'
+
+new container: /srv/m-sdd/GLM-5.3-Flash-5ssd
+Now measure it before switching — a re-stripe that is 5 % slower must be a
+one-line change to the model dir, not an incident:
+
+  MODEL_DIR=/srv/m-sdd/GLM-5.3-Flash-5ssd ./scripts/bench-lookahead-arms.sh bench-data/$(date +%F)-reshard 3
+  MODEL_DIR=/srv/m-sdd/GLM-5.3-Flash-5ssd COLI_MODEL=/srv/m-sdd/GLM-5.3-Flash-5ssd ./scripts/serve-glm53-flash-cuda.sh
+
+If it is faster, point peregrine.env at it and delete the stage:
+  rm -rf /srv/m-sdb/glm53-reshard-5

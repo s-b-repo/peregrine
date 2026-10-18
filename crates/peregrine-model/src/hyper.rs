@@ -72,7 +72,26 @@ impl HyperConn {
         Ok(Some(HyperConn { fnw: QtWeight::load(st, &fn_name, mix, hc * d)?, base, scale, hc }))
     }
 
-    /// Compute one position's mixing weights from its streams (`[H*d]`).
+    pub fn load_hybrid(
+        resolver: &crate::hybrid::WeightResolver<'_>,
+        prefix: &str,
+        site: &str,
+        cfg: &Cfg,
+    ) -> Result<Option<HyperConn>, Error> {
+        let fn_name = format!("{prefix}hc_{site}_fn");
+        if !resolver.has(&fn_name) {
+            return Ok(None);
+        }
+        let hc = cfg.hc_mult.max(1) as usize;
+        let mix = (2 + hc) * hc;
+        let d = cfg.hidden as usize;
+        let mut base = vec![0f32; mix];
+        let mut scale = vec![0f32; 3];
+        resolver.read_f32(&format!("{prefix}hc_{site}_base"), &mut base)?;
+        resolver.read_f32(&format!("{prefix}hc_{site}_scale"), &mut scale)?;
+        Ok(Some(HyperConn { fnw: resolver.load_matrix(&fn_name, mix, hc * d)?, base, scale, hc }))
+    }
+
     pub fn mix(&self, streams: &[f32], cfg: &Cfg) -> HcMix {
         let hc = self.hc;
         debug_assert_eq!(streams.len() % hc, 0);

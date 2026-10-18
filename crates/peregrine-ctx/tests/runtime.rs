@@ -1,7 +1,6 @@
 //! End-to-end behaviour: memoisation, escalation, consistency, persistence.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use peregrine_ctx::graph::DcrError;
 use peregrine_ctx::llm::{LocalReasoner, Reasoner};
@@ -44,9 +43,9 @@ fn build(budget: usize, noise: usize) -> Dcr {
     rt
 }
 
-fn counting_cost(calls: Rc<RefCell<u32>>) -> impl Fn(&peregrine_ctx::execute::Inputs) -> f64 {
+fn counting_cost(calls: Arc<Mutex<u32>>) -> impl Fn(&peregrine_ctx::execute::Inputs) -> f64 + Send {
     move |inputs| {
-        *calls.borrow_mut() += 1;
+        *calls.lock().unwrap_or_else(|p| p.into_inner()) += 1;
         let get = |name: &str| {
             inputs
                 .iter()
@@ -63,7 +62,7 @@ fn counting_cost(calls: Rc<RefCell<u32>>) -> impl Fn(&peregrine_ctx::execute::In
 #[test]
 fn memoised_derivation_runs_once() {
     let mut rt = build(600, 60);
-    let calls = Rc::new(RefCell::new(0u32));
+    let calls = Arc::new(Mutex::new(0u32));
     rt.register("incident_cost", counting_cost(calls.clone()));
     let rate = *rt.graph.by_key("hourly.rate", true).last().unwrap();
     let deps = vec![rt.graph.node(rate).id.clone()];
@@ -80,14 +79,14 @@ fn memoised_derivation_runs_once() {
             .unwrap();
     }
     assert_eq!(rt.graph.node(node).value, "720");
-    assert_eq!(*calls.borrow(), 1);
+    assert_eq!(*calls.lock().unwrap_or_else(|p| p.into_inner()), 1);
     assert_eq!(rt.execution.memo_hits, 2);
 }
 
 #[test]
 fn changed_input_invalidates_and_recomputes() {
     let mut rt = build(600, 60);
-    let calls = Rc::new(RefCell::new(0u32));
+    let calls = Arc::new(Mutex::new(0u32));
     rt.register("incident_cost", counting_cost(calls.clone()));
     let rate = *rt.graph.by_key("hourly.rate", true).last().unwrap();
     let deps = vec![rt.graph.node(rate).id.clone()];
@@ -112,7 +111,7 @@ fn changed_input_invalidates_and_recomputes() {
         .unwrap();
     assert_eq!(rt.graph.node(again).value, "840");
     assert_eq!(
-        *calls.borrow(),
+        *calls.lock().unwrap_or_else(|p| p.into_inner()),
         2,
         "a changed dependency must not hit the memo"
     );
@@ -264,5 +263,20 @@ fn a_local_reasoner_only_answers_from_the_window() {
     assert_eq!(
         reasoner.complete(prompt, ""),
         "10.0.9.7 [clai_aaaaaaaaaaaa]"
+    );
+}
+
+/// The prefix-reuse metric slices the prompt at the shared byte prefix of two
+/// turns. 'é' (C3 A9) and 'è' (C3 A8) share a lead byte, so when consecutive
+/// queries differ only in an accented character the shared run ends *inside*
+/// a codepoint — slicing there panics. The metric must floor to a boundary.
+#[test]
+fn prefix_reuse_does_not_panic_on_multibyte_prompts() {
+    let mut rt = build(600, 0);
+    rt.ask("café?", None);
+    rt.ask("cafè?", None);
+    assert!(
+        rt.telemetry.report().prefix_reuse_mean.is_some(),
+        "two turns in, the metric must exist — and the asks must not panic"
     );
 }

@@ -44,6 +44,14 @@ pub struct Weights {
     /// A node with a live `contradicts` edge is *more* useful, not less: the
     /// model should adjudicate rather than inherit whichever side won.
     pub contradiction_bonus: f32,
+    /// Hysteresis: bonus for a node admitted in the previous window, so
+    /// membership stops oscillating turn to turn. Deliberately *not* part of
+    /// what makes a node worth knowing — it is the minimal-edit objective
+    /// `U(S) − λ·edit(S, S_prev)` with λ paid as a bonus, and it exists so a
+    /// prompt cache can reuse a prefix. `0.0` disables it, which is the
+    /// default: it trades probe correctness for stability, and that trade
+    /// must be measured (`bench --cache`), not assumed.
+    pub stickiness: f32,
     pub decay: f32,
 }
 
@@ -59,6 +67,7 @@ impl Default for Weights {
             stale_penalty: 2.0,
             superseded_source: 1.2,
             contradiction_bonus: 0.6,
+            stickiness: 0.0,
             decay: 0.6,
         }
     }
@@ -71,6 +80,10 @@ impl Weights {
             Kind::Decision => 0.25,
             Kind::Claim | Kind::Calculation => 0.2,
             Kind::OpenQuestion => 0.1,
+            // A skill competes on its description's similarity alone; the
+            // prior only keeps a marginally relevant one from crowding out a
+            // fact of equal score.
+            Kind::Skill => 0.1,
             Kind::Evidence => 0.0,
         }
     }
@@ -120,6 +133,10 @@ pub struct UtilityTerms {
     pub contradiction: f32,
     pub stale: f32,
     pub superseded_source: f32,
+    /// Not a property of the node — hysteresis against last turn's window.
+    /// Named separately so a plan can be audited with the retention bonus
+    /// visible rather than folded into a relevance term it does not belong to.
+    pub stickiness: f32,
 }
 
 impl UtilityTerms {
@@ -144,6 +161,7 @@ impl UtilityTerms {
             + self.contradiction
             + self.stale
             + self.superseded_source
+            + self.stickiness
     }
 
     pub fn named(&self) -> Vec<(&'static str, f32)> {
@@ -158,6 +176,7 @@ impl UtilityTerms {
             ("contradiction", self.contradiction),
             ("stale", self.stale),
             ("superseded_source", self.superseded_source),
+            ("stickiness", self.stickiness),
         ]
     }
 }
@@ -397,10 +416,66 @@ impl ActiveContext {
                 .total_cmp(&a.utility)
                 .then(a.node_id.cmp(&b.node_id))
         });
+        let groups = Self::render_groups(&sorted);
+        if with_header {
+            format!(
+                "# ACTIVE CONTEXT  (k={}/{} tokens, {} of {} candidates, query type: {})\n{groups}",
+                self.tokens,
+                self.budget,
+                self.entries.len(),
+                self.considered,
+                self.qtype.map(QueryType::as_str).unwrap_or("open")
+            )
+        } else {
+            groups
+        }
+    }
 
+    /// The prompt text, laid out for prompt-cache reuse across turns.
+    ///
+    /// `render` optimises for a model reading one turn; this optimises for the
+    /// *next* turn reusing this turn's bytes — providers bill a cached prefix
+    /// at a large discount, and the ranked layout re-derives those bytes every
+    /// turn. Three rules:
+    ///
+    /// 1. The header is turn-invariant. The per-turn stats `render` leads
+    ///    with — k, candidate count, query type — move to a trailer *after*
+    ///    all content: they are for the model, and placed first they
+    ///    invalidate the cache at byte ~30, before any content is compared.
+    /// 2. Membership is the planner's job; order is the content's job.
+    ///    Groups keep the fixed kind order, and within a group entries sort
+    ///    by `node_id` — content-addressed, so a node whose utility moved
+    ///    keeps its place as long as its text did.
+    /// 3. Per-turn data never precedes content.
+    ///
+    /// Membership still churns — that is the knapsack doing its job — so the
+    /// shared prefix ends at the first admitted or evicted node. What this
+    /// buys is everything before that point: the header, the pinned goals
+    /// and constraints, and every retained block up to the first edit.
+    pub fn render_prefix_stable(&self) -> String {
+        let mut sorted: Vec<&Admission> = self.entries.iter().collect();
+        sorted.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        format!(
+            "# ACTIVE CONTEXT{}\n\n---\nk={}/{} tokens, {} of {} candidates, query type: {}",
+            Self::render_groups(&sorted),
+            self.tokens,
+            self.budget,
+            self.entries.len(),
+            self.considered,
+            self.qtype.map(QueryType::as_str).unwrap_or("open")
+        )
+    }
+
+    /// Entries grouped under their fixed kind titles. The caller owns the
+    /// sort order; this owns only the grouping.
+    fn render_groups(sorted: &[&Admission]) -> String {
         let order = [
             (Kind::Goal, "GOALS"),
             (Kind::Constraint, "CONSTRAINTS"),
+            // Rendered only when admitted, and admission is what fires the
+            // loader — so "activated" is accurate by construction, not a claim
+            // the model has to take on faith.
+            (Kind::Skill, "SKILLS (activated)"),
             (Kind::Claim, "FACTS (cached state)"),
             (Kind::Calculation, "COMPUTED"),
             (Kind::Decision, "DECISIONS"),
@@ -408,19 +483,10 @@ impl ActiveContext {
             (Kind::Evidence, "EVIDENCE (raw spans)"),
         ];
         let mut blocks: Vec<String> = Vec::new();
-        if with_header {
-            blocks.push(format!(
-                "# ACTIVE CONTEXT  (k={}/{} tokens, {} of {} candidates, query type: {})",
-                self.tokens,
-                self.budget,
-                self.entries.len(),
-                self.considered,
-                self.qtype.map(QueryType::as_str).unwrap_or("open")
-            ));
-        }
         for (kind, title) in order {
-            let group: Vec<&&Admission> = sorted.iter().filter(|e| e.kind == kind).collect();
-            if group.is_empty() {
+            let group = sorted.iter().filter(|e| e.kind == kind);
+            let mut group = group.peekable();
+            if group.peek().is_none() {
                 continue;
             }
             blocks.push(format!("\n## {title}"));
@@ -449,6 +515,10 @@ pub struct PlanCtx<'a> {
     pub policy: &'a DecisionPolicy,
     pub now: u64,
     pub evidence_by_span: &'a HashMap<String, String>,
+    /// Node ids admitted by the previous plan — the `S_prev` of the
+    /// minimal-edit objective. Empty on the first turn and whenever stickiness
+    /// is disabled.
+    pub last_assembly: &'a HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -532,7 +602,7 @@ impl RelevancePlanner {
             [
                 w.similarity, w.proximity, w.explain_path, w.confidence,
                 w.read_through, w.recency, w.stale_penalty, w.superseded_source,
-                w.contradiction_bonus, w.decay,
+                w.contradiction_bonus, w.stickiness, w.decay,
             ],
             self.seed_min_ratio,
             self.max_depth,
@@ -608,10 +678,17 @@ impl RelevancePlanner {
                 active.profile.score_dropped_no_level += 1;
                 continue;
             }
-            let want = force_level
+            // A forced level the node does not have is meaningless — it cannot
+            // be rendered there. Skill nodes (L2 only) made this reachable: a
+            // reasoner can `#ESCALATE` one, and dropping it from the re-plan
+            // would remove exactly the context the escalation asked about.
+            // Fall back to the node's own levels instead.
+            let forced = force_level
                 .get(&idx)
                 .copied()
-                .unwrap_or_else(|| ctx.policy.preferred_level(node, qtype, &available));
+                .filter(|level| available.contains(level));
+            let want =
+                forced.unwrap_or_else(|| ctx.policy.preferred_level(node, qtype, &available));
             preferred.insert(idx, want);
             // Under the causal control the utility function is skipped entirely
             // and every other stage sees an identical candidate.
@@ -629,8 +706,8 @@ impl RelevancePlanner {
             let base = terms.base().max(0.01);
             let mut options: Vec<Choice> = Vec::new();
             for level in &available {
-                if let Some(forced) = force_level.get(&idx) {
-                    if level != forced {
+                if let Some(forced) = forced {
+                    if *level != forced {
                         continue;
                     }
                 }
@@ -986,6 +1063,11 @@ impl RelevancePlanner {
                 -w.superseded_source
             } else if !node.meta.corrected_by.is_empty() {
                 -w.superseded_source / 3.0
+            } else {
+                0.0
+            },
+            stickiness: if w.stickiness > 0.0 && ctx.last_assembly.contains(&node.id) {
+                w.stickiness
             } else {
                 0.0
             },

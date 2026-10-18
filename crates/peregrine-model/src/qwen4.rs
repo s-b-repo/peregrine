@@ -582,6 +582,32 @@ pub(crate) fn route(x: &[f32], weights: &[f32], cfg: &Cfg) -> Result<crate::rout
     Ok(routed)
 }
 
+pub(crate) fn route_ranks(
+    x: &[f32],
+    weights: &[f32],
+    cfg: &Cfg,
+    n: usize,
+) -> Result<Vec<i32>, Error> {
+    let d = cfg.hidden as usize;
+    let e_n = cfg.n_experts as usize;
+    let n = n.min(e_n);
+    if n == 0 || d == 0 || e_n == 0 || x.len() < d {
+        return Ok(Vec::new());
+    }
+    let Some(count) = d.checked_mul(e_n) else {
+        return Err(invalid("softmax router geometry overflow"));
+    };
+    if weights.len() < count {
+        return Ok(Vec::new());
+    }
+    let row = &x[..d];
+    let logits: Vec<f32> = weights[..count]
+        .chunks_exact(d)
+        .map(|w| w.iter().zip(row).map(|(a, b)| a * b).sum())
+        .collect();
+    Ok(softmax_topk(&logits, n, false)?.into_iter().map(|(e, _)| e as i32).collect())
+}
+
 /// Softmax-MoE forward for Qwen4Exp: `route` (plain softmax, no bias) selects
 /// the experts, each selected expert's SwiGLU is scattered back weighted, and
 /// the shared expert is added gated by `sigmoid(shared_gate·x)`.
@@ -604,7 +630,16 @@ pub(crate) fn moe_forward_qwen4(
     }
     finite(x)?;
     finite(router_w)?;
-    let r = route(x, router_w, cfg)?;
+    let mut r = route(x, router_w, cfg)?;
+    crate::router::apply_route_controls(
+        &mut r,
+        s_n,
+        crate::router::route_min_share(),
+        crate::router::route_topp(),
+        crate::router::expert_budget(),
+        cfg.norm_topk,
+        cfg.routed_scale,
+    );
     let mut out = vec![0.0f32; s_n * d];
     struct Plan { e: usize, rows: Vec<usize>, rw: Vec<f32> }
     let union = crate::router::batch_union(&r, s_n);
@@ -736,5 +771,40 @@ impl Qsa {
         for block in blocks { selected.extend_from_slice(&visible[block * self.ratio..(block + 1) * self.ratio]); }
         selected.extend_from_slice(&visible[complete * self.ratio..]);
         Ok(selected)
+    }
+}
+
+#[cfg(test)]
+mod softmax_router_tests {
+    use super::*;
+
+    #[test]
+    fn softmax_lookahead_ranks_without_a_bias_tensor() -> Result<(), Error> {
+        let cfg = Cfg::from_json(&serde_json::json!({
+            "model_type": "qwen4_exp_text",
+            "hidden_size": 1,
+            "vocab_size": 8,
+            "num_hidden_layers": 1,
+            "num_experts": 3,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 2,
+            "shared_expert_intermediate_size": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 2,
+            "layer_types": ["linear_attention"],
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": 1,
+            "linear_value_head_dim": 1,
+            "linear_conv_kernel_dim": 1
+        }))?;
+        let x = [1.0f32];
+        let weights = [0.0f32, 1.0, 2.0];
+        let routed = route(&x, &weights, &cfg)?;
+        let ranks = route_ranks(&x, &weights, &cfg, 2)?;
+        assert_eq!(ranks, routed.idx[..2].to_vec());
+        assert!(route_ranks(&x, &[], &cfg, 2)?.is_empty());
+        Ok(())
     }
 }

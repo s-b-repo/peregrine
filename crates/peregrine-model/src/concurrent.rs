@@ -21,6 +21,7 @@ use peregrine_io::{Bytes, CacheHit, OwnedReadReq, Reactor, ReadReq, RegionDone, 
 
 use crate::gpu::{GpuDenseTier, GpuTier, HeatTable};
 use crate::lane::LaneTimingsAccum;
+use crate::math::sigmoidf;
 use crate::mlp::Mlp;
 use crate::predict::RouteHistory;
 use crate::router::{batch_union, route, routed_at, RouterCfg};
@@ -32,6 +33,7 @@ use crate::weight::{QtWeight, QuantFmt};
 /// so the layer/MoE entry points stay small (no long argument lists).
 pub struct ForwardCtx<'a> {
     pub st: &'a SafeTensors,
+    pub reference: Option<&'a SafeTensors>,
     /// Run MLA attention through weight absorption instead of the dense
     /// reconstruction (`COLI_MLA_ABSORB`). Carried on the context rather than
     /// read from the environment per forward, so tests can exercise both paths
@@ -1064,6 +1066,9 @@ fn device_claim_groups(
     for (idx, fd) in fds.enumerate() {
         by_dev.entry(table.get(&fd).copied().unwrap_or(u8::MAX)).or_default().push(idx);
     }
+    if by_dev.is_empty() {
+        return vec![Vec::new()];
+    }
     by_dev.into_values().collect()
 }
 
@@ -1597,6 +1602,8 @@ pub struct MoeCall<'a> {
     pub router_w: &'a [f32],
     pub router_bias: &'a [f32],
     pub shared: Option<&'a Mlp>,
+    pub shared_gate: Option<&'a crate::qwen4::Matrix>,
+    pub fallback_experts: Option<&'a [Option<Mlp>]>,
     pub s_n: usize,
 }
 
@@ -1638,6 +1645,25 @@ pub fn moe_engine_name() -> &'static str {
 /// Routes to an installed [`MoeEngine`] when one exists, else to the default
 /// three-lane [`moe_forward_concurrent`]. With nothing installed this is one
 /// `OnceLock` load per sparse layer and the path is unchanged.
+pub(crate) fn qwen35_alternative_dispatch_forbidden(
+    stream_experts: bool,
+    arch: peregrine_core::Arch,
+    installed: bool,
+) -> bool {
+    stream_experts
+        && installed
+        && matches!(
+            arch,
+            peregrine_core::Arch::Qwen35Moe | peregrine_core::Arch::Glm5Next
+        )
+}
+
+pub(crate) fn qwen35_alternative_dispatch_error(engine_name: &str) -> Error {
+    Error::Format(format!(
+        "installed MoE engine {engine_name} does not support qwen3_5_moe routing or glm5_next expert semantics"
+    ))
+}
+
 pub fn moe_forward_dispatch(
     ctx: &ForwardCtx,
     layer: usize,
@@ -1647,12 +1673,25 @@ pub fn moe_forward_dispatch(
     shared: Option<&Mlp>,
     s_n: usize,
 ) -> Result<Vec<f32>, Error> {
-    match MOE_ENGINE.get() {
-        Some(engine) => {
-            engine.moe_forward(ctx, MoeCall { layer, x, router_w, router_bias, shared, s_n })
-        }
-        None => moe_forward_concurrent(ctx, layer, x, router_w, router_bias, shared, s_n),
+    if ctx.cfg.arch == peregrine_core::Arch::Qwen35Moe {
+        return Err(Error::Format(
+            "qwen3_5_moe dispatch requires the shared gate; use moe_forward_dispatch_call".into(),
+        ));
     }
+    moe_forward_dispatch_call(
+        ctx,
+        MoeCall { layer, x, router_w, router_bias, shared, shared_gate: None, fallback_experts: None, s_n },
+    )
+}
+
+pub fn moe_forward_dispatch_call(ctx: &ForwardCtx, call: MoeCall<'_>) -> Result<Vec<f32>, Error> {
+    if let Some(engine) = MOE_ENGINE.get() {
+        if qwen35_alternative_dispatch_forbidden(ctx.stream_experts, ctx.cfg.arch, true) {
+            return Err(qwen35_alternative_dispatch_error(engine.name()));
+        }
+        return engine.moe_forward(ctx, call);
+    }
+    moe_forward_concurrent_call(ctx, call)
 }
 
 pub fn moe_forward_concurrent(
@@ -1664,6 +1703,24 @@ pub fn moe_forward_concurrent(
     shared: Option<&Mlp>,
     s_n: usize,
 ) -> Result<Vec<f32>, Error> {
+    if ctx.cfg.arch == peregrine_core::Arch::Qwen35Moe {
+        return Err(Error::Format(
+            "qwen3_5_moe concurrent MoE requires the shared gate; use moe_forward_concurrent_call".into(),
+        ));
+    }
+    moe_forward_concurrent_call(
+        ctx,
+        MoeCall { layer, x, router_w, router_bias, shared, shared_gate: None, fallback_experts: None, s_n },
+    )
+}
+
+pub fn moe_forward_concurrent_call(ctx: &ForwardCtx, call: MoeCall<'_>) -> Result<Vec<f32>, Error> {
+    if ctx.cfg.arch == peregrine_core::Arch::Qwen35Moe && call.shared_gate.is_none() {
+        return Err(Error::Format(
+            "qwen3_5_moe concurrent MoE requires the shared gate; use moe_forward_concurrent_call with MoeCall.shared_gate".into(),
+        ));
+    }
+    let MoeCall { layer, x, router_w, router_bias, shared, shared_gate, fallback_experts, s_n } = call;
     let st = ctx.st;
     let gpu = ctx.gpu;
     let workers = ctx.workers;
@@ -1689,12 +1746,23 @@ pub fn moe_forward_concurrent(
     // `moe_inter` is no longer read here: the expert map (or `plans_for`'s
     // fallback) owns the tensor shapes now.
     let (e_n, k) = (cfg.n_experts as usize, cfg.topk as usize);
-    let mut r = if cfg.arch == peregrine_core::Arch::Qwen4Exp {
-        crate::qwen4::route(x, router_w, cfg)?
+    let softmax_router = matches!(cfg.arch, peregrine_core::Arch::Qwen35Moe | peregrine_core::Arch::Qwen4Exp);
+    let mut r = if softmax_router {
+        let mut r = crate::qwen4::route(x, router_w, cfg)?;
+        crate::router::apply_route_controls(
+            &mut r,
+            s_n,
+            crate::router::route_min_share(),
+            crate::router::route_topp(),
+            crate::router::expert_budget(),
+            cfg.norm_topk,
+            cfg.routed_scale,
+        );
+        r
     } else {
         route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk: cfg.norm_topk, routed_scale: cfg.routed_scale, min_share: crate::router::route_min_share() })
     };
-    if cfg.arch != peregrine_core::Arch::Qwen4Exp {
+    if !softmax_router {
         crate::router::apply_route_topp(&mut r, s_n, crate::router::route_topp(), cfg.norm_topk, cfg.routed_scale);
         crate::router::apply_expert_budget(&mut r, s_n, crate::router::expert_budget(), cfg.norm_topk, cfg.routed_scale);
     }
@@ -1704,6 +1772,7 @@ pub fn moe_forward_concurrent(
     // so the final reduce stays deterministic regardless of which lane finishes.
     let mut plans: Vec<EPlan> = Vec::new();
     let mut gplans: Vec<GPlan> = Vec::new();
+    let mut precomputed: Vec<(usize, EOut)> = Vec::new();
     let mut pos = 0usize;
     let uniq = batch_union(&r, s_n);
     // Number of experts per layer — needed to look up per-expert heat in the
@@ -1742,7 +1811,10 @@ pub fn moe_forward_concurrent(
         }
         let this_pos = pos;
         pos += 1;
-        let gpu_resident = gpu.is_some_and(|g| g.has(layer, e));
+        let gpu_resident = fallback_experts
+            .and_then(|v| v.get(e))
+            .is_none()
+            && gpu.is_some_and(|g| g.has(layer, e));
         // LaneBalancer consultation: if the balancer says the GPU lane is the
         // bottleneck and this expert is cold enough, route it through the CPU
         // lane instead — even though it's GPU-resident. When the resident
@@ -1779,12 +1851,20 @@ pub fn moe_forward_concurrent(
                 xg[ri * hidden..ri * hidden + hidden].copy_from_slice(&x[s * hidden..s * hidden + hidden]);
             }
             gplans.push(GPlan { pos: this_pos, e, rows, rw, xg });
+        } else if let Some(mlp) = fallback_experts.and_then(|v| v.get(e).and_then(Option::as_ref)) {
+            let nr = rows.len();
+            let mut xg = vec![0f32; nr * hidden];
+            for (ri, &s) in rows.iter().enumerate() {
+                xg[ri * hidden..(ri + 1) * hidden].copy_from_slice(&x[s * hidden..(s + 1) * hidden]);
+            }
+            precomputed.push((this_pos, EOut { rows, rw, h: mlp.swiglu(&xg, nr) }));
         } else {
             let entry = entry_for(ctx.expert_index, st, cfg, layer, e)?;
             plans.push(EPlan { pos: this_pos, expert: e, rows, rw, entry });
         }
     }
     let n = pos;
+    let precomputed_count = precomputed.len();
 
     // Order the streamed `EPlan`s so the batched submit issues ascending-offset
     // reads. This changes only the io_uring submit order — the deterministic
@@ -2284,7 +2364,20 @@ pub fn moe_forward_concurrent(
                                     g.remove_corrupt((layer as u32, plan.expert as u32));
                                 }
                                 match restream_expert_blocking(&plan.entry) {
-                                    Ok(slab) => (idx, slab),
+                                    Ok(slab) => {
+                                        let admit = admit_min_heat == 0
+                                            || heat_ref.is_none_or(|h| h.get(layer, plan.expert) >= admit_min_heat);
+                                        if let Some(c) = ecache {
+                                            let prepared = admit
+                                                .then(|| WarmCache::prepare_insert(slab.clone(), cache_compress));
+                                            let mut g = c.lock();
+                                            g.note_disk_read(layer as u32, (layer as u32, plan.expert as u32));
+                                            if let Some(prepared) = prepared {
+                                                g.insert_prepared((layer as u32, plan.expert as u32), prepared);
+                                            }
+                                        }
+                                        (idx, slab)
+                                    }
                                     Err(e) => {
                                         if res_tx.send(Err(e)).is_err() {
                                             peregrine_io::note_advisory_err(
@@ -2395,7 +2488,7 @@ pub fn moe_forward_concurrent(
         // the lane read is what keeps "how many messages are coming" from being
         // two independent opinions that can disagree and hang the forward.
         let gpu_slots = if fused_reduce { gplans_ref.len() } else { 0 };
-        let want_slots = n - gpu_slots;
+        let want_slots = n.saturating_sub(gpu_slots).saturating_sub(precomputed_count);
         let mut gpu_partial: Option<Vec<f32>> = None;
         let complete = |got: usize, partial: &Option<Vec<f32>>| {
             got == want_slots && (!fused_reduce || partial.is_some())
@@ -2488,7 +2581,16 @@ pub fn moe_forward_concurrent(
     if let Some(t) = timings_ref {
         t.add_lane_wall(t_lane.elapsed().as_micros() as u64);
     }
-    let (slots, gpu_partial) = results?;
+    let (mut slots, gpu_partial) = results?;
+    for (pos, eo) in precomputed {
+        let Some(slot) = slots.get_mut(pos) else {
+            return Err(Error::Format(format!("fallback expert slot {pos} is out of range")));
+        };
+        if slot.is_some() {
+            return Err(Error::Format(format!("duplicate fallback expert slot {pos}")));
+        }
+        *slot = Some(eo);
+    }
 
     // ---- deterministic reduce: scatter in fixed batch-union order ----
     //
@@ -2566,8 +2668,26 @@ pub fn moe_forward_concurrent(
     }
     if let Some(sh) = shared {
         let hs = sh.swiglu(x, s_n);
-        for z in 0..s_n * hidden {
-            out[z] += hs[z];
+        if let Some(gate) = shared_gate {
+            let gates = gate.apply(x)?;
+            if gates.len() != s_n {
+                return Err(Error::Format(format!(
+                    "layer {layer}: shared gate produced {} values for {s_n} rows",
+                    gates.len()
+                )));
+            }
+            for s in 0..s_n {
+                let scale = sigmoidf(gates[s]);
+                let dst = &mut out[s * hidden..(s + 1) * hidden];
+                let src = &hs[s * hidden..(s + 1) * hidden];
+                for (value, input) in dst.iter_mut().zip(src) {
+                    *value += scale * input;
+                }
+            }
+        } else {
+            for z in 0..s_n * hidden {
+                out[z] += hs[z];
+            }
         }
     }
     if let Some(t) = ctx.timings {
@@ -2623,6 +2743,7 @@ pub fn moe_forward_concurrent(
 /// One expert queued for speculative prefetch: its `(layer, expert)` cache key and
 /// the three tensor plans to stream. Built by [`prefetch_item`], consumed by
 /// [`prefetch_read`] on the prefetch lane's own ring.
+#[derive(Clone)]
 pub struct PrefetchItem {
     key: (u32, u32),
     entry: ExpertEntry,
@@ -2655,6 +2776,31 @@ pub fn prefetch_item(
 /// is bit-identical.
 pub fn prefetch_read(reactor: &mut Reactor, item: &PrefetchItem, direct: bool) -> Result<peregrine_io::ExpertSlab, Error> {
     read_expert(Some(reactor), &item.entry, direct)
+}
+
+pub fn prefetch_read_batch(
+    reactor: &mut Reactor,
+    items: &[PrefetchItem],
+    direct: bool,
+) -> Result<Vec<peregrine_io::ExpertSlab>, Error> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut regions = Vec::with_capacity(items.len() * 2);
+    let mut counts = Vec::with_capacity(items.len());
+    for item in items {
+        let item_regions = expert_regions(&item.entry, direct);
+        counts.push(item_regions.len());
+        regions.extend_from_slice(&item_regions);
+    }
+    let bytes = read_regions(Some(reactor), &regions, direct)?;
+    let mut bytes = bytes.into_iter();
+    let mut slabs = Vec::with_capacity(items.len());
+    for (item, count) in items.iter().zip(counts) {
+        let got: Vec<Bytes> = bytes.by_ref().take(count).collect();
+        slabs.push(pack_slab_from(&item.entry, got)?);
+    }
+    Ok(slabs)
 }
 
 /// One expert queued for a page-cache *hint* (`fadvise(WILLNEED)`): its six
@@ -2719,6 +2865,15 @@ mod tests {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
 
+    #[test]
+    fn qwen35_alternative_rejection_requires_streaming_and_installation() {
+        assert!(qwen35_alternative_dispatch_forbidden(true, peregrine_core::Arch::Qwen35Moe, true));
+        assert!(qwen35_alternative_dispatch_forbidden(true, peregrine_core::Arch::Glm5Next, true));
+        assert!(!qwen35_alternative_dispatch_forbidden(false, peregrine_core::Arch::Qwen35Moe, true));
+        assert!(!qwen35_alternative_dispatch_forbidden(true, peregrine_core::Arch::Qwen35Moe, false));
+        assert!(!qwen35_alternative_dispatch_forbidden(true, peregrine_core::Arch::GlmMla, true));
+    }
+
     /// Device-pure partition: every plan index lands in exactly one group, groups
     /// come out in ascending-ordinal order preserving in-group plan order, and an
     /// fd the table has never seen is quarantined in the trailing `u8::MAX` group
@@ -2733,6 +2888,14 @@ mod tests {
         let mut all: Vec<usize> = groups.concat();
         all.sort_unstable();
         assert_eq!(all, (0..fds.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn device_claim_groups_empty_input_keeps_io_lane_indexable() {
+        let table: HashMap<RawFd, u8> = [(7, 0u8)].into_iter().collect();
+        let groups = device_claim_groups(std::iter::empty(), &table);
+        assert_eq!(groups, vec![Vec::<usize>::new()]);
+        assert_eq!(ring_homes(&[0], 4), vec![0; 4]);
     }
 
     /// The blind path's contract, restated for the grouped machinery: a table
@@ -2801,6 +2964,7 @@ mod tests {
         let ctx_of = |fd_devices| ForwardCtx {
             gate_trace: None,
             st: &st,
+            reference: None,
             absorb: false,
             dsa: false,
             reactors: &reactors,
@@ -2827,16 +2991,26 @@ mod tests {
             block_exec: crate::block_exec::BlockExecMode::Par,
         };
         let blind =
-            moe_forward_concurrent(&ctx_of(None), layer, &x, &router_w, &router_bias, None, s_n)?;
-        let grouped = moe_forward_concurrent(
-            &ctx_of(Some(&table)),
+            moe_forward_concurrent_call(&ctx_of(None), MoeCall {
+                layer,
+                x: &x,
+                router_w: &router_w,
+                router_bias: &router_bias,
+                shared: None,
+                shared_gate: None,
+                fallback_experts: None,
+                s_n,
+            })?;
+        let grouped = moe_forward_concurrent_call(&ctx_of(Some(&table)), MoeCall {
             layer,
-            &x,
-            &router_w,
-            &router_bias,
-            None,
+            x: &x,
+            router_w: &router_w,
+            router_bias: &router_bias,
+            shared: None,
+            shared_gate: None,
+            fallback_experts: None,
             s_n,
-        )?;
+        })?;
         assert_eq!(blind.len(), grouped.len());
         for (i, (a, b)) in blind.iter().zip(&grouped).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "diverged at f32 index {i}");
@@ -2901,6 +3075,7 @@ mod tests {
         let ctx_of = |fd_devices| ForwardCtx {
             gate_trace: None,
             st: &st,
+            reference: None,
             absorb: false,
             dsa: false,
             reactors: &reactors,
@@ -2934,19 +3109,29 @@ mod tests {
         crate::ssdclock::observe(1, 277_000_000, std::time::Duration::from_secs(1));
 
         let blind =
-            moe_forward_concurrent(&ctx_of(None), layer, &x, &router_w, &router_bias, None, s_n)?;
+            moe_forward_concurrent_call(&ctx_of(None), MoeCall {
+                layer,
+                x: &x,
+                router_w: &router_w,
+                router_bias: &router_bias,
+                shared: None,
+                shared_gate: None,
+                fallback_experts: None,
+                s_n,
+            })?;
 
         // ON arm.
         std::env::set_var("COLI_SSD_AWARE_SCHED", "1");
-        let scheduled = moe_forward_concurrent(
-            &ctx_of(Some(&table)),
+        let scheduled = moe_forward_concurrent_call(&ctx_of(Some(&table)), MoeCall {
             layer,
-            &x,
-            &router_w,
-            &router_bias,
-            None,
+            x: &x,
+            router_w: &router_w,
+            router_bias: &router_bias,
+            shared: None,
+            shared_gate: None,
+            fallback_experts: None,
             s_n,
-        );
+        });
         std::env::remove_var("COLI_SSD_AWARE_SCHED");
         let scheduled = scheduled?;
         assert_eq!(

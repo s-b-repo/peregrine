@@ -14,7 +14,7 @@ use crate::ids::digest;
 use crate::nodes::{Derivation, Kind, NewNode, Node, NodeMeta, Origin};
 
 pub type Inputs = Vec<(String, f64)>;
-pub type DerivationFn = Box<dyn Fn(&Inputs) -> f64>;
+pub type DerivationFn = Box<dyn Fn(&Inputs) -> f64 + Send>;
 
 #[derive(Debug, Clone)]
 pub struct MemoEntry {
@@ -45,7 +45,7 @@ impl std::fmt::Debug for ExecutionLayer {
 }
 
 impl ExecutionLayer {
-    pub fn register(&mut self, name: &str, f: impl Fn(&Inputs) -> f64 + 'static) {
+    pub fn register(&mut self, name: &str, f: impl Fn(&Inputs) -> f64 + Send + 'static) {
         self.derivations.insert(name.to_string(), Box::new(f));
     }
 

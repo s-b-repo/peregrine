@@ -28,6 +28,10 @@ pub enum Arch {
     /// linear-attention layers carrying a per-stream recurrent state instead
     /// of KV. Dense SwiGLU MLP every layer, like [`Arch::DenseGqa`].
     HybridGdn,
+    /// Qwen3.5/Ornith MoE (`model_type: qwen3_5_moe[_text]`): the hybrid
+    /// gated-DeltaNet/GQA stack with a softmax-routed MoE on every layer and a
+    /// sigmoid-gated shared expert.
+    Qwen35Moe,
     /// GLM-5.3-Flash (`model_type: glm5_next[_text]`): a hybrid of KDA
     /// linear-attention layers (Kimi Delta Attention — per-*channel* forget
     /// gates, where [`Arch::HybridGdn`]'s GDN decays per head) and NoPE MLA
@@ -229,6 +233,9 @@ impl Cfg {
             Some("qwen4_exp" | "qwen4_exp_text") => {
                 return Cfg::from_json_qwen4(root.get("text_config").unwrap_or(root));
             }
+            Some("qwen3_5_moe" | "qwen3_5_moe_text") => {
+                return Cfg::from_json_qwen35moe(root);
+            }
             // Hybrid families first: "qwen3_5"/"qwen3_next" (and the VL wrapper,
             // whose text stack lives under `text_config`) — checked before the
             // "qwen3" prefix would swallow them into the pure-dense path.
@@ -247,7 +254,7 @@ impl Cfg {
             None => {}
             Some(other) => {
                 return Err(Error::Format(format!(
-                    "config: model_type \"{other}\" is not supported (glm/deepseek MLA-MoE, glm5_next KDA+MLA-MoE, qwen3 dense-GQA, or qwen3_5 hybrid)"
+                    "config: model_type \"{other}\" is not supported (glm/deepseek MLA-MoE, glm5_next KDA+MLA-MoE, qwen3 dense-GQA, qwen3_5 hybrid, or qwen3_5_moe)"
                 )))
             }
         }
@@ -712,6 +719,170 @@ impl Cfg {
         Ok(c)
     }
 
+    fn from_json_qwen35moe(root: &Value) -> Result<Cfg, Error> {
+        let source = root.get("text_config").unwrap_or(root);
+        if !source.is_object() {
+            return Err(Error::Format("config: qwen3_5_moe text_config must be an object".into()));
+        }
+        if let Some(dtype) = source.get("mamba_ssm_dtype").and_then(Value::as_str) {
+            if dtype != "float32" {
+                return Err(Error::Format(format!(
+                    "config: qwen3_5_moe mamba_ssm_dtype={dtype} is unsupported; only float32 is supported"
+                )));
+            }
+        }
+        if let Some(layers) = source.get("mtp_num_hidden_layers") {
+            if layers.as_i64() != Some(1) {
+                return Err(Error::Format(format!(
+                    "config: qwen3_5_moe mtp_num_hidden_layers={layers} is unsupported; only one layer is supported"
+                )));
+            }
+        }
+        if source.get("mtp_use_dedicated_embeddings").and_then(Value::as_bool) == Some(true) {
+            return Err(Error::Format(
+                "config: qwen3_5_moe dedicated MTP embeddings are unsupported".into(),
+            ));
+        }
+        if source.get("tie_word_embeddings").and_then(Value::as_bool) == Some(true) {
+            return Err(Error::Format(
+                "config: qwen3_5_moe tied input/output embeddings are unsupported".into(),
+            ));
+        }
+        let rope_parameters = source.get("rope_parameters");
+        if rope_parameters.is_some_and(|value| !value.is_object() && !value.is_null()) {
+            return Err(Error::Format("config: qwen3_5_moe rope_parameters must be an object".into()));
+        }
+        let validate_rope_type = |value: Option<&Value>| -> Result<(), Error> {
+            match value {
+                None | Some(Value::Null) => Ok(()),
+                Some(Value::String(kind)) if kind == "default" => Ok(()),
+                Some(value) => Err(Error::Format(format!(
+                    "config: qwen3_5_moe rope_type={value} is unsupported; only default is supported"
+                ))),
+            }
+        };
+        validate_rope_type(rope_parameters.and_then(|value| value.get("rope_type")))?;
+        validate_rope_type(source.get("rope_type"))?;
+        let validate_rope_scaling = |value: Option<&Value>| -> Result<(), Error> {
+            match value {
+                None | Some(Value::Null) => Ok(()),
+                Some(Value::String(kind)) if kind == "default" => Ok(()),
+                Some(Value::Object(scale)) => match scale.get("rope_type").or_else(|| scale.get("type")) {
+                    Some(Value::String(kind)) if kind == "default" => Ok(()),
+                    None if scale.is_empty() => Ok(()),
+                    _ => Err(Error::Format(format!(
+                        "config: qwen3_5_moe rope_scaling={value:?} is unsupported; only default is supported"
+                    ))),
+                },
+                Some(value) => Err(Error::Format(format!(
+                    "config: qwen3_5_moe rope_scaling={value} is unsupported; only default is supported"
+                ))),
+            }
+        };
+        validate_rope_scaling(rope_parameters.and_then(|value| value.get("rope_scaling")))?;
+        validate_rope_scaling(source.get("rope_scaling"))?;
+        let partial_rotary_factor = match rope_parameters
+            .and_then(|value| value.get("partial_rotary_factor"))
+            .or_else(|| source.get("partial_rotary_factor"))
+        {
+            None => 0.25,
+            Some(value) => value.as_f64().ok_or_else(|| {
+                Error::Format(format!("config: qwen3_5_moe partial_rotary_factor={value} must be numeric"))
+            })?,
+        };
+        if !(partial_rotary_factor.is_finite() && partial_rotary_factor > 0.0 && partial_rotary_factor <= 1.0) {
+            return Err(Error::Format(format!(
+                "config: qwen3_5_moe partial_rotary_factor={partial_rotary_factor} is outside (0,1]"
+            )));
+        }
+        let full_attention_interval = match source.get("full_attention_interval") {
+            Some(value) => {
+                let interval = value.as_i64().ok_or_else(|| {
+                    Error::Format(format!("config: qwen3_5_moe full_attention_interval={value} must be an integer"))
+                })?;
+                if !(1..=128).contains(&interval) {
+                    return Err(Error::Format(format!(
+                        "config: qwen3_5_moe full_attention_interval={interval} is outside [1,128]"
+                    )));
+                }
+                Some(interval)
+            }
+            None if source.get("layer_types").is_none() => Some(4),
+            None => None,
+        };
+        let shared = gi(source, "shared_expert_intermediate_size");
+        if shared < 1 {
+            return Err(Error::Format("config: qwen3_5_moe requires shared_expert_intermediate_size".into()));
+        }
+        if source.get("hidden_act").and_then(Value::as_str) != Some("silu") {
+            return Err(Error::Format("config: qwen3_5_moe requires hidden_act=silu".into()));
+        }
+        if source.get("attention_bias").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(Error::Format("config: qwen3_5_moe attention bias is not supported".into()));
+        }
+        let mut dense_root = source.clone();
+        dense_root["intermediate_size"] = Value::from(shared);
+        dense_root["partial_rotary_factor"] = Value::from(partial_rotary_factor);
+        if let Some(interval) = full_attention_interval {
+            dense_root["full_attention_interval"] = Value::from(interval);
+        }
+        let mut c = Cfg::from_json_hybrid(&dense_root)?;
+        c.arch = Arch::Qwen35Moe;
+        c.n_experts = gi(source, "num_experts");
+        c.topk = gi(source, "num_experts_per_tok");
+        c.moe_inter = gi(source, "moe_intermediate_size");
+        c.dense_inter = shared;
+        c.first_dense = 0;
+        c.n_shared = 1;
+        c.norm_topk = true;
+        c.routed_scale = 1.0;
+        c.q_lora = 0;
+        c.kv_lora = 0;
+        c.qk_nope = c.head_dim - c.qk_rope;
+        c.v_head = c.head_dim;
+        c.n_group = 1;
+        c.topk_group = 1;
+        c.idx_type = vec![false; c.n_layers.max(0) as usize];
+        c.qk_head = c.head_dim;
+        c.attn_scale = 1.0 / (c.head_dim.max(1) as f32).sqrt();
+        c.validate_gqa()?;
+        c.validate_hybrid()?;
+        let mut add_stop = |value: Option<&Value>| -> Result<(), Error> {
+            let ids: Vec<i64> = match value {
+                Some(Value::Number(n)) => n.as_i64().into_iter().collect(),
+                Some(Value::Array(a)) => a.iter().filter_map(Value::as_i64).collect(),
+                _ => Vec::new(),
+            };
+            for id in ids {
+                let id = i32::try_from(id).map_err(|_| Error::Format("config: eos_token_id is outside i32".into()))?;
+                if !c.stop_ids.contains(&id) {
+                    c.stop_ids.push(id);
+                }
+            }
+            Ok(())
+        };
+        add_stop(root.get("eos_token_id"))?;
+        if !std::ptr::eq(source, root) {
+            add_stop(source.get("eos_token_id"))?;
+        }
+        if !c.attn_gate {
+            return Err(Error::Format("config: qwen3_5_moe requires attn_output_gate=true".into()));
+        }
+        if c.n_experts < 1 || c.n_experts > 4096 {
+            return Err(Error::Format(format!("config: num_experts={} is outside [1,4096]", c.n_experts)));
+        }
+        if c.topk < 1 || c.topk > c.n_experts.min(64) {
+            return Err(Error::Format(format!(
+                "config: num_experts_per_tok={} is outside [1,min(num_experts,64)]",
+                c.topk
+            )));
+        }
+        if !(1..=1 << 20).contains(&c.moe_inter) {
+            return Err(Error::Format(format!("config: moe_intermediate_size={} is outside [1,1048576]", c.moe_inter)));
+        }
+        Ok(c)
+    }
+
     /// Parse a GLM-5.3-Flash config (`root` is already the text sub-config when
     /// the checkpoint is the multimodal wrapper). The MoE half is the GLM-5.2
     /// shape (sigmoid router, correction bias, shared expert); attention is a
@@ -1077,7 +1248,7 @@ impl Cfg {
     pub fn kv_row_a(&self) -> i64 {
         match self.arch {
             Arch::GlmMla | Arch::Glm5Next => self.kv_lora,
-            Arch::DenseGqa | Arch::HybridGdn | Arch::Qwen4Exp => self.n_kv_heads * self.head_dim,
+            Arch::DenseGqa | Arch::HybridGdn | Arch::Qwen35Moe | Arch::Qwen4Exp => self.n_kv_heads * self.head_dim,
         }
     }
 
@@ -1088,7 +1259,7 @@ impl Cfg {
             // Glm5Next is NoPE (qk_rope = 0): its second slot is legitimately
             // zero-width — LayerKv is width-parameterized and appends empty rows.
             Arch::GlmMla | Arch::Glm5Next => self.qk_rope,
-            Arch::DenseGqa | Arch::HybridGdn | Arch::Qwen4Exp => self.n_kv_heads * self.head_dim,
+            Arch::DenseGqa | Arch::HybridGdn | Arch::Qwen35Moe | Arch::Qwen4Exp => self.n_kv_heads * self.head_dim,
         }
     }
 
@@ -1523,6 +1694,174 @@ mod tests {
         // KV rows cover only full-attention layers' geometry.
         assert_eq!((c.kv_row_a(), c.kv_row_b()), (16, 16));
         assert_eq!(c.first_dense, c.n_layers, "hybrid MLPs all take the dense path");
+        Ok(())
+    }
+
+    fn tiny_qwen35moe_json() -> Value {
+        serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "eos_token_id": 0,
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_act": "silu",
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 4,
+                "linear_value_head_dim": 4,
+                "linear_conv_kernel_dim": 4,
+                "attn_output_gate": true,
+                "rope_scaling": null,
+                "rope_parameters": {"rope_theta": 10000.0},
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 3,
+                "shared_expert_intermediate_size": 2,
+                "rms_norm_eps": 1e-6,
+                "eos_token_id": 0
+            }
+        })
+    }
+
+    #[test]
+    fn qwen35moe_defaults_stock_rope_and_interval() -> Result<(), Error> {
+        let c = Cfg::from_json(&tiny_qwen35moe_json())?;
+        assert_eq!(c.arch, Arch::Qwen35Moe);
+        assert_eq!(c.qk_rope, 2);
+        assert_eq!(c.full_attn, (0..8).map(|i| (i + 1) % 4 == 0).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    fn qwen35moe_nested_partial_rotary_factor_wins() -> Result<(), Error> {
+        let mut j = tiny_qwen35moe_json();
+        j["text_config"]["partial_rotary_factor"] = serde_json::json!(1.0);
+        j["text_config"]["rope_parameters"]["partial_rotary_factor"] = serde_json::json!(0.5);
+        assert_eq!(Cfg::from_json(&j)?.qk_rope, 4);
+
+        let mut top_level = tiny_qwen35moe_json();
+        top_level["text_config"]["partial_rotary_factor"] = serde_json::json!(0.5);
+        assert_eq!(Cfg::from_json(&top_level)?.qk_rope, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn qwen35moe_rejects_unsupported_rope_scaling() {
+        let mut rope_type = tiny_qwen35moe_json();
+        rope_type["text_config"]["rope_parameters"]["rope_type"] = serde_json::json!("yarn");
+        assert!(Cfg::from_json(&rope_type).is_err());
+
+        let mut top_level_scaling = tiny_qwen35moe_json();
+        top_level_scaling["text_config"]["rope_scaling"] =
+            serde_json::json!({"rope_type": "yarn", "factor": 2.0});
+        assert!(Cfg::from_json(&top_level_scaling).is_err());
+
+        let mut nested_scaling = tiny_qwen35moe_json();
+        nested_scaling["text_config"]["rope_parameters"]["rope_scaling"] =
+            serde_json::json!({"rope_type": "linear"});
+        assert!(Cfg::from_json(&nested_scaling).is_err());
+    }
+
+    #[test]
+    fn qwen35moe_rejects_unsupported_state_and_mtp_geometry() {
+        let mut dtype = tiny_qwen35moe_json();
+        dtype["text_config"]["mamba_ssm_dtype"] = serde_json::json!("float16");
+        assert!(Cfg::from_json(&dtype).is_err());
+
+        let mut mtp_layers = tiny_qwen35moe_json();
+        mtp_layers["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(2);
+        assert!(Cfg::from_json(&mtp_layers).is_err());
+
+        let mut dedicated = tiny_qwen35moe_json();
+        dedicated["text_config"]["mtp_use_dedicated_embeddings"] = serde_json::json!(true);
+        assert!(Cfg::from_json(&dedicated).is_err());
+
+        let mut tied = tiny_qwen35moe_json();
+        tied["text_config"]["tie_word_embeddings"] = serde_json::json!(true);
+        assert!(Cfg::from_json(&tied).is_err());
+    }
+
+    #[test]
+    fn qwen35moe_rejects_invalid_full_attention_interval() {
+        for interval in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("4"),
+            serde_json::json!(129),
+        ] {
+            let mut j = tiny_qwen35moe_json();
+            j["text_config"]["full_attention_interval"] = interval;
+            assert!(Cfg::from_json(&j).is_err());
+        }
+
+        let mut with_layer_types = tiny_qwen35moe_json();
+        with_layer_types["text_config"]["layer_types"] = serde_json::json!([
+            "linear_attention", "linear_attention", "linear_attention", "full_attention",
+            "linear_attention", "linear_attention", "linear_attention", "full_attention"
+        ]);
+        with_layer_types["text_config"]["full_attention_interval"] = serde_json::json!(0);
+        assert!(Cfg::from_json(&with_layer_types).is_err());
+    }
+
+    #[test]
+    fn qwen35moe_official_geometry_parses_without_qwen4_features() -> Result<(), Error> {
+        let layer_types: Vec<Value> = (0..40)
+            .map(|i| Value::from(if i % 4 == 3 { "full_attention" } else { "linear_attention" }))
+            .collect();
+        let j = serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "eos_token_id": 248046,
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_act": "silu",
+                "vocab_size": 248320,
+                "hidden_size": 2048,
+                "num_hidden_layers": 40,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "layer_types": layer_types,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 32,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "attn_output_gate": true,
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": {
+                    "rope_theta": 10000000.0,
+                    "partial_rotary_factor": 0.25,
+                    "mrope_section": [11, 11, 10]
+                },
+                "num_experts": 256,
+                "num_experts_per_tok": 8,
+                "moe_intermediate_size": 512,
+                "shared_expert_intermediate_size": 512,
+                "mamba_ssm_dtype": "float32",
+                "mtp_num_hidden_layers": 1,
+                "mtp_use_dedicated_embeddings": false,
+                "rms_norm_eps": 1e-6,
+                "eos_token_id": 248044
+            }
+        });
+        let c = Cfg::from_json(&j)?;
+        assert_eq!(c.arch, Arch::Qwen35Moe);
+        assert_eq!(c.full_attn.iter().filter(|&&v| v).count(), 10);
+        assert_eq!((c.n_experts, c.topk, c.moe_inter, c.dense_inter, c.n_shared), (256, 8, 512, 512, 1));
+        assert_eq!((c.qk_rope, c.qk_head, c.kv_row_a(), c.kv_row_b()), (64, 256, 512, 512));
+        assert_eq!((c.first_dense, c.norm_topk, c.routed_scale, c.attn_gate), (0, true, 1.0, true));
+        assert_eq!((c.lin_k_heads, c.lin_v_heads, c.lin_k_dim, c.lin_v_dim, c.lin_conv_k), (16, 32, 128, 128, 4));
+        assert_eq!(c.theta, 10_000_000.0);
+        assert_eq!(c.stop_ids, [248044, 248046]);
+        let mut invalid = j.clone();
+        invalid["text_config"]["moe_intermediate_size"] = serde_json::json!(i64::MAX);
+        assert!(Cfg::from_json(&invalid).is_err());
         Ok(())
     }
 

@@ -60,13 +60,16 @@ fn main() -> std::process::ExitCode {
     match import_hf(indir, outdir, shard_bytes) {
         Ok(rep) => {
             eprintln!(
-                "peregrine-import-hf: {} tensors -> {} int4 + {} int8 + {} float, {} vision skipped | \
+                "peregrine-import-hf: {} tensors -> {} int4 + {} int8 + {} float, {} vision skipped ({}), {} MTP skipped ({}) | \
                  {:.2} GB -> {:.2} GB | sidecars: {}",
                 rep.tensors_total,
                 rep.imported_int4,
                 rep.imported_int8,
                 rep.imported_float,
                 rep.skipped_visual,
+                rep.skipped_visual_names.join(", "),
+                rep.skipped_mtp,
+                rep.skipped_mtp_names.join(", "),
                 rep.bytes_in as f64 / 1e9,
                 rep.bytes_out as f64 / 1e9,
                 rep.sidecars.join(", "),

@@ -42,7 +42,7 @@ Below: every actionable item, with its current status and the evidence.
 | §7 persistent CUDA kernels | **Declined on evidence**, and the audit agrees | They would delete the shipped CUDA-graph cache to solve the same problem and monopolize the one non-blocking stream |
 | §8 `cudaMallocAsync` defrag pool | **Closed on measurement** | After worst-case churn of the two expert block sizes, **96.7 %** of free VRAM is still one block. The probe was built instead of the pool |
 | §20.4 "several historical benchmark cells were single runs" | **Fixed in the harness** | `scripts/bench-serve-envarms.sh` rotates arm order across repeats and reports medians; `iobench` defaults to `REPS=5` and refuses to resolve a gap smaller than the measured spread |
-| §19 "dead/unreachable code was a real gap" | **Now a permanent gate** | `[R]` is a counted class in `scripts/audit-bad-patterns.sh`, reported on every run |
+| §19 "dead/unreachable code was a real gap" | **Now a permanent gate** | `[Z]` is a counted class in `scripts/audit-bad-patterns.sh`, reported on every run |
 
 Two audit claims are simply superseded by later data rather than by work:
 

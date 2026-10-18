@@ -183,10 +183,11 @@ server) are mapped in [`DESIGN.md`](docs/DESIGN.md#concurrency--parallelism-map-
 ## Build & test
 
 ```bash
-cargo test --workspace          # 482 tests, CPU-only, no GPU needed
+cargo test --workspace          # 1243 tests, CPU-only, no GPU needed
 cargo build --release           # optimized (fat LTO)
 cargo clippy --workspace --all-targets    # clean
-scripts/audit-bad-patterns.sh --strict   # quality gate: no panic-vectors/UB (see docs/BAD_PATTERNS.md)
+scripts/audit-bad-patterns.sh --strict   # bad-pattern gate (see docs/BAD_PATTERNS.md)
+cargo run -p peregrine-verify --release -- verify   # numerical certificate gate
 
 # GPU lane (on an NVIDIA host with CUDA installed):
 cargo build -p peregrine-cuda --features cuda
@@ -217,6 +218,10 @@ COLI_MODEL=/path/to/model cargo run --release --bin peregrine -- bench 1 4 16
 
 # offline prefetch automaton: writes <model-dir>/automaton.json (auto-loaded next load)
 cargo run --release --bin peregrine -- build-automaton /path/to/model 256
+
+# learn a token-context -> routed-expert predictor for future-token prefetch
+cargo run --release --bin peregrine -- build-router-predictor /path/to/model 4096 \
+  --text corpus.txt --out /path/to/model/token_routes.json
 
 # offline routing trace + disk-layout reorg (--method greedy|louvain|spectral):
 cargo run --release --bin peregrine -- dump-routes /path/to/model routes.json 512

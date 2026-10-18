@@ -536,6 +536,12 @@ impl KvSessionStore {
         }
         let export = KvExport { n: n_tokens, layers };
         let mut kv = SeqKv::import(&self.cfg, self.dtype, &export)?;
+        if kv.has_recurrent_state() {
+            return Err(Error::Format(format!(
+                "{}: recurrent-state model cannot restore a KV-only checkpoint",
+                path.display()
+            )));
+        }
         kv.truncate(n);
         Ok(Some((kv, n)))
     }
@@ -549,6 +555,13 @@ impl KvSessionStore {
     /// hash + fsync to the writer. The entry appears in the index when its file
     /// commits, not when this returns.
     pub fn save(&mut self, tokens: &[i32], kv: &SeqKv) {
+        if kv.has_recurrent_state() {
+            note_advisory_err(
+                "kvstore save",
+                &"recurrent-state sequences are not KV-exportable; cold prefill remains the correctness path",
+            );
+            return;
+        }
         let n = save_len(tokens.len().min(kv.len()), self.trim, self.align);
         if n < KV_STORE_MIN_TOKENS {
             return;

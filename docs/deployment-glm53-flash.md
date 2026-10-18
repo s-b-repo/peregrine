@@ -40,13 +40,6 @@ unchanged.
 
 ## What is deliberately not enabled (yet)
 
-- **GPU expert tier (`COLI_GPU`)** — refused with a boot note: the CUDA
-  expert kernels compute `silu(gate)·up` with no clamp. Lifting this needs
-  the clamp in `backend_cuda.cu`; until then experts stay on the CPU lane.
-- **Router look-ahead / predict-eval under hc** — the predictors rank the
-  next layer's router over the hidden state, and mid-stack that state is the
-  `[4·hidden]` stream form. Wiring a per-layer collapse for prediction is
-  future work; the look-ahead is silently off for this arch.
 - **Model-resident speculative decode** — falls back to greedy (KDA states
   cannot rewind a rejected draft; the serve engine's SeqKv
   snapshot/restore rollback is the supported speculation path, as for the
@@ -132,10 +125,140 @@ possible +4% if that drive is ever cleared.
 
 **5. Serve** with the machinery GLM-5.2 earned: `COLI_IO_DEVICE_SCHED` (on
 by default), `COLI_SSD_AWARE_SCHED=1`, the warm cache, `COLI_ENTROPY_ADAPT`,
-and the batch engine. The GLM prompt dialect is selected automatically
-(`uses_chatml_prompt` is false for this arch); verify the shipped
-`chat_template.jinja` against `build_prompt`'s markup once the download
-completes before trusting served chats.
+and the batch engine. The shipped profile is `scripts/serve-glm53-flash-cuda.sh`.
+The GLM prompt dialect is selected automatically (`uses_chatml_prompt` is
+false for this arch); verify the shipped `chat_template.jinja` against
+`build_prompt`'s markup once the download completes before trusting served
+chats.
+
+## Measured CUDA profile
+
+The retained profile combines device-side fused reduction, fused shared/dense
+residency for row-count 1, the four-drive concurrent stream, a 6 GiB warm cache,
+and MTP disabled. Measurements are tok/s; B=16 values are aggregate.
+
+### 2026-10-08: five SSDs, and the cache policies finally measured
+
+`scripts/reshard-glm53-5ssd.sh` re-striped the container across **five** SSDs
+(the two new ones: `sdc`, formerly the Kali drive, and `sde`, formerly a Windows
+install — both wiped and formatted ext4 on the user's instruction), weighting each
+device by its **measured** O_DIRECT read bandwidth rather than a carried-over
+constant. Every tensor was byte-verified before the stage was accepted
+(`verification passed (byte-identical)`), and the new container lives beside the
+old one at `/srv/m-sdd/GLM-5.3-Flash-5ssd` with per-device dirs named
+`glm53-experts-5ssd`, so the three-drive container is untouched and still serves.
+
+| device | measured read (O_DIRECT, 8M, median of 12) | spread |
+|---|---:|---:|
+| sda Kingston A400 | 434 MB/s | **307 %** |
+| sdb Acer RE100 | 537 | 1 % |
+| sdc Crucial 120G | 562 | 0 % |
+| sdd Crucial 1T | 561 | 5 % |
+| sde Seagate 120G | 551 | 0 % |
+
+Interleaved A/B, 6 decode steps, CUDA profile, aggregate tok/s:
+
+| container | median | runs | GB/token from disk | slowest device's learned rate |
+|---|---:|---|---:|---:|
+| 3 SSD | 0.187 | 0.182 / 0.187 / 0.197 | 3.139 | 185 MB/s |
+| **5 SSD** | **0.227** | 0.207 / 0.227 / 0.232 | 3.139 | **379 MB/s** |
+
+**+21 %**, 3 of 3 reps, against an 11 % spread. Bytes per token are identical —
+the model did not change — so this is bandwidth, and the mechanism is in the
+per-device rates: with five drives *every* device sits above 379 MB/s, where with
+three, one was at 185 MB/s and gated every token.
+
+Note the 21 % against 2.65/1.47 = **+80 %** of raw array bandwidth. The missing
+59 % is the engine-side inefficiency measured on 2026-10-06 and still the largest
+open gap on this box: it sustains roughly a third of what the array can deliver.
+
+**Cache size, the first policy win that is not noise.** `COLI_ECACHE_GB=14` takes
+the bytes a token reads from 3.139 to **2.704 GB** (−14 %; every CUDA run of its
+arm reproduces both numbers exactly, including on a freshly rebuilt binary) because one token routes 4.04 GB and the cache now holds ~1.3
+passes instead of ~0.6. The tok/s gain (+4 %) is inside this box's noise; the byte
+saving is not.
+
+**`COLI_CACHE_LFRU=1` is a measured loss, and the literature is on the other side
+of it.** FlashMoE (arXiv 2601.17063) reports a frequency+recency replacement policy
+beating LRU/LFU by **51 % hit rate** on an SSD-offloaded MoE; here it *adds* 14 %
+to the bytes (3.581 vs 3.139 GB/token), because `tier::lfru_score` ranks by
+`heat << 8 | (255 - age)` and one routing-frequency count outweighs every
+recency advantage — right in principle, wrong when `heat` is sparse relative to a
+cache holding several passes. `COLI_JOINT_EVICTION=1` changed no bytes. Both stay
+off, now for a recorded reason rather than a default.
+
+Raw runs: [`bench-data/2026-10-08-5ssd/`](../bench-data/2026-10-08-5ssd/).
+
+### Re-measured 2026-10-06: the router look-ahead is a net loss here
+
+The shipped profile ran `COLI_ROUTER_LOOKAHEAD_N=64`. On the current **three-SSD**
+stripe (`GLM-5.3-Flash-4ssd`, the HDD removed) it no longer pays: interleaved
+arms, 6 decode steps, CUDA profile, aggregate tok/s.
+
+| Arm | B=1 (median of 4) | B=8 (median of 2) | B=16 (median of 3) |
+|---|---:|---:|---:|
+| `N=64` (was shipped) | 0.095 | 0.193 | 0.275 |
+| `COLI_ROUTER_LOOKAHEAD=0` | **0.163** (+72%) | **0.308** (+60%) | 0.271 (no difference) |
+| spread of the shipped arm across its reps | 14.8% | 17.7% | 34.5% |
+
+The shipped profile **after** this change, B=1, three runs: 0.244 / 0.148 /
+0.246 aggregate tok/s, median **0.244** — 2.6× the N=64 median above, at
+3.139 GB/token from disk. The box is noisy (0.148 and 0.246 back to back on the
+same configuration), so quote the median and the count.
+
+Raw runs and every knob that was measured and *not* acted on are in
+[`bench-data/2026-10-06-lookahead/`](../bench-data/2026-10-06-lookahead/).
+
+The look-ahead's window **pre-streams every predicted candidate**
+(`COLI_PREFETCH_WARM_PATHS` defaults to "all"), and each device has exactly one
+ring (`device-pure claims on (3 devices, … one ring per device)`), so a
+speculative read sits in the same FIFO as the read the token is waiting for. The
+ledger prices the bytes at 12.9% of disk traffic; the queue delay is the larger
+term. Turning it off costs the cache some warmth — re-read-after-eviction rises
+from 1.8% to 11.3% of disk traffic at B=1 — and that is more than repaid.
+
+`COLI_PREFETCH_HINT_PATHS=64` is the cheap half of the same idea: a page-cache
+`fadvise` rather than a device read. It is suppressed under O_DIRECT, so on this
+lane it is inert rather than harmful; it earns its place on a buffered lane.
+
+**This does not generalise.** The previous claim on this file — "N=64 is the
+measured pick on this box (+14% over off)" — was measured against a *four*-drive
+stripe that included a 5.4k RPM HDD, and it does not reproduce on three SSDs.
+Re-measure per container.
+
+### Two open findings from the same session
+
+- **The warm cache serves nothing at B>1.** At B=16 the ledger prints
+  `cache-served 0.0%` while `re-read (evicted) 22.0% of disk traffic`, and
+  `COLI_ECACHE_GB` of 6, 12 and 18 GB produce byte-identical ledgers. A cache
+  that is filled, evicts, and never serves is worse than no cache: it reserves
+  6–18 GB of RAM. Not diagnosed here — flagged because 22% of the batched lane's
+  disk traffic is the size of the win.
+- **The io_uring path is ~22% below `dd` on the same drive.** `dd iflag=direct
+  bs=8M` measures 370/536/560 MB/s on sda/sdb/sdd; `iobench` through the engine's
+  own reactor measures 0.43–0.46 GB/s on sdd regardless of block size (1–64 MB) or
+  ring count (1–16). During decode the three drives together sustain ~0.6 GB/s of
+  useful bytes against a ~1.3 GB/s ceiling for this path.
+
+### The retained CUDA profile (older arms, four-drive stripe)
+
+| Arm | Result | Decision |
+|---|---:|---|
+| Original B=1, one step | 0.574 | baseline |
+| Fused reduction B=1, one step | 0.709 | retain |
+| Best new B=1, one step | 0.812 | retain |
+| New sustained B=1, three steps | 0.154 | production shape |
+| Sustained without shared/dense tier | 0.118 | reject; about 30% slower |
+| New B=16 | 0.299 | diagnostic |
+| Original B=16 | 0.335 | use CPU shared path above B=1 |
+| MTP depth 1 | 0.106, zero accepted | reject |
+| 12 GiB expert cache | 0.131 | reject versus 0.154 at 6 GiB |
+
+`COLI_GPU_DENSE_MAX_BATCH=1` keeps the B=1 fused shared path while the CPU
+shared path serves wider batches. `COLI_CUDA_FUSED_REDUCE=1`,
+`COLI_GPU_DENSE=1`, `COLI_ECACHE_GB=6`, and `COLI_DRAFT=0` remain independent
+and compose in the same process. `scripts/bench-glm53-cuda-matrix.sh` reruns
+the matrix in fresh, serialized processes; performance arms must not overlap.
 
 ## The bytes/token arithmetic (issue #9's denominator)
 

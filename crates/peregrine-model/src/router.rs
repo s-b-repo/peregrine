@@ -226,6 +226,85 @@ pub fn route_min_share() -> f32 {
     })
 }
 
+pub fn apply_route_min_share(
+    r: &mut Routed,
+    s_n: usize,
+    min_share: f32,
+    norm_topk: bool,
+    routed_scale: f32,
+) -> usize {
+    if min_share <= 0.0 || r.k == 0 || s_n == 0 {
+        return 0;
+    }
+    let mut dropped = 0usize;
+    for s in 0..s_n {
+        let Some(kept) = r.keff.get(s).copied().map(|v| v.max(0) as usize).map(|v| v.min(r.k)) else {
+            continue;
+        };
+        if kept <= 1 {
+            continue;
+        }
+        let Some(base) = s.checked_mul(r.k) else {
+            continue;
+        };
+        let Some(end) = base.checked_add(kept) else {
+            continue;
+        };
+        let Some(weights) = r.w.get(base..end) else {
+            continue;
+        };
+        let drop = negligible_tail(weights, kept, min_share);
+        if drop == 0 {
+            continue;
+        }
+        let kept = kept - drop;
+        for slot in kept..r.k {
+            let Some(index) = base.checked_add(slot) else {
+                continue;
+            };
+            if let Some(value) = r.idx.get_mut(index) {
+                *value = 0;
+            }
+            if let Some(value) = r.w.get_mut(index) {
+                *value = 0.0;
+            }
+        }
+        if let Some(value) = r.keff.get_mut(s) {
+            *value = kept as i32;
+        }
+        if norm_topk {
+            let Some(end) = base.checked_add(kept) else {
+                continue;
+            };
+            if let Some(weights) = r.w.get_mut(base..end) {
+                let sum: f32 = weights.iter().sum();
+                if sum.is_finite() && sum > 0.0 && routed_scale.is_finite() {
+                    let gain = routed_scale / sum;
+                    for value in weights {
+                        *value *= gain;
+                    }
+                }
+            }
+        }
+        dropped += drop;
+    }
+    dropped
+}
+
+pub fn apply_route_controls(
+    r: &mut Routed,
+    s_n: usize,
+    min_share: f32,
+    topp: f32,
+    budget: usize,
+    norm_topk: bool,
+    routed_scale: f32,
+) {
+    apply_route_min_share(r, s_n, min_share, norm_topk, routed_scale);
+    apply_route_topp(r, s_n, topp, norm_topk, routed_scale);
+    apply_expert_budget(r, s_n, budget, norm_topk, routed_scale);
+}
+
 /// Cumulative-mass per-position trim (`COLI_ROUTE_TOPP`). `0`/unset disables
 /// (the historical behaviour). When set in `(0, 1]`, each position keeps the
 /// leading selections until the kept mass reaches `topp` of the position's
@@ -1141,5 +1220,24 @@ mod tests {
         // Full mass keeps everything.
         let mut full = Routed { idx: vec![0, 1, 2], w: vec![0.7, 0.2, 0.1], keff: vec![3], k: 3 };
         assert_eq!(super::apply_route_topp(&mut full, 1, 1.0, false, 1.0), 0);
+    }
+
+    #[test]
+    fn route_controls_compose_min_share_topp_and_budget() {
+        let mut min = Routed { idx: vec![0, 1, 2], w: vec![0.94, 0.04, 0.02], keff: vec![3], k: 3 };
+        apply_route_controls(&mut min, 1, 0.05, 0.0, 0, true, 1.0);
+        assert_eq!(min.keff, vec![1]);
+        assert!((min.w[0] - 1.0).abs() < 1e-6);
+
+        let mut topp = Routed { idx: vec![0, 1, 2], w: vec![0.7, 0.2, 0.1], keff: vec![3], k: 3 };
+        apply_route_controls(&mut topp, 1, 0.0, 0.8, 0, true, 1.0);
+        assert_eq!(topp.keff, vec![2]);
+        assert!((topp.w[..2].iter().sum::<f32>() - 1.0).abs() < 1e-6);
+
+        let mut budget = Routed { idx: vec![0, 1, 2], w: vec![0.7, 0.2, 0.1], keff: vec![3], k: 3 };
+        apply_route_controls(&mut budget, 1, 0.0, 0.0, 2, true, 1.0);
+        assert_eq!(budget.keff, vec![2]);
+        assert_eq!(&budget.idx[..2], &[0, 1]);
+        assert!((budget.w[..2].iter().sum::<f32>() - 1.0).abs() < 1e-6);
     }
 }

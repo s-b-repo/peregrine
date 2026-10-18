@@ -12,6 +12,7 @@ const PROSE: &str = "A mixture-of-experts layer routes each token to a small sub
     across a batch is what the disk must deliver, so batching amortizes reads.";
 
 #[test]
+#[ignore = "requires /srv/m-sdd/GLM-5.3-Flash-peregrine-v2 and at least 10.5 GB available RAM"]
 fn scratch_absorb_flip() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../peregrine-token/tests/fixtures/gpt2_tokenizer.json");

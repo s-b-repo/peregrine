@@ -33,6 +33,21 @@ pub fn upload_lane_counts() -> (usize, usize) {
     (0, 0)
 }
 
+pub fn dense_batch_allowed(batch: usize) -> bool {
+    static MAX_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let max = *MAX_BATCH.get_or_init(|| {
+        std::env::var("COLI_GPU_DENSE_MAX_BATCH")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(usize::MAX)
+    });
+    dense_batch_allowed_with_max(batch, max)
+}
+
+fn dense_batch_allowed_with_max(batch: usize, max_batch: usize) -> bool {
+    batch > 0 && batch <= max_batch
+}
+
 /// Choose which `(layer, expert)` pairs to hold VRAM-resident, given how many
 /// experts fit in `budget`. Spreads residency **round-robin across all sparse
 /// layers** (expert 0 of every layer, then expert 1 of every layer, …) instead of
@@ -1382,8 +1397,17 @@ mod gpu_residency_tests {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::{partition_placement, pick_device, plan_residency};
+    use super::{dense_batch_allowed_with_max, partition_placement, pick_device, plan_residency};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn dense_batch_gate_keeps_the_measured_b1_path_and_rejects_b16() {
+        assert!(dense_batch_allowed_with_max(1, 1));
+        assert!(!dense_batch_allowed_with_max(16, 1));
+        assert!(dense_batch_allowed_with_max(16, usize::MAX));
+        assert!(!dense_batch_allowed_with_max(0, usize::MAX));
+        assert!(!dense_batch_allowed_with_max(1, 0));
+    }
 
     #[test]
     fn spreads_across_all_sparse_layers() {
@@ -1974,16 +1998,11 @@ mod real {
     /// were int4. Under-planning wastes VRAM; over-planning silently truncates
     /// the tier, so the conservative answer is the right one.
     fn experts_are_per_row_int4(st: &SafeTensors, cfg: &Cfg) -> bool {
-        // Every sparse layer, including the MTP head at `cfg.n_layers`, and not
-        // just one expert of one layer. A single probe of (first_dense, 0) answers
-        // for a uniform container but reports "all int4" on a per-layer-tiered one
-        // — the GLM-5.2 checkpoint stores the MTP layer's 256 experts at int8 and
-        // the rest at int4, so the probe said yes and the operator never saw the
-        // "not per-row int4" notice that explains an 8x-larger VRAM plan. Expert 0
-        // still stands in for its layer: precision is chosen per layer by
-        // `peregrine-requantize`, and `solve_residency_sized` asks per expert
-        // anyway when it actually sizes the tier.
+        let present = |layer: usize| {
+            st.has(&format!("model.layers.{layer}.mlp.experts.0.gate_proj.weight"))
+        };
         ((cfg.first_dense as usize)..=(cfg.n_layers as usize))
+            .filter(|&layer| present(layer))
             .all(|layer| expert_is_per_row_int4(st, cfg, layer, 0))
     }
 
