@@ -581,13 +581,6 @@ pub(crate) fn route(x: &[f32], weights: &[f32], cfg: &Cfg) -> Result<crate::rout
     Ok(routed)
 }
 
-/// Softmax-MoE forward for Qwen4Exp: `route` (plain softmax, no bias) selects
-/// the experts, each selected expert's SwiGLU is scattered back weighted, and
-/// the shared expert is added gated by `sigmoid(shared_gate·x)`.
-///
-/// Batch-union ordered like [`crate::mlp::moe_forward`] (one pass to bucket,
-/// serial scatter in union order) so prefill-chunked and stepwise decodes are
-/// bit-identical — the property `generate` depends on.
 /// Read one routed Qwen4 expert from the checkpoint.
 /// Unlike the resident path, callers drop this value immediately after its
 /// rows have been computed, which bounds the extra weight set to one expert.
@@ -608,23 +601,33 @@ fn load_qwen4_expert(
     })
 }
 
+/// The information the Qwen4 routed-expert path needs from the loaded model.
+/// Keeping these related inputs together keeps the MoE compute API small.
+pub(crate) struct Qwen4MoeCtx<'a> {
+    pub st: &'a peregrine_core::SafeTensors,
+    pub layer: usize,
+    pub stream_experts: bool,
+    pub cfg: &'a Cfg,
+}
+
 /// Softmax-MoE forward for Qwen4Exp. In streaming mode only the unique experts
 /// selected by this forward are read, and each expert is dropped after its
 /// weighted scatter. The order of expert plans and scatter additions is kept
 /// identical to the resident path so routing and floating-point accumulation
 /// order do not change.
+///
+/// Batch-union ordering and serial scatter match the resident implementation,
+/// preserving expert ordering and floating-point accumulation order.
 pub(crate) fn moe_forward_qwen4(
     x: &[f32],
     router_w: &[f32],
     shared_gate: &Matrix,
     experts: &[crate::mlp::Mlp],
     shared: Option<&crate::mlp::Mlp>,
-    st: &peregrine_core::SafeTensors,
-    layer: usize,
-    stream_experts: bool,
-    cfg: &Cfg,
+    ctx: Qwen4MoeCtx<'_>,
     s_n: usize,
 ) -> Result<Vec<f32>, Error> {
+    let Qwen4MoeCtx { st, layer, stream_experts, cfg } = ctx;
     let d = cfg.hidden as usize;
     if d == 0 || s_n == 0 || x.len() != s_n.saturating_mul(d)
         || router_w.is_empty() || router_w.len() % d != 0 {
