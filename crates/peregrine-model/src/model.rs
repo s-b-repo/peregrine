@@ -6594,10 +6594,7 @@ impl Model {
                 &ql.shared_gate,
                 &l.experts,
                 l.shared.as_ref(),
-                st,
-                li,
-                *stream_experts,
-                cfg,
+                crate::qwen4::Qwen4MoeCtx { st, layer: li, stream_experts: *stream_experts, cfg },
                 s_n,
             )
             .map_err(|e| Error::Format(format!("qwen4_exp: layer {li} MoE failed: {e}")))?;
