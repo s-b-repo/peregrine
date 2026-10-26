@@ -271,7 +271,6 @@ fn qwen4_tiny_model_loads_and_decodes_deterministically() -> Result<(), Error> {
     let mut c = crate::sample::Sampler::new(0.0, 0.9, 1);
     let streamed_tokens = streamed.generate(&tokens, 8, &mut c)?;
 
-    std::fs::remove_dir_all(dir)?;
     assert_eq!(first.len(), 8);
     assert_eq!(first, second);
     assert_eq!(first, streamed_tokens, "resident and streamed Qwen4 inference diverged");
@@ -287,6 +286,7 @@ fn qwen4_tiny_model_loads_and_decodes_deterministically() -> Result<(), Error> {
         &streamed_hidden,
         "resident vs streamed Qwen4 hidden state",
     );
+    std::fs::remove_dir_all(dir)?;
     Ok(())
 }
 
