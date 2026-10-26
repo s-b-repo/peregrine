@@ -46,11 +46,10 @@ use peregrine_core::config::Qwen4OutputGate;
 mod tests;
 
 pub(crate) fn require_runtime(_cfg: &Cfg) -> Result<(), Error> {
-    // Single-stream resident forward (gated residuals, GDN, QSA-selected GQA,
-    // PLE, softmax MoE) is implemented in `Model::forward_hidden_qwen4` and
-    // exercised by `qwen4_tiny_model_loads_and_decodes_deterministically`.
-    // Expert streaming and batched serving remain unsupported and fail with
-    // explicit errors on those paths instead of at load.
+    // Single-stream forward (resident or demand-streamed routed experts) is
+    // implemented in `Model::forward_hidden_qwen4` and exercised by
+    // `qwen4_tiny_model_loads_and_decodes_deterministically`. Batched serving
+    // remains unsupported and fails explicitly on that path rather than at load.
     Ok(())
 }
 
