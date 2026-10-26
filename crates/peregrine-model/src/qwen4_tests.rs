@@ -275,6 +275,18 @@ fn qwen4_tiny_model_loads_and_decodes_deterministically() -> Result<(), Error> {
     assert_eq!(first.len(), 8);
     assert_eq!(first, second);
     assert_eq!(first, streamed_tokens, "resident and streamed Qwen4 inference diverged");
+
+    // Compare the raw forward result as well as sampled token IDs. Fresh model
+    // instances keep recurrent/PLE state equivalent at position zero.
+    let mut resident_hidden_model = crate::Model::load(&dir)?;
+    let mut streamed_hidden_model = crate::Model::load_streaming(&dir, true)?;
+    let resident_hidden = resident_hidden_model.forward_hidden(&tokens, 0)?;
+    let streamed_hidden = streamed_hidden_model.forward_hidden(&tokens, 0)?;
+    assert_bit_identical(
+        &resident_hidden,
+        &streamed_hidden,
+        "resident vs streamed Qwen4 hidden state",
+    );
     Ok(())
 }
 
