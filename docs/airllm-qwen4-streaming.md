@@ -19,7 +19,7 @@ This bounds the *extra routed-expert weight residency* to roughly one expert at 
 Set the runtime environment variable before loading a model:
 
 ```bash
-COLI_STREAM=1 cargo run --release -p peregrine-engine -- --help
+COLI_STREAM=1 cargo run --release -p peregrine-engine -- /path/to/model
 ```
 
 For code that controls model loading directly, use the existing explicit loader:
