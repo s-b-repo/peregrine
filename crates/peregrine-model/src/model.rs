@@ -6505,11 +6505,6 @@ impl Model {
         if hc < 2 {
             return Err(Error::Format("qwen4_exp: hc_count must be >= 2".into()));
         }
-        if self.stream_experts {
-            return Err(crate::qwen4::unsupported(
-                "expert streaming (the shared-gate MoE only has a resident implementation)",
-            ));
-        }
         let width = d * hc;
         let vocab = self.cfg.vocab as usize;
         let mut embed = vec![0f32; s_n * d];
@@ -6527,7 +6522,7 @@ impl Model {
             }
         }
         // Split disjoint fields so layers (imm) + kv/gdn (mut) borrow together.
-        let Model { cfg, layers, kv, gdn, st, qwen4_mixer, .. } = self;
+        let Model { cfg, layers, kv, gdn, st, qwen4_mixer, stream_experts, .. } = self;
         let mixer = qwen4_mixer.as_ref().ok_or_else(|| {
             Error::Format("qwen4_exp: missing global hyper-connection mixer".into())
         })?;
@@ -6599,6 +6594,9 @@ impl Model {
                 &ql.shared_gate,
                 &l.experts,
                 l.shared.as_ref(),
+                st,
+                li,
+                *stream_experts,
                 cfg,
                 s_n,
             )
