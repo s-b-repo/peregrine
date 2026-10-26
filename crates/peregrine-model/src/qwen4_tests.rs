@@ -264,9 +264,17 @@ fn qwen4_tiny_model_loads_and_decodes_deterministically() -> Result<(), Error> {
     let tokens: Vec<i32> = [1, 2, 3, 4, 5, 6, 7, 8].to_vec();
     let first = m.generate(&tokens, 8, &mut a)?;
     let second = m.generate(&tokens, 8, &mut b)?;
+
+    // The AirLLM-style path reads only route-selected experts. It must produce
+    // the exact same greedy token sequence as resident inference.
+    let mut streamed = crate::Model::load_streaming(&dir, true)?;
+    let mut c = crate::sample::Sampler::new(0.0, 0.9, 1);
+    let streamed_tokens = streamed.generate(&tokens, 8, &mut c)?;
+
     std::fs::remove_dir_all(dir)?;
     assert_eq!(first.len(), 8);
     assert_eq!(first, second);
+    assert_eq!(first, streamed_tokens, "resident and streamed Qwen4 inference diverged");
     Ok(())
 }
 
