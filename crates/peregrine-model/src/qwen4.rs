@@ -3,16 +3,16 @@
 //! the single-stream forward they compose into
 //! (`Model::forward_hidden_qwen4`).
 //!
-//! Supported today (all exercised by `qwen4_tests` on the tiny fixture):
-//! single-stream resident-CPU inference — `generate`, `forward_step`,
-//! `forward_hidden`, `teacher_forcing` — with bit-identical chunked-prefill
-//! vs stepwise-decode state handling (GDN recurrence, PLE hash/conv history,
-//! KV and indexer-key appends, all sequential).
+//! Supported today (exercised by `qwen4_tests` on the tiny fixture):
+//! single-stream CPU inference — `generate`, `forward_step`, `forward_hidden`,
+//! and `teacher_forcing` — with bit-identical chunked-prefill vs stepwise-decode
+//! state handling. `COLI_STREAM=1` also streams only the routed experts selected
+//! by each forward, loading one expert at a time to bound peak expert-weight RAM.
+//! This memory-first path uses demand reads; it does not yet share the generic
+//! expert cache/prefetch lane, so it may trade tokens/sec for lower RAM use.
 //!
 //! Not supported — each refuses loudly with a `qwen4_exp`-prefixed error
 //! rather than running a degraded path:
-//! * expert streaming (`COLI_STREAM=1`): the shared-gate MoE only has a
-//!   resident implementation;
 //! * batched / concurrent serving (`forward_rows_batched*`, the serve engine):
 //!   per-sequence GDN/PLE recurrence and stream-form residuals have no
 //!   multi-sequence counterpart yet;
@@ -46,11 +46,10 @@ use peregrine_core::config::Qwen4OutputGate;
 mod tests;
 
 pub(crate) fn require_runtime(_cfg: &Cfg) -> Result<(), Error> {
-    // Single-stream resident forward (gated residuals, GDN, QSA-selected GQA,
-    // PLE, softmax MoE) is implemented in `Model::forward_hidden_qwen4` and
-    // exercised by `qwen4_tiny_model_loads_and_decodes_deterministically`.
-    // Expert streaming and batched serving remain unsupported and fail with
-    // explicit errors on those paths instead of at load.
+    // Single-stream forward (resident or demand-streamed routed experts) is
+    // implemented in `Model::forward_hidden_qwen4` and exercised by
+    // `qwen4_tiny_model_loads_and_decodes_deterministically`. Batched serving
+    // remains unsupported and fails explicitly on that path rather than at load.
     Ok(())
 }
 
@@ -582,25 +581,61 @@ pub(crate) fn route(x: &[f32], weights: &[f32], cfg: &Cfg) -> Result<crate::rout
     Ok(routed)
 }
 
-/// Softmax-MoE forward for Qwen4Exp: `route` (plain softmax, no bias) selects
-/// the experts, each selected expert's SwiGLU is scattered back weighted, and
-/// the shared expert is added gated by `sigmoid(shared_gate·x)`.
+/// Read one routed Qwen4 expert from the checkpoint.
+/// Unlike the resident path, callers drop this value immediately after its
+/// rows have been computed, which bounds the extra weight set to one expert.
+fn load_qwen4_expert(
+    st: &peregrine_core::SafeTensors,
+    layer: usize,
+    expert: usize,
+    cfg: &Cfg,
+) -> Result<crate::mlp::Mlp, Error> {
+    let d = cfg.hidden as usize;
+    let mi = cfg.moe_inter as usize;
+    let prefix = format!("model.layers.{layer}.mlp.experts.{expert}");
+    Ok(crate::mlp::Mlp {
+        gate: crate::weight::QtWeight::load(st, &format!("{prefix}.gate_proj.weight"), mi, d)?,
+        up: crate::weight::QtWeight::load(st, &format!("{prefix}.up_proj.weight"), mi, d)?,
+        down: crate::weight::QtWeight::load(st, &format!("{prefix}.down_proj.weight"), d, mi)?,
+        limit: cfg.swiglu_limit,
+    })
+}
+
+/// The information the Qwen4 routed-expert path needs from the loaded model.
+/// Keeping these related inputs together keeps the MoE compute API small.
+pub(crate) struct Qwen4MoeCtx<'a> {
+    pub st: &'a peregrine_core::SafeTensors,
+    pub layer: usize,
+    pub stream_experts: bool,
+    pub cfg: &'a Cfg,
+}
+
+/// Softmax-MoE forward for Qwen4Exp. In streaming mode only the unique experts
+/// selected by this forward are read, and each expert is dropped after its
+/// weighted scatter. The order of expert plans and scatter additions is kept
+/// identical to the resident path so routing and floating-point accumulation
+/// order do not change.
 ///
-/// Batch-union ordered like [`crate::mlp::moe_forward`] (one pass to bucket,
-/// serial scatter in union order) so prefill-chunked and stepwise decodes are
-/// bit-identical — the property `generate` depends on.
+/// Batch-union ordering and serial scatter match the resident implementation,
+/// preserving expert ordering and floating-point accumulation order.
 pub(crate) fn moe_forward_qwen4(
     x: &[f32],
     router_w: &[f32],
     shared_gate: &Matrix,
     experts: &[crate::mlp::Mlp],
     shared: Option<&crate::mlp::Mlp>,
-    cfg: &Cfg,
+    ctx: Qwen4MoeCtx<'_>,
     s_n: usize,
 ) -> Result<Vec<f32>, Error> {
+    let Qwen4MoeCtx { st, layer, stream_experts, cfg } = ctx;
     let d = cfg.hidden as usize;
-    if s_n == 0 || x.len() != s_n * d || experts.is_empty() {
+    if d == 0 || s_n == 0 || x.len() != s_n.saturating_mul(d)
+        || router_w.is_empty() || router_w.len() % d != 0 {
         return Err(invalid("invalid Qwen4 MoE batch geometry"));
+    }
+    let n_experts = router_w.len() / d;
+    if n_experts == 0 || (!stream_experts && experts.len() != n_experts) {
+        return Err(invalid("Qwen4 resident expert count disagrees with router"));
     }
     finite(x)?;
     finite(router_w)?;
@@ -608,10 +643,10 @@ pub(crate) fn moe_forward_qwen4(
     let mut out = vec![0.0f32; s_n * d];
     struct Plan { e: usize, rows: Vec<usize>, rw: Vec<f32> }
     let union = crate::router::batch_union(&r, s_n);
-    let mut slot_of: Vec<Option<usize>> = vec![None; experts.len()];
+    let mut slot_of: Vec<Option<usize>> = vec![None; n_experts];
     let mut plans: Vec<Plan> = Vec::with_capacity(union.len());
     for &e in union.iter() {
-        if let Some(slot) = usize::try_from(e).ok().filter(|&e| e < experts.len()) {
+        if let Some(slot) = usize::try_from(e).ok().filter(|&e| e < n_experts) {
             if slot_of[slot].is_none() {
                 slot_of[slot] = Some(plans.len());
                 plans.push(Plan { e: slot, rows: Vec::new(), rw: Vec::new() });
@@ -628,27 +663,50 @@ pub(crate) fn moe_forward_qwen4(
         }
     }
     plans.retain(|p| !p.rows.is_empty());
-    // Experts compute on the pool (disjoint scratch per plan); the scatter
-    // stays serial in batch-union order, so `f32 +=` accumulation order — and
-    // every bit — matches the serial loop. Same shape as `mlp::moe_forward`.
-    let hs: Vec<Vec<f32>> = peregrine_par::par_map(plans.len(), peregrine_par::PAR_MOE_MIN, |i| {
-        let p = &plans[i];
-        let nr = p.rows.len();
-        let mut xg = vec![0.0f32; nr * d];
-        for (ri, &s) in p.rows.iter().enumerate() {
-            xg[ri * d..ri * d + d].copy_from_slice(&x[s * d..s * d + d]);
+
+    if stream_experts {
+        // Memory-first mode: load/compute/scatter one unique routed expert at
+        // a time. On a long prefill this avoids holding the full batch-union's
+        // experts live together, at the cost of less cross-expert parallelism.
+        for p in &plans {
+            let expert = load_qwen4_expert(st, layer, p.e, cfg)?;
+            let nr = p.rows.len();
+            let mut xg = vec![0.0f32; nr * d];
+            for (ri, &s) in p.rows.iter().enumerate() {
+                xg[ri * d..ri * d + d].copy_from_slice(&x[s * d..s * d + d]);
+            }
+            let h = expert.swiglu(&xg, nr);
+            for (ri, (&s, &wgt)) in p.rows.iter().zip(&p.rw).enumerate() {
+                let dst = &mut out[s * d..s * d + d];
+                let src = &h[ri * d..ri * d + d];
+                for j in 0..d {
+                    dst[j] += wgt * src[j];
+                }
+            }
         }
-        experts[p.e].swiglu(&xg, nr)
-    });
-    for (p, h) in plans.iter().zip(&hs) {
-        for (ri, (&s, &wgt)) in p.rows.iter().zip(&p.rw).enumerate() {
-            let dst = &mut out[s * d..s * d + d];
-            let src = &h[ri * d..ri * d + d];
-            for j in 0..d {
-                dst[j] += wgt * src[j];
+    } else {
+        // Experts compute on the pool (disjoint scratch per plan); the scatter
+        // stays serial in batch-union order, keeping the established reference.
+        let hs: Vec<Vec<f32>> = peregrine_par::par_map(plans.len(), peregrine_par::PAR_MOE_MIN, |i| {
+            let p = &plans[i];
+            let nr = p.rows.len();
+            let mut xg = vec![0.0f32; nr * d];
+            for (ri, &s) in p.rows.iter().enumerate() {
+                xg[ri * d..ri * d + d].copy_from_slice(&x[s * d..s * d + d]);
+            }
+            experts[p.e].swiglu(&xg, nr)
+        });
+        for (p, h) in plans.iter().zip(&hs) {
+            for (ri, (&s, &wgt)) in p.rows.iter().zip(&p.rw).enumerate() {
+                let dst = &mut out[s * d..s * d + d];
+                let src = &h[ri * d..ri * d + d];
+                for j in 0..d {
+                    dst[j] += wgt * src[j];
+                }
             }
         }
     }
+
     if let Some(sh) = shared {
         let hs = sh.swiglu(x, s_n);
         let gates = shared_gate.apply(x)?;
