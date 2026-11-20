@@ -46,6 +46,13 @@ path = "src/basis_main.rs"
 name = "peregrine-gen"
 path = "src/gen_main.rs"
 
+# §17c idea #5 experiment: measures whether co-activation expert ordering cuts
+# contiguous disk run-breaks, on a synthetic trace by default or a real
+# dump-routes trace when given a path. Library-only, no engine/model needed.
+[[bin]]
+name = "peregrine-coactivation-experiment"
+path = "src/coactivation_main.rs"
+
 [dependencies]
 serde_json.workspace = true
 peregrine-core = { path = "../peregrine-core" }
