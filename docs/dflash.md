@@ -17,6 +17,23 @@ importantly — what could not be taken and why, in the style of
 Read [speculative decoding alternatives](speculative-decoding-alternatives.md)
 first for the economics every row below is scored against.
 
+## Nina integration
+
+Omni can use a compatible DFlash serving runtime through an OpenAI-compatible
+endpoint. The published Qwen3.5-4B pair is a reference deployment with its
+own target and draft. Nina's native NCM path uses level-conditioned code
+prediction, geometric scoring, and latent vector updates in Unifur. It needs
+a separately trained concept-code draft and a matched target verification
+path. Benchmark a draft against identical target-only settings before
+enabling it. Keep request-local hidden features in the inference runtime and
+workspace memory in Subnext.
+[Reference pair](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash)
+
+Size the native target's training worker from a measured memory and
+throughput profile, then measure the draft's training cost and concurrent
+serving footprint separately. Unifur's guide records the tested CPU worker
+capacity and the full 4B target budget. [Nina training resources](https://github.com/s-b-repo/unifur/blob/main/docs/Training-Guide.md#training-resources)
+
 ## Summary
 
 | Taken from | peregrine | Status |
