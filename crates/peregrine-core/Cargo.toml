@@ -10,7 +10,7 @@ description = "colibrì engine core: config, safetensors index, quantized-tensor
 serde_json.workspace = true
 peregrine-io = { path = "../peregrine-io" }
 thiserror = "2"
-parking_lot = "0.12"
+parking_lot = "0.13"
 zstd = { version = "0.13", default-features = false }
 
 # O_DIRECT flag is architecture-specific — don't hardcode it. Linux-only.
