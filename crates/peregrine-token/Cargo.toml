@@ -34,5 +34,5 @@ libc = "0.2"
 [dev-dependencies]
 serde_json.workspace = true
 fancy-regex = "0.16"
-rand = "0.9"
+rand = "0.10"
 memmap2 = "0.9"
