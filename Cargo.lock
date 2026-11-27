@@ -1449,7 +1449,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "peregrine-core"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "libc",
  "parking_lot",
@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "peregrine-cuda"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "peregrine-core",
  "peregrine-io",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "peregrine-engine"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "peregrine-core",
  "peregrine-io",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "peregrine-io"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "io-uring",
  "libc",
@@ -1491,11 +1491,11 @@ dependencies = [
 
 [[package]]
 name = "peregrine-kernels"
-version = "0.1.0"
+version = "0.1.4"
 
 [[package]]
 name = "peregrine-model"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "bytemuck",
  "crossbeam-channel",
@@ -1510,11 +1510,11 @@ dependencies = [
 
 [[package]]
 name = "peregrine-par"
-version = "0.1.0"
+version = "0.1.4"
 
 [[package]]
 name = "peregrine-sched"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "parking_lot",
  "peregrine-core",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "peregrine-serve"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "axum",
  "clap",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "peregrine-token"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "peregrine-tools"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "peregrine-core",
  "peregrine-model",

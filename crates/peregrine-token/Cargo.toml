@@ -9,7 +9,7 @@
 # workspace stays on 2021.
 [package]
 name = "peregrine-token"
-version = "0.1.0"
+version = "0.1.4"
 edition = "2024"
 license = "MIT"
 repository.workspace = true
