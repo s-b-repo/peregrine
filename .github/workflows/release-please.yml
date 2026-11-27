@@ -3,12 +3,18 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
 
 jobs:
+  validate:
+    uses: ./.github/workflows/ci-automation.yml
   release:
-    uses: s-b-repo/release-automation/.github/workflows/release.yml@v1
+    needs: validate
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    uses: s-b-repo/release-automation/.github/workflows/release.yml@af4eab1ada8d7d9afbf67b822fe790fb43b0d779 # v1

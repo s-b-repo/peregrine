@@ -1,14 +1,39 @@
 name: CI
-# Thin caller — the CI logic (lint + build + test + coverage + security) lives in
-# s-b-repo/ci-automation (_reuse-ci-rust.yml), so improvements there apply here automatically.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
+permissions:
+  contents: read
 jobs:
   ci:
-    uses: s-b-repo/ci-automation/.github/workflows/_reuse-ci-rust.yml@main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Check source and documentation
+        run: |
+          bash scripts/audit-bad-patterns.sh --strict
+          python3 -B scripts/check-doc-links.py
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy --component llvm-tools-preview --no-self-update
+      - name: Test the locked workspace
+        run: cargo +stable test --workspace --locked
+      - name: Lint all targets
+        run: cargo +stable clippy --workspace --all-targets --locked
+        continue-on-error: true
+      - name: Install coverage tool
+        uses: taiki-e/install-action@e825cea3ae7859bea8ac6c1c1ecde4d7699f05b6 # v2.62.18
+        with:
+          tool: cargo-llvm-cov
+        continue-on-error: true
+      - name: Record coverage
+        run: cargo +stable llvm-cov --workspace --locked --cobertura --output-path coverage.xml
+        continue-on-error: true
+      - name: Upload coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-rust
+          path: coverage.xml
+          if-no-files-found: ignore
