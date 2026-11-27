@@ -8,10 +8,9 @@
 //! Splitting *experts* into per-(layer, group) files lets every token's expert
 //! reads fan out across all devices in proportion to their bandwidth.
 //!
-//! Scope is deliberately narrow: this tool **groups and re-packs, nothing
-//! else**. Physical placement happens later by moving each group's files onto
-//! its device and symlinking them back into one model directory, so there is
-//! no `--layout` flag. Two invariants the engine depends on:
+//! Expert groups can be placed after repacking. `--layer-drive` writes whole
+//! layers directly to the specified model directories in round-robin order.
+//! Both layouts copy the existing tensor encoding verbatim.
 //!
 //! - **Bytes are copied verbatim** from the source regions — no dequantize/
 //!   requantize, no transformation. Unlike `peregrine-requantize` this tool is
@@ -32,10 +31,10 @@ use crate::requant::expert_coords;
 use crate::stwrite::{write_streaming, PieceMeta};
 use peregrine_core::config::Cfg;
 use peregrine_core::dtype::Dtype;
-use peregrine_core::safetensors::{SafeTensors, TensorInfo};
+use peregrine_core::safetensors::{layer_tensor, SafeTensors, TensorInfo};
 use peregrine_core::{Context, Error};
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -447,43 +446,163 @@ fn piece_meta(t: &TensorInfo) -> PieceMeta {
     }
 }
 
-/// Lazily-opened plain fds onto the source shards, for chunked `pread` copies.
-/// (`SafeTensors` reads go through io_uring and materialise whole tensors; a
-/// verbatim copier wants bounded chunks, so it reads the files directly.)
+/// Reuse the same file handles whose headers were indexed and stream copies
+/// through one bounded buffer.
 struct SourceFiles<'a> {
     st: &'a SafeTensors,
-    open: HashMap<usize, std::fs::File>,
+    files: Vec<&'a File>,
+    copy_buf: Vec<u8>,
 }
 
 impl<'a> SourceFiles<'a> {
     fn new(st: &'a SafeTensors) -> SourceFiles<'a> {
-        SourceFiles { st, open: HashMap::new() }
+        Self { st, files: st.shards().map(|(_, f)| f).collect(), copy_buf: Vec::new() }
     }
 
-    fn file(&mut self, idx: usize) -> Result<&std::fs::File, Error> {
-        if !self.open.contains_key(&idx) {
-            let path = &self.st.paths()[idx];
-            let f = std::fs::File::open(path).ctx(|| path.display().to_string())?;
-            self.open.insert(idx, f);
-        }
-        Ok(&self.open[&idx])
+    fn file(&self, idx: usize) -> Result<&'a File, Error> {
+        self.files.get(idx).copied().ok_or_else(|| Error::Format(format!("unknown shard index {idx}")))
     }
 
     /// Stream one tensor's on-disk region into `w`, verbatim, in bounded chunks.
     fn copy_region(&mut self, t: &TensorInfo, w: &mut dyn Write) -> Result<(), Error> {
         let f = self.file(t.file_idx)?;
-        let mut buf = vec![0u8; COPY_CHUNK.min(t.nbytes.max(0) as usize).max(1)];
         let mut off = t.off;
         let mut remaining = t.nbytes.max(0) as usize;
+        self.copy_buf.resize(self.copy_buf.len().max(COPY_CHUNK.min(remaining)), 0);
         while remaining > 0 {
             let n = COPY_CHUNK.min(remaining);
-            f.read_exact_at(&mut buf[..n], off).ctx(|| format!("read '{}' @ {off}", t.name))?;
-            w.write_all(&buf[..n]).ctx(|| format!("write '{}'", t.name))?;
+            f.read_exact_at(&mut self.copy_buf[..n], off).ctx(|| format!("read '{}' @ {off}", t.name))?;
+            w.write_all(&self.copy_buf[..n]).ctx(|| format!("write '{}'", t.name))?;
             off += n as u64;
             remaining -= n;
         }
         Ok(())
     }
+
+    fn write_file(&mut self, plan: &FilePlan, path: &Path, meta: &[(String, String)]) -> Result<(), Error> {
+        let mut infos = Vec::with_capacity(plan.tensors.len());
+        for name in &plan.tensors {
+            infos.push(self.st.find(name)
+                .ok_or_else(|| Error::Format(format!("planned tensor '{name}' vanished from the source")))?);
+        }
+        let pieces: Vec<PieceMeta> = infos.iter().map(|t| piece_meta(t)).collect();
+        write_streaming(path, meta, &pieces, |i, w| self.copy_region(infos[i], w))
+    }
+}
+
+fn copy_sidecars(model: &Path, out: &Path) -> Result<Vec<String>, Error> {
+    let mut copied = Vec::new();
+    for name in ["config.json", "tokenizer.json", "generation_config.json", "tokenizer_config.json"] {
+        let source = model.join(name);
+        if source.try_exists()? {
+            let dest = out.join(name);
+            fs::copy(&source, &dest).ctx(|| format!("copy {name}"))?;
+            File::open(&dest)?.sync_all().ctx(|| format!("sync {}", dest.display()))?;
+            copied.push(name.to_string());
+        }
+    }
+    Ok(copied)
+}
+
+/// Plan one shard per transformer layer, alternating drives in forward order.
+/// Group zero is the model directory for the embedding, head and sidecars.
+pub fn plan_layers(model: &Path, n_drives: usize) -> Result<Vec<FilePlan>, Error> {
+    if n_drives == 0 {
+        return Err(Error::Format("at least one --layer-drive is required".into()));
+    }
+    let cfg = Cfg::load(model)?;
+    let st = SafeTensors::open(model)?;
+    let n_layers = cfg.n_layers as usize;
+    let mut layers = vec![Vec::new(); n_layers];
+    let mut global = Vec::new();
+    for t in st.tensors() {
+        match layer_tensor(&t.name) {
+            Some((layer, _)) if layer < n_layers => layers[layer].push(t),
+            _ => global.push(t),
+        }
+    }
+    let make_file = |file_name, group, mut tensors: Vec<&TensorInfo>| {
+        tensors.sort_unstable_by_key(|t| (t.file_idx, t.off));
+        FilePlan {
+            file_name,
+            group,
+            bytes: tensors.iter().map(|t| t.nbytes as u64).fold(0, u64::saturating_add),
+            tensors: tensors.into_iter().map(|t| t.name.clone()).collect(),
+        }
+    };
+    let mut files = Vec::with_capacity(n_layers + 1);
+    for (i, tensors) in layers.into_iter().enumerate() {
+        if tensors.is_empty() {
+            return Err(Error::Format(format!("no tensors found for transformer layer {i}")));
+        }
+        files.push(make_file(format!("layer-{i:05}.safetensors"), 1 + i % n_drives, tensors));
+    }
+    if !global.is_empty() {
+        files.push(make_file("global.safetensors".into(), 0, global));
+    }
+    Ok(files)
+}
+
+#[derive(Default)]
+struct LayerDirectories {
+    created: Vec<PathBuf>,
+    complete: bool,
+}
+
+impl LayerDirectories {
+    fn create(&mut self, path: &Path) -> Result<PathBuf, Error> {
+        fs::create_dir(path).ctx(|| format!("create new model directory {}", path.display()))?;
+        self.created.push(path.to_path_buf());
+        path.canonicalize().ctx(|| format!("resolve {}", path.display()))
+    }
+}
+
+impl Drop for LayerDirectories {
+    fn drop(&mut self) {
+        if !self.complete {
+            for path in self.created.iter().rev() {
+                if let Err(e) = fs::remove_dir_all(path) {
+                    peregrine_core::note_advisory_err("remove incomplete layer output", &e);
+                }
+            }
+        }
+    }
+}
+
+/// Write complete layer files to new directories on their destination drives.
+/// The model paths file is installed only after all shards and sidecars land.
+pub fn write_layers(model: &Path, out: &Path, drives: &[PathBuf], files: &[FilePlan]) -> Result<WriteReport, Error> {
+    let st = SafeTensors::open(model)?;
+    let mut src = SourceFiles::new(&st);
+    let mut dirs = LayerDirectories::default();
+    let out = dirs.create(out)?;
+    let mut roots = BTreeMap::new();
+    for group in files.iter().map(|f| f.group).filter(|&g| g != 0) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = roots.entry(group) {
+            let path = drives.get(group - 1)
+                .ok_or_else(|| Error::Format(format!("no destination for layer drive {group}")))?;
+            entry.insert(dirs.create(path)?);
+        }
+    }
+    let mut report = WriteReport {
+        files: Vec::with_capacity(files.len()),
+        bytes_written: 0,
+        sidecars: Vec::new(),
+        manifest: out.join("model_paths.json"),
+    };
+    for file in files {
+        let root = if file.group == 0 { &out } else { &roots[&file.group] };
+        let path = root.join(&file.file_name);
+        src.write_file(file, &path, &[])?;
+        report.bytes_written = report.bytes_written.saturating_add(file.bytes);
+        report.files.push(path);
+    }
+    report.sidecars = copy_sidecars(model, &out)?;
+    let paths = roots.into_values().collect::<Vec<_>>();
+    let manifest = serde_json::to_vec_pretty(&BTreeMap::from([("paths", paths)]))?;
+    peregrine_core::write_atomic(&report.manifest, &manifest)?;
+    dirs.complete = true;
+    Ok(report)
 }
 
 /// Execute a plan: write every output file, copy the model sidecars, and emit
@@ -513,21 +632,12 @@ pub fn write(model: &Path, out: &Path, plan: &Plan) -> Result<WriteReport, Error
         manifest: out.join("manifest.json"),
     };
     for fp in &plan.files {
-        let mut infos: Vec<TensorInfo> = Vec::with_capacity(fp.tensors.len());
-        for name in &fp.tensors {
-            infos.push(
-                st.find(name)
-                    .ok_or_else(|| Error::Format(format!("planned tensor '{name}' vanished from the source")))?
-                    .clone(),
-            );
-        }
-        let pieces: Vec<PieceMeta> = infos.iter().map(piece_meta).collect();
         let meta = vec![
             ("peregrine.reshard.source".to_string(), model.display().to_string()),
             ("peregrine.reshard.group".to_string(), plan.groups[fp.group].name.clone()),
         ];
         let path = out.join(&fp.file_name);
-        write_streaming(&path, &meta, &pieces, |i, w| src.copy_region(&infos[i], w))?;
+        src.write_file(fp, &path, &meta)?;
         rep.bytes_written += fp.bytes;
         rep.files.push(path);
     }
@@ -535,13 +645,7 @@ pub fn write(model: &Path, out: &Path, plan: &Plan) -> Result<WriteReport, Error
     // A directory of shards is not a model: once the group files are symlinked
     // back together, `Cfg::load` still needs `config.json` and serving needs
     // the tokenizer. Same sidecar set `peregrine-requantize` carries.
-    for side in ["config.json", "tokenizer.json", "generation_config.json", "tokenizer_config.json"] {
-        let s = model.join(side);
-        if s.exists() {
-            std::fs::copy(&s, out.join(side)).ctx(|| format!("copy {side}"))?;
-            rep.sidecars.push(side.to_string());
-        }
-    }
+    rep.sidecars = copy_sidecars(model, out)?;
 
     let manifest = manifest_json(model, plan);
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| Error::Format(format!("manifest: {e}")))?;
@@ -629,8 +733,8 @@ pub fn verify(model: &Path, out: &Path) -> Result<VerifyReport, Error> {
         );
     }
     let mut rep = VerifyReport::default();
-    let mut sfiles = SourceFiles::new(&src);
-    let mut dfiles = SourceFiles::new(&dst);
+    let sfiles = SourceFiles::new(&src);
+    let dfiles = SourceFiles::new(&dst);
     let mut sbuf = vec![0u8; COPY_CHUNK];
     let mut dbuf = vec![0u8; COPY_CHUNK];
 
@@ -647,11 +751,10 @@ pub fn verify(model: &Path, out: &Path) -> Result<VerifyReport, Error> {
             continue;
         };
         verdict.tensors += 1;
-        if o.dtype != t.dtype || o.shape != t.shape || o.nbytes != t.nbytes {
-            verdict.mismatches.push(format!(
-                "{}: header differs (dtype/shape/nbytes {:?}/{:?}/{} vs {:?}/{:?}/{})",
-                t.name, o.dtype, o.shape, o.nbytes, t.dtype, t.shape, t.nbytes
-            ));
+        if o.dtype != t.dtype || o.shape != t.shape || o.nbytes != t.nbytes
+            || o.compression != t.compression || o.uncompressed_nbytes != t.uncompressed_nbytes || o.layout != t.layout
+        {
+            verdict.mismatches.push(format!("{}: tensor metadata differs", t.name));
             continue;
         }
         let sf = sfiles.file(t.file_idx)?;
@@ -697,6 +800,32 @@ mod tests {
             }
         }
         (dir, out)
+    }
+
+    #[test]
+    fn whole_layers_alternate_drives_and_roundtrip() -> Result<(), Error> {
+        let (source, out) = fixture_dirs("layers");
+        let drives = [source.join("first"), source.join("second")];
+        build_fixture(&source)?;
+        let plan = plan_layers(&source, drives.len())?;
+        let report = write_layers(&source, &out, &drives, &plan)?;
+        assert_eq!(report.manifest, out.join("model_paths.json").canonicalize()?);
+        let split = SafeTensors::open(&out)?;
+        for t in split.tensors() {
+            let root = match layer_tensor(&t.name) {
+                Some((layer @ 0..=1, _)) => &drives[layer],
+                _ => &out,
+            };
+            assert!(split.paths()[t.file_idx].starts_with(root.canonicalize()?));
+        }
+        assert!(verify(&source, &out)?.ok());
+        let duplicate = out.with_extension("duplicate");
+        assert!(write_layers(&source, &duplicate, &drives, &plan).is_err());
+        assert!(!duplicate.exists());
+        assert!(verify(&source, &out)?.ok());
+        fs::remove_dir_all(out)?;
+        fs::remove_dir_all(source)?;
+        Ok(())
     }
 
     /// Deterministic per-tensor bytes: same name → same content, different

@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use peregrine_core::safetensors::TensorReader;
 use peregrine_core::{Arch, Cfg, Context, Error, SafeTensors};
 use crate::gdn::GdnState;
 use peregrine_io::{Reactor, WarmCache};
@@ -21,6 +22,7 @@ use crate::draftdist::DraftDist;
 use crate::dsa::IndexerWeights;
 use crate::concurrent::{default_workers, experts_per_batch, moe_forward_dispatch, ForwardCtx};
 use crate::gpu::{GpuTier, HeatTable};
+use crate::layer_stream::{LayerPlan, LayerReads, LayerStream};
 use crate::math::rmsnorm;
 use crate::mlp::{moe_forward, Mlp, MoeCfg};
 use crate::predict::{Momentum, PredictSource, PrefetchTuner, RouteHistory, TransitionTable};
@@ -232,6 +234,7 @@ pub struct Model {
     /// `COLI_RSS_GUARD_GB`, else the projected peak recorded at load.
     rss_limit_bytes: u64,
     layers: Vec<LayerW>,
+    layer_stream: Option<LayerStream>,
     final_norm: Vec<f32>,
     lm_head: QtWeight,
     kv: Vec<LayerKv>,
@@ -243,6 +246,7 @@ pub struct Model {
     /// instead of held resident — required to run models that exceed RAM
     /// (e.g. the 744B GLM-5.2). `LayerW::experts` is empty in this mode.
     stream_experts: bool,
+    demand_experts: bool,
     /// Stream expert reads via O_DIRECT (bypass the page cache). `true` only when
     /// `COLI_DIRECT` is set, streaming is on, and the shards opened O_DIRECT fds.
     direct: bool,
@@ -1310,7 +1314,8 @@ fn max_expert_region_bytes(st: &SafeTensors) -> usize {
         let Some((eid, _)) = rest.split_once('.') else { continue };
         let key_end = head.len() + ".mlp.experts.".len() + eid.len();
         let Some(key) = t.name.get(..key_end) else { continue };
-        *runs.entry((key, t.name.ends_with(".qs"))).or_insert(0) += t.nbytes.max(0) as usize;
+        *runs.entry((key, t.name.ends_with(".qs"))).or_insert(0) +=
+            t.nbytes.max(t.uncompressed_nbytes).max(0) as usize;
     }
     let max = runs.into_values().max().unwrap_or(32 << 20);
     max + 2 * peregrine_io::ALIGN
@@ -2762,7 +2767,7 @@ fn prefetch_worker(
 /// every hot path untouched. Applies to the hybrid's input/post layernorms,
 /// q/k norms and the final norm — NOT to the GDN's gated norm (`torch.ones`
 /// init, plain form) and NOT to classic Qwen3 or GLM, whose norms are plain.
-fn load_norm_zero_centered(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
+fn load_norm_zero_centered(st: &TensorReader<'_>, name: &str, n: usize) -> Result<Vec<f32>, Error> {
     let mut w = load_f32(st, name, n)?;
     for v in &mut w {
         *v += 1.0;
@@ -2770,7 +2775,7 @@ fn load_norm_zero_centered(st: &SafeTensors, name: &str, n: usize) -> Result<Vec
     Ok(w)
 }
 
-fn load_f32(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
+fn load_f32(st: &TensorReader<'_>, name: &str, n: usize) -> Result<Vec<f32>, Error> {
     let mut v = vec![0f32; n];
     st.read_f32(name, &mut v)?;
     Ok(v)
@@ -2783,7 +2788,7 @@ fn load_f32(st: &SafeTensors, name: &str, n: usize) -> Result<Vec<f32>, Error> {
 /// Qwen3 checkpoints put the stack at `model.layers.*`; the Qwen3.5 hybrid's
 /// text stack lives under `model.language_model.layers.*` (the VL wrapper's
 /// naming, kept verbatim per the Track C contract).
-fn layer_prefix(cfg: &Cfg, i: usize) -> String {
+pub(crate) fn layer_prefix(cfg: &Cfg, i: usize) -> String {
     match cfg.arch {
         Arch::GlmMla | Arch::DenseGqa => format!("model.layers.{i}."),
         Arch::HybridGdn => format!("model.language_model.layers.{i}."),
@@ -2810,12 +2815,12 @@ struct LayerSite<'a> {
     sparse: Option<bool>,
 }
 
-fn load_layer(st: &SafeTensors, i: usize, cfg: &Cfg, stream_experts: bool) -> Result<LayerW, Error> {
+fn load_layer(st: &TensorReader<'_>, i: usize, cfg: &Cfg, stream_experts: bool) -> Result<LayerW, Error> {
     load_layer_at(st, i, cfg, stream_experts, LayerSite::default())
 }
 
 fn load_layer_at(
-    st: &SafeTensors,
+    st: &TensorReader<'_>,
     i: usize,
     cfg: &Cfg,
     stream_experts: bool,
@@ -2836,13 +2841,13 @@ fn load_layer_at(
 
     let attn = match cfg.arch {
         Arch::GlmMla => LayerAttn::Mla {
-            q_a: QtWeight::load(st, &p("self_attn.q_a_proj.weight"), ql, d)?,
+            q_a: QtWeight::load_from(st, &p("self_attn.q_a_proj.weight"), ql, d)?,
             q_a_ln: load_f32(st, &p("self_attn.q_a_layernorm.weight"), ql)?,
-            q_b: QtWeight::load(st, &p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
-            kv_a: QtWeight::load(st, &p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d)?,
+            q_b: QtWeight::load_from(st, &p("self_attn.q_b_proj.weight"), h * qkh, ql)?,
+            kv_a: QtWeight::load_from(st, &p("self_attn.kv_a_proj_with_mqa.weight"), kvl + qkr, d)?,
             kv_a_ln: load_f32(st, &p("self_attn.kv_a_layernorm.weight"), kvl)?,
-            kv_b: QtWeight::load(st, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
-            o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, h * vh)?,
+            kv_b: QtWeight::load_from(st, &p("self_attn.kv_b_proj.weight"), h * (qkn + vh), kvl)?,
+            o: QtWeight::load_from(st, &p("self_attn.o_proj.weight"), d, h * vh)?,
         },
         Arch::DenseGqa | Arch::HybridGdn if is_full_attn => {
             let (nh, nkv, hd) = (cfg.n_heads as usize, cfg.n_kv_heads as usize, cfg.head_dim as usize);
@@ -2850,10 +2855,10 @@ fn load_layer_at(
             // gate rows, the flat-chunk layout (Track C contract, gate-pinned).
             let q_rows = if cfg.attn_gate { 2 * nh * hd } else { nh * hd };
             LayerAttn::Gqa {
-                wq: QtWeight::load(st, &p("self_attn.q_proj.weight"), q_rows, d)?,
-                wk: QtWeight::load(st, &p("self_attn.k_proj.weight"), nkv * hd, d)?,
-                wv: QtWeight::load(st, &p("self_attn.v_proj.weight"), nkv * hd, d)?,
-                o: QtWeight::load(st, &p("self_attn.o_proj.weight"), d, nh * hd)?,
+                wq: QtWeight::load_from(st, &p("self_attn.q_proj.weight"), q_rows, d)?,
+                wk: QtWeight::load_from(st, &p("self_attn.k_proj.weight"), nkv * hd, d)?,
+                wv: QtWeight::load_from(st, &p("self_attn.v_proj.weight"), nkv * hd, d)?,
+                o: QtWeight::load_from(st, &p("self_attn.o_proj.weight"), d, nh * hd)?,
                 q_norm: if cfg.arch == Arch::HybridGdn {
                     load_norm_zero_centered(st, &p("self_attn.q_norm.weight"), hd)?
                 } else {
@@ -2875,15 +2880,15 @@ fn load_layer_at(
             );
             let conv_dim = 2 * kh * kd + vh_l * vd;
             LayerAttn::Gdn {
-                in_qkv: QtWeight::load(st, &p("linear_attn.in_proj_qkv.weight"), conv_dim, d)?,
-                in_z: QtWeight::load(st, &p("linear_attn.in_proj_z.weight"), vh_l * vd, d)?,
-                in_a: QtWeight::load(st, &p("linear_attn.in_proj_a.weight"), vh_l, d)?,
-                in_b: QtWeight::load(st, &p("linear_attn.in_proj_b.weight"), vh_l, d)?,
+                in_qkv: QtWeight::load_from(st, &p("linear_attn.in_proj_qkv.weight"), conv_dim, d)?,
+                in_z: QtWeight::load_from(st, &p("linear_attn.in_proj_z.weight"), vh_l * vd, d)?,
+                in_a: QtWeight::load_from(st, &p("linear_attn.in_proj_a.weight"), vh_l, d)?,
+                in_b: QtWeight::load_from(st, &p("linear_attn.in_proj_b.weight"), vh_l, d)?,
                 conv: load_f32(st, &p("linear_attn.conv1d.weight"), conv_dim * cfg.lin_conv_k as usize)?,
                 a_log: load_f32(st, &p("linear_attn.A_log"), vh_l)?,
                 dt_bias: load_f32(st, &p("linear_attn.dt_bias"), vh_l)?,
                 norm: load_f32(st, &p("linear_attn.norm.weight"), vd)?,
-                out: QtWeight::load(st, &p("linear_attn.out_proj.weight"), d, vh_l * vd)?,
+                out: QtWeight::load_from(st, &p("linear_attn.out_proj.weight"), d, vh_l * vd)?,
             }
         }
     };
@@ -2892,37 +2897,15 @@ fn load_layer_at(
         (None, Vec::new(), Vec::new(), None, Vec::new());
     if !sparse {
         let di = cfg.dense_inter as usize;
-        dense = Some(Mlp {
-            gate: QtWeight::load(st, &p("mlp.gate_proj.weight"), di, d)?,
-            up: QtWeight::load(st, &p("mlp.up_proj.weight"), di, d)?,
-            down: QtWeight::load(st, &p("mlp.down_proj.weight"), d, di)?,
-        });
+        dense = Some(Mlp::load(st, &p("mlp."), d, di)?);
     } else {
         let (e_n, mi, si) = (cfg.n_experts as usize, cfg.moe_inter as usize, (cfg.moe_inter * cfg.n_shared) as usize);
         router = load_f32(st, &p("mlp.gate.weight"), e_n * d)?;
         router_bias = load_f32(st, &p("mlp.gate.e_score_correction_bias"), e_n)?;
-        shared = Some(Mlp {
-            gate: QtWeight::load(st, &p("mlp.shared_experts.gate_proj.weight"), si, d)?,
-            up: QtWeight::load(st, &p("mlp.shared_experts.up_proj.weight"), si, d)?,
-            down: QtWeight::load(st, &p("mlp.shared_experts.down_proj.weight"), d, si)?,
-        });
-        for e in 0..e_n {
-            let pe = |s: &str| format!("{pre}mlp.experts.{e}.{s}");
-            if stream_experts {
-                // don't hold experts resident; verify presence so a malformed
-                // checkpoint fails at load, not mid-decode.
-                for t in ["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
-                    let name = pe(t);
-                    if !st.has(&name) {
-                        return Err(Error::Format(format!("missing expert tensor: {name}")));
-                    }
-                }
-            } else {
-                experts.push(Mlp {
-                    gate: QtWeight::load(st, &pe("gate_proj.weight"), mi, d)?,
-                    up: QtWeight::load(st, &pe("up_proj.weight"), mi, d)?,
-                    down: QtWeight::load(st, &pe("down_proj.weight"), d, mi)?,
-                });
+        shared = Some(Mlp::load(st, &p("mlp.shared_experts."), d, si)?);
+        if !stream_experts {
+            for e in 0..e_n {
+                experts.push(Mlp::load(st, &format!("{pre}mlp.experts.{e}."), d, mi)?);
             }
         }
     }
@@ -2945,8 +2928,71 @@ fn load_layer_at(
         router_bias,
         shared,
         experts,
-        indexer: IndexerWeights::load(st, i, cfg)?,
+        indexer: IndexerWeights::load_from(st, i, cfg)?,
     })
+}
+
+fn check_layer_experts(st: &SafeTensors, cfg: &Cfg, layer: usize) -> Result<(), Error> {
+    let prefix = layer_prefix(cfg, layer);
+    for expert in 0..cfg.n_experts {
+        for projection in ["gate_proj", "up_proj", "down_proj"] {
+            for suffix in ["weight", "weight.qs"] {
+                let name = format!("{prefix}mlp.experts.{expert}.{projection}.{suffix}");
+                if !st.has(&name) {
+                    return Err(Error::Format(format!("missing expert tensor: {name}")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// CPU layers are leased in forward order. The async reader can hold future
+/// layers' raw ranges, but only one layer's decoded weights are alive per pass.
+struct LayerPass<'a> {
+    cfg: &'a Cfg,
+    st: &'a SafeTensors,
+    resident: &'a [LayerW],
+    reads: Option<LayerReads<'a>>,
+    stream_experts: bool,
+    next: usize,
+    current: Option<LayerW>,
+}
+
+impl<'a> LayerPass<'a> {
+    fn new(
+        cfg: &'a Cfg,
+        st: &'a SafeTensors,
+        resident: &'a [LayerW],
+        stream: Option<&'a LayerStream>,
+        stream_experts: bool,
+        start: usize,
+    ) -> Result<Self, Error> {
+        let reads = stream.map(|stream| stream.begin(start)).transpose()?;
+        Ok(Self { cfg, st, resident, reads, stream_experts, next: start, current: None })
+    }
+
+    fn next_layer(&mut self) -> Result<Option<(usize, &LayerW)>, Error> {
+        self.current = None;
+        let layer = self.next;
+        if layer == self.cfg.n_layers as usize {
+            return Ok(None);
+        }
+        self.next += 1;
+        let Some(reads) = self.reads.as_mut() else {
+            return Ok(Some((layer, &self.resident[layer])));
+        };
+        let ranges = reads.take(layer)?;
+        let reader = match &ranges {
+            Some(ranges) => TensorReader::staged(self.st, ranges),
+            None => TensorReader::new(self.st),
+        };
+        let weights = load_layer(&reader, layer, self.cfg, self.stream_experts)
+            .ctx(|| format!("load SSD layer {layer}"))?;
+        drop(ranges);
+        reads.queue(1)?;
+        Ok(Some((layer, self.current.insert(weights))))
+    }
 }
 
 /// Row-wise RMSNorm of `x[s_n, d]` with weight `w`, into a fresh buffer. Rows are
@@ -3272,6 +3318,19 @@ fn forward_layer_batched(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpertMode {
+    Resident,
+    Concurrent,
+    Demand,
+}
+
+impl From<bool> for ExpertMode {
+    fn from(stream: bool) -> Self {
+        if stream { Self::Concurrent } else { Self::Resident }
+    }
+}
+
 impl Model {
     /// Load a model directory (config.json + `*.safetensors` in the int4/int8
     /// container format).
@@ -3286,7 +3345,7 @@ impl Model {
     /// Bypasses the RAM-budget heuristic — used to run a >RAM model explicitly
     /// and to test that the streamed path matches the resident one.
     pub fn load_streaming(dir: &std::path::Path, stream: bool) -> Result<Model, Error> {
-        Self::load_inner(dir, Some(stream), None, None)
+        Self::load_inner(dir, Some(stream.into()), None, None)
     }
 
     /// Load with streaming forced and an explicit warm-cache byte budget
@@ -3294,21 +3353,32 @@ impl Model {
     /// cache deterministically without touching process env (which races under
     /// parallel test execution).
     pub fn load_streaming_ecache(dir: &std::path::Path, stream: bool, ecache_budget: usize) -> Result<Model, Error> {
-        Self::load_inner(dir, Some(stream), Some(ecache_budget), None)
+        Self::load_inner(dir, Some(stream.into()), Some(ecache_budget), None)
     }
 
     /// Load with streaming forced and O_DIRECT explicitly on/off (cache disabled).
     /// Bypasses `COLI_DIRECT` so tests can compare the direct-streamed path against
     /// the resident one without touching process env (parallel-test-safe).
     pub fn load_streaming_direct(dir: &std::path::Path, stream: bool, direct: bool) -> Result<Model, Error> {
-        Self::load_inner(dir, Some(stream), Some(0), Some(direct))
+        Self::load_inner(dir, Some(stream.into()), Some(0), Some(direct))
     }
 
     fn load_inner(
         dir: &std::path::Path,
-        force_stream: Option<bool>,
+        force_stream: Option<ExpertMode>,
         force_ecache: Option<usize>,
         force_direct: Option<bool>,
+    ) -> Result<Model, Error> {
+        let layer_window = crate::layer_stream::window_from_env()?;
+        Self::load_with_layer_window(dir, force_stream, force_ecache, force_direct, layer_window)
+    }
+
+    fn load_with_layer_window(
+        dir: &std::path::Path,
+        force_stream: Option<ExpertMode>,
+        force_ecache: Option<usize>,
+        force_direct: Option<bool>,
+        layer_window: usize,
     ) -> Result<Model, Error> {
         // Before any par_* call can lazily build the global pool: install the
         // NUMA-pinning worker hook (no-op unless COLI_NUMA_PIN=1).
@@ -3323,15 +3393,16 @@ impl Model {
             .tensors()
             .iter()
             .filter(|t| t.name.contains(".mlp.experts."))
-            .map(|t| t.nbytes as u64)
-            .sum();
-        let stream_experts = force_stream.unwrap_or_else(|| {
+            .map(|t| t.uncompressed_nbytes.max(0) as u64)
+            .fold(0, u64::saturating_add);
+        let mut mode = force_stream.unwrap_or_else(|| {
             match std::env::var("COLI_STREAM").ok().as_deref() {
-                Some("1") | Some("true") => true,
-                Some("0") | Some("false") => false,
+                Some("demand") => ExpertMode::Demand,
+                Some("1") | Some("true") => ExpertMode::Concurrent,
+                Some("0") | Some("false") => ExpertMode::Resident,
                 _ => {
                     let avail = mem_available_bytes();
-                    avail > 0 && routed_bytes as f64 > 0.6 * avail as f64
+                    ExpertMode::from(avail > 0 && routed_bytes as f64 > 0.6 * avail as f64)
                 }
             }
         });
@@ -3347,12 +3418,15 @@ impl Model {
         // then loaded all of them resident. The guard passed and the kernel killed
         // the process anyway, which is the exact failure the preflight exists to
         // prevent.
-        let stream_experts = if stream_experts && st.has_compressed_tensors() {
-            eprintln!("[peregrine] compressed checkpoint detected — disabling expert streaming (compressed reads decompress on read)");
-            false
-        } else {
-            stream_experts
-        };
+        if mode == ExpertMode::Concurrent && st.has_compressed_tensors() {
+            mode = if layer_window > 0 {
+                eprintln!("peregrine: compressed checkpoint uses demand reads for routed experts in layer mode");
+                ExpertMode::Demand
+            } else {
+                eprintln!("peregrine: compressed checkpoint uses resident routed experts");
+                ExpertMode::Resident
+            };
+        }
         // A container with no routed-expert tensors has nothing to stream, and
         // honoring a streaming request anyway builds rings, transient reserves
         // and a warm cache for a lane that will never read a byte — measured on
@@ -3361,11 +3435,34 @@ impl Model {
         // streaming, which is also why COLI_STREAM=0 appeared to be ignored).
         // Same shape as the compressed override above: the container's own
         // contents outrank the caller's flag, and the override says so out loud.
-        let stream_experts = if stream_experts && !has_routed_experts(&st) {
+        if mode != ExpertMode::Resident && routed_bytes == 0 {
             eprintln!("[peregrine] no routed-expert tensors — forcing resident mode (nothing to stream)");
-            false
+            mode = ExpertMode::Resident;
+        }
+        if mode == ExpertMode::Concurrent && layer_window > 0
+            && crate::concurrent::engine_needs_rings() && !st.supports_io_uring()
+        {
+            eprintln!("peregrine: io_uring unavailable, using positioned demand reads for routed experts");
+            mode = ExpertMode::Demand;
+        }
+        let stream_experts = mode != ExpertMode::Resident;
+        let demand_experts = mode == ExpertMode::Demand;
+        let concurrent_experts = mode == ExpertMode::Concurrent;
+        if stream_experts {
+            for layer in cfg.first_dense as usize..cfg.n_layers as usize {
+                check_layer_experts(&st, &cfg, layer)?;
+            }
+        }
+        let layer_plan = if layer_window > 0 {
+            Some(LayerPlan::new(
+                &st,
+                cfg.n_layers as usize,
+                layer_window,
+                stream_experts,
+                force_direct.unwrap_or_else(direct_enabled),
+            )?)
         } else {
-            stream_experts
+            None
         };
 
         // Ring count, device-aware: one per physical device the shards span, so
@@ -3374,7 +3471,7 @@ impl Model {
         // projection below and the reactor construction further down must agree
         // — projecting for four rings and then building six is how a load passes
         // its own preflight and then gets OOM-killed.
-        let n_io_rings = if stream_experts {
+        let n_io_rings = if concurrent_experts {
             io_rings_for(st.n_devices(), host_mem_available_bytes(), max_expert_region_bytes(&st))
         } else {
             io_rings()
@@ -3390,28 +3487,36 @@ impl Model {
             // what the process actually holds is the decompressed size. A 2.5:1
             // container would have projected at 40% of its real footprint —
             // under-reporting in precisely the direction that gets a run killed.
-            let total_bytes: u64 = st.tensors().iter().map(|t| t.uncompressed_nbytes.max(0) as u64).sum();
+            let total_bytes = st.tensors().iter()
+                .map(|t| t.uncompressed_nbytes.max(0) as u64)
+                .fold(0, u64::saturating_add);
             let proj = crate::ram::project_load(&crate::ram::ProjectInputs {
-                dense_disk: total_bytes.saturating_sub(routed_bytes),
-                expert_disk: routed_bytes,
+                dense_disk: layer_plan.as_ref().map_or(
+                    total_bytes.saturating_sub(routed_bytes),
+                    |plan| plan.resident_bytes,
+                ),
+                expert_disk: if layer_plan.is_some() { 0 } else { routed_bytes },
                 stream_experts,
-                ecache: ecache_budget_bytes() as u64,
+                ecache: if concurrent_experts { force_ecache.unwrap_or_else(ecache_budget_bytes) as u64 } else { 0 },
                 // Zero when nothing streams: the reserve exists for the io lane's
                 // in-flight expert slabs, and a resident model never builds one.
                 // Charging it anyway projected 10.2 GB of buffers for a model that
                 // fits whole in RAM, which refused the load outright.
-                stream_transient: if stream_experts {
-                    stream_transient_reserve(n_io_rings, default_workers(), 4 * max_expert_region_bytes(&st)) as u64
-                } else {
-                    0
-                },
+                stream_transient: layer_plan.as_ref().map_or(0, |plan| plan.working_bytes)
+                    .saturating_add(match mode {
+                        ExpertMode::Concurrent => stream_transient_reserve(
+                            n_io_rings, default_workers(), 4 * max_expert_region_bytes(&st),
+                        ) as u64,
+                        ExpertMode::Demand => 4 * max_expert_region_bytes(&st) as u64,
+                        ExpertMode::Resident => 0,
+                    }),
                 kv_pool: crate::ram::kv_pool_bytes(
                     cfg.kv_lora as u64,
                     cfg.qk_rope as u64,
                     cfg.n_layers as u64,
                     crate::ram::DEFAULT_PROJECTED_CTX,
                 ),
-                buffered_reads: !direct_enabled(),
+                buffered_reads: demand_experts || !direct_enabled(),
             });
             let avail = mem_available_bytes();
             eprintln!("{}", crate::ram::summary(&proj, avail));
@@ -3435,22 +3540,6 @@ impl Model {
             }
         };
 
-        // Compressed checkpoints require the decompressing read path in
-        // `read_raw` / `read_f32`; the streaming lane hands raw on-disk bytes
-        // straight to the kernels, which would produce garbage. Force resident
-        // mode when any tensor is compressed. Emit a note so a user forcing
-        // streaming knows why it was overridden.
-        let stream_experts = if stream_experts && st.has_compressed_tensors() {
-            eprintln!("[peregrine] compressed checkpoint detected — disabling expert streaming (compressed reads decompress on read)");
-            false
-        } else {
-            stream_experts
-        };
-        // (The no-routed-experts override is applied once, above, before the RAM
-        // projection that depends on it — a merge briefly carried a second copy
-        // here, which was dead by construction since the first already cleared
-        // the flag.)
-
         let d = cfg.hidden as usize;
         let (kvl, qkr) = (cfg.kv_row_a() as usize, cfg.kv_row_b() as usize);
         let vocab = cfg.vocab as usize;
@@ -3461,16 +3550,22 @@ impl Model {
         };
         let embed = QtWeight::load(&st, embed_name, vocab, d)?;
         let lm_head = QtWeight::load(&st, "lm_head.weight", vocab, d)?;
+        let weights = TensorReader::new(&st);
         let final_norm = if cfg.arch == Arch::HybridGdn {
-            load_norm_zero_centered(&st, norm_name, d)?
+            load_norm_zero_centered(&weights, norm_name, d)?
         } else {
-            load_f32(&st, norm_name, d)?
+            load_f32(&weights, norm_name, d)?
         };
 
-        let mut layers = Vec::with_capacity(cfg.n_layers as usize);
-        for i in 0..cfg.n_layers as usize {
-            layers.push(load_layer(&st, i, &cfg, stream_experts)?);
-        }
+        let layer_reserve = layer_plan.as_ref().map_or(0, |plan| plan.working_bytes as usize);
+        let layer_stream = layer_plan.map(|plan| LayerStream::new(plan, &st));
+        let mut layers = if layer_stream.is_none() {
+            (0..cfg.n_layers as usize)
+                .map(|i| load_layer(&weights, i, &cfg, stream_experts))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
 
         let kv = (0..cfg.n_layers).map(|_| LayerKv::with_dtype(kvl, qkr, kv_dtype())).collect();
         let gdn: Vec<Option<GdnState>> = (0..cfg.n_layers as usize)
@@ -3485,7 +3580,7 @@ impl Model {
         // the process (prefetch lanes, the SafeTensors loader) keep plain rings
         // — each SQPOLL ring costs a polling kthread, worth it only on the
         // per-token critical path, and only when measured to win.
-        let io_reactors: Vec<Mutex<Reactor>> = if stream_experts && crate::concurrent::engine_needs_rings() {
+        let io_reactors: Vec<Mutex<Reactor>> = if concurrent_experts && crate::concurrent::engine_needs_rings() {
             let n = n_io_rings;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
@@ -3524,7 +3619,9 @@ impl Model {
         // when there are no rings, so a host running the fallback engine is
         // never left guessing which one it got — a silent degrade that halves
         // throughput is worse than a loud one.
-        if stream_experts && io_reactors.is_empty() {
+        if demand_experts {
+            eprintln!("peregrine: [io] engine=demand (one routed expert at a time)");
+        } else if concurrent_experts && io_reactors.is_empty() {
             eprintln!("peregrine: [io] rings=0 engine=pread (no io_uring) threads={}", default_workers());
         }
         let workers = default_workers();
@@ -3532,7 +3629,7 @@ impl Model {
         // the 0.6%-reuse expert reads. Only when streaming AND the shards actually
         // opened O_DIRECT fds. Size each reactor's aligned slab pool to the largest
         // expert region (Strategy A: 2 buffers in flight ≈ 2×19 MB).
-        let want_direct = force_direct.unwrap_or_else(direct_enabled) && stream_experts;
+        let want_direct = force_direct.unwrap_or_else(direct_enabled) && concurrent_experts;
         // O_DIRECT needs block-aligned buffers, which only the ring path has; the
         // pread engine would take `EINVAL` on every read. Report the reason
         // rather than the outcome, because "requested but unavailable" on a host
@@ -3562,14 +3659,15 @@ impl Model {
         // clears one token's working set is what decides the `prefetch_protect`
         // default below.
         let (ecache, granted_ecache_budget) = {
-            let requested = force_ecache.unwrap_or_else(ecache_budget_bytes);
+            let requested = if demand_experts { 0 } else { force_ecache.unwrap_or_else(ecache_budget_bytes) };
             // Cap the warm cache so it + the streaming lanes' transient landing/compute
             // buffers + a safety margin fit in available RAM (already net of the
             // resident model), so batched prefill/decode can't OOM. This is the peak-RAM
             // auto-budget; bounding the per-read allocation churn itself is the slab arena.
             let budget = if stream_experts && requested > 0 {
                 let per_expert = 4 * max_expert_region_bytes(&st);
-                let reserve = stream_transient_reserve(io_reactors.len(), workers, per_expert);
+                let reserve = stream_transient_reserve(io_reactors.len(), workers, per_expert)
+                    .saturating_add(layer_reserve);
                 let avail = mem_available_bytes();
                 let capped = cap_ecache_budget(requested, avail as usize, reserve, 1usize << 30);
                 // One line covering both hazards: a request that had to be cut, and a
@@ -3613,7 +3711,7 @@ impl Model {
         };
         // Optional GPU VRAM tier (opt-in via COLI_GPU): dequantize as many experts
         // as fit to f32 and upload. Reserve 2 GB headroom for activations/context.
-        let gpu = if std::env::var("COLI_GPU").is_ok() {
+        let gpu = if !demand_experts && std::env::var("COLI_GPU").is_ok() {
             // Open the disk→GPU lane before anything allocates an aligned
             // buffer. `cudaHostRegister` pins pages in place, so it can only
             // catch allocations made after the hook is installed — installing
@@ -3664,7 +3762,10 @@ impl Model {
         // `COLI_GPU_DENSE=0` enabled the tier — found while trying to isolate a
         // regression by turning it off, which is exactly when it matters.)
         let dense_requested = matches!(std::env::var("COLI_GPU_DENSE").as_deref(), Ok("1") | Ok("true"));
-        let gpu_dense = if dense_requested && !has_routed_experts(&st) {
+        if dense_requested && layer_stream.is_some() {
+            eprintln!("peregrine: [layer-io] streamed attention and dense MLPs use the CPU");
+        }
+        let gpu_dense = if dense_requested && layer_stream.is_none() && !has_routed_experts(&st) {
             let headroom = env_usize("COLI_GPU_DENSE_HEADROOM_MB", 1024) * (1 << 20);
             // `COLI_GPU_DENSE_LAYERS=N` pins the resident count instead of
             // taking whatever fits. It exists because placement is not output-
@@ -3810,12 +3911,15 @@ impl Model {
         let n = cfg.n_layers as usize;
         let mtp = if st.has(&format!("model.layers.{n}.eh_proj.weight")) {
             // GLM: the MTP layer is the (n_layers)-th layer of the main stack.
+            if stream_experts && n >= cfg.first_dense as usize {
+                check_layer_experts(&st, &cfg, n)?;
+            }
             Some(MtpHead {
-                layer: load_layer(&st, n, &cfg, stream_experts)?,
+                layer: load_layer(&weights, n, &cfg, stream_experts)?,
                 eh_proj: QtWeight::load(&st, &format!("model.layers.{n}.eh_proj.weight"), d, 2 * d)?,
-                enorm: load_f32(&st, &format!("model.layers.{n}.enorm.weight"), d)?,
-                hnorm: load_f32(&st, &format!("model.layers.{n}.hnorm.weight"), d)?,
-                mtp_norm: load_f32(&st, &format!("model.layers.{n}.shared_head.norm.weight"), d)?,
+                enorm: load_f32(&weights, &format!("model.layers.{n}.enorm.weight"), d)?,
+                hnorm: load_f32(&weights, &format!("model.layers.{n}.hnorm.weight"), d)?,
+                mtp_norm: load_f32(&weights, &format!("model.layers.{n}.shared_head.norm.weight"), d)?,
             })
         } else if st.has("mtp.fc.weight") {
             // Qwen family: the head lives under its own `mtp.` prefix, its single
@@ -3828,14 +3932,14 @@ impl Model {
             let zc = cfg.arch == Arch::HybridGdn;
             let norm = |name: &str| -> Result<Vec<f32>, Error> {
                 if zc {
-                    load_norm_zero_centered(&st, name, d)
+                    load_norm_zero_centered(&weights, name, d)
                 } else {
-                    load_f32(&st, name, d)
+                    load_f32(&weights, name, d)
                 }
             };
             Some(MtpHead {
                 layer: load_layer_at(
-                    &st,
+                    &weights,
                     n,
                     &cfg,
                     stream_experts,
@@ -3868,7 +3972,7 @@ impl Model {
         // a resident model never consults it. See `ExpertIndex` for why this is
         // not done lazily per request.
         let expert_index =
-            if stream_experts { Some(crate::concurrent::ExpertIndex::build(&st, &cfg)) } else { None };
+            if concurrent_experts { Some(crate::concurrent::ExpertIndex::build(&st, &cfg)) } else { None };
         // One token's routed working set, and therefore which of capacity or
         // policy binds on this deployment. Reported because an operator cannot
         // otherwise tell which side of the threshold they are on, and the two
@@ -3954,6 +4058,7 @@ impl Model {
         // routing (scaled down by entropy at run time); 0 keeps the static
         // all-time counters, which is the committed non-adaptive behaviour.
         let topic_halflife = env_usize("COLI_TOPIC_HALFLIFE", 512) as u64;
+        let predict_eval = if layer_stream.is_none() { predict_eval_init(model_topk) } else { None };
         let mut model = Model {
             route_hist_epoch: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -3962,10 +4067,12 @@ impl Model {
             dsa: dsa_enabled(),
             rss_limit_bytes,
             layers,
+            layer_stream,
             final_norm,
             lm_head,
             kv,
             stream_experts,
+            demand_experts,
             direct,
             st,
             expert_index,
@@ -3977,7 +4084,7 @@ impl Model {
             ecache,
             route_hist,
             predictor: PredictSource::default(),
-            predict_eval: predict_eval_init(model_topk),
+            predict_eval,
             prefetch_policy: PrefetchPolicy::from_env(),
             prefetch_tuner: prefetch_tuner_init(),
             perf_llc: None,
@@ -4968,6 +5075,10 @@ impl Model {
         &self.checkpoint_dir
     }
 
+    pub fn checkpoint_shards(&self) -> impl Iterator<Item = (&std::path::Path, &std::fs::File)> {
+        self.st.shards()
+    }
+
     /// Install the topic-routing profiles. The explicit seam behind
     /// `COLI_TOPIC_ROUTING=1`, so tests and offline tools never touch process
     /// env — the same rationale as [`Self::enable_calib_capture`].
@@ -5787,7 +5898,7 @@ impl Model {
             let eff_workers = self.effective_workers();
             let aff = self.affinity_snapshot();
             let Model {
-                cfg, layers, kv, gdn, st, expert_index, fd_device_table, stream_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, gpu_dense, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, calib, ..
+                cfg, layers, layer_stream, kv, gdn, st, expert_index, fd_device_table, stream_experts, demand_experts, direct, io_reactors, ecache, route_hist, predictor, predict_eval, prefetch, gpu, gpu_dense, heat, spill_log, lane_timings, layout_schedule, absorb, dsa, sweep, calib, ..
             } = self;
             let sweep: &SweepClock = sweep;
             let ctx = ForwardCtx {
@@ -5800,6 +5911,7 @@ impl Model {
                 workers: eff_workers,
                 cfg,
                 stream_experts: *stream_experts,
+                demand_experts: *demand_experts,
                 ecache: ecache.as_deref(),
                 route_log: route_hist.as_ref(),
                 calib: calib.as_ref().map(|(_, a)| a),
@@ -5859,7 +5971,11 @@ impl Model {
             // and that is the one the new multi-row look-ahead lives in. Keep this gate
             // the historical shape (single-row decode-only) so chunk-prefill stays
             // measured-neutral.
-            let la_width = if router_lookahead() && s_n == 1 { router_lookahead_width() } else { 0 };
+            let la_width = if layer_stream.is_none() && router_lookahead() && s_n == 1 {
+                router_lookahead_width()
+            } else {
+                0
+            };
             // Built independently of `pfc`, not from it: the two are separate
             // features with separate knobs, and one asks the routing history while
             // the other asks the next layer's router. Deriving this from `pfc` would
@@ -5889,7 +6005,8 @@ impl Model {
             let mut deep: Vec<Vec<i32>> =
                 if eval.is_some() { vec![Vec::new(); layers.len()] } else { Vec::new() };
             let layers: &[LayerW] = layers;
-            for (li, l) in layers.iter().enumerate() {
+            let mut pass = LayerPass::new(cfg, st, layers, layer_stream.as_ref(), *stream_experts, 0)?;
+            while let Some((li, l)) = pass.next_layer()? {
                 sweep.tick();
                 forward_layer(l, li, LayerState { kv: &mut kv[li], gdn: gdn[li].as_mut() }, &ctx, &mut x, s_n, pos_base)?;
                 if let Some(pfc) = &pfc {
@@ -6093,9 +6210,11 @@ impl Model {
         // noise — the lifetime, not the destructor, is what we want to bound).
         let lg = {
             let ctx = self.forward_ctx();
-            for (i, l) in self.layers[start..].iter().enumerate() {
-                forward_layer(l, start + i, LayerState { kv: &mut kv_local[i], gdn: None }, &ctx, h, s_n, pos_base)?;
+            let mut pass = self.layer_pass(start)?;
+            while let Some((li, l)) = pass.next_layer()? {
+                forward_layer(l, li, LayerState { kv: &mut kv_local[li - start], gdn: None }, &ctx, h, s_n, pos_base)?;
             }
+            drop(pass);
             // Drop `kv_local` here is unnecessary — it owns no shared `&self`
             // borrow; the constraint is just `ctx` going out of scope.
             let xf = rmsnorm_rows(h, &self.final_norm, s_n, d, eps);
@@ -6153,6 +6272,10 @@ impl Model {
     /// prefetch/route-logging **disabled** — the shape the external-KV batched and
     /// prefill paths use (the B-way expert union is not a useful next-token
     /// predictor, so prefetch is gated off under batching).
+    fn layer_pass(&self, start: usize) -> Result<LayerPass<'_>, Error> {
+        LayerPass::new(&self.cfg, &self.st, &self.layers, self.layer_stream.as_ref(), self.stream_experts, start)
+    }
+
     fn forward_ctx(&self) -> ForwardCtx<'_> {
         ForwardCtx {
             st: &self.st,
@@ -6164,6 +6287,7 @@ impl Model {
             workers: self.effective_workers(),
             cfg: &self.cfg,
             stream_experts: self.stream_experts,
+            demand_experts: self.demand_experts,
             ecache: self.ecache.as_deref(),
             route_log: None,
             calib: self.calib.as_ref().map(|(_, a)| a),
@@ -6200,7 +6324,8 @@ impl Model {
             self.embed.dequant_row_into(tid, &mut x[s * d..s * d + d]);
         }
         let ctx = self.forward_ctx();
-        for (li, l) in self.layers.iter().enumerate() {
+        let mut pass = self.layer_pass(0)?;
+        while let Some((li, l)) = pass.next_layer()? {
             // Advancing the sweep clock here matters even though this path emits no
             // speculation: a prefill's demand reads churn the cache exactly like a
             // decode step's, so a warm item queued just before a long prefill is
@@ -6208,6 +6333,7 @@ impl Model {
             self.sweep.tick();
             forward_layer(l, li, LayerState { kv: &mut seq.layers[li], gdn: seq.gdn[li].as_mut() }, &ctx, &mut x, s_n, pos_base)?;
         }
+        drop(pass);
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
         Ok(self.lm_head.apply_vec(&xf, s_n))
     }
@@ -6513,6 +6639,7 @@ impl Model {
             workers: self.effective_workers(),
             cfg: &self.cfg,
             stream_experts: self.stream_experts,
+            demand_experts: self.demand_experts,
             ecache: self.ecache.as_deref(),
             route_log: None,
             calib: self.calib.as_ref().map(|(_, a)| a),
@@ -6545,14 +6672,18 @@ impl Model {
             let mut seen = std::collections::HashSet::with_capacity(seqs.len());
             owner.iter().all(|&o| seen.insert(o)) && seen.len() == s_n
         };
-        let la_width = if router_lookahead() && (s_n == 1 || (batched_decode && router_lookahead_batch())) {
+        let la_width = if self.layer_stream.is_none()
+            && router_lookahead()
+            && (s_n == 1 || (batched_decode && router_lookahead_batch()))
+        {
             router_lookahead_width()
         } else {
             0
         };
         let la = (la_width > 0).then(|| self.lookahead_ctx()).flatten();
         let layers: &[LayerW] = &self.layers;
-        for (li, l) in layers.iter().enumerate() {
+        let mut pass = self.layer_pass(0)?;
+        while let Some((li, l)) = pass.next_layer()? {
             self.sweep.tick();
             // Disjoint split per sequence: the KV cache and the GDN state are
             // separate fields, so one pass hands the batched layer both.
@@ -6574,6 +6705,7 @@ impl Model {
                 la.emit(layers, li + 1, &x, la_width);
             }
         }
+        drop(pass);
         self.publish_lane_timings();
         let xf = rmsnorm_rows(&x, &self.final_norm, s_n, d, eps);
         Ok((self.lm_head.apply_vec(&xf, s_n), x))
@@ -6811,7 +6943,7 @@ impl Model {
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
 
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, demand_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft without an MTP head".into()))?;
         // One round per draft *call*, not per step: a call is the unit a
@@ -6828,6 +6960,7 @@ impl Model {
             workers: *workers,
             cfg,
             stream_experts: *stream_experts,
+            demand_experts: *demand_experts,
             ecache: ecache.as_deref(),
             route_log: None, // drafts must not overwrite the main-stream prediction
             calib: None, // drafts replay accumulated positions — counting them double-weights
@@ -6976,7 +7109,7 @@ impl Model {
         let vocab = self.cfg.vocab as usize;
         let n_layers = self.cfg.n_layers as usize;
         let (kvl, qkr) = (self.cfg.kv_row_a() as usize, self.cfg.kv_row_b() as usize);
-        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, .. } =
+        let Model { mtp, st, embed, lm_head, final_norm, io_reactors, workers, ecache, direct, gpu, gpu_dense, stream_experts, demand_experts, cfg, absorb, dsa, expert_index, heat, mtp_pins, .. } =
             self;
         let mtp = mtp.as_ref().ok_or_else(|| Error::Format("mtp_draft_batched without an MTP head".into()))?;
         let pins_gen = mtp_pins.as_ref().is_some_and(|p| p.note_round());
@@ -6993,6 +7126,7 @@ impl Model {
             workers: *workers,
             cfg,
             stream_experts: *stream_experts,
+            demand_experts: *demand_experts,
             ecache: ecache.as_deref(),
             route_log: None,
             calib: None,
@@ -8148,12 +8282,92 @@ mod tests {
         let dir = tmp_model_dir("stream")?;
         let mut resident = Model::load_streaming(&dir, false)?;
         let mut streamed = Model::load_streaming(&dir, true)?;
+        let mut demand = Model::load_inner(&dir, Some(ExpertMode::Demand), None, None)?;
         assert!(streamed.stream_experts && !resident.stream_experts);
+        assert!(demand.demand_experts && demand.io_reactors.is_empty() && demand.ecache.is_none());
         let toks = [1, 5, 9, 2, 7];
         let lr = resident.forward_step(&toks, 0)?;
         let ls = streamed.forward_step(&toks, 0)?;
         assert_eq!(lr, ls, "streamed logits must equal resident logits");
+        assert_eq!(lr, demand.forward_step(&toks, 0)?, "demand logits must equal resident logits");
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ssd_layers_match_resident_on_mla_gqa_and_hybrid() -> Result<(), Error> {
+        let gqa = tmp_model_dir("ssd_gqa")?;
+        crate::testkit::build_tiny_qwen_model(&gqa, 21)?;
+        for dir in [tmp_indexer_model_dir("ssd_mla", 2)?, gqa, tmp_hybrid_mtp_dir("ssd_hybrid", 21)?] {
+            let mut resident = Model::load_with_layer_window(&dir, Some(ExpertMode::Resident), None, None, 0)?;
+            let mut disk = Model::load_with_layer_window(&dir, Some(ExpertMode::Resident), None, Some(true), 2)?;
+            let layer_stream = disk.layer_stream.as_ref().ok_or_else(|| Error::Format("expected SSD layers".into()))?;
+            if std::env::var_os("PEREGRINE_TEST_REQUIRE_LAYER_RING").is_some() {
+                assert!(layer_stream.uses_ring());
+            }
+            assert!(disk.layers.is_empty());
+            assert_eq!(disk.has_mtp(), resident.has_mtp());
+            let prompt = [1, 5, 9, 2];
+            assert_eq!(disk.forward_step(&prompt, 0)?, resident.forward_step(&prompt, 0)?);
+            assert_eq!(disk.forward_step(&[7], 4)?, resident.forward_step(&[7], 4)?);
+
+            let [mut r0, mut r1] = std::array::from_fn(|_| SeqKv::new(&resident.cfg));
+            let [mut d0, mut d1] = std::array::from_fn(|_| SeqKv::new(&disk.cfg));
+            assert_eq!(disk.forward_prefill_seq(&prompt, &mut d0, 0)?, resident.forward_prefill_seq(&prompt, &mut r0, 0)?);
+            assert_eq!(disk.forward_prefill_seq(&prompt[..3], &mut d1, 0)?, resident.forward_prefill_seq(&prompt[..3], &mut r1, 0)?);
+            assert_eq!(
+                disk.forward_step_batched(&[7, 2], &mut [&mut d0, &mut d1], &[4, 3], None)?,
+                resident.forward_step_batched(&[7, 2], &mut [&mut r0, &mut r1], &[4, 3], None)?,
+            );
+            drop(disk);
+            drop(resident);
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_routed_weights_run_through_demand_loading() -> Result<(), Error> {
+        use peregrine_core::pack::{write_safetensors, Blob};
+        use peregrine_core::{Compression, Dtype};
+
+        let dir = tmp_model_dir("demand_compressed")?;
+        let tensors = SafeTensors::open(&dir)?;
+        let mut blobs = Vec::new();
+        for tensor in tensors.tensors() {
+            let dtype = match tensor.dtype {
+                Dtype::Bf16 => "BF16",
+                Dtype::F16 => "F16",
+                Dtype::F32 => "F32",
+                Dtype::U8 => "U8",
+            };
+            let mut bytes = vec![0; tensor.nbytes as usize];
+            tensors.read_raw(&tensor.name, &mut bytes)?;
+            let mut blob = Blob::new(&tensor.name, dtype, tensor.shape.clone(), bytes);
+            if tensor.name == "model.layers.0.self_attn.q_a_proj.weight" {
+                blob = blob.with_kblock_layout(tensor.shape[0] as usize, 1);
+                assert!(blob.layout.is_some());
+            }
+            blobs.push(if peregrine_core::safetensors::layer_tensor(&tensor.name).is_some() {
+                blob.with_compression(Compression::Zstd)
+            } else {
+                blob
+            });
+        }
+        drop(tensors);
+        write_safetensors(&dir, &blobs)?;
+
+        let mut resident = Model::load_streaming(&dir, false)?;
+        let mut demand = Model::load_inner(&dir, Some(ExpertMode::Demand), None, None)?;
+        let tokens = [1, 5, 9, 2, 7];
+        assert!(demand.demand_experts);
+        let want = resident.forward_step(&tokens, 0)?;
+        assert_eq!(want, demand.forward_step(&tokens, 0)?);
+        for mode in [ExpertMode::Demand, ExpertMode::Resident] {
+            let mut disk = Model::load_with_layer_window(&dir, Some(mode), None, Some(false), 3)?;
+            assert_eq!(want, disk.forward_step(&tokens, 0)?);
+        }
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 
@@ -8710,7 +8924,6 @@ mod tests {
         assert_eq!(cap_ecache_budget(4 << 30, 2 << 30, 2 << 30, 1 << 30), 0);
     }
 
-    #[test]
     /// One ring per device is the whole point of the device-aware sizing: with
     /// fewer rings than device groups, `ring_homes` leaves at least one group
     /// with no home ring, reachable only by a ring that has run dry.
@@ -8779,6 +8992,7 @@ mod tests {
         assert!(b > a, "an extra ring must cost extra reserve, else the projection is blind to it");
     }
 
+    #[test]
     fn stream_transient_reserve_scales_with_lanes() {
         assert_eq!(stream_transient_reserve(4, 8, 1000), (4 * experts_per_batch() + 8) * 1000);
         assert_eq!(stream_transient_reserve(0, 0, 1000), 0); // no lanes → no reserve

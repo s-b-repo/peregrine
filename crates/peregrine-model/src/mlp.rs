@@ -5,8 +5,10 @@
 //! (M2), CACHE_ROUTE, and EXPERT_BUDGET opt-ins.
 
 use crate::math::silu_mul;
-use crate::router::{batch_union, route, RouterCfg};
+use crate::router::{batch_union, route, Routed, RouterCfg};
 use crate::weight::QtWeight;
+use peregrine_core::safetensors::TensorReader;
+use peregrine_core::Error;
 
 /// One expert (or the shared expert / a dense layer's MLP): gate, up, down.
 pub struct Mlp {
@@ -16,6 +18,14 @@ pub struct Mlp {
 }
 
 impl Mlp {
+    pub(crate) fn load(st: &TensorReader<'_>, prefix: &str, hidden: usize, inter: usize) -> Result<Self, Error> {
+        Ok(Self {
+            gate: QtWeight::load_from(st, &format!("{prefix}gate_proj.weight"), inter, hidden)?,
+            up: QtWeight::load_from(st, &format!("{prefix}up_proj.weight"), inter, hidden)?,
+            down: QtWeight::load_from(st, &format!("{prefix}down_proj.weight"), hidden, inter)?,
+        })
+    }
+
     /// SwiGLU: `down( silu(gate·x) ⊙ (up·x) )`. Input `x[s_n, gate.i]`, output
     /// `[s_n, down.o]`.
     pub fn swiglu(&self, x: &[f32], s_n: usize) -> Vec<f32> {
@@ -55,13 +65,65 @@ pub fn moe_forward(
     let e_n = experts.len();
     let r = route(x, router_w, router_bias, RouterCfg { s_n, d_n: hidden, e_n, k, norm_topk, routed_scale, min_share: crate::router::route_min_share() });
     let mut out = vec![0f32; s_n * hidden];
-
-    // Gather each routed expert's positions (+ gate weights) in batch-union order.
-    struct Plan {
-        e: usize,
-        rows: Vec<usize>,
-        rw: Vec<f32>,
+    let plans = expert_plans(&r, s_n, e_n);
+    let hs: Vec<Vec<f32>> = peregrine_par::par_map(plans.len(), peregrine_par::PAR_MOE_MIN, |i| {
+        let plan = &plans[i];
+        let mut rows = Vec::with_capacity(plan.rows.len() * hidden);
+        plan.gather(x, hidden, &mut rows);
+        experts[plan.expert].swiglu(&rows, plan.rows.len())
+    });
+    for (plan, h) in plans.iter().zip(&hs) {
+        plan.scatter(&mut out, h, hidden);
     }
+    add_shared(&mut out, shared, x, s_n);
+    out
+}
+
+pub(crate) fn moe_forward_demand(
+    r: &Routed,
+    x: &[f32],
+    shared: Option<&Mlp>,
+    cfg: MoeCfg,
+    n_experts: usize,
+    mut load: impl FnMut(usize) -> Result<Mlp, Error>,
+) -> Result<Vec<f32>, Error> {
+    let MoeCfg { s_n, hidden, .. } = cfg;
+    let mut out = vec![0.0; s_n * hidden];
+    let mut rows = Vec::new();
+    for plan in expert_plans(r, s_n, n_experts) {
+        plan.gather(x, hidden, &mut rows);
+        let output = load(plan.expert)?.swiglu(&rows, plan.rows.len());
+        plan.scatter(&mut out, &output, hidden);
+    }
+    add_shared(&mut out, shared, x, s_n);
+    Ok(out)
+}
+
+struct ExpertPlan {
+    expert: usize,
+    rows: Vec<usize>,
+    weights: Vec<f32>,
+}
+
+impl ExpertPlan {
+    fn gather(&self, input: &[f32], hidden: usize, rows: &mut Vec<f32>) {
+        rows.clear();
+        for &row in &self.rows {
+            rows.extend_from_slice(&input[row * hidden..(row + 1) * hidden]);
+        }
+    }
+
+    fn scatter(&self, out: &mut [f32], values: &[f32], hidden: usize) {
+        for ((&row, &weight), src) in self.rows.iter().zip(&self.weights).zip(values.chunks_exact(hidden)) {
+            let dst = &mut out[row * hidden..(row + 1) * hidden];
+            for (o, &value) in dst.iter_mut().zip(src) {
+                *o += weight * value;
+            }
+        }
+    }
+}
+
+fn expert_plans(r: &Routed, s_n: usize, e_n: usize) -> Vec<ExpertPlan> {
     // One pass over the routing table buckets every expert's rows; the previous
     // shape rescanned the whole table once per unique expert
     // (O(|union| × S × K) — millions of comparisons per sparse layer on a long
@@ -70,14 +132,14 @@ pub fn moe_forward(
     // Emission stays in `batch_union` order and rows stay in ascending `s` with
     // the first matching `kk` per position, so the scatter order — and therefore
     // the f32 accumulation order — is bit-identical to the rescan version.
-    let union = batch_union(&r, s_n);
+    let union = batch_union(r, s_n);
     let mut slot_of: Vec<Option<usize>> = vec![None; e_n];
-    let mut plans: Vec<Plan> = Vec::with_capacity(union.len());
+    let mut plans = Vec::with_capacity(union.len());
     for &e in union.iter() {
         if let Some(slot) = usize::try_from(e).ok().filter(|&e| e < e_n) {
             if slot_of[slot].is_none() {
                 slot_of[slot] = Some(plans.len());
-                plans.push(Plan { e: slot, rows: Vec::new(), rw: Vec::new() });
+                plans.push(ExpertPlan { expert: slot, rows: Vec::new(), weights: Vec::new() });
             }
         }
     }
@@ -90,41 +152,20 @@ pub fn moe_forward(
                 continue;
             }
             plans[pi].rows.push(s);
-            plans[pi].rw.push(r.w[s * r.k + kk]);
+            plans[pi].weights.push(r.w[s * r.k + kk]);
         }
     }
     plans.retain(|p| !p.rows.is_empty());
 
-    // Compute each expert's SwiGLU on the pool (disjoint scratch), then scatter
-    // SERIALLY in batch-union order — a row hit by two experts accumulates in the
-    // same order as the serial loop, so the result is bit-identical (f32 `+=` is not
-    // associative). This mirrors the concurrent streaming lane's post-scope reduce.
-    let hs: Vec<Vec<f32>> = peregrine_par::par_map(plans.len(), peregrine_par::PAR_MOE_MIN, |i| {
-        let p = &plans[i];
-        let nr = p.rows.len();
-        let mut xg = vec![0f32; nr * hidden];
-        for (ri, &s) in p.rows.iter().enumerate() {
-            xg[ri * hidden..ri * hidden + hidden].copy_from_slice(&x[s * hidden..s * hidden + hidden]);
-        }
-        experts[p.e].swiglu(&xg, nr)
-    });
-    for (p, h) in plans.iter().zip(&hs) {
-        for (ri, (&s, &wgt)) in p.rows.iter().zip(&p.rw).enumerate() {
-            let dst = &mut out[s * hidden..s * hidden + hidden];
-            let src = &h[ri * hidden..ri * hidden + hidden];
-            for d in 0..hidden {
-                dst[d] += wgt * src[d];
-            }
-        }
-    }
+    plans
+}
 
+fn add_shared(out: &mut [f32], shared: Option<&Mlp>, x: &[f32], s_n: usize) {
     if let Some(sh) = shared {
-        let hs = sh.swiglu(x, s_n);
-        for z in 0..s_n * hidden {
-            out[z] += hs[z];
+        for (o, value) in out.iter_mut().zip(sh.swiglu(x, s_n)) {
+            *o += value;
         }
     }
-    out
 }
 
 #[cfg(test)]

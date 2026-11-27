@@ -45,7 +45,8 @@ unmodified configuration before you rely on it:
 | Var | Default | Effect |
 |---|---|---|
 | `COLI_MODEL` | unset | model directory (serve mode; wins over the positional arg; the only source for `bench`). The directory may carry a `model_paths.json` — see below |
-| `COLI_STREAM` | auto | `1`/`0` force/disable expert streaming (auto-decided from available RAM vs model size) |
+| `COLI_STREAM` | auto | `1` forces concurrent expert streaming, `0` loads all experts with their layer, and `demand` loads one routed expert at a time in batch-union order. Demand mode supports compressed weights and trades I/O overlap for lower peak expert memory. |
+| `COLI_LAYER_STREAM` | `0` | Number of whole transformer layers to stage from disk. `0` keeps the stack resident. `true` selects a two-layer window. |
 | `COLI_RSS_GUARD_GB` | projected peak | RSS ceiling the runtime guard enforces — [note](#coli_rss_guard_gb) |
 | `COLI_RAM_OVERCOMMIT` | off | skip the pre-load RAM check — [note](#coli_ram_overcommit) |
 | `COLI_DIRECT_LOAD` | off | read the resident trunk through O_DIRECT at load (`peregrine-core/src/safetensors.rs`) |
@@ -73,6 +74,37 @@ and a file name present in two directories is a hard error — the loader will
 not guess which copy to serve. A listed directory that is missing or not
 mounted fails the load immediately with the path named, rather than serving a
 silently incomplete model.
+
+### Stream whole layers from SSDs
+
+`COLI_LAYER_STREAM=2` prefetches layer weights through a dedicated Linux
+`io_uring` ring. Reads from the active drives are interleaved within the window,
+and reads for later layers can run while the current layer computes. Prefill
+and batched decode share one disk pass across their input rows. The embedding,
+output head, final norm, and optional MTP head load at startup. RAM preflight
+includes the staging window and decoded layer.
+
+Use the mode on an existing checkpoint or distribute complete layers across
+SSDs. Pass each drive's new model directory once. Its parent must already
+exist. The command alternates layer files across the drive directories in
+forward order and creates the model directory and `model_paths.json`.
+
+```bash
+peregrine-reshard --model /models/source --out /models/ssd-layout \
+  --layer-drive /mnt/ssd0/my-model --layer-drive /mnt/ssd1/my-model --verify
+COLI_LAYER_STREAM=2 peregrine-serve --model /models/ssd-layout
+```
+
+Add `--dry-run` to inspect the split and its per-drive byte counts. A window
+at least as wide as the SSD count can read across all of them, subject to the
+available RAM. Set `COLI_DIRECT=1` to bypass the page cache on drives that
+support direct reads. When `io_uring` is unavailable, the loader logs a
+fallback to positioned reads and still loads one layer at a time.
+
+Streamed attention and dense MLPs compute on the CPU. For MoE checkpoints,
+`COLI_STREAM=demand` can limit routed expert working memory independently of
+the layer window. Next-layer router look-ahead and its evaluation require a
+resident stack.
 
 ### `COLI_RSS_GUARD_GB`
 
@@ -478,7 +510,7 @@ finally the one in force. Only takes effect with `COLI_PREDICT_SOURCE=phase-awar
 | `COLI_KV_POOL_MB` | 0 | recycle a retired sequence's KV allocations — [note](#coli_kv_pool_mb) |
 | `COLI_PREFIX_CACHE_MB` | **2048** (2026-08-13) | cross-request KV prefix cache (`0` disables); caches prompts *and* generated tokens, matched by comparing tokens, not hashing |
 | `COLI_MAX_BATCH_ROWS` | 0 | ceiling on rows in one fused forward (chunk yields first; bounds draft depth); `0` = uncapped |
-| `COLI_QUEUE_DEPTH` | 0 | admission backlog cap; a submit at the cap gets an OpenAI-shaped 503 instead of queueing forever; `0` = unbounded |
+| `COLI_QUEUE_DEPTH` | 128 | Native HTTP admission backlog. A full queue returns HTTP 503. Set `0` for an unbounded queue. |
 | `COLI_TOK_MERGE_SIMD` | auto | tokenizer short-merge tier A/B (`auto`\|`scalar`\|`avx2`\|`avx512`); auto = measured scalar default — see [tokenizer.md](tokenizer.md) |
 | `COLI_DRAFT` | 0 | MTP speculative-decode depth — [note](#coli_draft) |
 | `COLI_DRAFT_SAMPLED` | off | extend speculation to temperature > 0 — [note](#coli_draft_sampled) |

@@ -16,26 +16,29 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod batch;
+mod http;
 mod kvstore;
 mod memo;
+mod omni;
 mod tok;
 mod tools;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{rejection::JsonRejection, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
-use batch::{EngineHandle, EngineOut, EngineRequest, Priority};
-use clap::Parser;
+use axum::{middleware, Json, Router};
+use batch::{EngineHandle, EngineOut, EngineRequest, FinishReason, Priority};
+use clap::{CommandFactory, Parser};
 use peregrine_core::Error;
 use peregrine_model::{Model, Sampler};
 use serde::{Deserialize, Serialize};
 use tok::TokenBackend;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// CLI configuration.
@@ -43,16 +46,33 @@ use tokio_stream::wrappers::ReceiverStream;
 #[command(name = "peregrine-serve", about = "OpenAI-compatible server for peregrine")]
 struct Args {
     /// Model directory (config.json + *.safetensors + tokenizer.json). Falls back to $COLI_MODEL.
-    #[arg(long, env = "COLI_MODEL")]
-    model: String,
+    #[arg(long, conflicts_with = "omni_suite")]
+    model: Option<PathBuf>,
+    /// Serve trained checkpoints from an Omni suite bundle.
+    #[arg(long, value_name = "BUNDLE")]
+    omni_suite: Option<PathBuf>,
+    /// Omni binary for the suite. Defaults to runtime/omni in the suite artifact root.
+    #[arg(long, requires = "omni_suite")]
+    omni_bin: Option<PathBuf>,
+    /// Suite artifact root. Defaults to BUNDLE/artifacts.
+    #[arg(long, requires = "omni_suite")]
+    suite_artifacts: Option<PathBuf>,
+    /// A Subnext store for the suite's evidence routes.
+    #[arg(long, requires = "omni_suite")]
+    context_store: Option<PathBuf>,
     /// Bind host (default localhost for safety).
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     /// Bind port.
     #[arg(long, default_value_t = 8080)]
     port: u16,
-    /// Require this bearer token on every request when set.
-    #[arg(long, env = "PEREGRINE_API_KEY")]
+    /// Require this bearer token on API requests when set.
+    #[arg(
+        long,
+        env = "PEREGRINE_API_KEY",
+        hide_env_values = true,
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
     api_key: Option<String>,
     /// Hard cap on generated tokens per request.
     #[arg(long, default_value_t = 1024)]
@@ -60,17 +80,17 @@ struct Args {
     /// Hard cap on prompt tokens per request.
     #[arg(long, default_value_t = 8192)]
     max_prompt_tokens: usize,
-    /// Public model id reported by /v1/models and in responses.
-    #[arg(long, default_value = "glm-5.2")]
-    model_id: String,
-    /// Max sequences decoded together per batched step (continuous-batching width).
+    /// Public model id for a native checkpoint. Defaults to its directory name.
+    #[arg(long)]
+    model_id: Option<String>,
+    /// Max sequences per batched step, or max concurrent Omni workers in suite mode.
     #[arg(long, default_value_t = 32)]
     max_batch: usize,
     /// Benchmark the tokenizer backends on a text file and exit: encodes the
     /// file through the gigatoken tokenizer, reports MB/s. Needs
     /// `<model>/tokenizer.json`; no model weights are loaded.
-    #[arg(long, value_name = "TEXT_FILE")]
-    bench_tokenizer: Option<std::path::PathBuf>,
+    #[arg(long, value_name = "TEXT_FILE", conflicts_with = "omni_suite")]
+    bench_tokenizer: Option<PathBuf>,
 }
 
 /// Shared, cloneable server state.
@@ -82,6 +102,8 @@ struct AppState {
 struct Inner {
     engine: EngineHandle,
     tokenizer: Arc<TokenBackend>,
+    encode_slots: Arc<Semaphore>,
+    model_id: String,
     args: Args,
     /// Bounded exact response memo. Serves a byte-identical greedy request from a
     /// prior certified completion without entering the model. Deliberately *not*
@@ -101,6 +123,8 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     max_tokens: Option<usize>,
+    #[serde(default)]
+    max_completion_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
@@ -125,6 +149,15 @@ struct ChatRequest {
     /// does not implement — claiming otherwise would be worse than ignoring it.
     #[serde(default)]
     tool_choice: Option<serde_json::Value>,
+}
+
+impl ChatRequest {
+    fn token_limit(&self) -> Result<Option<usize>, ApiError> {
+        match self.max_completion_tokens.or(self.max_tokens) {
+            Some(0) => Err(ApiError::bad_request("the completion token limit must be positive")),
+            limit => Ok(limit),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -448,26 +481,8 @@ async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
-    let prompt = build_prompt(&req.messages, active_tools(req), state.inner.chatml_prompt);
-    // Encode is CPU-bound and serialized behind the process-wide encode mutex
-    // (`tok.rs`: `encode` is `&mut`, so every request takes the same lock). Run it
-    // on the blocking pool: a burst of B arrivals then parks blocking-pool threads
-    // waiting on that mutex, not the runtime workers the SSE pump tasks and every
-    // other endpoint are scheduled on. parking_lot does not yield to tokio, so
-    // before this change B-1 of a burst's handlers each pinned a worker thread
-    // doing nothing.
-    let tokenizer = state.inner.tokenizer.clone();
-    let ids = tk(tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
-        .await
-        .map_err(|e| ApiError::internal(format!("encode task: {e}")))?)?;
-    if ids.len() > state.inner.args.max_prompt_tokens {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "invalid_request_error",
-            format!("prompt is {} tokens; max is {}", ids.len(), state.inner.args.max_prompt_tokens),
-        ));
-    }
-    let max_new = req.max_tokens.unwrap_or(256).min(state.inner.args.max_tokens).max(1);
+    let max_new = req.token_limit()?.unwrap_or(256).min(state.inner.args.max_tokens);
+    let (_, ids) = encode_prompt(state, req).await?;
     let temperature = req.temperature.unwrap_or(0.0).clamp(0.0, 2.0);
     let top_p = req.top_p.unwrap_or(0.95).clamp(0.0, 1.0);
     // `0` is "no rank cutoff", which is both the historical behaviour and what
@@ -476,6 +491,33 @@ async fn resolve_params(state: &AppState, req: &ChatRequest) -> Result<(Vec<u32>
     // and `Sampler` applies that itself.
     let top_k = req.top_k.unwrap_or(0) as usize;
     Ok((ids, max_new, Sampling { temperature, top_p, top_k }))
+}
+
+async fn encode_prompt(state: &AppState, req: &ChatRequest) -> Result<(String, Vec<u32>), ApiError> {
+    let permit = Arc::clone(&state.inner.encode_slots).try_acquire_owned().map_err(|error| {
+        peregrine_io::note_advisory_err("tokenizer admission", &error);
+        ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "overloaded_error", "tokenizer is busy")
+    })?;
+    let prompt = build_prompt(&req.messages, active_tools(req), state.inner.chatml_prompt);
+    let tokenizer = Arc::clone(&state.inner.tokenizer);
+    // Retain admission until the blocking task completes, including after a disconnect.
+    let (prompt, ids) = tokio::task::spawn_blocking(move || {
+        let result = tokenizer.encode(&prompt).map(|ids| (prompt, ids));
+        drop(permit);
+        result
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("encode task: {e}")))?
+    .map_err(ApiError::from)?;
+    let cap = state.inner.args.max_prompt_tokens;
+    if ids.len() > cap {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            format!("prompt is {} tokens; max is {cap}", ids.len()),
+        ));
+    }
+    Ok((prompt, ids))
 }
 
 /// A header value as UTF-8, treating a non-UTF-8 value as absent — the lax
@@ -489,31 +531,6 @@ fn header_utf8(v: &axum::http::HeaderValue) -> Option<&str> {
             None
         }
     }
-}
-
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let Some(want) = state.inner.args.api_key.as_deref() else {
-        return Ok(());
-    };
-    let got = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(header_utf8)
-        .and_then(|s| s.strip_prefix("Bearer "));
-    if got.is_some_and(|g| constant_time_eq(g.as_bytes(), want.as_bytes())) {
-        Ok(())
-    } else {
-        Err(ApiError::new(StatusCode::UNAUTHORIZED, "invalid_request_error", "missing or invalid API key"))
-    }
-}
-
-/// Compare two secrets without leaking their common prefix length through
-/// timing. `==` on strings returns at the first differing byte, which lets a
-/// caller recover the key byte-by-byte.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -683,22 +700,21 @@ async fn metrics(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<ModelList>, ApiError> {
-    check_auth(&state, &headers)?;
+async fn list_models(State(state): State<AppState>) -> Result<Json<ModelList>, ApiError> {
     Ok(Json(ModelList {
         object: "list",
-        data: vec![ModelCard { id: state.inner.args.model_id.clone(), object: "model", owned_by: "peregrine" }],
+        data: vec![ModelCard { id: state.inner.model_id.clone(), object: "model", owned_by: "peregrine" }],
     }))
 }
 
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<ChatRequest>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    check_auth(&state, &headers)?;
+    let req = http::json_body(body)?;
     let (ids, max_new, sampling) = resolve_params(&state, &req).await?;
-    let model_id = state.inner.args.model_id.clone();
+    let model_id = state.inner.model_id.clone();
     let priority = priority_from_header(headers.get("x-peregrine-priority").and_then(header_utf8));
     let class = classify_request(&req.messages);
     let tokenizer = state.inner.tokenizer.clone();
@@ -730,14 +746,15 @@ async fn chat_completions(
             let stream = req.stream;
             let tool_defs = active_tools(&req).to_vec();
             let replay_tok = tokenizer.clone();
-            let frame = ReplayFrame {
+            let frame = CompletionFrame {
                 completion_id: completion_id.clone(),
                 model_id: model_id.clone(),
                 created,
                 prompt_tokens,
             };
             return tokio::task::spawn_blocking(move || {
-                memo_response(stream, &tool_defs, &replay_tok, &out_ids, &frame)
+                let reason = if out_ids.len() == max_new { FinishReason::Length } else { FinishReason::Stop };
+                memo_response(stream, &tool_defs, &replay_tok, &out_ids, &frame, reason)
             })
             .await
             .map_err(|e| ApiError::internal(format!("memo replay task: {e}")))?;
@@ -757,14 +774,7 @@ async fn chat_completions(
         // from them, and the spawned task owns everything it touches.
         let stream_tools: Vec<tools::ToolDef> = active_tools(&req).to_vec();
         tokio::spawn(async move {
-            // Token payloads split multi-byte characters, so deltas come from an
-            // incremental decoder that holds an unfinished character until the
-            // next token completes it (see `IncrementalDecoder`).
-            let mut dec = tok::IncrementalDecoder::new();
-            // One lock acquisition per stream, then per-token decode is a
-            // lock-free table read — N streams at token rate must not contend
-            // on the encode mutex.
-            let vocab = tokenizer.decode_handle();
+            let mut dec = tokenizer.stream();
             let mut out_ids: Vec<u32> = Vec::new();
             // Tool markup arrives split across tokens, so the decoded text goes
             // through the filter before any of it becomes a delta: a client must
@@ -775,11 +785,16 @@ async fn chat_completions(
             if sse_tx.send(Ok(chunk_event(&cid, &mid, created, None, Some("assistant"), None))).await.is_err() {
                 return; // client disconnected before the first frame
             }
-            while let Some(msg) = rx.recv().await {
+            let reason = loop {
+                let msg = tokio::select! {
+                    () = sse_tx.closed() => return,
+                    msg = rx.recv() => msg,
+                }
+                .unwrap_or_else(|| EngineOut::Error("inference ended before completion".into()));
                 match msg {
                     EngineOut::Token(t) => {
                         out_ids.push(t);
-                        let decoded = dec.push(vocab.token_bytes(t).unwrap_or(&[]));
+                        let decoded = dec.push(t);
                         if decoded.is_empty() {
                             continue; // token only extended an unfinished character
                         }
@@ -799,6 +814,7 @@ async fn chat_completions(
                             return; // client disconnected
                         }
                     }
+                    EngineOut::Finished(reason) => break reason,
                     EngineOut::Error(m) => {
                         if sse_tx.send(Ok(sse_error(&m))).await.is_err() {
                             peregrine_core::note_advisory_err("SSE error event", &"client already disconnected");
@@ -806,18 +822,21 @@ async fn chat_completions(
                         return;
                     }
                 }
-            }
-            // Reaching here means the engine's channel closed with no error, so the
-            // completion is whole. Every earlier exit — an engine error, a client
-            // disconnect mid-stream — returns above with a partial `out_ids` and
-            // memoizes nothing: a truncated answer replayed as a complete one would
-            // be worse than no memo at all.
+            };
+            let decoded_tail = match dec.finish(&tokenizer, &out_ids) {
+                Ok(text) => text,
+                Err(error) => {
+                    if sse_tx.send(Ok(sse_error(&error.to_string()))).await.is_err() {
+                        peregrine_core::note_advisory_err("SSE decode error", &error);
+                    }
+                    return;
+                }
+            };
             if let Some(key) = memo_key {
                 memo_state.memo.lock().insert(key, out_ids);
             }
             // tail frames: a send error just means the client hung up first
             let tail = {
-                let decoded_tail = dec.finish();
                 let mut t = filter.push(&decoded_tail);
                 t.push_str(&filter.finish());
                 t
@@ -837,7 +856,7 @@ async fn chat_completions(
                 emitted_calls += 1;
                 hung_up = hung_up || sse_tx.send(Ok(tool_call_chunk_event(&cid, &mid, created, call))).await.is_err();
             }
-            let finish = if emitted_calls > 0 { "tool_calls" } else { "stop" };
+            let finish = if emitted_calls > 0 { "tool_calls" } else { reason.as_str() };
             if hung_up
                 || sse_tx.send(Ok(chunk_event(&cid, &mid, created, None, None, Some(finish)))).await.is_err()
                 || sse_tx.send(Ok(Event::default().data("[DONE]"))).await.is_err()
@@ -850,35 +869,27 @@ async fn chat_completions(
     } else {
         // Non-streaming: collect the whole token stream, decode once, one JSON body.
         let mut out_ids: Vec<u32> = Vec::new();
-        while let Some(msg) = rx.recv().await {
+        let reason = loop {
+            let msg = rx.recv().await.ok_or_else(|| ApiError::internal("inference ended before completion"))?;
             match msg {
                 EngineOut::Token(t) => out_ids.push(t),
+                EngineOut::Finished(reason) => break reason,
                 EngineOut::Error(m) => return Err(ApiError::internal(m)),
             }
-        }
-        // The stream closed without an error, so this completion is whole and may be
-        // memoized. The error arm above returns instead, so a failed generation is
-        // never stored.
-        if let Some(key) = memo_key {
-            state.inner.memo.lock().insert(key, out_ids.clone());
-        }
-        // Decode goes through the same global tokenizer mutex as encode, so it
-        // belongs on the blocking pool for the same reason (see `resolve_params`).
+        };
+        let (text, out_ids) = tokio::task::spawn_blocking(move || {
+            tokenizer.decode(&out_ids).map(|text| (text, out_ids))
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("decode task: {e}")))?
+        .map_err(ApiError::from)?;
+        let (text, calls) = split_output(&text, active_tools(&req));
         let n_out = out_ids.len();
-        let decoded = tokio::task::spawn_blocking(move || tokenizer.decode(&out_ids))
-            .await
-            .map_err(|e| ApiError::internal(format!("decode task: {e}")))?;
-        let (text, calls) = split_output(&tk(decoded)?, active_tools(&req));
-        Ok(Json(json_completion(
-            &text,
-            &calls,
-            &completion_id,
-            &model_id,
-            created,
-            prompt_tokens,
-            n_out,
-        ))
-        .into_response())
+        if let Some(key) = memo_key {
+            state.inner.memo.lock().insert(key, out_ids);
+        }
+        let frame = CompletionFrame { completion_id, model_id, created, prompt_tokens };
+        Ok(Json(json_completion(&text, &calls, &frame, n_out, reason)).into_response())
     }
 }
 
@@ -897,22 +908,15 @@ async fn chat_completions(
 /// hunted is usually in the markup.
 async fn debug_tokenize(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<ChatRequest>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_auth(&state, &headers)?;
-    let prompt = build_prompt(&req.messages, active_tools(&req), state.inner.chatml_prompt);
-    let tokenizer = state.inner.tokenizer.clone();
-    let p2 = prompt.clone();
-    let ids = tk(tokio::task::spawn_blocking(move || tokenizer.encode(&p2))
-        .await
-        .map_err(|e| ApiError::internal(format!("encode task: {e}")))?)?;
+    let req = http::json_body(body)?;
+    let (prompt, ids) = encode_prompt(&state, &req).await?;
     // Per-id decode alongside the ids: an id that renders to nothing is the
     // signature that matters, and only the pairing makes it visible.
-    let vocab = state.inner.tokenizer.decode_handle();
-    let pieces: Vec<String> = ids
+    let pieces: Vec<Option<String>> = ids
         .iter()
-        .map(|&t| String::from_utf8_lossy(vocab.token_bytes(t).unwrap_or(&[])).into_owned())
+        .map(|&token| state.inner.tokenizer.piece(token))
         .collect();
     Ok(Json(serde_json::json!({
         "prompt": prompt,
@@ -927,19 +931,18 @@ async fn debug_tokenize(
 fn json_completion(
     text: &str,
     calls: &[tools::ParsedCall],
-    completion_id: &str,
-    model_id: &str,
-    created: u64,
-    prompt_tokens: usize,
+    frame: &CompletionFrame,
     completion_tokens: usize,
+    reason: FinishReason,
 ) -> serde_json::Value {
+    let CompletionFrame { completion_id, model_id, created, prompt_tokens } = frame;
     let mut message = serde_json::Map::new();
     message.insert("role".into(), serde_json::json!("assistant"));
     // `content` stays present-but-null when the turn was only tool calls: a
     // client that reads `content` unconditionally gets null, not the markup.
     message.insert(
         "content".into(),
-        if text.is_empty() && !calls.is_empty() { serde_json::Value::Null } else { serde_json::json!(text) },
+        if text.trim().is_empty() && !calls.is_empty() { serde_json::Value::Null } else { serde_json::json!(text) },
     );
     if !calls.is_empty() {
         let arr: Vec<serde_json::Value> =
@@ -948,7 +951,7 @@ fn json_completion(
     }
     // A turn with calls finishes as `tool_calls`; agent clients branch on this
     // rather than on the presence of the array.
-    let finish = if calls.is_empty() { "stop" } else { "tool_calls" };
+    let finish = if calls.is_empty() { reason.as_str() } else { "tool_calls" };
     serde_json::json!({
         "id": completion_id,
         "object": "chat.completion",
@@ -962,7 +965,7 @@ fn json_completion(
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
+            "total_tokens": *prompt_tokens + completion_tokens
         }
     })
 }
@@ -980,7 +983,7 @@ fn json_completion(
 /// as one ready-made stream with no engine behind it.
 /// The framing a memo replay rebuilds — always *this* request's identifiers and
 /// timestamp, never the original's (see [`memo_response`]).
-struct ReplayFrame {
+struct CompletionFrame {
     completion_id: String,
     model_id: String,
     created: u64,
@@ -992,33 +995,24 @@ fn memo_response(
     tool_defs: &[tools::ToolDef],
     tokenizer: &TokenBackend,
     out_ids: &[u32],
-    frame: &ReplayFrame,
+    frame: &CompletionFrame,
+    reason: FinishReason,
 ) -> Result<Response, ApiError> {
     let (completion_id, model_id) = (frame.completion_id.as_str(), frame.model_id.as_str());
     let created = frame.created;
     if !stream {
         let (text, calls) = split_output(&tk(tokenizer.decode(out_ids))?, tool_defs);
-        return Ok(Json(json_completion(
-            &text,
-            &calls,
-            completion_id,
-            model_id,
-            created,
-            frame.prompt_tokens,
-            out_ids.len(),
-        ))
-        .into_response());
+        return Ok(Json(json_completion(&text, &calls, frame, out_ids.len(), reason)).into_response());
     }
     let mut events: Vec<Result<Event, std::convert::Infallible>> =
         vec![Ok(chunk_event(completion_id, model_id, created, None, Some("assistant"), None))];
-    let mut dec = tok::IncrementalDecoder::new();
+    let mut dec = tokenizer.stream();
     // The replay runs through the same filter as a live stream, so a memoized
     // tool call comes back as a call and not as the markup that produced it.
     let mut filter = tools::OutputFilter::with_tools(tool_defs);
     let mut emitted_calls = 0usize;
-    let vocab = tokenizer.decode_handle();
     for &t in out_ids {
-        let decoded = dec.push(vocab.token_bytes(t).unwrap_or(&[]));
+        let decoded = dec.push(t);
         if decoded.is_empty() {
             continue;
         }
@@ -1033,7 +1027,7 @@ fn memo_response(
         }
     }
     let tail = {
-        let decoded_tail = dec.finish();
+        let decoded_tail = tk(dec.finish(tokenizer, out_ids))?;
         let mut t = filter.push(&decoded_tail);
         t.push_str(&filter.finish());
         t
@@ -1046,7 +1040,7 @@ fn memo_response(
         emitted_calls += 1;
         events.push(Ok(tool_call_chunk_event(completion_id, model_id, created, call)));
     }
-    let finish = if emitted_calls > 0 { "tool_calls" } else { "stop" };
+    let finish = if emitted_calls > 0 { "tool_calls" } else { reason.as_str() };
     events.push(Ok(chunk_event(completion_id, model_id, created, None, None, Some(finish))));
     events.push(Ok(Event::default().data("[DONE]")));
     Ok(Sse::new(tokio_stream::iter(events)).keep_alive(KeepAlive::default()).into_response())
@@ -1059,7 +1053,7 @@ fn split_output(raw: &str, tool_defs: &[tools::ToolDef]) -> (String, Vec<tools::
     let mut f = tools::OutputFilter::with_tools(tool_defs);
     let mut text = f.push(raw);
     text.push_str(&f.finish());
-    (text.trim().to_string(), f.take_calls())
+    (text, f.take_calls())
 }
 
 /// A tool call's id, derived from the completion id so it is unique per
@@ -1289,15 +1283,63 @@ fn install_moe_engine() {
     }
 }
 
+async fn bind(host: &str, port: u16) -> Result<tokio::net::TcpListener, std::io::Error> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(host);
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    eprintln!("peregrine-serve listening on http://{}", listener.local_addr()?);
+    Ok(listener)
+}
+
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let result = match signal(SignalKind::terminate()) {
+        Ok(mut terminate) => tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        },
+        Err(error) => {
+            eprintln!("peregrine-serve: SIGTERM handler unavailable ({error})");
+            tokio::signal::ctrl_c().await
+        }
+    };
+    if let Err(error) = result {
+        eprintln!("peregrine-serve: shutdown signal handler failed ({error})");
+    }
+    eprintln!("peregrine-serve shutting down");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = Args::parse();
+    if args.max_tokens == 0 || args.max_prompt_tokens == 0 || args.max_batch == 0 {
+        Args::command()
+            .error(clap::error::ErrorKind::ValueValidation, "token limits and batch size must be positive")
+            .exit();
+    }
+    if let Some(bundle) = &args.omni_suite {
+        return omni::serve(&args, bundle).await;
+    }
+    let Some(dir) = args
+        .model
+        .clone()
+        .or_else(|| std::env::var_os("COLI_MODEL").map(PathBuf::from))
+    else {
+        Args::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "supply --model, COLI_MODEL, or --omni-suite",
+            )
+            .exit();
+    };
     // Cap glibc arenas before the model spawns its worker pools, so the server no
     // longer needs `MALLOC_ARENA_MAX=2` in the environment to keep RSS flat.
     peregrine_model::cap_malloc_arenas();
     eprintln!("{}", peregrine_model::startup_banner());
     install_moe_engine();
-    let args = Args::parse();
-    let dir = std::path::PathBuf::from(&args.model);
     // Tokenizer throughput bench: encode a text file through both backends and
     // exit — no model weights loaded, so it runs anywhere tokenizer.json does.
     if let Some(file) = &args.bench_tokenizer {
@@ -1322,11 +1364,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One engine thread owns the model and continuously batches all requests.
     let (engine, engine_join) = batch::spawn(model, args.max_batch)?;
 
-    let addr = format!("{}:{}", args.host, args.port);
+    let listener = bind(&args.host, args.port).await?;
+    let api_key = args.api_key.take().map(Arc::<str>::from);
+    let model_id = args.model_id.take().unwrap_or_else(|| {
+        dir.file_name().map_or_else(|| "peregrine".into(), |name| name.to_string_lossy().into_owned())
+    });
     let state = AppState {
         inner: Arc::new(Inner {
             engine,
             tokenizer: Arc::new(tokenizer),
+            encode_slots: Arc::new(Semaphore::new(args.max_batch.clamp(4, 64))),
+            model_id,
             args,
             memo: parking_lot::Mutex::new(memo::ResponseMemo::from_env()),
             chatml_prompt,
@@ -1334,22 +1382,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/debug/tokenize", post(debug_tokenize))
+        .route_layer(middleware::from_fn_with_state(api_key, http::authorize))
+        .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("peregrine-serve listening on http://{addr}");
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                eprintln!("peregrine-serve: ctrl-c handler failed ({e}); shutting down");
-            }
-            eprintln!("peregrine-serve shutting down");
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
 
     // Wait for the engine thread to drain before returning from `main`.
@@ -1600,18 +1642,26 @@ mod tests {
     #[test]
     fn a_calls_only_turn_nulls_content_and_finishes_as_tool_calls() {
         let calls = vec![tools::ParsedCall { name: "read".into(), arguments: json!({"p": 1}) }];
-        let v = json_completion("", &calls, "chatcmpl-abc", "m", 0, 1, 1);
+        let frame = CompletionFrame {
+            completion_id: "chatcmpl-abc".into(),
+            model_id: "m".into(),
+            created: 0,
+            prompt_tokens: 1,
+        };
+        let v = json_completion("", &calls, &frame, 1, FinishReason::Length);
         let choice = &v["choices"][0];
         assert_eq!(choice["message"]["content"], serde_json::Value::Null, "null, not \"\"");
         assert_eq!(choice["finish_reason"], json!("tool_calls"));
         assert_eq!(choice["message"]["tool_calls"][0]["id"], json!("call_abc_0"));
 
         // Opposite outcome over the same function: no calls → text and "stop".
-        let plain = json_completion("hello", &[], "chatcmpl-abc", "m", 0, 1, 1);
+        let plain = json_completion("hello", &[], &frame, 1, FinishReason::Stop);
         let choice = &plain["choices"][0];
         assert_eq!(choice["message"]["content"], json!("hello"));
         assert_eq!(choice["finish_reason"], json!("stop"));
         assert_eq!(choice["message"].get("tool_calls"), None, "no empty array when there are no calls");
+        let capped = json_completion("hello", &[], &frame, 1, FinishReason::Length);
+        assert_eq!(capped["choices"][0]["finish_reason"], "length");
     }
 
     #[test]

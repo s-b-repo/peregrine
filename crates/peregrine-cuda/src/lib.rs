@@ -432,7 +432,9 @@ impl GpuExpert {
             Err(e) => {
                 // The failed call left nothing queued, but `g`'s copy may still be
                 // in flight; drain before freeing its device memory.
-                let _ = stream_sync(device);
+                if let Err(sync_error) = stream_sync(device) {
+                    eprintln!("[cuda] failed to synchronize interrupted expert upload: {sync_error}");
+                }
                 free_tensor(g);
                 return Err(e);
             }
@@ -440,7 +442,9 @@ impl GpuExpert {
         let d = match upload_tensor_i4_async(device, down.0, down.1, inter, hidden) {
             Ok(t) => t,
             Err(e) => {
-                let _ = stream_sync(device);
+                if let Err(sync_error) = stream_sync(device) {
+                    eprintln!("[cuda] failed to synchronize interrupted expert upload: {sync_error}");
+                }
                 free_tensor(g);
                 free_tensor(u);
                 return Err(e);
@@ -582,19 +586,10 @@ pub fn pin_stats() -> PinStats {
 /// CUDA can then DMA those same bytes to the device, with no copy in between.
 /// Returns whether the pin took.
 ///
-/// **This is a `peregrine_io::set_pin_hook` callback and nothing else.** It is a
-/// safe `fn` because that hook's type is a safe fn pointer; its actual contract
-/// is the hook's contract — `peregrine_io::AlignedBuf` calls it with the base
-/// and length of an allocation it has just made, and calls [`unpin_host`] with
-/// the same pair from its own `Drop`, while the pages are still mapped. Calling
-/// it with anything else is unsound. It lives here rather than in
-/// `peregrine-model` because that crate denies `unsafe`, and this is FFI.
-///
-/// Failure is ordinary rather than exceptional, which is why it returns `bool`
-/// instead of an error: a declined buffer costs the pinned lane and nothing
-/// else — the pageable upload path still works. See [`pin_stats`] for what does
-/// and does not cause a refusal.
-pub fn pin_host(ptr: *mut u8, len: usize) -> bool {
+/// # Safety
+/// `ptr` must address a live allocation of `len` bytes. It must stay mapped
+/// at the same address until a successful pin is released with [`unpin_host`].
+pub unsafe fn pin_host(ptr: *mut u8, len: usize) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     if len < MIN_PIN_BYTES {
         return false; // declined by policy, not by the driver — not counted
@@ -612,18 +607,30 @@ pub fn pin_host(ptr: *mut u8, len: usize) -> bool {
     }
 }
 
-/// Undo a [`pin_host`]. Same contract: a `peregrine_io::set_pin_hook` callback,
-/// called from `AlignedBuf::drop` while the pages are still mapped.
-pub fn unpin_host(ptr: *mut u8, len: usize) {
+/// Release a successful [`pin_host`] registration.
+///
+/// # Safety
+/// The original allocation and its registration must still be live.
+pub unsafe fn unpin_host(ptr: *mut u8, len: usize) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     // SAFETY: the hook contract — a pointer `pin_host` returned true for, still
     // mapped.
     if unsafe { host_unregister(ptr) } {
         PINNED_BUFS.fetch_sub(1, Relaxed);
         PINNED_BYTES.fetch_sub(len as u64, Relaxed);
+        true
     } else {
         eprintln!("[peregrine advisory] cudaHostUnregister failed; pinned pages leaked");
+        false
     }
+}
+
+/// Register the CUDA callbacks with the aligned buffer allocator.
+#[cfg(feature = "cuda")]
+pub fn install_host_pinning() -> bool {
+    // SAFETY: both callbacks check or forward the sizes of live allocations.
+    unsafe { peregrine_io::set_pin_hook(pin_host, unpin_host) };
+    peregrine_io::pin_hook_installed()
 }
 
 /// Pin an existing host allocation with `cudaHostRegister`, so io_uring can DMA
@@ -2346,12 +2353,14 @@ mod gpu_tests {
             return Ok(());
         }
         let before = pin_stats();
-        let pinned = pin_host(ptr, LEN);
+        // SAFETY: the allocation remains mapped until after unpin below.
+        let pinned = unsafe { pin_host(ptr, LEN) };
         let after = pin_stats();
         if pinned {
             assert_eq!(after.buffers, before.buffers + 1, "a pinned buffer must be counted");
             assert_eq!(after.bytes, before.bytes + LEN as u64, "its bytes must be counted");
-            unpin_host(ptr, LEN);
+            // SAFETY: pin accepted this allocation, which is still live.
+            assert!(unsafe { unpin_host(ptr, LEN) });
             let end = pin_stats();
             assert_eq!(end.buffers, before.buffers, "unpin must give the count back");
             assert_eq!(end.bytes, before.bytes, "unpin must give the bytes back");
@@ -2378,7 +2387,8 @@ mod gpu_tests {
     fn pin_host_declines_small_buffers_without_calling_the_driver() {
         let before = pin_stats();
         let mut small = [0u8; 64];
-        assert!(!pin_host(small.as_mut_ptr(), small.len()), "a 64-byte buffer must be declined");
+        // SAFETY: the live buffer is below the minimum registration size.
+        assert!(!unsafe { pin_host(small.as_mut_ptr(), small.len()) }, "a 64-byte buffer must be declined");
         let after = pin_stats();
         assert_eq!(after, before, "a policy refusal must not touch the driver or the counters");
     }

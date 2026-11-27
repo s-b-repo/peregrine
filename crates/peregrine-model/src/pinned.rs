@@ -78,10 +78,7 @@ pub fn install() -> bool {
     if !enabled() || !peregrine_cuda::is_available() {
         return false;
     }
-    // `set_pin_hook` returns false if one is already installed, which on a
-    // second call is this same hook — so the lane is active either way.
-    peregrine_io::set_pin_hook(peregrine_cuda::pin_host, peregrine_cuda::unpin_host);
-    peregrine_io::pin_hook_installed()
+    peregrine_cuda::install_host_pinning()
 }
 
 /// No CUDA in this build: there is nothing to pin against, and the aligned

@@ -14,22 +14,74 @@
 //! filesystem), then `fsync` the directory so the rename itself is durable.
 
 use crate::{Context, Error};
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Replace `path` with `bytes`, atomically. Either the old contents or the new
 /// ones survive a crash — never a partial write.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let tmp = temp_sibling(path)?;
-    // create + ring write + ring fsync, and the file is closed before the
-    // rename. `write_file` carries the no-ring fallback (a positioned write and
-    // `sync_all`), so a host without io_uring still saves its artifacts.
-    peregrine_io::write_file(&tmp, bytes).ctx(|| format!("write {}", tmp.display()))?;
-    finish_swap(&tmp, path)
+    let tmp = AtomicFile::new(path)?;
+    peregrine_io::ring::write_open_file(tmp.file(), bytes)
+        .ctx(|| format!("write {}", path.display()))?;
+    tmp.commit()
 }
 
-/// The temp path [`write_atomic`] would use for `path`, for callers that must
-/// stream their payload instead of holding it in memory (the checkpoint
-/// rewrite). Pair it with [`commit_atomic`].
+/// An exclusively created sibling file. Concurrent writers own independent
+/// inodes, and readers see a complete file once its writer renames it.
+pub struct AtomicFile {
+    target: PathBuf,
+    temp: PathBuf,
+    file: File,
+    committed: bool,
+}
+
+impl AtomicFile {
+    pub fn new(target: &Path) -> Result<Self, Error> {
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        let prefix = temp_sibling(target)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        loop {
+            let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let mut name = prefix.as_os_str().to_os_string();
+            name.push(format!(".{}.{serial}", std::process::id()));
+            let temp = PathBuf::from(name);
+            match options.open(&temp) {
+                Ok(file) => return Ok(Self { target: target.to_path_buf(), temp, file, committed: false }),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error).ctx(|| format!("create {}", temp.display())),
+            }
+        }
+    }
+
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Replace the destination after the caller has synchronized the contents.
+    pub fn commit(mut self) -> Result<(), Error> {
+        finish_swap(&self.temp, &self.target)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for AtomicFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(error) = std::fs::remove_file(&self.temp) {
+                if error.kind() != ErrorKind::NotFound {
+                    crate::note_advisory_err("remove incomplete atomic file", &error);
+                }
+            }
+        }
+    }
+}
+
+/// Legacy fixed sibling name for callers that manage their own staging file.
 pub fn temp_sibling(path: &Path) -> Result<std::path::PathBuf, Error> {
     let name = path
         .file_name()
@@ -39,7 +91,7 @@ pub fn temp_sibling(path: &Path) -> Result<std::path::PathBuf, Error> {
     Ok(path.with_file_name(tmp))
 }
 
-/// Commit a fully-written temp file (from [`temp_sibling`]) over `path`. The
+/// Commit a fully-written staging file over `path`. The
 /// caller is responsible for `sync_all`-ing the temp file's contents first;
 /// this fsyncs the directory so the rename survives a crash.
 pub fn commit_atomic(tmp: &Path, path: &Path) -> Result<(), Error> {
@@ -133,12 +185,29 @@ mod tests {
         let d = tmpdir("failed")?;
         let p = d.join("state.json");
         write_atomic(&p, b"original")?;
-        // A directory at the temp path makes `File::create` fail.
-        let tmp = temp_sibling(&p)?;
-        std::fs::create_dir(&tmp)?;
-        assert!(write_atomic(&p, b"replacement").is_err());
+        let tmp = AtomicFile::new(&p)?;
+        tmp.file().write_all(b"incomplete replacement")?;
+        drop(tmp);
         assert_eq!(std::fs::read(&p)?, b"original", "the old file is intact");
+        assert_eq!(std::fs::read_dir(&d)?.count(), 1);
         std::fs::remove_dir_all(&d)?;
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_writers_commit_independent_files() -> Result<(), Error> {
+        let dir = tmpdir("writers")?;
+        let target = dir.join("state.json");
+        let first = AtomicFile::new(&target)?;
+        let second = AtomicFile::new(&target)?;
+        peregrine_io::ring::write_open_file(first.file(), b"first value")?;
+        peregrine_io::ring::write_open_file(second.file(), b"second")?;
+        first.commit()?;
+        assert_eq!(std::fs::read(&target)?, b"first value");
+        second.commit()?;
+        assert_eq!(std::fs::read(&target)?, b"second");
+        assert_eq!(std::fs::read_dir(&dir)?.count(), 1);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 

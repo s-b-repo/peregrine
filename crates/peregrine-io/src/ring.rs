@@ -330,6 +330,13 @@ mod uring {
             // to free — wait their completions out before anything is dropped.
             if !self.pending.is_empty() || self.advisory_inflight > 0 {
                 self.abort_owned();
+                // A fatal ring error can leave ownership unconfirmed. Keep
+                // those landing allocations alive if no CQE was observed.
+                if !self.pending.is_empty() {
+                    static RETAINED_LANDINGS: std::sync::Mutex<Vec<LandingBuf>> = std::sync::Mutex::new(Vec::new());
+                    let mut retained = RETAINED_LANDINGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    retained.extend(self.pending.drain().map(|(_, read)| read.buf));
+                }
             }
             if !self.registered_bufs.is_empty() {
                 if let Err(e) = self.ring.submitter().unregister_buffers() {
@@ -694,7 +701,7 @@ mod uring {
                     .user_data(0);
                 // SAFETY: buffer outlives the op — completion reaped below.
                 unsafe { self.push_counted(&e) }?;
-                self.ring.submit_and_wait(1)?;
+                self.submit_and_wait(1)?;
                 let mut n: Option<i64> = None;
                 for cqe in self.ring.completion() {
                     n = Some(cqe.result() as i64);
@@ -798,7 +805,7 @@ mod uring {
                     }
                     return Err(err);
                 }
-                self.ring.submit_and_wait(pushed)?;
+                self.submit_and_wait(pushed)?;
                 let mut got = 0usize;
                 for cqe in self.ring.completion() {
                     let ud = cqe.user_data();
@@ -856,7 +863,7 @@ mod uring {
             // SAFETY: Fadvise carries no buffer — the op only hints the page cache.
             // SAFETY: Fadvise carries no buffer.
             unsafe { self.push_counted(&e) }?;
-            self.ring.submit_and_wait(1)?;
+            self.submit_and_wait(1)?;
             let mut n = 0i64;
             for cqe in self.ring.completion() {
                 n = cqe.result() as i64;
@@ -943,6 +950,16 @@ mod uring {
             Ok(())
         }
 
+        fn submit_and_wait(&self, count: usize) -> io::Result<usize> {
+            loop {
+                match self.ring.submit_and_wait(count) {
+                    // An interrupted wait leaves pending operations in flight.
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => return result,
+                }
+            }
+        }
+
         /// Submit `pushed` queued entries and reap exactly that many completions,
         /// discarding their results. Used to return the ring to a clean state on
         /// an error path — an abandoned SQE is visible to the kernel, so leaving
@@ -953,7 +970,7 @@ mod uring {
             if pushed == 0 {
                 return Ok(());
             }
-            let r = self.ring.submit_and_wait(pushed);
+            let r = self.submit_and_wait(pushed);
             let mut seen = 0usize;
             for _ in self.ring.completion() {
                 seen += 1;
@@ -961,7 +978,7 @@ mod uring {
             // A short reap means completions are still in flight; wait them out so
             // the ring is genuinely empty before the caller reuses it.
             while r.is_ok() && seen < pushed {
-                self.ring.submit_and_wait(pushed - seen)?;
+                self.submit_and_wait(pushed - seen)?;
                 let mut progressed = false;
                 for _ in self.ring.completion() {
                     seen += 1;
@@ -1037,7 +1054,7 @@ mod uring {
                     }
                     return Err(err);
                 }
-                self.ring.submit_and_wait(pushed)?;
+                self.submit_and_wait(pushed)?;
                 // One timestamp per wave, read at each completion. Every entry
                 // in a wave is pushed within microseconds of the others, so
                 // this is submit->complete per request to within the push loop
@@ -1081,7 +1098,7 @@ mod uring {
                                 "io_uring returned {got} completions for {pushed} submitted reads"
                             )));
                         }
-                        self.ring.submit_and_wait(pushed - got)?;
+                        self.submit_and_wait(pushed - got)?;
                     }
                 }
                 // Fold the wave's samples in after the borrow of `results` ends.
@@ -1171,7 +1188,7 @@ mod uring {
                     }
                     return Err(err);
                 }
-                self.ring.submit_and_wait(pushed)?;
+                self.submit_and_wait(pushed)?;
                 let mut got = 0;
                 while got < pushed {
                     let mut progressed = false;
@@ -1202,7 +1219,7 @@ mod uring {
                                 "io_uring returned {got} completions for {pushed} submitted writes"
                             )));
                         }
-                        self.ring.submit_and_wait(pushed - got)?;
+                        self.submit_and_wait(pushed - got)?;
                     }
                 }
                 i = end;
@@ -1282,7 +1299,7 @@ mod uring {
             // SAFETY: an Fsync SQE carries no user buffer, and the fd outlives
             // this call, which blocks until the completion is reaped.
             unsafe { self.push_counted(&e) }?;
-            self.ring.submit_and_wait(1)?;
+            self.submit_and_wait(1)?;
             let mut res: Option<i64> = None;
             while res.is_none() {
                 let mut progressed = false;
@@ -1302,7 +1319,7 @@ mod uring {
                     if !progressed {
                         return Err(io::Error::other(format!("io_uring returned no completion for {what}")));
                     }
-                    self.ring.submit_and_wait(1)?;
+                    self.submit_and_wait(1)?;
                 }
             }
             match res {
@@ -1590,22 +1607,34 @@ mod uring {
         /// [`RegionDone::idx`] is the request's position in this call's `reqs`;
         /// submit one batch per claim so the mapping stays unambiguous.
         pub fn submit_owned(&mut self, reqs: Vec<OwnedReadReq>, direct: bool) -> io::Result<()> {
+            self.submit_owned_mixed(reqs.into_iter().map(|req| (req, direct)))
+        }
+
+        /// Start a batch spanning buffered and O_DIRECT files. Each bool
+        /// indicates whether that request's file was opened with O_DIRECT.
+        pub fn submit_owned_mixed(
+            &mut self,
+            reqs: impl IntoIterator<Item = (OwnedReadReq, bool)>,
+        ) -> io::Result<()> {
             // Validate and allocate for the whole batch before accepting any of
-            // it: one op cannot carry more than u32 bytes, and failing after
-            // half the batch was queued would leave orphaned reads to fire
-            // during a later caller's reap.
+            // it. No partial batch should fire during a later caller's reap.
+            let reqs = reqs.into_iter();
             let mut ready: Vec<RegionDone> = Vec::new();
-            let mut accepted: Vec<InFlight> = Vec::with_capacity(reqs.len());
-            for (idx, r) in reqs.into_iter().enumerate() {
+            let mut accepted: Vec<InFlight> = Vec::with_capacity(reqs.size_hint().0);
+            for (idx, (r, direct)) in reqs.enumerate() {
                 if r.len == 0 {
                     ready.push(RegionDone { idx, tag: r.tag, bytes: Bytes::Vec(Vec::new()) });
                     continue;
                 }
+                let end = r.offset.checked_add(r.len as u64)
+                    .ok_or_else(|| io::Error::other("owned read range overflows"))?;
                 let inf = if direct {
                     let a = ALIGN as u64;
                     let a_off = align_down(r.offset, a);
                     let head = (r.offset - a_off) as usize;
-                    let a_len = (align_up(r.offset + r.len as u64, a) - a_off) as usize;
+                    let a_end = end.checked_add((a - end % a) % a)
+                        .ok_or_else(|| io::Error::other("aligned owned read range overflows"))?;
+                    let a_len = usize::try_from(a_end - a_off).map_err(io::Error::other)?;
                     let buf = AlignedBuf::with_capacity(a_len)
                         .ok_or_else(|| io::Error::other("aligned alloc failed"))?;
                     InFlight {
@@ -1622,6 +1651,9 @@ mod uring {
                         submitted: self.latency.is_some().then(std::time::Instant::now),
                     }
                 } else {
+                    let mut buf = Vec::new();
+                    buf.try_reserve_exact(r.len).map_err(io::Error::other)?;
+                    buf.resize(r.len, 0u8);
                     InFlight {
                         fd: r.fd,
                         a_off: r.offset,
@@ -1632,17 +1664,10 @@ mod uring {
                         done: 0,
                         tag: r.tag,
                         idx,
-                        buf: LandingBuf::Plain(vec![0u8; r.len]),
+                        buf: LandingBuf::Plain(buf),
                         submitted: self.latency.is_some().then(std::time::Instant::now),
                     }
                 };
-                if u32::try_from(inf.a_len).is_err() {
-                    return Err(io::Error::other(format!(
-                        "owned read {idx} needs a {}-byte submission; io_uring reads are limited to {} per op",
-                        inf.a_len,
-                        u32::MAX
-                    )));
-                }
                 accepted.push(inf);
             }
             self.ready.append(&mut ready);
@@ -1653,14 +1678,10 @@ mod uring {
         }
 
         /// Build the submission entry for `inf`'s next (continuation) read.
-        fn owned_sqe(&self, inf: &mut InFlight, ud: u64) -> io::Result<squeue::Entry> {
+        fn owned_sqe(&self, inf: &mut InFlight, ud: u64) -> squeue::Entry {
             let remaining = inf.a_len - inf.done;
-            let Ok(len32) = u32::try_from(remaining) else {
-                return Err(io::Error::other(format!(
-                    "owned read continuation is {remaining} bytes; io_uring reads are limited to {} per op",
-                    u32::MAX
-                )));
-            };
+            // The completion handler continues reads larger than one operation.
+            let len32 = remaining.min(1 << 30) as u32;
             let base = match &mut inf.buf {
                 LandingBuf::Plain(v) => v.as_mut_ptr(),
                 LandingBuf::Aligned(b) => b.as_mut_slice().as_mut_ptr(),
@@ -1679,7 +1700,7 @@ mod uring {
             if self.force_async {
                 e = e.flags(squeue::Flags::ASYNC);
             }
-            Ok(e)
+            e
         }
 
         /// Fill the ring from the owned queue (reads first), then let queued
@@ -1690,13 +1711,7 @@ mod uring {
             while self.pending.len() < self.cap {
                 let Some(mut inf) = self.queued.pop_front() else { break };
                 let ud = Self::OWNED_TAG | self.next_ud;
-                let e = match self.owned_sqe(&mut inf, ud) {
-                    Ok(e) => e,
-                    Err(err) => {
-                        self.queued.push_front(inf);
-                        return Err(err);
-                    }
-                };
+                let e = self.owned_sqe(&mut inf, ud);
                 // SAFETY: the landing buffer is owned by `inf`, which moves into
                 // `self.pending` below and stays there until this completion is
                 // reaped (or waited out by `abort_owned`), so the kernel never
@@ -1771,7 +1786,7 @@ mod uring {
                 }
                 return Ok(0);
             }
-            self.ring.submit_and_wait(1)?;
+            self.submit_and_wait(1)?;
             let mut reaped = 0usize;
             let mut first_err: Option<io::Error> = None;
             for cqe in self.ring.completion() {
@@ -1891,7 +1906,7 @@ mod uring {
                 self.reap_some(out)?;
             }
             while self.advisory_inflight > 0 {
-                self.ring.submit_and_wait(1)?;
+                self.submit_and_wait(1)?;
                 let mut progressed = false;
                 for cqe in self.ring.completion() {
                     progressed = true;
@@ -1907,6 +1922,17 @@ mod uring {
             Ok(())
         }
 
+        /// Drop queued reads and drain submitted reads after an interrupted
+        /// caller. A ring that cannot be drained must be retired.
+        pub fn discard_owned(&mut self) -> io::Result<()> {
+            self.abort_owned();
+            if self.pending.is_empty() && self.advisory_inflight == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::other("could not drain owned reads"))
+            }
+        }
+
         /// Return the owned lane to a clean state after an error (or at drop):
         /// drop queued work and ready results, then wait out every in-flight
         /// completion — an abandoned CQE would satisfy a later wave's wait in
@@ -1917,10 +1943,7 @@ mod uring {
             self.advisory.clear();
             self.ready.clear();
             while !self.pending.is_empty() || self.advisory_inflight > 0 {
-                if let Err(e) = self.ring.submit_and_wait(1) {
-                    crate::note_advisory_err("owned-lane drain: submit_and_wait", &e);
-                    break;
-                }
+                let waited = self.submit_and_wait(1);
                 let mut progressed = false;
                 for cqe in self.ring.completion() {
                     progressed = true;
@@ -1930,6 +1953,9 @@ mod uring {
                     } else if self.pending.remove(&ud).is_none() {
                         crate::note_advisory_err("owned-lane drain: stray completion", &ud);
                     }
+                }
+                if let Err(e) = waited {
+                    crate::note_advisory_err("owned-lane drain: submit_and_wait", &e);
                 }
                 if !progressed {
                     break;
@@ -2065,6 +2091,15 @@ impl Reactor {
     pub fn submit_owned(&mut self, _reqs: Vec<OwnedReadReq>, _direct: bool) -> std::io::Result<()> {
         Self::unsupported()
     }
+    pub fn submit_owned_mixed(
+        &mut self,
+        _reqs: impl IntoIterator<Item = (OwnedReadReq, bool)>,
+    ) -> std::io::Result<()> {
+        Self::unsupported()
+    }
+    pub fn discard_owned(&mut self) -> std::io::Result<()> {
+        Self::unsupported()
+    }
     pub fn pending_owned(&self) -> usize {
         0
     }
@@ -2110,8 +2145,13 @@ pub fn read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 /// write has an exact portable equivalent, and the absence of a ring should not
 /// stop one being saved. Reported rather than swallowed.
 pub fn write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
     let f = std::fs::File::create(path)?;
+    write_open_file(&f, bytes)
+}
+
+/// Write and synchronize a new or truncated file already opened by the caller.
+pub fn write_open_file(f: &std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
     match Reactor::new(1) {
         Ok(mut reactor) => {
             if !bytes.is_empty() {
@@ -2124,7 +2164,7 @@ pub fn write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         Err(e) => {
             crate::note_advisory_err("io_uring unavailable for whole-file write (using pwrite)", &e);
             if !bytes.is_empty() {
-                std::os::unix::fs::FileExt::write_all_at(&f, bytes, 0)?;
+                std::os::unix::fs::FileExt::write_all_at(f, bytes, 0)?;
             }
             f.sync_all()?;
         }
@@ -2986,8 +3026,8 @@ mod tests {
             Ok(r) => r,
             Err(e) => {
                 skip_or_fail("uring_write_many_matches_pwrite", &e);
-                let _ = std::fs::remove_file(&p_ring);
-                let _ = std::fs::remove_file(&p_pw);
+                std::fs::remove_file(&p_ring)?;
+                std::fs::remove_file(&p_pw)?;
                 return Ok(());
             }
         };

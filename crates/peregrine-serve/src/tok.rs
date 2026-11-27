@@ -1,75 +1,120 @@
-//! Tokenizer: the vendored gigatoken BPE engine (`peregrine-token`) is the
-//! **only** runtime tokenizer. Models whose `tokenizer.json` gigatoken cannot
-//! load (SentencePiece / non-BPE flavors) fail at boot with a descriptive
-//! error rather than silently degrading. Correctness is gated by the id-for-id
-//! parity suite against the HF `tokenizers` oracle (dev-dependency only, see
-//! `tests/tokenizer_parity.rs`).
-//!
-//! The gigatoken instance is process-persistent behind a mutex, so its
-//! pretoken memo cache warms **across requests** — a repeated chat-template
-//! prefix encodes from cache. Encode is one short critical section per
-//! request. Streaming decode does NOT go through that mutex: each stream
-//! takes a [`DecodeHandle`] (an `Arc` view of the immutable vocab) once and
-//! decodes at token rate with no shared state — N concurrent streams would
-//! otherwise contend on the encode lock at token frequency for what is a
-//! read of an immutable table.
+//! Serving tokenizers share one interface. Gigatoken handles supported
+//! ByteLevel BPE tokenizers and shares an immutable vocabulary for decoding.
+//! The Hugging Face backend handles the other supported tokenizer.json formats.
 
 use peregrine_core::{Context, Error};
 use peregrine_token::{DecodeHandle, GigaTokenizer};
 
-/// The process-wide tokenizer. `Mutex` because encode is `&mut` (the memo
-/// cache learns); kept for the process so the cache persists across requests.
-pub struct TokenBackend {
-    giga: Box<parking_lot::Mutex<GigaTokenizer>>,
+pub enum TokenBackend {
+    Giga {
+        encoder: Box<parking_lot::Mutex<GigaTokenizer>>,
+        vocab: DecodeHandle,
+    },
+    HuggingFace(Box<tokenizers::Tokenizer>),
 }
 
 impl TokenBackend {
-    /// Construct from the model dir's `tokenizer.json`. Logs the vocab size to
-    /// stderr (a server boots once; the operator should see the tokenizer came
-    /// up). Non-BPE models are a hard boot error by design.
     pub fn load(dir: &std::path::Path) -> Result<TokenBackend, Error> {
         let path = dir.join("tokenizer.json");
-        // Through the ring like every other file the engine opens; the
-        // helper falls back to `pread` on a host without io_uring.
         let bytes = peregrine_io::read_file(&path).ctx(|| path.display().to_string())?;
-        match GigaTokenizer::from_hf_json_bytes(&bytes) {
-            Ok(t) => {
-                eprintln!("[tokenizer] gigatoken BPE active, vocab={}", t.vocab_size());
-                Ok(TokenBackend { giga: Box::new(parking_lot::Mutex::new(t)) })
+        Self::from_bytes(&bytes)
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<TokenBackend, Error> {
+        match GigaTokenizer::from_hf_json_bytes(bytes) {
+            Ok(encoder) => {
+                let vocab = encoder.decode_handle();
+                eprintln!("[tokenizer] gigatoken BPE active, vocab={}", encoder.vocab_size());
+                Ok(Self::Giga { encoder: Box::new(parking_lot::Mutex::new(encoder)), vocab })
             }
-            Err(e) => Err(Error::Format(format!(
-                "gigatoken can't load this model's tokenizer.json \
-                 (SentencePiece/non-BPE models are unsupported): {e}"
-            ))),
+            Err(fast_error) => {
+                let tokenizer = tokenizers::Tokenizer::from_bytes(bytes).map_err(|error| {
+                    Error::Format(format!("tokenizer.json: {error} (gigatoken: {fast_error})"))
+                })?;
+                eprintln!("[tokenizer] Hugging Face active, vocab={}", tokenizer.get_vocab_size(true));
+                Ok(Self::HuggingFace(Box::new(tokenizer)))
+            }
         }
     }
 
     /// Encode `text` to token ids.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, Error> {
-        Ok(self.giga.lock().encode(text))
+        match self {
+            Self::Giga { encoder, .. } => Ok(encoder.lock().encode(text)),
+            // The server already renders the model's conversation template.
+            Self::HuggingFace(tokenizer) => tokenizer
+                .encode(text, false)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|error| Error::Format(format!("encode prompt: {error}"))),
+        }
     }
 
     /// Decode token ids to text (whole-stream form, used by the non-streaming
     /// path). Streaming callers want [`IncrementalDecoder`] instead.
     pub fn decode(&self, ids: &[u32]) -> Result<String, Error> {
-        let bytes = self.giga.lock().decode(ids);
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        match self {
+            Self::Giga { vocab, .. } => {
+                let mut bytes = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(piece) = vocab.token_bytes(*id) {
+                        bytes.extend_from_slice(piece);
+                    }
+                }
+                Ok(match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+                })
+            }
+            Self::HuggingFace(tokenizer) => tokenizer
+                .decode(ids, false)
+                .map_err(|error| Error::Format(format!("decode completion: {error}"))),
+        }
     }
 
-    /// A lock-free per-token decode view for one stream: one mutex
-    /// acquisition here, then [`DecodeHandle::token_bytes`] at token rate
-    /// with no lock and no allocation. Token boundaries do not respect
-    /// character boundaries, so streaming callers must join bytes through
-    /// [`IncrementalDecoder`]. Out-of-vocab ids read as `None` (same lenient
-    /// contract as [`Self::decode`]'s skip — a padded `lm_head` can sample
-    /// past the vocab and must not kill the stream).
-    pub fn decode_handle(&self) -> DecodeHandle {
-        self.giga.lock().decode_handle()
+    pub fn piece(&self, id: u32) -> Option<String> {
+        match self {
+            Self::Giga { vocab, .. } => vocab.token_bytes(id)
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+            Self::HuggingFace(tokenizer) => tokenizer.id_to_token(id),
+        }
+    }
+
+    pub fn stream(&self) -> StreamDecoder {
+        match self {
+            Self::Giga { vocab, .. } => StreamDecoder::Incremental(vocab.clone(), IncrementalDecoder::new()),
+            // Some decoders revise the prefix when more tokens arrive, for
+            // example when applying WordPiece punctuation cleanup.
+            Self::HuggingFace(_) => StreamDecoder::Buffered,
+        }
     }
 
     /// The active tokenizer name (for logs / health output).
     pub fn name(&self) -> &'static str {
-        "gigatoken"
+        match self {
+            Self::Giga { .. } => "gigatoken",
+            Self::HuggingFace(_) => "huggingface",
+        }
+    }
+}
+
+pub enum StreamDecoder {
+    Incremental(DecodeHandle, IncrementalDecoder),
+    Buffered,
+}
+
+impl StreamDecoder {
+    pub fn push(&mut self, token: u32) -> String {
+        match self {
+            Self::Incremental(vocab, decoder) => decoder.push(vocab.token_bytes(token).unwrap_or(&[])),
+            Self::Buffered => String::new(),
+        }
+    }
+
+    pub fn finish(&mut self, tokenizer: &TokenBackend, ids: &[u32]) -> Result<String, Error> {
+        match self {
+            Self::Incremental(_, decoder) => Ok(decoder.finish()),
+            Self::Buffered => tokenizer.decode(ids),
+        }
     }
 }
 
@@ -152,7 +197,32 @@ impl IncrementalDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::IncrementalDecoder;
+    use super::{IncrementalDecoder, TokenBackend};
+
+    #[test]
+    fn wordpiece_uses_its_sequence_decoder_for_both_formats() -> Result<(), peregrine_core::Error> {
+        let tokenizer = TokenBackend::from_bytes(br###"{
+            "version": "1.0",
+            "pre_tokenizer": {"type": "Whitespace"},
+            "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true},
+            "model": {
+                "type": "WordPiece",
+                "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 100,
+                "vocab": {"[UNK]": 0, "hello": 1, "world": 2, "!": 3}
+            }
+        }"###)?;
+        assert_eq!(tokenizer.name(), "huggingface");
+        let ids = tokenizer.encode("hello world!")?;
+        assert_eq!(ids, [1, 2, 3]);
+        let mut stream = tokenizer.stream();
+        assert!(ids.iter().all(|&id| stream.push(id).is_empty()));
+        let text = tokenizer.decode(&ids)?;
+        assert_eq!(stream.finish(&tokenizer, &ids)?, text);
+        assert_eq!(text, "hello world!");
+        Ok(())
+    }
 
     /// Feeding bytes one at a time must reproduce the lossy whole-buffer decode.
     fn assert_streams_like_lossy(chunks: &[&[u8]]) {

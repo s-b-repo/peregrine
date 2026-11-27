@@ -4,10 +4,9 @@
 
 `peregrine-token` is a **vendored, stable-toolchain subset** of
 [marcelroed/gigatoken](https://github.com/marcelroed/gigatoken) **v0.10.0**
-(MIT — `LICENSE-MIT-gigatoken`): GB/s-class BPE tokenization. It is the
-**sole runtime tokenizer** of `peregrine-serve`; the HuggingFace `tokenizers`
-crate survives only as a dev-dependency parity oracle and is not linked into
-the serve binary (verified: `ldd` clean, no libpython).
+(MIT, `LICENSE-MIT-gigatoken`). It is Peregrine's fast ByteLevel BPE backend.
+Hugging Face Tokenizers serves other supported tokenizer formats and provides the
+reference implementation for parity tests.
 
 Measured on the reference box: **204 MB/s vs 6 MB/s HF (34×)** on a 12 MB
 mixed corpus, identical ids (`peregrine-serve --bench-tokenizer <file>`).
@@ -33,8 +32,8 @@ peregrine-authored surface.
 
 - **SentencePiece engine** — upstream's only `portable_simd` user, which is
   what makes upstream nightly-only. Dropping it keeps the workspace on
-  **stable Rust**. `byte_fallback` models get a descriptive error, and serve
-  treats that as a **hard boot error** — there is no silent runtime fallback.
+  **stable Rust**. The serving backend loads those tokenizer files through
+  Hugging Face Tokenizers.
 - **PyO3 / numpy bindings** — would link libpython into `peregrine-serve`.
 - **batch / parquet / jsonl / hub layers** — peregrine feeds in-memory prompts.
 

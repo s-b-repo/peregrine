@@ -124,6 +124,5 @@ pub fn write_streaming(
         // Durability before the rename: a file that exists must be complete.
         f.sync_all().ctx(|| format!("fsync {}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path).ctx(|| format!("commit {}", path.display()))?;
-    Ok(())
+    peregrine_core::commit_atomic(&tmp, path)
 }

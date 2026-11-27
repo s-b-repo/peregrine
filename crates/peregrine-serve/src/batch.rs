@@ -335,11 +335,32 @@ pub struct EngineRequest {
     pub class: peregrine_model::TokenClass,
 }
 
-/// One engine → handler message. The token stream ends when the channel closes
-/// (stop id, `max_new` reached, or a fatal error already reported via `Error`).
+/// The inference result is complete only after an explicit terminal message.
 pub enum EngineOut {
     Token(u32),
+    Finished(FinishReason),
     Error(String),
+}
+
+#[derive(Clone, Copy)]
+pub enum FinishReason {
+    Stop,
+    Length,
+}
+
+impl FinishReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+        }
+    }
+}
+
+fn finish(out: &mpsc::UnboundedSender<EngineOut>, reason: FinishReason) {
+    if let Err(error) = out.send(EngineOut::Finished(reason)) {
+        peregrine_core::note_advisory_err("send completion status", &error);
+    }
 }
 
 /// What the engine thread publishes each tick for `GET /metrics` to read.
@@ -535,20 +556,26 @@ impl EngineHandle {
     /// [`SubmitRefused::Down`] once the engine thread has shut down.
     pub fn submit(&self, req: EngineRequest) -> Result<(), SubmitRefused> {
         use std::sync::atomic::Ordering::Relaxed;
-        // Approximate on purpose: two racing submits can both pass a cap-1
-        // check. The cap is overload shedding, not an admission invariant —
-        // off-by-a-few under race is fine, silently unbounded is not.
-        if self.queue_cap > 0 && self.queued.load(Relaxed) >= self.queue_cap {
+        // Reserve before publishing the request so the receiver can release
+        // the reservation even when it wakes before send() returns.
+        let reserved = self.queued.try_update(Relaxed, Relaxed, |depth| {
+            if self.queue_cap == 0 || depth < self.queue_cap {
+                depth.checked_add(1)
+            } else {
+                None
+            }
+        });
+        if reserved.is_err() {
             return Err(SubmitRefused::Full);
         }
         let ch = match req.priority {
             Priority::High => &self.tx_high,
             Priority::Normal => &self.tx_normal,
         };
-        ch.send(Queued { req, at: std::time::Instant::now() })
-            .map_err(|send_err| SubmitRefused::Down(send_err.to_string()))?;
-        self.queued.fetch_add(1, Relaxed);
-        Ok(())
+        ch.send(Queued { req, at: std::time::Instant::now() }).map_err(|error| {
+            release_queue_slot(&self.queued);
+            SubmitRefused::Down(error.to_string())
+        })
     }
 
     /// The engine's most recent published telemetry. All-zero before the first
@@ -1077,13 +1104,13 @@ fn max_batch_rows() -> usize {
     std::env::var("COLI_MAX_BATCH_ROWS").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
 }
 
-/// Admission-queue depth cap (`COLI_QUEUE_DEPTH`); `0`/unset = unbounded, the
-/// historical behaviour. When set, a submit against a backlog this deep is
+/// Admission-queue depth cap (`COLI_QUEUE_DEPTH`); defaults to 128, with `0`
+/// selecting an unbounded queue. A submit against a backlog this deep is
 /// refused ([`SubmitRefused::Full`] → HTTP 503) instead of queued forever —
 /// overload becomes visible backpressure rather than unbounded memory and a
 /// client timeout long after the fact.
 fn queue_depth_cap() -> usize {
-    std::env::var("COLI_QUEUE_DEPTH").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0)
+    std::env::var("COLI_QUEUE_DEPTH").ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(128)
 }
 
 /// Number of decode ticks per prefill tick when the adaptive window is on.
@@ -1386,6 +1413,8 @@ fn run(
     };
 
     loop {
+        active.retain(|seq| !seq.out.is_closed());
+        pending.retain(|seq| !seq.out.is_closed());
         // Drain queued requests into the prefill queue: HIGH first (so they
         // beat normal admissions to the batch), NORMAL second — both capped by
         // the *working* cap so an SLA-shrunk engine backpressures both queues,
@@ -1842,9 +1871,11 @@ fn run(
             run.push(final_next);
 
             let mut alive = true;
+            let mut finished = None;
             let mut drafts_emitted = 0usize;
             for (j, &tok) in run.iter().enumerate() {
                 if stop_ids.contains(&tok) {
+                    finished = Some(FinishReason::Stop);
                     alive = false; // a stop token is not emitted, and ends the run
                     break;
                 }
@@ -1858,6 +1889,7 @@ fn run(
                     drafts_emitted += 1; // the final entry is not a cached row
                 }
                 if s.produced >= s.max_new {
+                    finished = Some(FinishReason::Length);
                     alive = false;
                     break;
                 }
@@ -1893,14 +1925,17 @@ fn run(
                 // is exactly the position it lands on. Trees are MLA-only, so
                 // this and the recurrent arm can never both apply.
                 None if s.tree.is_some() && g > 0 => {
-                    let keep: Vec<usize> = std::iter::once(pos0)
+                    let retained_rows: Vec<usize> = std::iter::once(pos0)
                         .chain(path.iter().take(drafts_emitted).map(|&nd| pos0 + nd))
                         .collect();
-                    if let Err(e) = s.seq.retain_tail(pos0, &keep) {
+                    if let Err(e) = s.seq.retain_tail(pos0, &retained_rows) {
                         // The cache is now neither shape. Retire rather than
                         // serve on a history nothing else can detect is wrong.
-                        peregrine_core::note_advisory_err("tree commit", &e);
-                        alive = false;
+                        if let Err(send_error) = s.out.send(EngineOut::Error(e.to_string())) {
+                            peregrine_core::note_advisory_err("report tree commit error", &send_error);
+                        }
+                        keep.push(false);
+                        continue;
                     }
                 }
                 None => s.seq.truncate(s.pos),
@@ -1909,7 +1944,7 @@ fn run(
             // (the *old* `next_tok`, so this must precede the overwrite below)
             // plus the accepted drafts, keeping `toks` row-aligned with `seq`.
             s.toks.push(s.next_tok);
-            s.toks.extend_from_slice(&s.draft[..drafts_emitted]);
+            s.toks.extend_from_slice(&run[..drafts_emitted]);
             // `final_next` has been emitted but not yet fed, which is exactly
             // the pending-token invariant. Only meaningful when the sequence
             // survives; a retiring one is dropped below.
@@ -1951,6 +1986,9 @@ fn run(
             // differs simply degrades to the prompt-prefix match it gets today.
             if !alive {
                 prefix.insert(&s.toks[..s.pos.min(s.toks.len())], &s.seq);
+            }
+            if let Some(reason) = finished {
+                finish(&s.out, reason);
             }
             keep.push(alive);
         }
@@ -2565,19 +2603,8 @@ fn admit_pending(
     // The request has left the channel: it no longer counts against
     // `COLI_QUEUE_DEPTH`. Saturating (a plain `fetch_sub` would wrap) because
     // tests drive this function directly with a counter no submit incremented.
-    let mut cur = queued.load(std::sync::atomic::Ordering::Relaxed);
-    while cur > 0 {
-        match queued.compare_exchange_weak(
-            cur,
-            cur - 1,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(now) => cur = now,
-        }
-    }
-    if req.prompt.is_empty() || req.max_new == 0 {
+    release_queue_slot(queued);
+    if req.out.is_closed() || req.prompt.is_empty() || req.max_new == 0 {
         return waited; // nothing to generate; dropping req.out closes the stream cleanly
     }
     model.set_workload_class(req.class);
@@ -2601,6 +2628,17 @@ fn admit_pending(
         seq_id: NEXT_SEQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
     waited
+}
+
+fn release_queue_slot(queued: &std::sync::atomic::AtomicUsize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut depth = queued.load(Relaxed);
+    while depth > 0 {
+        match queued.compare_exchange_weak(depth, depth - 1, Relaxed, Relaxed) {
+            Ok(_) => break,
+            Err(actual) => depth = actual,
+        }
+    }
 }
 
 /// Advance the front prefilling sequence by up to `PREFILL_CHUNK` tokens. When its
@@ -2726,6 +2764,7 @@ fn finish_prefill_chunk(
     };
     let t0 = sampler.pick(&logits[last..last + vocab], -1) as i32;
     if stop_ids.contains(&t0) {
+        finish(&out, FinishReason::Stop);
         return 0; // first token is a stop → emit nothing
     }
     if out.send(EngineOut::Token(t0 as u32)).is_err() {
@@ -2733,6 +2772,7 @@ fn finish_prefill_chunk(
     }
     // Sent, so it counts from here whatever becomes of the sequence.
     if max_new <= 1 {
+        finish(&out, FinishReason::Length);
         return 1; // only one token requested
     }
     active.push(SeqState {
@@ -3074,6 +3114,7 @@ mod tests {
             while let Some(msg) = rx.blocking_recv() {
                 match msg {
                     EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Finished(_) => {},
                     EngineOut::Error(e) => return Err(Error::Format(e)),
                 }
             }
@@ -3125,6 +3166,7 @@ mod tests {
             while let Some(msg) = rx.blocking_recv() {
                 match msg {
                     EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Finished(_) => {},
                     EngineOut::Error(e) => return Err(Error::Format(e)),
                 }
             }
@@ -3370,6 +3412,7 @@ mod tests {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
                 EngineOut::Token(_) => produced += 1,
+                EngineOut::Finished(_) => {},
                 EngineOut::Error(e) => return Err(Error::Format(e)),
             }
         }
@@ -3432,6 +3475,7 @@ mod tests {
                 while let Some(msg) = rx.blocking_recv() {
                     match msg {
                         EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Finished(_) => {},
                         EngineOut::Error(e) => return Err(Error::Format(e)),
                     }
                 }
@@ -3540,6 +3584,7 @@ mod tests {
                 while let Some(msg) = rx.blocking_recv() {
                     match msg {
                         EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Finished(_) => {},
                         EngineOut::Error(e) => return Err(Error::Format(e)),
                     }
                 }
@@ -3764,6 +3809,7 @@ mod tests {
             while let Some(msg) = rx.blocking_recv() {
                 match msg {
                     EngineOut::Token(_) => received += 1,
+                    EngineOut::Finished(_) => {},
                     EngineOut::Error(e) => return Err(Error::Format(e)),
                 }
             }
@@ -3845,6 +3891,7 @@ mod tests {
                 while let Some(msg) = rx.blocking_recv() {
                     match msg {
                         EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Finished(_) => {},
                         EngineOut::Error(e) => return Err(Error::Format(e)),
                     }
                 }
@@ -3915,6 +3962,7 @@ mod tests {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
                 EngineOut::Token(t) => got.push(t),
+                EngineOut::Finished(_) => {},
                 EngineOut::Error(e) => return Err(Error::Format(e)),
             }
         }
@@ -3965,6 +4013,7 @@ mod tests {
                 while let Some(msg) = rx.blocking_recv() {
                     match msg {
                         EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Finished(_) => {},
                         EngineOut::Error(e) => return Err(Error::Format(e)),
                     }
                 }
@@ -4041,6 +4090,7 @@ mod tests {
                 while let Some(msg) = rx.blocking_recv() {
                     match msg {
                         EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Finished(_) => {},
                         EngineOut::Error(e) => return Err(Error::Format(e)),
                     }
                 }
@@ -4105,6 +4155,7 @@ mod tests {
             while let Some(msg) = rx.blocking_recv() {
                 match msg {
                     EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Finished(_) => {},
                     EngineOut::Error(e) => return Err(Error::Format(e)),
                 }
             }
@@ -4168,6 +4219,7 @@ mod tests {
             while let Some(msg) = rx.blocking_recv() {
                 match msg {
                     EngineOut::Token(t) => toks.push(t),
+                    EngineOut::Finished(_) => {},
                     EngineOut::Error(e) => return Err(Error::Format(e)),
                 }
             }
@@ -4252,6 +4304,7 @@ mod tests {
                 while let Some(msg) = rx.blocking_recv() {
                     match msg {
                         EngineOut::Token(t) => toks.push(t),
+                        EngineOut::Finished(_) => {},
                         EngineOut::Error(e) => return Err(Error::Format(e)),
                     }
                 }
@@ -4291,6 +4344,7 @@ mod tests {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
                 EngineOut::Token(t) => got.push(t),
+                EngineOut::Finished(_) => {},
                 EngineOut::Error(e) => return Err(Error::Format(e)),
             }
         }
@@ -4338,6 +4392,7 @@ mod tests {
         while let Some(msg) = fast_rx.blocking_recv() {
             match msg {
                 EngineOut::Token(t) => fast.push(t),
+                EngineOut::Finished(_) => {},
                 EngineOut::Error(e) => return Err(Error::Format(e)),
             }
         }
@@ -4348,6 +4403,7 @@ mod tests {
         while let Some(msg) = slow_rx.blocking_recv() {
             match msg {
                 EngineOut::Token(t) => slow.push(t),
+                EngineOut::Finished(_) => {},
                 EngineOut::Error(e) => return Err(Error::Format(e)),
             }
         }
@@ -4371,12 +4427,16 @@ mod tests {
         let (tx1, mut rx1) = mpsc::unbounded_channel::<EngineOut>();
         handle.submit(EngineRequest { prompt: vec![2, 5, 1], max_new: 3, sampler: Sampler::new(0.0, 0.9, 1), out: tx1, priority: Priority::Normal, class: peregrine_model::TokenClass::Prose })?;
         let mut n1 = 0;
+        let mut limited = false;
         while let Some(msg) = rx1.blocking_recv() {
-            if let EngineOut::Token(_) = msg {
-                n1 += 1;
+            match msg {
+                EngineOut::Token(_) => n1 += 1,
+                EngineOut::Finished(reason) => limited = matches!(reason, FinishReason::Length),
+                EngineOut::Error(e) => return Err(Error::Format(e)),
             }
         }
         assert_eq!(n1, 3, "max_new must cap emitted tokens");
+        assert!(limited, "the stream must report the token cap explicitly");
 
         let (tx2, mut rx2) = mpsc::unbounded_channel::<EngineOut>();
         handle.submit(EngineRequest { prompt: vec![], max_new: 5, sampler: Sampler::new(0.0, 0.9, 1), out: tx2, priority: Priority::Normal, class: peregrine_model::TokenClass::Prose })?;

@@ -7,6 +7,7 @@
 //! (fmt 1), per-row packed int4 (fmt 2), grouped packed int4 (fmt 4, the
 //! coherence-critical format for GLM-5.2), and packed int2 (fmt 3).
 
+use peregrine_core::safetensors::TensorReader;
 use peregrine_core::{Error, QtFmt, QtInfo, SafeTensors};
 use peregrine_io::Bytes;
 use peregrine_kernels::{
@@ -136,7 +137,7 @@ impl QtWeight {
 
     /// Load a container weight `[O, I]` (`name` + `name.qs`) from a model dir.
     pub fn load(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<QtWeight, Error> {
-        Self::load_into(st, name, o, i, false)
+        Self::load_from(&TensorReader::new(st), name, o, i)
     }
 
     /// [`Self::load`], but the quantized payload lands in a **page-aligned**
@@ -152,18 +153,22 @@ impl QtWeight {
     /// that will be dequantized on the host gains nothing — the f32 the GPU
     /// receives is computed, not read, so no read can land in the pinned buffer.
     pub fn load_aligned(st: &SafeTensors, name: &str, o: usize, i: usize) -> Result<QtWeight, Error> {
-        Self::load_into(st, name, o, i, true)
+        Self::load_into(&TensorReader::new(st), name, o, i, true)
     }
 
-    fn load_into(st: &SafeTensors, name: &str, o: usize, i: usize, aligned: bool) -> Result<QtWeight, Error> {
-        let info = QtInfo::detect(st, name, o as i64, i as i64);
+    pub(crate) fn load_from(st: &TensorReader<'_>, name: &str, o: usize, i: usize) -> Result<QtWeight, Error> {
+        Self::load_into(st, name, o, i, false)
+    }
+
+    fn load_into(st: &TensorReader<'_>, name: &str, o: usize, i: usize, aligned: bool) -> Result<QtWeight, Error> {
+        let info = QtInfo::detect(st.index, name, o as i64, i as i64);
         let fmt = match QuantFmt::from_qt(info.fmt) {
             Some(f) => f,
             None if info.fmt == QtFmt::Unknown => {
                 return Err(Error::Format(format!(
                     "weight '{name}': {} bytes match no quantized container for [{o},{i}] \
                      (truncated tensor, or the shape disagrees with the checkpoint)",
-                    st.uncompressed_nbytes(name).unwrap_or(0)
+                    st.index.uncompressed_nbytes(name).unwrap_or(0)
                 )))
             }
             None => {

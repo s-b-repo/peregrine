@@ -16,6 +16,7 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
+use peregrine_core::safetensors::TensorReader;
 use peregrine_core::{Cfg, Context, Error, QtInfo, SafeTensors};
 use peregrine_io::{Bytes, CacheHit, OwnedReadReq, Reactor, ReadReq, RegionDone, WarmCache};
 
@@ -23,7 +24,7 @@ use crate::gpu::{GpuDenseTier, GpuTier, HeatTable};
 use crate::lane::LaneTimingsAccum;
 use crate::mlp::Mlp;
 use crate::predict::RouteHistory;
-use crate::router::{batch_union, route, routed_at, RouterCfg};
+use crate::router::{batch_union, route, routed_at, Routed, RouterCfg};
 use crate::weight::{QtWeight, QuantFmt};
 
 /// Shared per-forward state threaded through the layer/MoE compute: the
@@ -53,6 +54,7 @@ pub struct ForwardCtx<'a> {
     pub workers: usize,
     pub cfg: &'a Cfg,
     pub stream_experts: bool,
+    pub demand_experts: bool,
     /// RAM warm tier consulted by the I/O lane before streaming (streaming mode
     /// only). A hit returns the exact previously-streamed bytes, so output is
     /// bit-identical; a miss streams then inserts. `None` disables caching.
@@ -448,7 +450,8 @@ fn entry_for(
     }
     let hidden = cfg.hidden as usize;
     let mi = cfg.moe_inter as usize;
-    let p = |t: &str| format!("model.layers.{layer}.mlp.experts.{expert}.{t}");
+    let prefix = crate::model::layer_prefix(cfg, layer);
+    let p = |t: &str| format!("{prefix}mlp.experts.{expert}.{t}");
     let plans = [
         tplan(st, &p("gate_proj.weight"), mi, hidden)?,
         tplan(st, &p("up_proj.weight"), mi, hidden)?,
@@ -1429,12 +1432,47 @@ pub fn moe_forward_dispatch(
     shared: Option<&Mlp>,
     s_n: usize,
 ) -> Result<Vec<f32>, Error> {
+    if ctx.demand_experts {
+        return moe_forward_on_demand(ctx, MoeCall { layer, x, router_w, router_bias, shared, s_n });
+    }
     match MOE_ENGINE.get() {
         Some(engine) => {
             engine.moe_forward(ctx, MoeCall { layer, x, router_w, router_bias, shared, s_n })
         }
         None => moe_forward_concurrent(ctx, layer, x, router_w, router_bias, shared, s_n),
     }
+}
+
+fn moe_forward_on_demand(ctx: &ForwardCtx, call: MoeCall) -> Result<Vec<f32>, Error> {
+    let MoeCall { layer, x, router_w, router_bias, shared, s_n } = call;
+    let cfg = ctx.cfg;
+    let hidden = cfg.hidden as usize;
+    let inter = cfg.moe_inter as usize;
+    let e_n = cfg.n_experts as usize;
+    let route_cfg = RouterCfg {
+        s_n,
+        d_n: hidden,
+        e_n,
+        k: cfg.topk as usize,
+        norm_topk: cfg.norm_topk,
+        routed_scale: cfg.routed_scale,
+        min_share: crate::router::route_min_share(),
+    };
+    let r = route(x, router_w, router_bias, route_cfg);
+    let prefix = crate::model::layer_prefix(cfg, layer);
+    let shape = crate::mlp::MoeCfg {
+        s_n,
+        hidden,
+        k: route_cfg.k,
+        norm_topk: route_cfg.norm_topk,
+        routed_scale: route_cfg.routed_scale,
+    };
+    let weights = TensorReader::new(ctx.st);
+    let out = crate::mlp::moe_forward_demand(&r, x, shared, shape, e_n, |expert| {
+        Mlp::load(&weights, &format!("{prefix}mlp.experts.{expert}."), hidden, inter)
+    })?;
+    record_routing(ctx, layer, &r, batch_union(&r, s_n), s_n);
+    Ok(out)
 }
 
 pub fn moe_forward_concurrent(
@@ -2253,6 +2291,11 @@ pub fn moe_forward_concurrent(
         t.add_reduce(t_reduce.elapsed().as_micros() as u64);
     }
 
+    record_routing(ctx, layer, &r, uniq, s_n);
+    Ok(out)
+}
+
+fn record_routing(ctx: &ForwardCtx, layer: usize, r: &Routed, uniq: Vec<i32>, s_n: usize) {
     // Accumulate routing frequency so the GPU tier can migrate hot experts into
     // VRAM (heat-ranked residency). Union hotness is the batched-relevant signal;
     // single-threaded here (after the reduce), so the lock-free bumps never race.
@@ -2280,7 +2323,7 @@ pub fn moe_forward_concurrent(
     // s) into its per-sequence history, for per-stream prediction.
     if let Some(multi) = ctx.route_log_multi {
         for (s, rh) in multi.iter().enumerate().take(s_n) {
-            rh.lock().push_layer(layer, routed_at(&r, s));
+            rh.lock().push_layer(layer, routed_at(r, s));
         }
     }
     // Per position, ids *and* weights, before `Routed` is dropped. This is the
@@ -2296,7 +2339,6 @@ pub fn moe_forward_concurrent(
             gt.push(layer, ids, w);
         }
     }
-    Ok(out)
 }
 
 /// One expert queued for speculative prefetch: its `(layer, expert)` cache key and
@@ -2488,6 +2530,7 @@ mod tests {
             workers: 2,
             cfg: &cfg,
             stream_experts: true,
+            demand_experts: false,
             ecache: None,
             route_log: None,
             calib: None,

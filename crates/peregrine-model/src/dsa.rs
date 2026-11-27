@@ -9,6 +9,7 @@
 //! with `--indexer`; this module implements + unit-tests the scoring and top-k
 //! selection, which compose with the (separately tested) sparse attend path.
 
+use peregrine_core::safetensors::TensorReader;
 use peregrine_core::{Cfg, Error, SafeTensors};
 
 use crate::math::rope_interleave;
@@ -79,9 +80,13 @@ pub struct IndexerWeights {
 impl IndexerWeights {
     /// Load the indexer for `layer` if present; `Ok(None)` otherwise.
     pub fn load(st: &SafeTensors, layer: usize, cfg: &Cfg) -> Result<Option<IndexerWeights>, Error> {
+        Self::load_from(&TensorReader::new(st), layer, cfg)
+    }
+
+    pub(crate) fn load_from(st: &TensorReader<'_>, layer: usize, cfg: &Cfg) -> Result<Option<IndexerWeights>, Error> {
         let base = format!("model.layers.{layer}.self_attn");
         let wqn = format!("{base}.indexer_projections.wq_b");
-        if !st.has(&wqn) {
+        if !st.index.has(&wqn) {
             return Ok(None);
         }
         let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
@@ -91,9 +96,9 @@ impl IndexerWeights {
         st.read_f32(&format!("{base}.indexer.k_norm.weight"), &mut k_norm_w)?;
         st.read_f32(&format!("{base}.indexer.k_norm.bias"), &mut k_norm_b)?;
         Ok(Some(IndexerWeights {
-            wq: QtWeight::load(st, &wqn, nh * hd, ql)?,
-            wk: QtWeight::load(st, &format!("{base}.indexer_projections.wk"), hd, hidden)?,
-            wp: QtWeight::load(st, &format!("{base}.indexer_projections.weights_proj"), nh, hidden)?,
+            wq: QtWeight::load_from(st, &wqn, nh * hd, ql)?,
+            wk: QtWeight::load_from(st, &format!("{base}.indexer_projections.wk"), hd, hidden)?,
+            wp: QtWeight::load_from(st, &format!("{base}.indexer_projections.weights_proj"), nh, hidden)?,
             k_norm_w,
             k_norm_b,
             nh,

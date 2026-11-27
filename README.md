@@ -70,11 +70,11 @@ checkpoint self-rewrite (`--apply`), online bandit + Q-learning schedulers,
 per-shape dispatch specialization, kblock tensor-layout auto-conversion, and
 the `compile-plan` profile-guided execution plan. The serve layer now runs a
 **vendored [gigatoken](https://github.com/marcelroed/gigatoken) BPE tokenizer**
-(stable-toolchain subset, MIT) as its **sole runtime tokenizer** — measured **34×
+(stable-toolchain subset, MIT) as its fast BPE path — measured **34×
 faster than HF `tokenizers` on this box** (204 vs 6 MB/s, the per-line serve
 pattern; the whole-buffer and parallel-batch paths run 3–7× higher still — see
 [docs/tokenizer.md](docs/tokenizer.md#throughput-anatomy)), id-for-id parity-gated
-(the HF crate remains only as the test-suite oracle).
+with Hugging Face Tokenizers supporting additional tokenizer formats.
 
 The 2026-08-03 wave came from cross-reading two parallel projects solving the same
 problem — [WASTE](https://github.com/sqliteai/waste) (C) and
@@ -113,7 +113,7 @@ See [`todo.md`](docs/todo.md) for the audited roadmap (**~86% strict / ~89% weig
 | Adaptive runtime | `peregrine-model` (`lane.rs`, `iotune.rs`, `telemetry.rs`, `workload.rs`) | ✅ | per-lane wall-time accum + `BubbleTuner` EWMA → `LaneBalancer` (CPU/GPU bias-driven downgrade); `IoTuner` adjusts `iowq_max_workers` between forwards; `PredictSource::PhaseAware` (depth-derived boost; `PhaseTracker` is the unwired stateful alternative); per-class prefetch breadth from the serving layer's prompt classifier; heat-threshold cache admission; NUMA worker pinning; real `perf_event_open` LLC-miss counter; cross-session `route_stats.json` at Drop / auto-load on load |
 | Offline layout tool | `peregrine-tools` | ✅ | `peregrine-layout-reorg` consumes `dump-routes` JSON, emits `<dir>/schedule.json` via `--method greedy`, `louvain`, or `spectral` (Fiedler ordering); loader picks it up and pre-sorts disk reads |
 | Compression | `peregrine-core` (`compress.rs`), `peregrine-io` (`warmcache.rs`) | ✅ | zstd end-to-end on disk (`Blob::with_compression`, header carries the tag + original size); optional transparent zstd on WarmCache admissions (`COLI_CACHE_COMPRESS`) |
-| Tokenizer fast path | `peregrine-token`, `peregrine-serve` (`tok.rs`) | ✅ | vendored gigatoken BPE subset (stable toolchain, no libpython); id-for-id parity vs HF `tokenizers` on the committed GPT-2 fixture; cross-request memo cache; sole runtime tokenizer (HF crate is test-oracle only); `--bench-tokenizer` (34× locally) |
+| Tokenizer fast path | `peregrine-token`, `peregrine-serve` (`tok.rs`) | ✅ | Gigatoken ByteLevel BPE with a cross-request encode cache and lock-free decode. Hugging Face Tokenizers supports additional formats. |
 
 ### Not yet done
 **Ten of the nineteen open items need hardware this workspace lacks**: CUDA Graphs

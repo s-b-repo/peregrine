@@ -27,6 +27,7 @@ pub mod iotune;
 pub mod statefp;
 pub mod ledger;
 pub mod lane;
+mod layer_stream;
 pub mod learn;
 pub mod math;
 pub mod mlp;
@@ -53,7 +54,7 @@ pub mod topic;
 /// outright) once a second module grew tests of its own. The lock lives at crate
 /// level so `gpu.rs` and `model.rs` share ONE, rather than each serializing only
 /// against itself.
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub(crate) mod gpu_test_lock {
     static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     /// `unwrap_or_else` recovers a poisoned lock (a panicked test) without

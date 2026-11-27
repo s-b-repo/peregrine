@@ -38,6 +38,7 @@ use peregrine_core::config::Cfg;
 use peregrine_core::{durable, note_advisory_err, Context, Error};
 use peregrine_model::{KvDtype, KvExport, KvLayerExport, Model, SeqKv};
 use std::io::Write;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -81,36 +82,25 @@ fn common_prefix(a: &[i32], b: &[i32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-/// Identity of a model container, from its artifacts alone: `config.json`
-/// bytes, then each `*.safetensors` shard's name, size, and first 4 KiB — the
-/// header page, which carries tensor shapes/offsets *and* the
-/// `peregrine.requantize.scheme` provenance stamp. Two containers that differ
-/// in scheme, layout, or shard set therefore fingerprint differently without
-/// reading any payload. (Two containers with byte-identical headers but
-/// different payloads — e.g. the same scheme converted twice from different
-/// sources — would collide; the header stamp records the source dir precisely
-/// to keep that theoretical.)
-fn container_fingerprint(dir: &Path) -> Result<u64, Error> {
-    let cfg_path = dir.join("config.json");
+/// Fingerprint the loaded shard set, including files resolved by model_paths.json.
+/// File identity and change times invalidate locally replaced or edited weights.
+fn container_fingerprint(model: &Model) -> Result<u64, Error> {
+    let cfg_path = model.checkpoint_dir().join("config.json");
     let cfg_bytes = peregrine_io::read_file(&cfg_path).ctx(|| format!("read {}", cfg_path.display()))?;
-    let mut h = fnv1a64(FNV_OFFSET, &cfg_bytes);
-    let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ctx(|| format!("scan {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    shards.sort();
-    for shard in shards {
-        if let Some(name) = shard.file_name().and_then(|n| n.to_str()) {
-            h = fnv1a64(h, name.as_bytes());
+    let mut h = fnv1a64(FNV_OFFSET, b"peregrine-kv-2");
+    h = fnv1a64(h, &cfg_bytes);
+    for (path, file) in model.checkpoint_shards() {
+        let meta = file.metadata().ctx(|| format!("stat {}", path.display()))?;
+        for value in [
+            meta.dev(), meta.ino(), meta.len(), meta.mtime() as u64,
+            meta.mtime_nsec() as u64, meta.ctime() as u64, meta.ctime_nsec() as u64,
+        ] {
+            h = fnv1a64(h, &value.to_le_bytes());
         }
-        let meta = std::fs::metadata(&shard).ctx(|| format!("stat {}", shard.display()))?;
-        h = fnv1a64(h, &meta.len().to_le_bytes());
-        // A shard is multi-gigabyte, so this reads the header page only —
-        // through the ring, and short for a shard smaller than a page.
-        let head = peregrine_io::read_region(&shard, 0, 4096)
-            .ctx(|| format!("read header of {}", shard.display()))?;
-        h = fnv1a64(h, &head);
+        let mut page = [0u8; 4096];
+        let head = &mut page[..meta.len().min(4096) as usize];
+        file.read_exact_at(head, 0).ctx(|| format!("read header of {}", path.display()))?;
+        h = fnv1a64(h, head);
     }
     Ok(h)
 }
@@ -312,7 +302,7 @@ impl KvSessionStore {
         std::fs::create_dir_all(dir).ctx(|| format!("create {}", dir.display()))?;
         let ctx = WriterCtx {
             dir: dir.to_path_buf(),
-            fingerprint: container_fingerprint(model.checkpoint_dir())?,
+            fingerprint: container_fingerprint(model)?,
             dtype: peregrine_model::kv_dtype(),
             cfg: model.cfg.clone(),
             cap_bytes,
@@ -406,7 +396,8 @@ impl KvSessionStore {
         if n_layers != self.cfg.n_layers as usize {
             return Ok(None);
         }
-        let want = n_tokens.saturating_mul(4);
+        let want = n_tokens.checked_mul(4).filter(|&size| size as u64 <= bytes.saturating_sub(FIXED as u64))
+            .ok_or_else(|| Error::Format(format!("{}: token count exceeds checkpoint size", path.display())))?;
         let tok_bytes = peregrine_io::read_region(path, FIXED as u64, want)
             .ctx(|| format!("read tokens of {}", path.display()))?;
         if tok_bytes.len() < want {
@@ -641,17 +632,17 @@ impl KvSessionStore {
         for &t in tokens {
             name_hash = fnv1a64(name_hash, &t.to_le_bytes());
         }
-        let name = format!("{name_hash:016x}-{n}.pgkv");
+        let name = format!("{:016x}-{name_hash:016x}-{n}.pgkv", ctx.fingerprint);
         let path = ctx.dir.join(name);
-        let tmp = durable::temp_sibling(&path)?;
+        let tmp = durable::AtomicFile::new(&path)?;
         {
-            let f = std::fs::File::create(&tmp).ctx(|| format!("create {}", tmp.display()))?;
+            let f = tmp.file();
             match peregrine_io::Reactor::new(8) {
                 Ok(reactor) => {
                     use std::os::unix::io::AsRawFd;
                     let mut w = HashingWriter { w: RingSink::new(reactor, f.as_raw_fd()), h: FNV_OFFSET };
                     Self::serialize_entry(&mut w, ctx, tokens, export)?;
-                    w.w.finish().ctx(|| format!("fsync {}", tmp.display()))?;
+                    w.w.finish().ctx(|| format!("sync checkpoint {}", path.display()))?;
                 }
                 // A checkpoint is an optimization, so a host without io_uring
                 // must still be able to save one — the same rule the whole-file
@@ -663,11 +654,11 @@ impl KvSessionStore {
                     Self::serialize_entry(&mut w, ctx, tokens, export)?;
                     w.flush().ctx(|| "kvstore flush".to_string())?;
                     let f = w.w.into_inner().map_err(|e| Error::Format(format!("kvstore buffered write: {e}")))?;
-                    f.sync_all().ctx(|| format!("fsync {}", tmp.display()))?;
+                    f.sync_all().ctx(|| format!("sync checkpoint {}", path.display()))?;
                 }
             }
         }
-        durable::commit_atomic(&tmp, &path)?;
+        tmp.commit()?;
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         Ok(IndexEntry { path, tokens: tokens.to_vec(), bytes })
     }
@@ -891,6 +882,26 @@ mod tests {
         assert_eq!(fresh.best_match_len(&prompt), 0);
         std::fs::remove_dir_all(&mdir)?;
         std::fs::remove_dir_all(&sdir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_shard_in_an_external_model_directory_changes_identity() -> Result<(), Error> {
+        let root = tiny_dir("split_fingerprint")?;
+        let shard_dir = root.join("external");
+        let replacement_dir = root.join("replacement");
+        std::fs::create_dir(&shard_dir)?;
+        let shard = shard_dir.join("model.safetensors");
+        std::fs::rename(root.join("model.safetensors"), &shard)?;
+        std::fs::write(root.join("model_paths.json"), br#"{"paths":["external"]}"#)?;
+        let first = Model::load(&root)?;
+        let before = container_fingerprint(&first)?;
+
+        peregrine_model::testkit::build_tiny_model_seeded(&replacement_dir, 8192)?;
+        std::fs::rename(replacement_dir.join("model.safetensors"), &shard)?;
+        let second = Model::load(&root)?;
+        assert_ne!(before, container_fingerprint(&second)?);
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

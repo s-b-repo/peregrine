@@ -142,7 +142,9 @@ echo "listen  : http://${HOST}:${PORT}/v1   batch=${MAX_BATCH}"
 echo "gpu     : ${COLI_GPU} (pinned=${COLI_GPU_PINNED})  ecache=${COLI_ECACHE_GB}G"
 echo "spec    : draft=${COLI_DRAFT} conf=${COLI_SPEC_CONF}   io_batch=${COLI_IO_BATCH}"
 echo "kvstore : ${COLI_KV_STORE_DIR} (${COLI_KV_STORE_MB} MB)"
-echo "auth    : ${PEREGRINE_API_KEY:+bearer key configured}${PEREGRINE_API_KEY:-NO KEY — refusing to start}"
+if [ -n "${PEREGRINE_API_KEY:-}" ]; then
+    echo "Bearer key configured"
+fi
 echo "===================================================="
 
 if [ -z "${PEREGRINE_API_KEY:-}" ]; then

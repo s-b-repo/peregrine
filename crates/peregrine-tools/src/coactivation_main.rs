@@ -210,8 +210,8 @@ fn run() -> Result<(), Error> {
     let mut best: Option<(String, f64)> = None;
     for method in ["greedy", "louvain", "spectral", "hilbert"] {
         let order = order_experts(&trace, method)?;
-        let layer_order = order.get(layer).cloned().unwrap_or_default();
-        let layout = disk_index(&layer_order, n);
+        let layer_order = order.get(layer).map_or(&[][..], Vec::as_slice);
+        let layout = disk_index(layer_order, n);
         let runs = mean_run_breaks(&trace, layer, &layout);
         let bij = is_bijection(&layout, n);
         rows.push((format!("co-activation: {method}"), runs, bij));
@@ -250,8 +250,6 @@ fn run() -> Result<(), Error> {
 }
 
 #[cfg(test)]
-// Tests may assert with unwrap/panic; production code in this file stays denied.
-#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -294,17 +292,18 @@ mod tests {
     }
 
     #[test]
-    fn co_activation_beats_identity_on_interleaved_clusters() {
+    fn co_activation_beats_identity_on_interleaved_clusters() -> Result<(), Error> {
         // Two clusters interleaved in id-space: evens co-fire, odds co-fire.
         let (trace, n) = synthetic_trace(2, 8, 1500, 4);
         let identity: Vec<i32> = (0..n as i32).collect();
         let id_runs = mean_run_breaks(&trace, 0, &disk_index(&identity, n));
-        let order = order_experts(&trace, "greedy").unwrap();
+        let order = order_experts(&trace, "greedy")?;
         let co_runs = mean_run_breaks(&trace, 0, &disk_index(&order[0], n));
         assert!(
             co_runs < id_runs,
             "co-activation {co_runs:.3} should beat identity {id_runs:.3}"
         );
+        Ok(())
     }
 
     #[test]

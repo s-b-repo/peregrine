@@ -49,7 +49,8 @@ pub const fn align_up_usize(x: usize, a: usize) -> usize {
 /// throttling: `cudaHostRegister` walks and pins page tables and is far too
 /// expensive to run per read. Returning `false` declines a buffer, and a
 /// declined buffer is never passed to `unpin`.
-type PinHook = (fn(*mut u8, usize) -> bool, fn(*mut u8, usize));
+type HostPinCallback = unsafe fn(*mut u8, usize) -> bool;
+type PinHook = (HostPinCallback, HostPinCallback);
 static PIN_HOOK: std::sync::OnceLock<PinHook> = std::sync::OnceLock::new();
 
 /// Install the [`PIN_HOOK`]. Returns `false` if one was already installed (the
@@ -57,7 +58,12 @@ static PIN_HOOK: std::sync::OnceLock<PinHook> = std::sync::OnceLock::new();
 /// second caller is a bug rather than a race.
 /// `unpin` receives the same length `pin` was given, so a backend can keep
 /// live-pinned-bytes accounting without a side table keyed by address.
-pub fn set_pin_hook(pin: fn(*mut u8, usize) -> bool, unpin: fn(*mut u8, usize)) -> bool {
+///
+/// # Safety
+/// Both callbacks must accept the base address and size of any live aligned
+/// allocation. They may run concurrently on different allocations. A callback
+/// that accepts a pin must return `true` on unpin only after registration ends.
+pub unsafe fn set_pin_hook(pin: HostPinCallback, unpin: HostPinCallback) -> bool {
     PIN_HOOK.set((pin, unpin)).is_ok()
 }
 
@@ -125,7 +131,8 @@ impl AlignedBuf {
         // Pin last: after the hugepage and NUMA advice, so the hook registers the
         // pages the kernel is actually going to back this range with.
         let pinned = match PIN_HOOK.get() {
-            Some((pin, _)) => pin(ptr.as_ptr(), len),
+            // SAFETY: this is a live, aligned allocation of exactly len bytes.
+            Some((pin, _)) => unsafe { pin(ptr.as_ptr(), len) },
             None => false,
         };
         Some(AlignedBuf { ptr, len, layout, pinned })
@@ -163,7 +170,11 @@ impl Drop for AlignedBuf {
         // mapped, and a `cudaHostUnregister` of a freed pointer is undefined.
         if self.pinned {
             if let Some((_, unpin)) = PIN_HOOK.get() {
-                unpin(self.ptr.as_ptr(), self.len);
+                // SAFETY: pin accepted this allocation and it is still live.
+                if !unsafe { unpin(self.ptr.as_ptr(), self.len) } {
+                    // Preserve the allocation if the device may still hold it.
+                    return;
+                }
             }
         }
         // SAFETY: `ptr` came from `alloc_zeroed` with exactly `self.layout` and is
@@ -631,11 +642,13 @@ mod tests {
             PINS.fetch_add(1, Ordering::SeqCst);
             true
         }
-        fn unpin(_p: *mut u8, _len: usize) {
+        fn unpin(_p: *mut u8, _len: usize) -> bool {
             UNPINS.fetch_add(1, Ordering::SeqCst);
+            true
         }
 
-        if !super::set_pin_hook(pin, unpin) {
+        // SAFETY: both callbacks only inspect the size and update atomic counters.
+        if !unsafe { super::set_pin_hook(pin, unpin) } {
             eprintln!("skipping: a pin hook was already installed in this process");
             return;
         }

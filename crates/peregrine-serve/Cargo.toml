@@ -25,14 +25,12 @@ peregrine-core = { path = "../peregrine-core" }
 peregrine-io = { path = "../peregrine-io" }
 peregrine-token = { path = "../peregrine-token" }
 parking_lot = "0.12"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "process", "io-util", "time"] }
 axum = "0.7"
 tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 
-[dev-dependencies]
-# Parity oracle only: tests/tokenizer_parity.rs asserts gigatoken ids match
-# the HF `tokenizers` crate id-for-id. Not linked into the serve binary.
+# Fallback for tokenizer.json formats beyond gigatoken's fast BPE subset.
 tokenizers = "0.20"

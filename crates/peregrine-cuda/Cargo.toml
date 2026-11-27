@@ -11,7 +11,8 @@ build = "build.rs"
 # Off by default so the workspace builds on hosts without nvcc/CUDA. Enable on an
 # NVIDIA box: `cargo build -p peregrine-cuda --features cuda`.
 default = []
-cuda = []
+cuda = ["dep:peregrine-io"]
 
 [dependencies]
 peregrine-core = { path = "../peregrine-core" }
+peregrine-io = { path = "../peregrine-io", optional = true }

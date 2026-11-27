@@ -9,9 +9,10 @@ use crate::compress::{decode, Compression};
 use crate::dtype::{bf16_to_f32, f16_to_f32, Dtype};
 use crate::{Context, Error};
 use parking_lot::Mutex;
-use peregrine_io::Reactor;
+use peregrine_io::{Bytes, Reactor};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -45,6 +46,18 @@ pub struct TensorInfo {
     /// transposed, auto-converted back to native by `read_raw`.
     pub layout: Option<(String, usize)>,
 }
+
+/// The stack layer and tensor suffix encoded in a native checkpoint name.
+/// Callers use the configured layer count to keep off-stack heads separate.
+pub fn layer_tensor(name: &str) -> Option<(usize, &str)> {
+    let rest = name.strip_prefix("model.layers.")
+        .or_else(|| name.strip_prefix("model.language_model.layers."))?;
+    let (layer, suffix) = rest.split_once('.')?;
+    Some((layer.parse().ok()?, suffix))
+}
+
+/// Completed on-disk ranges keyed by shard index and absolute offset.
+pub type TensorRanges = BTreeMap<(usize, u64), Bytes>;
 
 /// Index over all `*.safetensors` shards in a model directory.
 /// Device-ordinal mapping for a set of shard paths (Track A Seam 1) — pure so
@@ -334,6 +347,7 @@ impl SafeTensors {
                 .as_object()
                 .ok_or_else(|| Error::Format(format!("{}: header not a JSON object", path.display())))?;
 
+            let first_tensor = tensors.len();
             for (name, m) in obj {
                 if name == "__metadata__" {
                     continue;
@@ -342,7 +356,7 @@ impl SafeTensors {
                 let offs = m.get("data_offsets").and_then(|v| v.as_array());
                 let shp = m.get("shape").and_then(|v| v.as_array());
                 let (dt, offs, shp) = match (dt, offs, shp) {
-                    (Some(dt), Some(offs), Some(shp)) if offs.len() >= 2 => (dt, offs, shp),
+                    (Some(dt), Some(offs), Some(shp)) if offs.len() == 2 => (dt, offs, shp),
                     _ => {
                         return Err(Error::Format(format!(
                             "{}: tensor '{name}' malformed dtype/data_offsets/shape",
@@ -370,7 +384,9 @@ impl SafeTensors {
                         path.display()
                     )));
                 }
-                let shape: Vec<i64> = shp.iter().map(|v| v.as_i64().unwrap_or(0)).collect();
+                let shape: Vec<i64> = shp.iter().map(Value::as_i64).collect::<Option<_>>().ok_or_else(|| {
+                    Error::Format(format!("{}: tensor '{name}' has a non-integer dimension", path.display()))
+                })?;
                 if shape.iter().any(|&d| d < 0) {
                     return Err(Error::Format(format!("{}: tensor '{name}' has a negative dimension", path.display())));
                 }
@@ -388,6 +404,12 @@ impl SafeTensors {
                         .and_then(|v| v.as_i64())
                         .unwrap_or(on_disk_nbytes),
                 };
+                if uncompressed_nbytes < 0 {
+                    return Err(Error::Format(format!(
+                        "{}: tensor '{name}' has a negative uncompressed size",
+                        path.display()
+                    )));
+                }
                 // The shape and the payload length are independent fields; nothing
                 // tied them together, so a short payload for a declared shape read
                 // partially and left the tail of the destination at zero while
@@ -429,6 +451,16 @@ impl SafeTensors {
                     return Err(Error::Format(format!(
                         "{}: tensor '{name}' appears in more than one shard",
                         path.display()
+                    )));
+                }
+            }
+            let mut ranges: Vec<_> = tensors[first_tensor..].iter().filter(|tensor| tensor.nbytes > 0).collect();
+            ranges.sort_unstable_by_key(|tensor| tensor.off);
+            for pair in ranges.windows(2) {
+                if pair[0].off + pair[0].nbytes as u64 > pair[1].off {
+                    return Err(Error::Format(format!(
+                        "{}: tensors '{}' and '{}' have overlapping data ranges",
+                        path.display(), pair[0].name, pair[1].name
                     )));
                 }
             }
@@ -563,6 +595,11 @@ impl SafeTensors {
         self.direct_files.iter().any(Option::is_some)
     }
 
+    /// Whether this process could open an io_uring instance for the checkpoint.
+    pub fn supports_io_uring(&self) -> bool {
+        self.reactor.is_some()
+    }
+
     /// Every shard fd a streaming read can name: the buffered fd per shard plus
     /// its O_DIRECT twin where one exists — the exact set behind
     /// [`Self::region`] / [`Self::region_direct`]. For io_uring fixed-file
@@ -575,6 +612,11 @@ impl SafeTensors {
             .map(|f| f.as_raw_fd())
             .chain(self.direct_files.iter().flatten().map(|f| f.as_raw_fd()))
             .collect()
+    }
+
+    /// The ordered shard paths and their already-open buffered files.
+    pub fn shards(&self) -> impl Iterator<Item = (&Path, &File)> {
+        self.paths.iter().map(PathBuf::as_path).zip(&self.files)
     }
 
     /// The compression scheme applied to `name` (`Compression::None` for
@@ -595,28 +637,7 @@ impl SafeTensors {
     /// Read a tensor as f32, converting BF16/F16/F32. `out` must hold `numel`
     /// floats. Errors on a U8 (quantized) tensor — use [`Self::read_raw`].
     pub fn read_f32(&self, name: &str, out: &mut [f32]) -> Result<i64, Error> {
-        let t = self.tensor(name)?;
-        if t.dtype == Dtype::U8 {
-            return Err(Error::Format(format!("read_f32 on quantized (U8) tensor '{name}'")));
-        }
-        let need = t.numel as usize;
-        if out.len() < need {
-            return Err(Error::Format(format!(
-                "read_f32 '{name}': out buffer {} < numel {need}",
-                out.len()
-            )));
-        }
-        let (dtype, off, on_disk_nbytes, fidx) = (t.dtype, t.off, t.nbytes as usize, t.file_idx);
-        let mut disk = vec![0u8; on_disk_nbytes];
-        maybe_hugepage(&mut disk);
-        self.read_at(fidx, off, &mut disk)?;
-        let raw = match t.compression {
-            Compression::None => disk,
-            other => decode(&disk, other, t.uncompressed_nbytes as usize)
-                .ctx(|| format!("read_f32 '{name}' decompress"))?,
-        };
-        convert_f32(dtype, &raw, &mut out[..need])?;
-        Ok(need as i64)
+        TensorReader::new(self).read_f32(name, out)
     }
 
     /// Read the raw bytes of tensor number `idx` (index into [`Self::tensors`]).
@@ -635,43 +656,7 @@ impl SafeTensors {
     /// int4/int8/int2-quantized U8 container payloads. `out` must be
     /// `uncompressed_nbytes`.
     pub fn read_raw(&self, name: &str, out: &mut [u8]) -> Result<(), Error> {
-        let t = self.tensor(name)?;
-        let need = t.uncompressed_nbytes as usize;
-        // Exact, not "at least": an oversized buffer used to be filled partially
-        // and the tail left at zero. For a quantized payload zero nibbles decode
-        // to -8 (maximum-magnitude negative weights), so the model would produce
-        // confident garbage rather than an error.
-        if out.len() != need {
-            return Err(Error::Format(format!(
-                "read_raw '{name}': out buffer {} bytes, tensor is {need}",
-                out.len()
-            )));
-        }
-        maybe_hugepage(&mut out[..need]);
-        let (off, fidx) = (t.off, t.file_idx);
-        match t.compression {
-            Compression::None => self.read_at(fidx, off, &mut out[..need])?,
-            other => {
-                let mut disk = vec![0u8; t.nbytes as usize];
-                maybe_hugepage(&mut disk);
-                self.read_at(fidx, off, &mut disk)?;
-                let raw = decode(&disk, other, need).ctx(|| format!("read_raw '{name}' decompress"))?;
-                out[..need].copy_from_slice(&raw);
-            }
-        }
-        // Layout auto-conversion: a "kblock"-tagged payload is stored group-major
-        // on disk; permute back to the kernels' native row-major layout so every
-        // consumer sees identical bytes regardless of on-disk tiling.
-        if let Some((tag, gs_bytes)) = &t.layout {
-            if tag == "kblock" {
-                let o = t.shape.first().copied().unwrap_or(0).max(0) as usize;
-                let native = crate::pack::from_kblock(&out[..need], o, *gs_bytes).ok_or_else(|| {
-                    Error::Format(format!("read_raw '{name}': kblock layout does not tile (o={o}, gs_bytes={gs_bytes})"))
-                })?;
-                out[..need].copy_from_slice(&native);
-            }
-        }
-        Ok(())
+        TensorReader::new(self).read_raw(name, out)
     }
 
     /// Read `n_elems` starting at element `elem_off` (converted to f32). Used for
@@ -735,6 +720,98 @@ impl SafeTensors {
 
     fn tensor(&self, name: &str) -> Result<&TensorInfo, Error> {
         self.find(name).ok_or_else(|| Error::Format(format!("missing tensor: {name}")))
+    }
+}
+
+/// Read and decode against the checkpoint index, optionally using ranges that
+/// were already read asynchronously. Both paths share the format checks.
+pub struct TensorReader<'a> {
+    pub index: &'a SafeTensors,
+    ranges: Option<&'a TensorRanges>,
+}
+
+impl<'a> TensorReader<'a> {
+    pub fn new(index: &'a SafeTensors) -> Self {
+        Self { index, ranges: None }
+    }
+
+    pub fn staged(index: &'a SafeTensors, ranges: &'a TensorRanges) -> Self {
+        Self { index, ranges: Some(ranges) }
+    }
+
+    fn staged_bytes(ranges: &'a TensorRanges, t: &TensorInfo) -> Result<&'a [u8], Error> {
+        let len = t.nbytes as usize;
+        if len == 0 {
+            return Ok(&[]);
+        }
+        let bytes = ranges.range((t.file_idx, 0)..=(t.file_idx, t.off)).next_back()
+            .and_then(|(&(_, start), bytes)| {
+                let offset = usize::try_from(t.off - start).ok()?;
+                bytes.get(offset..offset.checked_add(len)?)
+            });
+        bytes.ok_or_else(|| Error::Format(format!("tensor '{}' is outside the staged layer ranges", t.name)))
+    }
+
+    fn disk_bytes(&self, t: &TensorInfo) -> Result<Cow<'a, [u8]>, Error> {
+        if let Some(ranges) = self.ranges {
+            return Ok(Cow::Borrowed(Self::staged_bytes(ranges, t)?));
+        }
+        let mut disk = vec![0u8; t.nbytes as usize];
+        maybe_hugepage(&mut disk);
+        self.index.read_at(t.file_idx, t.off, &mut disk)?;
+        Ok(Cow::Owned(disk))
+    }
+
+    pub fn read_f32(&self, name: &str, out: &mut [f32]) -> Result<i64, Error> {
+        let t = self.index.tensor(name)?;
+        if t.dtype == Dtype::U8 {
+            return Err(Error::Format(format!("read_f32 on quantized (U8) tensor '{name}'")));
+        }
+        let need = t.numel as usize;
+        if out.len() < need {
+            return Err(Error::Format(format!(
+                "read_f32 '{name}': out buffer {} < numel {need}", out.len()
+            )));
+        }
+        let disk = self.disk_bytes(t)?;
+        let raw = match t.compression {
+            Compression::None => disk,
+            other => Cow::Owned(decode(&disk, other, t.uncompressed_nbytes as usize)
+                .ctx(|| format!("read_f32 '{name}' decompress"))?),
+        };
+        convert_f32(t.dtype, &raw, &mut out[..need])?;
+        Ok(need as i64)
+    }
+
+    pub fn read_raw(&self, name: &str, out: &mut [u8]) -> Result<(), Error> {
+        let t = self.index.tensor(name)?;
+        let need = t.uncompressed_nbytes as usize;
+        if out.len() != need {
+            return Err(Error::Format(format!(
+                "read_raw '{name}': out buffer {} bytes, tensor is {need}", out.len()
+            )));
+        }
+        maybe_hugepage(out);
+        match (t.compression, self.ranges) {
+            (Compression::None, None) => self.index.read_at(t.file_idx, t.off, out)?,
+            (Compression::None, Some(ranges)) => out.copy_from_slice(Self::staged_bytes(ranges, t)?),
+            (other, _) => {
+                let disk = self.disk_bytes(t)?;
+                let raw = decode(&disk, other, need).ctx(|| format!("read_raw '{name}' decompress"))?;
+                out.copy_from_slice(&raw);
+            }
+        }
+        // Restore the packed row-major layout expected by the compute kernels.
+        if let Some((tag, gs_bytes)) = &t.layout {
+            if tag == "kblock" {
+                let o = t.shape.first().copied().unwrap_or(0).max(0) as usize;
+                let native = crate::pack::from_kblock(out, o, *gs_bytes).ok_or_else(|| {
+                    Error::Format(format!("read_raw '{name}': kblock layout does not tile (o={o}, gs_bytes={gs_bytes})"))
+                })?;
+                out.copy_from_slice(&native);
+            }
+        }
+        Ok(())
     }
 }
 

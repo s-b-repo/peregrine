@@ -232,7 +232,7 @@ impl ResidencyHint {
         // `Err` is not a failure here: the closure declining to store IS the
         // saturation rule (stick at 255), so both arms leave the counter
         // holding its intended value.
-        match c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| (v < u8::MAX).then(|| v + 1)) {
+        match c.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1)) {
             Ok(_) => {}
             Err(saturated) => debug_assert_eq!(saturated, u8::MAX),
         }
@@ -242,7 +242,7 @@ impl ResidencyHint {
         // 0 is defensive (an unpaired remove would otherwise wrap to 255);
         // 255 is the sticky saturation described on the type. As in `bump`,
         // `Err` means the floor/ceiling rule held — the intended outcome.
-        match c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        match c.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             (v != 0 && v != u8::MAX).then(|| v - 1)
         }) {
             Ok(_) => {}
@@ -514,7 +514,7 @@ impl WarmCache {
             return 0; // incompressible — leave raw (decode cost for no gain)
         }
         let saved = slot.bytes - new_bytes;
-        self.used -= saved;
+        self.used = self.used.saturating_sub(saved);
         slot.bytes = new_bytes;
         slot.data = SlotBytes::Compressed(Arc::new(compressed));
         saved
@@ -879,7 +879,7 @@ impl WarmCache {
         let was_new;
         match self.map.get_mut(&key) {
             Some(slot) => {
-                self.used = self.used - slot.bytes + incoming;
+                self.used = self.used.saturating_sub(slot.bytes).saturating_add(incoming);
                 slot.bytes = incoming;
                 slot.data = slot_data;
                 slot.used = now;
@@ -891,7 +891,7 @@ impl WarmCache {
                 was_new = false;
             }
             None => {
-                self.used += incoming;
+                self.used = self.used.saturating_add(incoming);
                 self.map
                     .insert(key, Slot { used: now, bytes: incoming, data: slot_data, from_prefetch, ever_hit: false, prio: 0, heat: 0 });
                 was_new = true;
@@ -1033,7 +1033,7 @@ impl WarmCache {
                     break;
                 }
                 if let Some(s) = self.map.remove(&k) {
-                    self.used -= s.bytes;
+                    self.used = self.used.saturating_sub(s.bytes);
                     self.hint.remove(k);
                     if s.from_prefetch && !s.ever_hit {
                         self.prefetch_wasted += 1;
@@ -1095,7 +1095,7 @@ impl WarmCache {
                 .map(|(k, _)| *k);
             let Some(vk) = victim else { break };
             if let Some(s) = self.map.remove(&vk) {
-                self.used -= s.bytes;
+                self.used = self.used.saturating_sub(s.bytes);
                 self.hint.remove(vk);
                 if s.from_prefetch && !s.ever_hit {
                     self.prefetch_wasted += 1;

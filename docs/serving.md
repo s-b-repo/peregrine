@@ -11,11 +11,51 @@ is `#![forbid(unsafe_code)]`.
 cargo run --release -p peregrine-serve -- --model /path/to/model --port 8080
 ```
 
-Boot prints `[tokenizer] gigatoken BPE active, vocab=<n>` and
-`peregrine-serve listening on http://<host>:<port>` to stderr. Shutdown is
-graceful on Ctrl-C / SIGINT (in-flight connections drain; no SIGTERM handler).
+Boot logs the tokenizer backend and listening address to stderr. SIGINT and
+SIGTERM drain in-flight connections before shutdown.
+
+`scripts/start-serve.sh` forwards the same CLI flags for native and Omni
+serving. Set `PEREGRINE_CUDA=1` to build it with CUDA.
+
+## Serve the trained Nina and TRISKELE models
+
+Point the standalone server at an extracted Nina demo bundle with its Omni,
+Subnext, and Unifur runtimes and trained checkpoints.
+
+```bash
+cargo run --locked --release -p peregrine-serve -- \
+  --omni-suite /path/to/triskele-nina-demo --port 8080 --max-batch 4
+```
+
+Peregrine lists the bundle's model IDs and aliases at `/v1/models`. Choose an ID
+when calling `/v1/chat/completions`. For example, ask the default Nina evidence
+route about Subnext.
+
+```bash
+curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data '{"model":"nina","messages":[{"role":"user","content":"What does Subnext do for the Omni pipeline?"}]}'
+```
+
+Omni selects the checkpoint and invokes its native inference runtime. The
+JSON response includes the model's checkpoint or task metadata in `omni`.
+With `"stream": true`, Peregrine sends the completed reply as a text delta.
+Bundles with a chat-capable worker accept an alternating conversation history
+for their chat routes. When the bundle supports handing off Nina chat
+generation, Peregrine invokes the Unifur decoder for the trained checkpoint
+and applies the requested completion limit and the server cap. Older workers
+advertise model families as strings. A worker can declare history support
+explicitly in its roster with `{"family":"text generation","input":"messages"}`
+and accept history over `invoke --messages`.
+
+Use `--context-store` to point the evidence models at an indexed Subnext store.
+`--suite-artifacts` selects a different artifact directory and `--omni-bin`
+selects a different Omni executable. In this mode `--max-batch` sets the
+maximum number of simultaneous Omni workers.
 
 ## CLI flags
+
+The following defaults describe single-model serving.
 
 | Flag | Default | Notes |
 |---|---|---|
@@ -25,7 +65,7 @@ graceful on Ctrl-C / SIGINT (in-flight connections drain; no SIGTERM handler).
 | `--api-key <key>` | unset (env: `PEREGRINE_API_KEY`) | enables bearer auth when set |
 | `--max-tokens <n>` | `1024` | hard server cap on generated tokens per request |
 | `--max-prompt-tokens <n>` | `8192` | hard cap on encoded prompt tokens (413 above it) |
-| `--model-id <id>` | `glm-5.2` | id reported by `/v1/models` and echoed in responses |
+| `--model-id <id>` | Checkpoint directory name | id reported by `/v1/models` and echoed in responses |
 | `--max-batch <n>` | `32` | continuous-batching width ceiling |
 | `--bench-tokenizer <file>` | unset | tokenizer throughput bench, then exit (no weights loaded) |
 
@@ -57,7 +97,7 @@ except that `messages` must be non-empty; unknown fields are ignored):
 | `messages` | `[{role, content, …}]` | — | required non-empty. `content` may be a string, `null`, absent, or an **array of `{type, text}` parts** (parts without `text` are dropped, the rest concatenated). Assistant turns may carry `tool_calls`; `role: "tool"` is accepted and replayed as an observation |
 | `tools` | `[{type, function:{name, description, parameters}}]` | none | tool schemas, rendered into the system turn — see [Tool calling](#tool-calling) |
 | `tool_choice` | string or object | none | only the exact string `"none"` is honoured, and it disables tools for that request. Any other value (including `"auto"`, `"required"`, or an object naming a function) leaves all tools active — peregrine does not force a call |
-| `max_tokens` | int | `256` | clamped to `[1, --max-tokens]` |
+| `max_completion_tokens` or `max_tokens` | int | `256` | Positive completion budget capped by `--max-tokens`. `max_completion_tokens` takes precedence when both are present. |
 | `temperature` | float | `0.0` (greedy) | clamped to `[0.0, 2.0]`; note the default differs from OpenAI's `1.0` |
 | `top_p` | float | `0.95` | clamped to `[0.0, 1.0]` |
 | `top_k` | int | `0` (off) | rank cutoff, applied **before** `top_p` and renormalized — the order DFlash and the Qwen/GLM model cards use. Not an OpenAI field; accepted because every client talking to those model families sends it. `0` is off, as in vLLM/SGLang |
@@ -69,9 +109,8 @@ come from the model's `config.json` `eos_token_id` and are never emitted.
 Non-greedy sampling is seeded from the clock, so it is not reproducible;
 `temperature: 0` is deterministic.
 
-Prompts are built with the GLM chat template: `[gMASK]<sop>` then
-`<|system|>` / `<|user|>` / `<|assistant|>` + `\n` + content per message
-(unknown roles map to `<|user|>`), ending with a trailing `<|assistant|>\n`.
+The loaded architecture selects either the GLM prompt format with
+`[gMASK]<sop>` and role markers or Qwen's ChatML format.
 
 **Non-streaming response** (`200`):
 
@@ -83,8 +122,8 @@ Prompts are built with the GLM chat template: `[gMASK]<sop>` then
  "usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}
 ```
 
-`finish_reason` is `"stop"`, or `"tool_calls"` when the generation produced
-tool calls (see §Tool calling); `"length"` is never emitted.
+The finish reason is `"stop"` at EOS, `"length"` when the token budget is
+exhausted, or `"tool_calls"` when the response includes tool calls.
 
 **Streaming response** (`200`, `text/event-stream`; keep-alive comment every
 15 s). The first chunk carries the assistant role delta; every chunk carries
@@ -99,21 +138,20 @@ Deltas are decoded-text suffixes — a token that doesn't lengthen the decoded
 string emits no chunk. If an engine error occurs mid-stream, the stream emits
 `data: {"error":{"message":"..."}}` and ends without a finish chunk or
 `[DONE]`. A client disconnect aborts the request and the sequence is retired
-on the next engine step. A submit against a full admission queue
-(`COLI_QUEUE_DEPTH` set) is refused up front with an OpenAI-shaped `503`
-`overloaded_error` — retry later.
+on the next engine step. A full queue returns an OpenAI-shaped `503`
+`overloaded_error`. The default backlog is 128 requests.
 
 **Errors** use the OpenAI shape `{"error":{"message":"…","type":"…"}}`:
 
 | Status | Trigger |
 |---|---|
-| 400 | `messages must not be empty` |
+| 400 | Empty messages or a zero completion budget |
 | 401 | missing or invalid API key (`Authorization: Bearer <key>` required) |
 | 413 | prompt exceeds `--max-prompt-tokens` |
 | 500 | tokenizer failure or engine error |
 
-(Unparseable JSON bodies are rejected by the framework before the handler and
-return plain-text 4xx, not the OpenAI shape.)
+Bearer authentication runs before JSON extraction. Authenticated requests with
+malformed JSON receive a structured client error.
 
 ### Tool calling
 
@@ -138,7 +176,7 @@ text, tool calls, and `<think>` reasoning, holding back any suffix that could
 still turn out to be a marker — so a `<tool_call>` arriving one character at a
 time never leaks a fragment to the client. Then:
 
-- `finish_reason` is `"tool_calls"` when the turn produced any call, else `"stop"`.
+- A response that includes a tool call reports `"tool_calls"`.
 - `content` is `null` on a calls-only turn, and the text otherwise.
 - Call ids are `call_<completion-id-without-the-chatcmpl-prefix>_<index>`, stable
   between the streaming and non-streaming paths for the same completion.
@@ -323,13 +361,12 @@ bit-identical when off.
 
 ## Runtime tokenizer
 
-The sole runtime tokenizer is the vendored gigatoken BPE engine
-([details](tokenizer.md)). It loads `<model-dir>/tokenizer.json`; a tokenizer
-gigatoken can't handle (SentencePiece/non-BPE) is a **hard boot error** —
-`tokenizer: gigatoken can't load this model's tokenizer.json …` — never a
-silent fallback. The instance is process-persistent, so its pretoken memo
-cache warms across requests (repeated chat-template prefixes encode from
-cache).
+The server loads `<model-dir>/tokenizer.json`. Supported ByteLevel BPE files use
+[gigatoken](tokenizer.md), whose encode cache persists across requests and whose
+decoder shares an immutable vocabulary. Other formats supported by Hugging
+Face Tokenizers use its sequence decoder. For those formats, the stream sends
+the fully decoded text in one delta so punctuation and spacing match JSON
+responses.
 
 `--bench-tokenizer <file>` runs without loading weights and prints three
 throughput rows: `gigatoken/line` (one encode per line — the serve pattern,

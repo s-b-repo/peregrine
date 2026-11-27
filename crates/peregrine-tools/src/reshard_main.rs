@@ -1,7 +1,6 @@
 //! `peregrine-reshard` — re-pack a sharded MoE checkpoint so each sparse
-//! layer's routed experts split across bandwidth-proportional device groups
-//! (M4b — see docs/performance-tuning.md). Verbatim bytes only; the tool
-//! groups and re-packs, physical placement is a later move-and-symlink step.
+//! layer's routed experts split across bandwidth-proportional device groups,
+//! or place complete transformer layers directly on several drives.
 //!
 //! ```text
 //! peregrine-reshard --model <dir> --out <dir> \
@@ -9,12 +8,13 @@
 //!     [--route-stats <path>] [--dry-run] [--verify]
 //! ```
 
-use peregrine_tools::reshard::{parse_groups, plan, verify, write, Options, Plan};
-use std::path::PathBuf;
+use peregrine_tools::reshard::{parse_groups, plan, plan_layers, verify, write, write_layers, Options, Plan, WriteReport};
+use std::path::{Path, PathBuf};
 
 fn usage() -> i32 {
     eprintln!(
         "usage: peregrine-reshard --model <dir> --out <dir> --groups <name>:<w>,... [options]\n\
+         \x20      peregrine-reshard --model <dir> --out <dir> --layer-drive <dir> [--layer-drive <dir> ...] [options]\n\
          \n\
          options:\n\
          \x20 --groups <spec>       comma-separated <name>:<weight> storage groups; weights are\n\
@@ -22,6 +22,8 @@ fn usage() -> i32 {
          \x20                       the FIRST group listed.\n\
          \x20 --route-stats <path>  route_stats.json-shaped heat for the greedy packer\n\
          \x20                       (uniform heat when omitted)\n\
+         \x20 --layer-drive <dir>   alternate whole layers across these new directories\n\
+         \x20                       and write model_paths.json under a new --out directory\n\
          \x20 --dry-run             print per-group file counts / bytes / expected per-token\n\
          \x20                       share, write nothing\n\
          \x20 --verify              after writing, byte-compare EVERY tensor against the source;\n\
@@ -49,11 +51,27 @@ fn print_plan(p: &Plan) {
     }
 }
 
+fn print_layer_plan(out: &Path, drives: &[PathBuf], files: &[peregrine_tools::reshard::FilePlan]) {
+    for (group, path) in std::iter::once(out).chain(drives.iter().map(PathBuf::as_path)).enumerate() {
+        let (count, bytes) = files.iter().filter(|f| f.group == group)
+            .fold((0, 0u64), |(count, bytes), f| (count + 1, bytes.saturating_add(f.bytes)));
+        eprintln!("peregrine-reshard: {} holds {count} shard(s), {:.3} GB", path.display(), bytes as f64 / 1e9);
+    }
+}
+
+fn print_written(rep: WriteReport) {
+    eprintln!(
+        "peregrine-reshard: wrote {} file(s), {:.3} GB, manifest {}",
+        rep.files.len(), rep.bytes_written as f64 / 1e9, rep.manifest.display()
+    );
+}
+
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut model: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut groups_spec: Option<String> = None;
+    let mut layer_drives = Vec::new();
     let mut route_stats: Option<PathBuf> = None;
     let mut dry_run = false;
     let mut do_verify = false;
@@ -90,6 +108,13 @@ fn main() -> std::process::ExitCode {
                     None => return std::process::ExitCode::from(usage() as u8),
                 }
             }
+            "--layer-drive" => {
+                i += 1;
+                match args.get(i) {
+                    Some(s) => layer_drives.push(PathBuf::from(s)),
+                    None => return std::process::ExitCode::from(usage() as u8),
+                }
+            }
             "-h" | "--help" => return std::process::ExitCode::from(usage() as u8),
             other => {
                 eprintln!("peregrine-reshard: unknown argument '{other}'");
@@ -98,44 +123,42 @@ fn main() -> std::process::ExitCode {
         }
         i += 1;
     }
-    let (Some(model), Some(out), Some(groups_spec)) = (model, out, groups_spec) else {
+    let (Some(model), Some(out)) = (model, out) else {
         return std::process::ExitCode::from(usage() as u8);
     };
-    let groups = match parse_groups(&groups_spec) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("peregrine-reshard: {e}");
-            return std::process::ExitCode::from(2);
-        }
-    };
-    let mut opts = Options::new(groups);
-    opts.route_stats = route_stats;
-
-    let p = match plan(&model, &opts) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("peregrine-reshard: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    print_plan(&p);
-
-    if !dry_run {
-        match write(&model, &out, &p) {
-            Ok(rep) => {
-                eprintln!(
-                    "peregrine-reshard: wrote {} file(s), {:.3} GB, manifest {}",
-                    rep.files.len(),
-                    rep.bytes_written as f64 / 1e9,
-                    rep.manifest.display()
-                );
-            }
+    let result = if let Some(groups_spec) = groups_spec.as_deref().filter(|_| layer_drives.is_empty()) {
+        let groups = match parse_groups(groups_spec) {
+            Ok(g) => g,
             Err(e) => {
                 eprintln!("peregrine-reshard: {e}");
-                return std::process::ExitCode::FAILURE;
+                return std::process::ExitCode::from(2);
             }
-        }
+        };
+        let mut opts = Options::new(groups);
+        opts.route_stats = route_stats;
+        plan(&model, &opts).and_then(|p| {
+            print_plan(&p);
+            if !dry_run {
+                print_written(write(&model, &out, &p)?);
+            }
+            Ok(())
+        })
+    } else if !layer_drives.is_empty() && groups_spec.is_none() && route_stats.is_none() {
+        plan_layers(&model, layer_drives.len()).and_then(|p| {
+            print_layer_plan(&out, &layer_drives, &p);
+            if !dry_run {
+                print_written(write_layers(&model, &out, &layer_drives, &p)?);
+            }
+            Ok(())
+        })
     } else {
+        return std::process::ExitCode::from(usage() as u8);
+    };
+    if let Err(e) = result {
+        eprintln!("peregrine-reshard: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    if dry_run {
         eprintln!("peregrine-reshard: --dry-run, nothing written");
     }
 

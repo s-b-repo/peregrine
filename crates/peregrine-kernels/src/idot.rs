@@ -34,6 +34,8 @@ pub fn dot_i4i8_scalar(w4: &[u8], x: &[i8], n: usize) -> i32 {
 /// Best available int8·int8 dot for this CPU (runtime feature dispatch).
 #[inline]
 pub fn dot_i8i8(w: &[i8], x: &[i8], n: usize) -> i32 {
+    let w = &w[..n];
+    let x = &x[..n];
     #[cfg(target_arch = "x86_64")]
     {
         // The VNNI kernel is `#[target_feature(enable = "avx2,avxvnni")]`, so BOTH
@@ -65,6 +67,8 @@ pub fn dot_i8i8(w: &[i8], x: &[i8], n: usize) -> i32 {
 /// Best available packed-int4·int8 dot for this CPU.
 #[inline]
 pub fn dot_i4i8(w4: &[u8], x: &[i8], n: usize) -> i32 {
+    let w4 = &w4[..n.div_ceil(2)];
+    let x = &x[..n];
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: the avx2 kernel is only called after detecting avx2 at runtime.
@@ -147,6 +151,8 @@ pub fn dot_i2i8_scalar(w2: &[u8], x: &[i8], n: usize) -> i32 {
 /// [`dot_i2i8_scalar`] (integer addition is associative).
 #[inline]
 pub fn dot_i2i8(w2: &[u8], x: &[i8], n: usize) -> i32 {
+    let w2 = &w2[..n.div_ceil(4)];
+    let x = &x[..n];
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: the avx2 kernel is only called after detecting avx2 at runtime.
@@ -612,6 +618,9 @@ pub fn dot_i2i8_g64_scalar(w2: &[u8], x: &[i8], scales: &[f32], n: usize) -> f32
 /// integer sums exactly and apply the same two float multiplies in the same
 /// order. Gated by `int2_g64_avx2_matches_scalar`.
 pub fn dot_i2i8_g64(w2: &[u8], x: &[i8], scales: &[f32], n: usize) -> f32 {
+    let w2 = &w2[..n.div_ceil(4)];
+    let x = &x[..n];
+    let scales = &scales[..n.div_ceil(64) * 2];
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: the avx2 kernel is only called after detecting avx2 at runtime.
@@ -1014,6 +1023,12 @@ mod tests {
 /// applied in the same order), so the SIMD path is a speed change only. Gated by
 /// `int3_g64_avx2_matches_scalar`.
 pub fn dot_i3i8_g64(w3: &[u8], x: &[i8], scales: &[f32], n: usize) -> f32 {
+    let groups = n.div_ceil(64);
+    let tail = n % 64;
+    let tail_bytes = if tail == 0 { 0 } else { 16 + tail.div_ceil(8) };
+    let w3 = &w3[..(n / 64) * 24 + tail_bytes];
+    let x = &x[..n];
+    let scales = &scales[..groups];
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: the avx2 kernel is only called after detecting avx2 at runtime.

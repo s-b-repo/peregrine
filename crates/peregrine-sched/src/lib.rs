@@ -455,6 +455,7 @@ mod tests {
             workers: 1,
             cfg: &cfg,
             stream_experts: true,
+            demand_experts: false,
             ecache: None,
             route_log: None,
             calib: None,
