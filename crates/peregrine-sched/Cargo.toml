@@ -16,4 +16,4 @@ peregrine-io = { path = "../peregrine-io" }
 # `ForwardCtx::reactors` is `&[parking_lot::Mutex<Reactor>]`, so the oracle test
 # has to build the same mutex type the production path uses. Dev-only: nothing
 # in this crate's own lanes locks anything.
-parking_lot = "0.12"
+parking_lot = "0.13"
